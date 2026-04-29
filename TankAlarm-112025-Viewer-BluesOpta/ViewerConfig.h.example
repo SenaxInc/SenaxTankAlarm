@@ -20,4 +20,49 @@
 // Format: com.company.product:project
 #define DEFAULT_VIEWER_PRODUCT_UID "com.your-company.your-product:your-project"
 
+// ============================================================================
+// Network Printer Configuration (optional)
+// ============================================================================
+// The Viewer Opta can send a plain-text daily fleet-snapshot report to a
+// network printer using the Raw / JetDirect protocol (TCP port 9100).  Most
+// laser, inkjet, and thermal network printers support this without any
+// additional driver or software.
+//
+// Steps to enable:
+//   1. Set PRINT_ENABLED to true.
+//   2. Set the four PRINTER_IP octets to your printer's LAN IP address.
+//      (e.g. 192.168.1.50  →  1=192, 2=168, 3=1, 4=50)
+//   3. Leave PRINTER_PORT at 9100 unless your printer uses a different raw port.
+//   4. Set PRINT_DAILY_HOUR to the UTC hour (0–23) when the report should fire.
+//      Example: 13 = 1 PM UTC (8 AM US Eastern in summer / 9 AM in winter).
+//   5. Recompile and flash the Viewer sketch.
+//
+// The report is sent once per UTC calendar day and includes the current level,
+// 24-hour change, and alarm status for every sensor in the fleet snapshot.
+// A form-feed character is appended at the end so the page is ejected
+// automatically.
+//
+// To find your printer's IP address:
+//   • Print a configuration page from the printer's control panel, or
+//   • Check your router's DHCP client list and assign the printer a
+//     static/reserved IP so it never changes.
+// ============================================================================
+
+// Set to true to enable daily report printing
+#define PRINT_ENABLED false
+
+// Network printer IPv4 address (four octets, e.g. 192.168.1.50)
+#define PRINTER_IP_1 192
+#define PRINTER_IP_2 168
+#define PRINTER_IP_3 1
+#define PRINTER_IP_4 50
+
+// TCP port for Raw / JetDirect printing (9100 is the standard default)
+#define PRINTER_PORT 9100
+
+// UTC hour at which the daily report is printed (0–23).
+// Convert from your local time zone: UTC = local + offset
+// Examples:  8 = 8 AM UTC,  13 = 1 PM UTC,  23 = 11 PM UTC
+#define PRINT_DAILY_HOUR 8
+
 #endif // VIEWER_CONFIG_H

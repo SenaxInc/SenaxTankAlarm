@@ -89,6 +89,34 @@
 #define MAX_HTTP_BODY_BYTES 1024
 #endif
 
+// ---- Network Printer Configuration (JetDirect / Raw port 9100) ----
+// Override in ViewerConfig.h to enable daily report printing.
+// The printer must be reachable on the same LAN as the Viewer Opta.
+#ifndef PRINT_ENABLED
+#define PRINT_ENABLED false        // Set true in ViewerConfig.h to enable printing
+#endif
+
+#ifndef PRINTER_IP_1
+#define PRINTER_IP_1 0             // Printer IPv4 octet 1
+#endif
+#ifndef PRINTER_IP_2
+#define PRINTER_IP_2 0             // Printer IPv4 octet 2
+#endif
+#ifndef PRINTER_IP_3
+#define PRINTER_IP_3 0             // Printer IPv4 octet 3
+#endif
+#ifndef PRINTER_IP_4
+#define PRINTER_IP_4 0             // Printer IPv4 octet 4
+#endif
+
+#ifndef PRINTER_PORT
+#define PRINTER_PORT 9100          // 9100 = JetDirect / Raw socket (default for most network printers)
+#endif
+
+#ifndef PRINT_DAILY_HOUR
+#define PRINT_DAILY_HOUR 8         // UTC hour (0–23) at which the daily report is printed
+#endif
+
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
@@ -102,6 +130,11 @@ struct ViewerConfig {
   uint8_t staticGateway[4];      // Gateway IP
   uint8_t staticSubnet[4];       // Subnet mask
   uint8_t staticDns[4];          // DNS server
+  // Network printer (JetDirect / Raw socket printing)
+  bool printEnabled;             // true = send daily fleet-snapshot report to the printer
+  uint8_t printerIp[4];         // Network printer IPv4 address
+  uint16_t printerPort;         // Printer port (9100 = JetDirect, also common: 515 LPR)
+  uint8_t printDailyHour;       // UTC hour (0–23) at which the daily report fires
 };
 
 struct SensorRecord {
@@ -133,11 +166,19 @@ static ViewerConfig gConfig = {
   { 192, 168, 1, 210 },          // staticIp
   { 192, 168, 1, 1 },            // staticGateway  
   { 255, 255, 255, 0 },          // staticSubnet
-  { 8, 8, 8, 8 }                 // staticDns
+  { 8, 8, 8, 8 },                // staticDns
+  // Printer defaults (override in ViewerConfig.h)
+  PRINT_ENABLED,                 // printEnabled
+  { PRINTER_IP_1, PRINTER_IP_2, PRINTER_IP_3, PRINTER_IP_4 },  // printerIp
+  PRINTER_PORT,                  // printerPort
+  PRINT_DAILY_HOUR               // printDailyHour
 };
 
 static SensorRecord gSensorRecords[MAX_SENSOR_RECORDS];
 static uint8_t gSensorRecordCount = 0;
+
+// Printer state
+static uint32_t gLastPrintDay = 0;  // Day number (epoch/86400) of the last successful print job
 
 static Notecard notecard;
 static EthernetServer gWebServer(ETHERNET_PORT);
@@ -206,6 +247,9 @@ static void enableDfuMode();
 static void checkGitHubForUpdate();
 static void handleGitHubUpdateGet(EthernetClient &client);
 static bool attemptGitHubDirectInstall(String &statusMessage);
+static void epochToDateStr(double epoch, char *buf, size_t bufLen);
+static void checkDailyPrint();
+static void sendDailyPrintJob();
 
 // ============================================================================
 // Diagnostics Helpers
@@ -364,6 +408,9 @@ void loop() {
     fetchViewerSummary();
     scheduleNextSummaryFetch();
   }
+
+  // Daily report printing (if printer is configured)
+  checkDailyPrint();
 
   // Check for firmware updates every hour
   unsigned long currentMillis = millis();
@@ -1226,3 +1273,204 @@ static void enableDfuMode() {
   }
 }
 
+// ============================================================================
+// Network Printing (JetDirect / Raw socket, port 9100)
+// ============================================================================
+
+/**
+ * Convert a Unix epoch (UTC seconds) to a human-readable "YYYY-MM-DD HH:MM:SS UTC" string.
+ * Uses Howard Hinnant's civil_from_days algorithm; no stdlib time functions required.
+ *
+ * @param epoch  Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+ * @param buf    Output character buffer
+ * @param bufLen Size of buf (at least 24 bytes recommended)
+ */
+static void epochToDateStr(double epoch, char *buf, size_t bufLen) {
+  if (epoch < 0.0 || !buf || bufLen < 20) {
+    if (buf && bufLen > 0) strlcpy(buf, "--", bufLen);
+    return;
+  }
+  uint32_t t = (uint32_t)epoch;
+  uint32_t sec  = t % 60;  t /= 60;
+  uint32_t min  = t % 60;  t /= 60;
+  uint32_t hour = t % 24;  t /= 24;
+  uint32_t days = t;
+
+  // Howard Hinnant civil_from_days
+  uint32_t z   = days + 719468UL;
+  uint32_t era = z / 146097UL;
+  uint32_t doe = z - era * 146097UL;
+  uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  uint32_t y   = yoe + era * 400UL;
+  uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  uint32_t mp  = (5 * doy + 2) / 153;
+  uint32_t d   = doy - (153 * mp + 2) / 5 + 1;
+  uint32_t m   = mp < 10 ? mp + 3 : mp - 9;
+  if (m <= 2) y++;
+
+  snprintf(buf, bufLen, "%04u-%02u-%02u %02u:%02u:%02u UTC",
+           (unsigned)y, (unsigned)m, (unsigned)d,
+           (unsigned)hour, (unsigned)min, (unsigned)sec);
+}
+
+/**
+ * Check whether it is time to send a daily print job and, if so, dispatch one.
+ *
+ * The job fires once per UTC calendar day when:
+ *   1. gConfig.printEnabled is true
+ *   2. gConfig.printerIp is not 0.0.0.0
+ *   3. The current UTC hour >= gConfig.printDailyHour
+ *   4. A job has not already been sent today (gLastPrintDay tracks the day)
+ *
+ * Called from loop().
+ */
+static void checkDailyPrint() {
+  if (!gConfig.printEnabled) return;
+
+  // Require a non-zero printer IP
+  if (gConfig.printerIp[0] == 0 && gConfig.printerIp[1] == 0 &&
+      gConfig.printerIp[2] == 0 && gConfig.printerIp[3] == 0) {
+    return;
+  }
+
+  double epoch = currentEpoch();
+  if (epoch < 1000000.0) return;  // Clock not yet synced (pre-1982)
+
+  uint32_t today = (uint32_t)(epoch / 86400.0);  // Day index since 1970-01-01
+  if (today == gLastPrintDay) return;             // Already printed today
+
+  // Only fire at or after the configured UTC hour
+  uint32_t secondsOfDay = (uint32_t)fmod(epoch, 86400.0);
+  uint8_t  currentHour  = (uint8_t)(secondsOfDay / 3600);
+  if (currentHour < gConfig.printDailyHour) return;
+
+  sendDailyPrintJob();
+  gLastPrintDay = today;
+}
+
+/**
+ * Connect to the configured network printer and transmit a plain-text daily
+ * fleet-snapshot report via Raw / JetDirect printing (TCP port 9100).
+ *
+ * Most network-capable laser, inkjet, and thermal printers accept plain ASCII
+ * on port 9100 without any additional driver or protocol overhead.  A form-feed
+ * character (0x0C) is appended so that the page is automatically ejected.
+ *
+ * The function is intentionally synchronous: it blocks until the job is
+ * transmitted or the connection fails.  Watchdog kicks are inserted around
+ * the potentially slow connect() call to prevent a hardware reset.
+ */
+static void sendDailyPrintJob() {
+  IPAddress printerAddr(gConfig.printerIp[0], gConfig.printerIp[1],
+                        gConfig.printerIp[2], gConfig.printerIp[3]);
+
+  Serial.print(F("Daily print: connecting to "));
+  Serial.print(printerAddr);
+  Serial.print(':');
+  Serial.println(gConfig.printerPort);
+
+  // Kick watchdog before the blocking connect() call
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    mbedWatchdog.kick();
+  #endif
+#endif
+
+  EthernetClient printer;
+  if (!printer.connect(printerAddr, gConfig.printerPort)) {
+    Serial.println(F("Daily print: could not connect to printer — will retry tomorrow"));
+    return;
+  }
+
+  // ---- Report header ----
+  char dateBuf[28];
+  epochToDateStr(currentEpoch(), dateBuf, sizeof(dateBuf));
+
+  printer.println(F("================================"));
+  printer.println(F("   TANK ALARM DAILY REPORT"));
+  printer.print(F("   "));   printer.println(gConfig.viewerName);
+  printer.print(F("   "));   printer.println(dateBuf);
+  printer.println(F("================================"));
+  printer.println();
+
+  // ---- Sensor rows ----
+  if (gSensorRecordCount == 0) {
+    printer.println(F("   No sensor data available."));
+  } else {
+    for (uint8_t i = 0; i < gSensorRecordCount; i++) {
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+      mbedWatchdog.kick();
+  #endif
+#endif
+      const SensorRecord &rec = gSensorRecords[i];
+
+      printer.println(F("--------------------------------"));
+
+      // Site / label / user number
+      printer.print(F("   "));
+      printer.print(rec.site[0] ? rec.site : "Unknown");
+      if (rec.label[0]) {
+        printer.print(F(" / "));
+        printer.print(rec.label);
+      }
+      if (rec.userNumber > 0) {
+        printer.print(F(" #"));
+        printer.print((int)rec.userNumber);
+      }
+      printer.println();
+
+      // Level in feet and inches
+      if (rec.levelInches >= 0.0f && isfinite(rec.levelInches)) {
+        int feet = (int)(rec.levelInches / 12.0f);
+        float remIn = rec.levelInches - (float)(feet * 12);
+        char levelBuf[16];
+        snprintf(levelBuf, sizeof(levelBuf), "%d' %.1f\"", feet, remIn);
+        printer.print(F("   Level:  "));
+        printer.println(levelBuf);
+      } else {
+        printer.println(F("   Level:  --"));
+      }
+
+      // 24-hour change
+      if (rec.hasChange24h) {
+        char changeBuf[16];
+        snprintf(changeBuf, sizeof(changeBuf), "%+.1f\"", rec.change24h);
+        printer.print(F("   Change: "));
+        printer.println(changeBuf);
+      }
+
+      // Alarm status
+      printer.print(F("   Status: "));
+      if (rec.alarmActive) {
+        printer.print(rec.alarmType[0] ? rec.alarmType : "ALARM");
+        printer.println(F("  *ALARM*"));
+      } else {
+        printer.println(F("Normal"));
+      }
+
+      // Last updated
+      char updBuf[28];
+      epochToDateStr(rec.lastUpdateEpoch, updBuf, sizeof(updBuf));
+      printer.print(F("   Upd:    "));
+      printer.println(updBuf);
+    }
+    printer.println(F("--------------------------------"));
+  }
+
+  // ---- Report footer ----
+  printer.println();
+  printer.println(F("================================"));
+  printer.print(F("   "));
+  printer.println(gViewerUid[0] ? gViewerUid : "Viewer");
+  printer.print(F("   Firmware v"));
+  printer.println(F(FIRMWARE_VERSION));
+  printer.println(F("================================"));
+  printer.println('\f');  // Form-feed — ejects the page on most printers
+
+  printer.flush();
+  safeSleep(500);
+  printer.stop();
+
+  Serial.println(F("Daily print job sent successfully"));
+}
