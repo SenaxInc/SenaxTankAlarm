@@ -183,8 +183,9 @@ static uint8_t gSensorRecordCount = 0;
 // a second print job will be dispatched once the hour condition is met again.
 // This is typically acceptable for daily reporting; if duplicates are a concern,
 // power the device from an uninterrupted supply to minimize unexpected reboots.
-static uint32_t gLastPrintDay = 0;         // Day number (epoch/86400) of last successful print
-static unsigned long gLastPrintAttemptMs = 0;  // millis() of last print attempt (success or fail)
+static uint32_t gLastPrintDay = 0;            // Day number (epoch/86400) of last successful print
+static uint32_t gLastPrintAttemptDay = 0;     // Day number of last print attempt (for throttle reset)
+static unsigned long gLastPrintAttemptMs = 0; // millis() of last print attempt (success or fail)
 // Retry failed print attempts at most once every 15 minutes within the same UTC day.
 #define PRINT_RETRY_INTERVAL_MS (15UL * 60UL * 1000UL)
 
@@ -1291,10 +1292,10 @@ static void enableDfuMode() {
  *
  * @param epoch  Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
  * @param buf    Output character buffer
- * @param bufLen Size of buf (at least 24 bytes recommended)
+ * @param bufLen Size of buf (must be at least 24 bytes)
  */
 static void epochToDateStr(double epoch, char *buf, size_t bufLen) {
-  if (epoch < 0.0 || !buf || bufLen < 20) {
+  if (epoch < 0.0 || !buf || bufLen < 24) {
     if (buf && bufLen > 0) strlcpy(buf, "--", bufLen);
     return;
   }
@@ -1345,23 +1346,41 @@ static void checkDailyPrint() {
     return;
   }
 
+  // Validate configuration — warn once and bail if misconfigured
+  if (gConfig.printDailyHour > 23 || gConfig.printerPort == 0) {
+    static bool sWarnedBadConfig = false;
+    if (!sWarnedBadConfig) {
+      Serial.println(F("Daily print: invalid config — printDailyHour must be 0–23 and printerPort must be non-zero"));
+      sWarnedBadConfig = true;
+    }
+    return;
+  }
+
   double epoch = currentEpoch();
   if (epoch < 1000000.0) return;  // Clock not yet synced (pre-1982)
 
-  uint32_t today = (uint32_t)(epoch / 86400.0);  // Day index since 1970-01-01
+  uint32_t epochSeconds = (uint32_t)epoch;
+  uint32_t today        = epochSeconds / 86400U;  // Day index since 1970-01-01
   if (today == gLastPrintDay) return;             // Already printed today
 
   // Only fire at or after the configured UTC hour
-  uint32_t secondsOfDay = ((uint32_t)epoch) % 86400U;
+  uint32_t secondsOfDay = epochSeconds % 86400U;
   uint8_t  currentHour  = (uint8_t)(secondsOfDay / 3600U);
   if (currentHour < gConfig.printDailyHour) return;
+
+  // Reset the per-attempt throttle when a new UTC day begins so the first
+  // attempt on a given day is never delayed by the previous day's attempt.
+  if (today != gLastPrintAttemptDay) {
+    gLastPrintAttemptMs = 0;
+  }
 
   // Throttle retries — don't hammer the printer every loop() iteration
   unsigned long now = millis();
   if (gLastPrintAttemptMs != 0 && (now - gLastPrintAttemptMs) < PRINT_RETRY_INTERVAL_MS) {
     return;
   }
-  gLastPrintAttemptMs = now;
+  gLastPrintAttemptDay = today;
+  gLastPrintAttemptMs  = now;
 
   if (sendDailyPrintJob()) {
     gLastPrintDay = today;  // Mark success; suppress further attempts today
