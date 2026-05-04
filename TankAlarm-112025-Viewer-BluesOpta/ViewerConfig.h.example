@@ -20,4 +20,58 @@
 // Format: com.company.product:project
 #define DEFAULT_VIEWER_PRODUCT_UID "com.your-company.your-product:your-project"
 
+// ============================================================================
+// Network Printer Configuration (optional)
+// ============================================================================
+// The Viewer Opta can send a plain-text daily fleet-snapshot report to a
+// network printer using the Raw / JetDirect protocol (TCP port 9100).  Most
+// laser, inkjet, and thermal network printers support this without any
+// additional driver or software.
+//
+// Steps to enable:
+//   1. Set PRINT_ENABLED to true.
+//   2. Set the four PRINTER_IP octets to your printer's LAN IP address.
+//      (e.g. 192.168.1.50  →  1=192, 2=168, 3=1, 4=50)
+//   3. Leave PRINTER_PORT at 9100 unless your printer uses a different raw port.
+//   4. Set PRINT_DAILY_HOUR to the UTC hour (0–23) when the report should fire.
+//      Use the formula: UTC_hour = local_hour − UTC_offset (offset is signed:
+//      negative west of UTC, positive east of UTC).
+//      Example: 8 AM US Eastern Standard (UTC-5) → 8 − (−5) = 13 → set 13.
+//   5. Recompile and flash the Viewer sketch.
+//
+// The report is sent once per UTC calendar day and includes the current level,
+// 24-hour change, and alarm status for every sensor in the fleet snapshot.
+// A form-feed character is appended at the end so the page is ejected
+// automatically.
+//
+// To find your printer's IP address:
+//   • Print a configuration page from the printer's control panel, or
+//   • Check your router's DHCP client list and assign the printer a
+//     static/reserved IP so it never changes.
+// ============================================================================
+
+// Set to true to enable daily report printing
+#define PRINT_ENABLED false
+
+// Network printer IPv4 address (four octets, e.g. 192.168.1.50)
+#define PRINTER_IP_1 192
+#define PRINTER_IP_2 168
+#define PRINTER_IP_3 1
+#define PRINTER_IP_4 50
+
+// TCP port for Raw / JetDirect printing (9100 is the standard default)
+#define PRINTER_PORT 9100
+
+// UTC hour at which the daily report is printed (0–23).
+// Formula: UTC_hour = local_hour − UTC_offset
+//   where UTC_offset is the signed value in your timezone name
+//   (negative west of UTC, positive east of UTC).
+//   US Eastern Standard Time (UTC-5): 8 AM − (−5) = 13 → set 13
+//   US Eastern Daylight Time (UTC-4): 8 AM − (−4) = 12 → set 12
+//   US Central Standard Time (UTC-6): 8 AM − (−6) = 14 → set 14
+//   US Mountain Standard Time (UTC-7): 8 AM − (−7) = 15 → set 15
+//   US Pacific Standard Time  (UTC-8): 8 AM − (−8) = 16 → set 16
+//   Central European Time     (UTC+1): 8 AM − (+1) =  7 → set  7
+#define PRINT_DAILY_HOUR 13
+
 #endif // VIEWER_CONFIG_H
