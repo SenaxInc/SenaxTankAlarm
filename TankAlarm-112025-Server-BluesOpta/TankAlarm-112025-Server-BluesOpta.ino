@@ -792,7 +792,7 @@ static bool archiveMonthToFtp(uint16_t year, uint8_t month);
 static bool loadArchivedMonth(uint16_t year, uint8_t month, JsonDocument &doc);
 static void populateHistorySettingsJson(JsonDocument &doc);
 static void applyHistorySettingsFromJson(const JsonDocument &doc);
-static void saveHistorySettings();
+static bool saveHistorySettings();
 static void loadHistorySettings();
 
 // Forward declarations for FTP structs
@@ -5173,19 +5173,55 @@ static bool saveServerHeartbeatEpoch(double epoch) {
 struct BackupFileEntry {
   const char *localPath;
   const char *remoteName;
+  bool required;
 };
 
 static const BackupFileEntry kBackupFiles[] = {
-  { SERVER_CONFIG_PATH, "server_config.json" },
-  { CONTACTS_CONFIG_PATH, "contacts_config.json" },
-  { "/email_format.json", "email_format.json" },
-  { CLIENT_CONFIG_CACHE_PATH, "client_config_cache.txt" },
-  { CALIBRATION_LOG_PATH, "calibration_log.txt" },
-  { "/calibration_data.txt", "calibration_data.txt" },
-  { SENSOR_REGISTRY_PATH, "sensor_registry.json" },
-  { CLIENT_METADATA_CACHE_PATH, "client_metadata.json" },
-  { "/history_settings.json", "history_settings.json" }
+  { SERVER_CONFIG_PATH, "server_config.json", true },
+  { CONTACTS_CONFIG_PATH, "contacts_config.json", false },
+  { "/email_format.json", "email_format.json", false },
+  { CLIENT_CONFIG_CACHE_PATH, "client_config_cache.txt", false },
+  { CALIBRATION_LOG_PATH, "calibration_log.txt", false },
+  { "/calibration_data.txt", "calibration_data.txt", false },
+  { SENSOR_REGISTRY_PATH, "sensor_registry.json", false },
+  { CLIENT_METADATA_CACHE_PATH, "client_metadata.json", false },
+  { "/history_settings.json", "history_settings.json", true }
 };
+
+static bool prepareLocalBackupFilesForFtp(FtpResult &result) {
+#ifndef FILESYSTEM_AVAILABLE
+  strlcpy(result.errorMessage,
+          "Local filesystem not available; cannot upload backup files",
+          sizeof(result.errorMessage));
+  return false;
+#else
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!mbedFS) {
+      strlcpy(result.errorMessage,
+              "Local filesystem not mounted; cannot read /fs backup files",
+              sizeof(result.errorMessage));
+      return false;
+    }
+  #endif
+
+  if (!saveConfig(gConfig)) {
+    strlcpy(result.errorMessage,
+            "Failed to save server_config.json before FTP backup",
+            sizeof(result.errorMessage));
+    return false;
+  }
+  gConfigDirty = false;
+
+  if (!saveHistorySettings()) {
+    strlcpy(result.errorMessage,
+            "Failed to save history_settings.json before FTP backup",
+            sizeof(result.errorMessage));
+    return false;
+  }
+
+  return true;
+#endif
+}
 
 static void buildLocalPath(const char *relativePath, char *out, size_t outSize) {
   if (!relativePath || !out || outSize == 0) {
@@ -6375,6 +6411,10 @@ static FtpResult performFtpBackupDetailed() {
     return result;
   }
 
+  if (!prepareLocalBackupFilesForFtp(result)) {
+    return result;
+  }
+
   // Patch C: pre-scan /fs before opening an FTP/FTPS session. If there is
   // nothing to upload, bail immediately instead of burning seconds on TLS
   // handshake + 9 failed reads + teardown while the HTTP peer is waiting.
@@ -6464,7 +6504,7 @@ static FtpResult performFtpBackupDetailed() {
     serviceTransferWatchdog();
 
     const BackupFileEntry &entry = kBackupFiles[i];
-    char contents[2048];
+    static char contents[FTP_MAX_FILE_BYTES + 1];
     size_t len = 0;
     if (!readFileToBuffer(entry.localPath, contents, sizeof(contents), len)) {
       // Log every skip so we can see why a backup produced no STORs.
@@ -6473,6 +6513,10 @@ static FtpResult performFtpBackupDetailed() {
       Serial.print(entry.localPath);
       Serial.print(F(" -> "));
       Serial.println(entry.remoteName);
+      if (entry.required) {
+        result.filesFailed++;
+        result.addFailedFile(entry.remoteName);
+      }
       continue;
     }
 
@@ -6657,6 +6701,11 @@ static FtpResult performFtpBackupDetailed() {
   serviceTransferWatchdog();
 
   result.success = (result.filesProcessed > 0);
+  if (result.success && result.filesFailed > 0 && result.errorMessage[0] == '\0') {
+    snprintf(result.errorMessage, sizeof(result.errorMessage),
+             "%u files uploaded, %u failed",
+             (unsigned)result.filesProcessed, (unsigned)result.filesFailed);
+  }
   if (!result.success && result.errorMessage[0] == '\0') {
     // Connection + login succeeded, but no file was readable from /fs — make
     // that visible instead of returning an empty "Backup failed".
@@ -7273,10 +7322,10 @@ static void populateHistorySettingsJson(JsonDocument &doc) {
 }
 
 // Save history settings to LittleFS
-static void saveHistorySettings() {
+static bool saveHistorySettings() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS) return;
+    if (!mbedFS) return false;
     
     JsonDocument doc;
     populateHistorySettingsJson(doc);
@@ -7287,7 +7336,9 @@ static void saveHistorySettings() {
     if (!tankalarm_posix_write_file_atomic("/fs/history_settings.json",
                                             output.c_str(), output.length())) {
       Serial.println(F("Failed to write history settings"));
+      return false;
     }
+    return true;
   #else
     JsonDocument doc;
     populateHistorySettingsJson(doc);
@@ -7298,8 +7349,12 @@ static void saveHistorySettings() {
     if (!tankalarm_littlefs_write_file_atomic("/history_settings.json",
             (const uint8_t *)output.c_str(), output.length())) {
       Serial.println(F("Failed to write history settings"));
+      return false;
     }
+    return true;
   #endif
+#else
+  return false;
 #endif
 }
 
@@ -15089,8 +15144,14 @@ static void handleServerSettingsPost(EthernetClient &client, const String &body)
     }
   }
 
-  // Mark configuration as dirty so the main loop will save it
-  gConfigDirty = true;
+  if (!saveConfig(gConfig)) {
+    respondStatus(client, 500, "Failed to save settings to local storage");
+    return;
+  }
+  gConfigDirty = false;
+  if (gConfig.ftpEnabled && gConfig.ftpBackupOnChange) {
+    gPendingFtpBackup = true;
+  }
   
   // Reschedule daily email if time changed
   if (dailyScheduleChanged) {
