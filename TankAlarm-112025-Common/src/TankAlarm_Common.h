@@ -16,7 +16,7 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "1.6.13"
+#define FIRMWARE_VERSION "1.6.14"
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.

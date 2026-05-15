@@ -1,7 +1,7 @@
-# TankAlarm v1.6.3 - Industrial Tank Monitoring System
+# TankAlarm v1.6.14 - Industrial Tank Monitoring System
 
 **Release Date:** April 18, 2026  
-**Version:** 1.6.3  
+**Version:** 1.6.14  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -344,7 +344,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
   - [ ] Ethernet connectivity stable
   
 - [ ] **Software Validation**
-  - [ ] Firmware version 1.6.3 confirmed
+  - [ ] Firmware version 1.6.14 confirmed
   - [ ] All clients reporting to server
   - [ ] Alarms triggering correctly
   - [ ] SMS/email alerts delivering
@@ -364,7 +364,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
 
 ### Deployment Checklist
 
-1. Flash all devices with v1.6.3 firmware
+1. Flash all devices with v1.6.14 firmware
 2. Configure Blues Notehub fleet assignments
 3. Set server IP address and network configuration
 4. Configure SMS/email recipients
