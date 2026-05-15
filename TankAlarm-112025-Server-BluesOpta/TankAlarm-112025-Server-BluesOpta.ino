@@ -781,7 +781,7 @@ static bool saveDailySummaryFile(uint16_t year, uint8_t month);
 static bool loadDailySummaryMonth(uint16_t year, uint8_t month, JsonDocument &doc);
 static void pruneDailySummaryFiles();
 // Hot tier persistence (survive reboots)
-static void saveHotTierSnapshot();
+static bool saveHotTierSnapshot();
 static void loadHotTierSnapshot();
 // FTP archive retrieval
 static bool loadFtpArchiveCached(uint16_t year, uint8_t month);
@@ -1191,6 +1191,57 @@ static bool gClientMetadataDirty = false;        // True when client metadata ne
 static unsigned long gLastRegistrySaveMillis = 0;
 static unsigned long gLastStaleCheckMillis = 0;
 
+// ----------------------------------------------------------------------------
+// Flash write observability
+// ----------------------------------------------------------------------------
+// Wraps tankalarm_posix_write_file_atomic() with counters so the dashboard
+// can show per-boot write activity. Hash-gate skips also tracked so we can
+// see how often the throttle is actually preventing redundant writes.
+//
+// IMPORTANT: All persistent writers in this sketch should call
+// serverWriteFileAtomic() instead of tankalarm_posix_write_file_atomic()
+// directly. The local posix_write_file() helper above also routes through
+// here.
+static volatile uint32_t gFlashWritesSinceBoot = 0;
+static volatile uint32_t gFlashWriteFailuresSinceBoot = 0;
+static volatile uint32_t gFlashWritesSkippedHash = 0;
+static volatile uint32_t gFlashBytesWrittenSinceBoot = 0;
+static const char *gLastFlashWritePath = "";
+static unsigned long gLastFlashWriteMillis = 0;
+static const char *gLastFlashWriteFailurePath = "";
+static unsigned long gLastFlashWriteFailureMillis = 0;
+
+static inline bool serverWriteFileAtomic(const char *path, const char *data, size_t len) {
+  bool ok = tankalarm_posix_write_file_atomic(path, data, len);
+  if (ok) {
+    gFlashWritesSinceBoot++;
+    gFlashBytesWrittenSinceBoot += (uint32_t)len;
+    gLastFlashWritePath = path ? path : "";
+    gLastFlashWriteMillis = millis();
+  } else {
+    gFlashWriteFailuresSinceBoot++;
+    gLastFlashWriteFailurePath = path ? path : "";
+    gLastFlashWriteFailureMillis = millis();
+  }
+  return ok;
+}
+
+// FNV-1a 32-bit hash. Used to gate periodic full-file rewrites: if the
+// serialized payload hashes to the same value as the last successful save,
+// skip the write entirely. Cheap on Cortex-M7 and avoids pulling in CRC32
+// table storage.
+static inline uint32_t fnv1a32(const char *data, size_t len) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= (uint8_t)data[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+// Last-saved hashes for hash-gated writers. 0 means "no prior save".
+static uint32_t gHotTierLastHash = 0;
+
 // POSIX file helpers - use tankalarm_ prefixed versions from shared library
 // Keep posix_write_file and posix_read_file locally as they have custom implementations
 #if defined(POSIX_FILE_IO_AVAILABLE)
@@ -1199,9 +1250,10 @@ static inline bool posix_file_exists(const char *path) { return tankalarm_posix_
 static inline void posix_log_error(const char *op, const char *path) { tankalarm_posix_log_error(op, path); }
 
 // POSIX-compliant safe file write — delegates to atomic write-to-temp-then-rename
-// to prevent data loss on power failure during save operations.
+// to prevent data loss on power failure during save operations. Routed through
+// serverWriteFileAtomic() so writes are counted in /api/system-status.
 static bool posix_write_file(const char *path, const char *data, size_t len) {
-  return tankalarm_posix_write_file_atomic(path, data, len);
+  return serverWriteFileAtomic(path, data, len);
 }
 
 // POSIX-compliant safe file read with error handling
@@ -2184,6 +2236,8 @@ static void handlePausePost(EthernetClient &client, const String &body);
 static void handleFtpBackupPost(EthernetClient &client, const String &body);
 static void handleFtpRestorePost(EthernetClient &client, const String &body);
 static void handleFtpBackupStatusGet(EthernetClient &client);
+static void handleSystemStatusGet(EthernetClient &client);
+static void printMemoryBudget();
 static bool readFtpBackupMarker(char *out, size_t outSize);
 static void writeFtpBackupMarker(const char *stage);
 static void clearFtpBackupMarker();
@@ -4189,6 +4243,7 @@ void setup() {
 #endif
 
   tankalarm_printHeapStats();
+  printMemoryBudget();
 
   Serial.println(F("Server setup complete"));
   Serial.println(F("----------------------------------"));
@@ -5061,8 +5116,8 @@ static bool saveConfig(const ServerConfig &cfg) {
       Serial.println(F("Failed to serialize server config"));
       return false;
     }
-    if (!tankalarm_posix_write_file_atomic("/fs/server_config.json",
-                                            jsonStr.c_str(), jsonStr.length())) {
+    if (!serverWriteFileAtomic("/fs/server_config.json",
+                               jsonStr.c_str(), jsonStr.length())) {
       Serial.println(F("Failed to write server config"));
       return false;
     }
@@ -5150,8 +5205,8 @@ static bool saveServerHeartbeatEpoch(double epoch) {
     if (len == 0) {
       return false;
     }
-    return tankalarm_posix_write_file_atomic("/fs/server_heartbeat.json",
-                                              jsonStr.c_str(), jsonStr.length());
+    return serverWriteFileAtomic("/fs/server_heartbeat.json",
+                                 jsonStr.c_str(), jsonStr.length());
   #else
     String jsonStr;
     size_t len = serializeJson(doc, jsonStr);
@@ -5204,13 +5259,19 @@ static bool prepareLocalBackupFilesForFtp(FtpResult &result) {
     }
   #endif
 
-  if (!saveConfig(gConfig)) {
-    strlcpy(result.errorMessage,
-            "Failed to save server_config.json before FTP backup",
-            sizeof(result.errorMessage));
-    return false;
+  // Gate the pre-backup config save on the dirty flag. Avoids burning a
+  // flash erase/program cycle on every backup when nothing has changed in
+  // memory since the last save. saveHistorySettings() is hash-gated
+  // internally, so it can be called unconditionally with the same effect.
+  if (gConfigDirty) {
+    if (!saveConfig(gConfig)) {
+      strlcpy(result.errorMessage,
+              "Failed to save server_config.json before FTP backup",
+              sizeof(result.errorMessage));
+      return false;
+    }
+    gConfigDirty = false;
   }
-  gConfigDirty = false;
 
   if (!saveHistorySettings()) {
     strlcpy(result.errorMessage,
@@ -5221,9 +5282,7 @@ static bool prepareLocalBackupFilesForFtp(FtpResult &result) {
 
   return true;
 #endif
-}
-
-static void buildLocalPath(const char *relativePath, char *out, size_t outSize) {
+}static void buildLocalPath(const char *relativePath, char *out, size_t outSize) {
   if (!relativePath || !out || outSize == 0) {
     return;
   }
@@ -5307,7 +5366,7 @@ static bool writeBufferToFile(const char *relativePath, const uint8_t *data, siz
   buildLocalPath(relativePath, fullPath, sizeof(fullPath));
 
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  return tankalarm_posix_write_file_atomic(fullPath, (const char *)data, len);
+  return serverWriteFileAtomic(fullPath, (const char *)data, len);
 #else
   return tankalarm_littlefs_write_file_atomic(fullPath, data, len);
 #endif
@@ -5711,9 +5770,9 @@ static void writeFtpBackupMarker(const char *stage) {
     if (!mbedFS) {
       return;
     }
-    (void)tankalarm_posix_write_file_atomic("/fs" FTP_BACKUP_MARKER_PATH,
-                                            marker,
-                                            strlen(marker));
+    (void)serverWriteFileAtomic("/fs" FTP_BACKUP_MARKER_PATH,
+                                marker,
+                                strlen(marker));
   #else
     (void)tankalarm_littlefs_write_file_atomic(FTP_BACKUP_MARKER_PATH,
                                                (const uint8_t *)marker,
@@ -5757,6 +5816,97 @@ static void handleFtpBackupStatusGet(EthernetClient &client) {
   doc["trace"] = gFtpsTraceBuf;
   doc["marker"] = hasMarker ? marker : "";
   doc["backupCriticalPath"] = gFtpBackupCriticalPathActive;
+  respondJson(client, doc, 200);
+}
+
+// ============================================================================
+// Memory Budget + System Status (Flash/RAM safety net)
+// ============================================================================
+// Logs the static memory footprint of the largest in-RAM pools at boot. Pairs
+// with tankalarm_printHeapStats() to give a complete picture of where the
+// 247 KB heap budget on Opta Lite is being spent. The numbers here are
+// compile-time constants, but printing them next to the runtime free-heap
+// figure makes regressions (a struct grew, a pool was sized up) immediately
+// obvious in the serial log.
+
+static void printMemoryBudget() {
+  Serial.println(F("Memory budget (static pools):"));
+  Serial.print(F("  gSensorHistory ["));
+  Serial.print((unsigned)MAX_HISTORY_SENSORS);
+  Serial.print(F("]: "));
+  Serial.print((unsigned long)sizeof(gSensorHistory));
+  Serial.println(F(" bytes"));
+
+  Serial.print(F("  gSensorRecords ["));
+  Serial.print((unsigned)MAX_SENSOR_RECORDS);
+  Serial.print(F("]: "));
+  Serial.print((unsigned long)sizeof(gSensorRecords));
+  Serial.println(F(" bytes"));
+
+  Serial.print(F("  gClientConfigs ["));
+  Serial.print((unsigned)MAX_CLIENT_CONFIG_SNAPSHOTS);
+  Serial.print(F("]: "));
+  Serial.print((unsigned long)sizeof(gClientConfigs));
+  Serial.println(F(" bytes"));
+
+  Serial.print(F("  gClientMetadata ["));
+  Serial.print((unsigned)MAX_CLIENT_METADATA);
+  Serial.print(F("]: "));
+  Serial.print((unsigned long)sizeof(gClientMetadata));
+  Serial.println(F(" bytes"));
+
+  Serial.print(F("  FTP_MAX_FILE_BYTES: "));
+  Serial.print((unsigned long)FTP_MAX_FILE_BYTES);
+  Serial.println(F(" bytes (per-file backup buffer cap)"));
+
+  Serial.print(F("  Free heap now: "));
+  Serial.print((unsigned long)tankalarm_freeRam());
+  Serial.println(F(" bytes"));
+}
+
+// /api/system-status: surfaces the flash-write counters, free-heap snapshot,
+// uptime, and pool capacities. Intended for operators running the dashboard
+// to spot (a) flash wear (writes/sec trending up), (b) the hash-gate
+// throttle firing as expected, and (c) heap headroom over time. Cheap
+// (no flash I/O), so safe to poll from the UI.
+
+static void handleSystemStatusGet(EthernetClient &client) {
+  JsonDocument doc;
+  doc["uptimeSec"] = (uint32_t)(millis() / 1000UL);
+  doc["nowMs"] = (uint32_t)millis();
+  doc["freeHeap"] = (uint32_t)tankalarm_freeRam();
+
+  JsonObject flash = doc["flash"].to<JsonObject>();
+  flash["writes"] = gFlashWritesSinceBoot;
+  flash["failures"] = gFlashWriteFailuresSinceBoot;
+  flash["skippedHash"] = gFlashWritesSkippedHash;
+  flash["bytesWritten"] = gFlashBytesWrittenSinceBoot;
+  flash["lastPath"] = gLastFlashWritePath ? gLastFlashWritePath : "";
+  flash["lastMs"] = (uint32_t)gLastFlashWriteMillis;
+  flash["lastFailurePath"] =
+      gLastFlashWriteFailurePath ? gLastFlashWriteFailurePath : "";
+  flash["lastFailureMs"] = (uint32_t)gLastFlashWriteFailureMillis;
+
+  JsonObject pools = doc["pools"].to<JsonObject>();
+  pools["sensorHistoryBytes"] = (uint32_t)sizeof(gSensorHistory);
+  pools["sensorHistorySlots"] = (uint16_t)MAX_HISTORY_SENSORS;
+  pools["sensorRecordsBytes"] = (uint32_t)sizeof(gSensorRecords);
+  pools["sensorRecordsSlots"] = (uint16_t)MAX_SENSOR_RECORDS;
+  pools["clientConfigBytes"] = (uint32_t)sizeof(gClientConfigs);
+  pools["clientConfigSlots"] = (uint16_t)MAX_CLIENT_CONFIG_SNAPSHOTS;
+  pools["clientMetadataBytes"] = (uint32_t)sizeof(gClientMetadata);
+  pools["clientMetadataSlots"] = (uint16_t)MAX_CLIENT_METADATA;
+  pools["ftpMaxFileBytes"] = (uint32_t)FTP_MAX_FILE_BYTES;
+
+  JsonObject features = doc["features"].to<JsonObject>();
+  features["ftpEnabled"] = gConfig.ftpEnabled;
+  features["filesystemAvailable"] =
+#ifdef FILESYSTEM_AVAILABLE
+      true;
+#else
+      false;
+#endif
+
   respondJson(client, doc, 200);
 }
 
@@ -6374,8 +6524,8 @@ static bool ftpRestoreClientConfigs(FtpSession &session, bool useFtps, char *err
   
   // Write accumulated cache content atomically
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  if (!tankalarm_posix_write_file_atomic("/fs/client_config_cache.txt",
-                                          cacheContent.c_str(), cacheContent.length())) {
+  if (!serverWriteFileAtomic("/fs/client_config_cache.txt",
+                             cacheContent.c_str(), cacheContent.length())) {
     snprintf(error, errorSize, "Failed to write cache file");
     return false;
   }
@@ -7321,7 +7471,11 @@ static void populateHistorySettingsJson(JsonDocument &doc) {
   doc["lastRollup"] = gLastDailyRollupDate;
 }
 
-// Save history settings to LittleFS
+// Save history settings to LittleFS. Hash-gated: skips the write if the
+// serialized payload is byte-identical to the last successful save. This lets
+// callers (including FTP backup prep) invoke this freely without burning a
+// flash erase/program cycle when nothing has actually changed.
+static uint32_t gHistorySettingsLastHash = 0;
 static bool saveHistorySettings() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -7332,12 +7486,19 @@ static bool saveHistorySettings() {
     
     String output;
     serializeJson(doc, output);
-    
-    if (!tankalarm_posix_write_file_atomic("/fs/history_settings.json",
-                                            output.c_str(), output.length())) {
+
+    uint32_t newHash = fnv1a32(output.c_str(), output.length());
+    if (newHash == gHistorySettingsLastHash && gHistorySettingsLastHash != 0) {
+      gFlashWritesSkippedHash++;
+      return true;  // No-op success: the on-disk file already matches.
+    }
+
+    if (!serverWriteFileAtomic("/fs/history_settings.json",
+                               output.c_str(), output.length())) {
       Serial.println(F("Failed to write history settings"));
       return false;
     }
+    gHistorySettingsLastHash = newHash;
     return true;
   #else
     JsonDocument doc;
@@ -7588,7 +7749,7 @@ static void rollupDailySummaries() {
   // Ensure directory exists
   mkdir("/fs/history", 0777);
   
-  if (tankalarm_posix_write_file_atomic(filePath, output.c_str(), output.length())) {
+  if (serverWriteFileAtomic(filePath, output.c_str(), output.length())) {
     gLastDailyRollupDate = yesterdayDate;
     Serial.print(F("Daily summary rollup: "));
     Serial.print(addedCount);
@@ -7691,11 +7852,17 @@ static void pruneDailySummaryFiles() {
 // ============================================================================
 // Saves the current hot-tier ring buffer to LittleFS so trending data
 // survives power cycles. Written periodically and on graceful shutdown.
+//
+// Hash-gated: if the serialized payload hashes (FNV-1a32) to the same value
+// as the last successful save, the write is skipped to avoid burning a flash
+// erase/program cycle on data that has not changed. The skip is recorded in
+// gFlashWritesSkippedHash so /api/system-status can show how often the
+// throttle is firing.
 
-static void saveHotTierSnapshot() {
+static bool saveHotTierSnapshot() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  if (!mbedFS || gSensorHistoryCount == 0) return;
+  if (!mbedFS || gSensorHistoryCount == 0) return false;
   
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
@@ -7724,17 +7891,34 @@ static void saveHotTierSnapshot() {
   
   size_t jsonLen = measureJson(doc);
   char *buf = (char *)malloc(jsonLen + 1);
-  if (!buf) return;
+  if (!buf) return false;
   serializeJson(doc, buf, jsonLen + 1);
-  
+
+  // Hash-gate: skip the write if the payload is byte-identical to the last
+  // successful save. This is the single biggest wear reduction on devices
+  // with a stable hot-tier ring (no new telemetry between save ticks).
+  uint32_t newHash = fnv1a32(buf, jsonLen);
+  if (newHash == gHotTierLastHash && gHotTierLastHash != 0) {
+    free(buf);
+    gFlashWritesSkippedHash++;
+    return true;  // No-op success: the on-disk file already matches.
+  }
+
   mkdir("/fs/history", 0777);
-  if (tankalarm_posix_write_file_atomic("/fs/history/hot_tier.json", buf, jsonLen)) {
+  bool ok = serverWriteFileAtomic("/fs/history/hot_tier.json", buf, jsonLen);
+  if (ok) {
+    gHotTierLastHash = newHash;
     Serial.print(F("Hot tier saved: "));
     Serial.print(gSensorHistoryCount);
     Serial.println(F(" sensors"));
   }
   free(buf);
+  return ok;
+  #else
+  return false;
   #endif
+#else
+  return false;
 #endif
 }
 
@@ -8804,6 +8988,8 @@ static void handleWebRequests() {
     }
   } else if (method == "GET" && path == "/api/ftp-backup-status") {
     handleFtpBackupStatusGet(client);
+  } else if (method == "GET" && path == "/api/system-status") {
+    handleSystemStatusGet(client);
   } else if (method == "GET" && path == "/api/transmission-log") {
     handleTransmissionLogGet(client);
   } else if (method == "GET" && path == "/api/notecard/status") {
@@ -13722,7 +13908,7 @@ static void saveClientConfigSnapshots() {
       pos += (size_t)n;
     }
 
-    if (!tankalarm_posix_write_file_atomic("/fs/client_config_cache.txt", buf, pos)) {
+    if (!serverWriteFileAtomic("/fs/client_config_cache.txt", buf, pos)) {
       Serial.println(F("Failed to write client config cache"));
     }
     free(buf);
@@ -14657,8 +14843,8 @@ static bool saveContactsConfig(const JsonDocument &doc) {
 
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) return false;
-    return tankalarm_posix_write_file_atomic("/fs/contacts_config.json",
-                                              output.c_str(), output.length());
+    return serverWriteFileAtomic("/fs/contacts_config.json",
+                                 output.c_str(), output.length());
   #else
     return tankalarm_littlefs_write_file_atomic(CONTACTS_CONFIG_PATH,
             (const uint8_t *)output.c_str(), output.length());
@@ -14888,8 +15074,8 @@ static bool saveEmailFormat(const JsonDocument &doc) {
   String output;
   serializeJson(doc, output);
   
-  return tankalarm_posix_write_file_atomic("/fs/email_format.json",
-                                            output.c_str(), output.length());
+  return serverWriteFileAtomic("/fs/email_format.json",
+                               output.c_str(), output.length());
 #else
   String output;
   serializeJson(doc, output);
@@ -15794,8 +15980,8 @@ static void saveCalibrationData() {
                cal.hasTempCompensation ? 1 : 0, cal.tempEntryCount);
       output += line;
     }
-    tankalarm_posix_write_file_atomic("/fs/calibration_data.txt",
-                                      output.c_str(), output.length());
+    serverWriteFileAtomic("/fs/calibration_data.txt",
+                          output.c_str(), output.length());
   #else
     // LittleFS branch: accumulate into String, then atomic write
     String output;
@@ -16232,8 +16418,8 @@ static void handleCalibrationDelete(EthernetClient &client, const String &body) 
         output += keepEntries[i];
         output += '\n';
       }
-      if (!tankalarm_posix_write_file_atomic("/fs/calibration_log.txt",
-                                              output.c_str(), output.length())) {
+      if (!serverWriteFileAtomic("/fs/calibration_log.txt",
+                                 output.c_str(), output.length())) {
         Serial.println(F("Failed to rewrite calibration log"));
       } else {
         Serial.print(F("Removed "));
