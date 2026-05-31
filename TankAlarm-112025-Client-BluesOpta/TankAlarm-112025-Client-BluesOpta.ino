@@ -670,6 +670,8 @@ struct MonitorRuntime {
   float currentInches;
   float currentSensorMa;        // Raw sensor reading in milliamps (for 4-20mA sensors)
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
+  double lastReadingEpoch;      // Epoch when current reading was actually acquired
+  bool sampleReused;            // True when this cycle reused the previous reading
   float lastReportedInches;
   float lastDailySentInches;
   bool highAlarmLatched;
@@ -1469,6 +1471,8 @@ void setup() {
     gMonitorState[i].currentInches = 0.0f;
     gMonitorState[i].currentSensorMa = 0.0f;
     gMonitorState[i].currentSensorVoltage = 0.0f;
+    gMonitorState[i].lastReadingEpoch = 0.0;
+    gMonitorState[i].sampleReused = false;
     gMonitorState[i].lastReportedInches = -9999.0f;
     gMonitorState[i].lastDailySentInches = -9999.0f;
     gMonitorState[i].highAlarmLatched = false;
@@ -4783,6 +4787,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
 
   float milliamps;
   if (validSamples == 0) {
+    gMonitorState[idx].sampleReused = true;
     return gMonitorState[idx].currentInches; // keep previous on failure
   }
   milliamps = total / validSamples;
@@ -4864,6 +4869,9 @@ static float readMonitorSensor(uint8_t idx) {
     return 0.0f;
   }
 
+  // Default to fresh each cycle; specific sensor paths mark reuse when needed.
+  gMonitorState[idx].sampleReused = false;
+
   const MonitorConfig &cfg = gConfig.monitors[idx];
 
   switch (cfg.sensorInterface) {
@@ -4886,14 +4894,19 @@ static void sampleMonitors() {
   trimTelemetryOutbox();
 
   for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    const double sampleEpoch = currentEpoch();
     float inches = readMonitorSensor(i);
     
     // Validate sensor reading
     if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
       inches = gMonitorState[i].currentInches;
+      gMonitorState[i].sampleReused = true;
     } else {
       gMonitorState[i].currentInches = inches;
+      if (!gMonitorState[i].sampleReused) {
+        gMonitorState[i].lastReadingEpoch = sampleEpoch;
+      }
     }
     
     evaluateAlarms(i);
@@ -5169,7 +5182,8 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
       break;
   }
   doc["r"] = reason;
-  doc["t"] = currentEpoch();
+  // Use acquisition time so stale/reused values do not get a fresh timestamp.
+  doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
 
   publishNote(TELEMETRY_FILE, doc, syncNow);
 }
