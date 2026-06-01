@@ -59,6 +59,7 @@ REPORT_LOG.TXT
 
 # Arduino CLI binary
 bin/
+arduino-cli.exe
 
 # RecycleBin (archived/temporary files)
 RecycleBin/
