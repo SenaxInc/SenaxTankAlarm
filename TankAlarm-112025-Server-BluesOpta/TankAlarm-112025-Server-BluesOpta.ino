@@ -1813,23 +1813,266 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 )HTML";
 
-static const char CONFIG_GENERATOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Client Configuration</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill" href="/config-generator">Client Config</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Client Configuration</h2>
-<div class="actions" style="margin-bottom:20px;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-  <div style="display:flex;gap:8px;"><button type="button" id="loadFromCloudBtn" class="secondary">Load from Cloud</button>
-  <button type="button" id="importBtn" class="secondary">Import JSON</button></div>
-  <div style="display:flex;gap:8px;"><button type="submit" form="generatorForm">Save to Device</button>
-  <button type="button" id="downloadBtn" class="secondary">Download JSON</button></div>
+static const char CONFIG_GENERATOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Client Configuration</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-theme="light">
+<header>
+<div class="bar">
+<div class="brand">TankAlarm</div>
+<div class="header-actions">
+<button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button>
+<a class="pill secondary" href="/">Dashboard</a>
+<a class="pill secondary" href="/client-console">Client Console</a>
+<a class="pill" href="/config-generator">Client Config</a>
+<a class="pill secondary" href="/contacts">Contacts</a>
+<a class="pill secondary" href="/server-settings">Server Settings</a>
+<button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button>
 </div>
-<div id="configStatus" style="display:none;padding:12px;margin-bottom:16px;border-radius:var(--radius);background:#e6f2ff;border:1px solid #b3d9ff;color:#0066cc;"></div><form id="generatorForm"><div class="form-grid"><label class="field"><span>Product UID <span class="tooltip-icon" tabindex="0" data-tooltip="Blues Notehub Product UID. Must match the server's Product UID for client-server communication.">?</span></span><input id="productUid" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>Device UID</span><input id="clientUid" type="text" placeholder="dev:xxxxxxxx"></label><label class="field"><span>Site Name</span><input id="siteName" type="text" placeholder="Site Name" required></label><label class="field"><span>Device Label</span><input id="deviceLabel" type="text" placeholder="Device Label" required></label><label class="field"><span>Client Fleet</span><input id="clientFleet" type="text" placeholder="Client Fleet"></label><label class="field"><span>Server Fleet</span><input id="serverFleet" type="text" value="tankalarm-server"></label><label class="field"><span>Sample Minutes</span><input id="sampleMinutes" type="number" value="30" min="1" max="1440"></label><label class="field"><span>Report Time</span><input id="reportTime" type="time" value="05:00"></label><label class="field"><span>Daily Report Email Recipient</span><input id="dailyEmail" type="email"></label></div><h3>Power Configuration</h3><div class="form-grid"><label class="field"><span>Power Source<span class="tooltip-icon" tabindex="0" data-tooltip="Primary power supply feeding the device. Battery selection is configured separately below.">?</span></span><select id="powerSource" onchange="updatePowerConfigInfo()"><option value="grid">Grid AC</option><option value="solar">Solar (Passive Charger)</option><option value="solar_mppt">Solar + Non-Monitored MPPT</option><option value="solar_modbus_mppt">Solar + Modbus MPPT (RS-485)</option></select></label><label class="field"><span>Battery<span class="tooltip-icon" tabindex="0" data-tooltip="Battery chemistry. Lead-acid variants share thresholds; Flooded uses a higher equalization ceiling. Select None for grid-only or solar-direct installs.">?</span></span><select id="batteryType" onchange="updatePowerConfigInfo()"><option value="none">None (no battery)</option><option value="agm" selected>AGM (Sealed)</option><option value="sla">SLA (Sealed Lead-Acid)</option><option value="flooded">Flooded (Wet Cell)</option><option value="gel">Gel</option><option value="lifepo4">LiFePO4</option><option value="li_ion">Li-ion (NMC)</option><option value="lipo">LiPo (single cell)</option><option value="custom">Custom (manual thresholds)</option></select></label><label class="field" id="batteryVoltageField"><span>Battery Pack Voltage<span class="tooltip-icon" tabindex="0" data-tooltip="Nominal pack voltage. 24V scales all thresholds 2x from the 12V baseline. 24V support is experimental — verify Vin divider headroom.">?</span></span><select id="batteryVoltage"><option value="12" selected>12V</option><option value="24">24V (experimental)</option></select></label><label class="field"><span>Vin Monitor<span class="tooltip-icon" tabindex="0" data-tooltip="Enable an external voltage divider on an Opta analog input to read actual battery voltage. Required for accurate solar-only sunset detection.">?</span></span><select id="vinMonitorEnabled" onchange="updatePowerConfigInfo()"><option value="0">Disabled</option><option value="1">Enabled</option></select></label></div><div id="powerCombinationWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:10px 12px;margin-bottom:12px;border-radius:var(--radius);font-size:0.88rem;"></div><div id="powerConfigInfo" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;font-size:0.9rem;color:var(--muted);"><strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.</div><div id="vinConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Vin Monitor — Voltage Divider Configuration</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">Wire a voltage divider from the battery to an Opta analog input: Battery+ → R1 → Pin → R2 → GND</p><div class="form-grid"><label class="field"><span>Analog Pin</span><select id="vinPin"><option value="0">A0</option><option value="1">A1</option><option value="2">A2</option><option value="3">A3</option><option value="4">A4</option><option value="5">A5</option><option value="6">A6</option><option value="7">A7</option></select></label><label class="field"><span>R1 High-side (kΩ)</span><input id="vinR1" type="number" value="22" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label><label class="field"><span>R2 Low-side (kΩ)</span><input id="vinR2" type="number" value="47" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label></div><div id="vinCalcInfo" style="margin-top:8px;font-size:0.85rem;color:var(--muted);"></div></div><div id="solarOnlyConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Solar-Only (No Battery) Settings</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">This device is powered directly by a solar panel without battery backup. It will only operate during daylight hours.</p><div class="form-grid"><label class="field" id="solarOnlyDebounceVField"><span>Startup Debounce Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage before the system considers power stable enough to start. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlyDebounceSField"><span>Debounce Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of seconds the voltage must remain above the debounce threshold. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceSec" type="number" value="30" min="5" max="300"></label><label class="field" id="solarOnlyWarmupField"><span>Startup Warmup (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Fixed warmup timer used when no Vin divider is installed. The device waits this long after boot before reading sensors.">?</span></span><input id="solarOnlyWarmupSec" type="number" value="60" min="10" max="600"></label><label class="field" id="solarOnlySensorGateField"><span>Sensor Gate Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage required before sensor readings are taken. 4-20mA sensors typically need at least 11V excitation. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySensorGateV" type="number" value="11" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlySunsetVField"><span>Sunset Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="When Vin drops below this and continues declining, the device saves state and prepares for power loss. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySunsetV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field"><span>Sunset Confirm Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="How long voltage must be declining below sunset threshold before triggering shutdown save.">?</span></span><input id="solarOnlySunsetSec" type="number" value="120" min="30" max="600"></label><label class="field"><span>Opportunistic Report (hours)<span class="tooltip-icon" tabindex="0" data-tooltip="If more than this many hours have passed since the last daily report, send one immediately on startup. For solar-only, reports cannot be scheduled at a fixed time.">?</span></span><input id="solarOnlyReportHours" type="number" value="20" min="6" max="48"></label></div><div id="solarOnlyBatFailSection" style="display:none;margin-top:12px;border-top:1px solid var(--card-border);padding-top:12px;"><label style="display:flex;align-items:center;gap:8px;font-size:0.9rem;margin-bottom:8px;"><input type="checkbox" id="solarOnlyBatFail"> Enable battery failure fallback<span class="tooltip-icon" tabindex="0" data-tooltip="For solar+battery setups: if the battery voltage stays critically low for extended time, automatically switch to solar-only behaviors (opportunistic reporting, sunset protocol).">?</span></label><label class="field"><span>Failure Threshold (readings)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of consecutive critical-voltage readings before declaring battery failure.">?</span></span><input id="solarOnlyBatFailCount" type="number" value="10" min="3" max="50"></label></div></div><h3>Sensors</h3><div id="sensorsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addSensorBtn" class="secondary">+ Add Sensor</button></div><h3>Inputs (Buttons &amp; Switches)</h3><p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Configure physical inputs for actions like clearing relay alarms.</p><div id="inputsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addInputBtn" class="secondary">+ Add Input</button></div><div class="actions"><button type="submit" id="sendConfigBtn">Save Configuration to Device</button><button type="button" id="retryConfigBtn" class="secondary" style="display:none">Retry Send to Notecard</button><button type="button" id="syncRequestBtn" class="secondary" style="display:none" title="Force the client Notecard to sync inbound notes (useful for weak signal)">Request Client Sync</button></div></form></div></main><div id="toast"></div><div id="selectClientModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2>Load Configuration</h2><button class="modal-close" onclick="closeSelectClientModal()">&times;</button></div><div id="clientList" class="client-list"><div class="empty-state">Loading clients...</div></div></div></div><datalist id="relayTargetSuggestions"></datalist><input type="file" id="importFileInput" accept=".json" style="display:none" />
+</div>
+</header>
+<main>
+<div class="card">
+<h2>Client Configuration</h2>
+<div class="actions" style="margin-bottom:20px;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+  <div style="display:flex;gap:8px;">
+<button type="button" id="loadFromCloudBtn" class="secondary">Load from Cloud</button>
+  <button type="button" id="importBtn" class="secondary">Import JSON</button>
+</div>
+  <div style="display:flex;gap:8px;">
+<button type="submit" form="generatorForm">Save to Device</button>
+  <button type="button" id="downloadBtn" class="secondary">Download JSON</button>
+</div>
+</div>
+<div id="configStatus" style="display:none;padding:12px;margin-bottom:16px;border-radius:var(--radius);background:#e6f2ff;border:1px solid #b3d9ff;color:#0066cc;">
+</div>
+<form id="generatorForm">
+<div class="form-grid">
+<label class="field">
+<span>Product UID <span class="tooltip-icon" tabindex="0" data-tooltip="Blues Notehub Product UID. Must match the server's Product UID for client-server communication.">?</span>
+</span>
+<input id="productUid" type="text" placeholder="com.company.product:project" required>
+</label>
+<label class="field">
+<span>Device UID</span>
+<input id="clientUid" type="text" placeholder="dev:xxxxxxxx">
+</label>
+<label class="field">
+<span>Site Name</span>
+<input id="siteName" type="text" placeholder="Site Name" required>
+</label>
+<label class="field">
+<span>Device Label</span>
+<input id="deviceLabel" type="text" placeholder="Device Label" required>
+</label>
+<label class="field">
+<span>Client Fleet</span>
+<input id="clientFleet" type="text" placeholder="Client Fleet">
+</label>
+<label class="field">
+<span>Server Fleet</span>
+<input id="serverFleet" type="text" value="tankalarm-server">
+</label>
+<label class="field">
+<span>Sample Minutes</span>
+<input id="sampleMinutes" type="number" value="30" min="1" max="1440">
+</label>
+<label class="field">
+<span>Report Time</span>
+<input id="reportTime" type="time" value="05:00">
+</label>
+<label class="field">
+<span>Daily Report Email Recipient</span>
+<input id="dailyEmail" type="email">
+</label>
+</div>
+<h3>Power Configuration</h3>
+<div class="form-grid">
+<label class="field">
+<span>Power Source<span class="tooltip-icon" tabindex="0" data-tooltip="Primary power supply feeding the device. Battery selection is configured separately below.">?</span>
+</span>
+<select id="powerSource" onchange="updatePowerConfigInfo()">
+<option value="grid">Grid AC</option>
+<option value="solar">Solar (Passive Charger)</option>
+<option value="solar_mppt">Solar + Non-Monitored MPPT</option>
+<option value="solar_modbus_mppt">Solar + Modbus MPPT (RS-485)</option>
+</select>
+</label>
+<label class="field">
+<span>Battery<span class="tooltip-icon" tabindex="0" data-tooltip="Battery chemistry. Lead-acid variants share thresholds; Flooded uses a higher equalization ceiling. Select None for grid-only or solar-direct installs.">?</span>
+</span>
+<select id="batteryType" onchange="updatePowerConfigInfo()">
+<option value="none">None (no battery)</option>
+<option value="agm" selected>AGM (Sealed)</option>
+<option value="sla">SLA (Sealed Lead-Acid)</option>
+<option value="flooded">Flooded (Wet Cell)</option>
+<option value="gel">Gel</option>
+<option value="lifepo4">LiFePO4</option>
+<option value="li_ion">Li-ion (NMC)</option>
+<option value="lipo">LiPo (single cell)</option>
+<option value="custom">Custom (manual thresholds)</option>
+</select>
+</label>
+<label class="field" id="batteryVoltageField">
+<span>Battery Pack Voltage<span class="tooltip-icon" tabindex="0" data-tooltip="Nominal pack voltage. 24V scales all thresholds 2x from the 12V baseline. 24V support is experimental — verify Vin divider headroom.">?</span>
+</span>
+<select id="batteryVoltage">
+<option value="12" selected>12V</option>
+<option value="24">24V (experimental)</option>
+</select>
+</label>
+<label class="field">
+<span>Vin Monitor<span class="tooltip-icon" tabindex="0" data-tooltip="Enable an external voltage divider on an Opta analog input to read actual battery voltage. Required for accurate solar-only sunset detection.">?</span>
+</span>
+<select id="vinMonitorEnabled" onchange="updatePowerConfigInfo()">
+<option value="0">Disabled</option>
+<option value="1">Enabled</option>
+</select>
+</label>
+</div>
+<div id="powerCombinationWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:10px 12px;margin-bottom:12px;border-radius:var(--radius);font-size:0.88rem;">
+</div>
+<div id="powerConfigInfo" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;font-size:0.9rem;color:var(--muted);">
+<strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.</div>
+<div id="vinConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);">
+<strong style="display:block;margin-bottom:8px;">Vin Monitor — Voltage Divider Configuration</strong>
+<p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">Wire a voltage divider from the battery to an Opta analog input: Battery+ → R1 → Pin → R2 → GND</p>
+<div class="form-grid">
+<label class="field">
+<span>Analog Pin</span>
+<select id="vinPin">
+<option value="0">A0</option>
+<option value="1">A1</option>
+<option value="2">A2</option>
+<option value="3">A3</option>
+<option value="4">A4</option>
+<option value="5">A5</option>
+<option value="6">A6</option>
+<option value="7">A7</option>
+</select>
+</label>
+<label class="field">
+<span>R1 High-side (kΩ)</span>
+<input id="vinR1" type="number" value="22" min="1" max="1000" step="0.1" onchange="updateVinCalc()">
+</label>
+<label class="field">
+<span>R2 Low-side (kΩ)</span>
+<input id="vinR2" type="number" value="47" min="1" max="1000" step="0.1" onchange="updateVinCalc()">
+</label>
+</div>
+<div id="vinCalcInfo" style="margin-top:8px;font-size:0.85rem;color:var(--muted);">
+</div>
+</div>
+<div id="solarOnlyConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);">
+<strong style="display:block;margin-bottom:8px;">Solar-Only (No Battery) Settings</strong>
+<p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">This device is powered directly by a solar panel without battery backup. It will only operate during daylight hours.</p>
+<div class="form-grid">
+<label class="field" id="solarOnlyDebounceVField">
+<span>Startup Debounce Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage before the system considers power stable enough to start. Only applies when Vin divider is connected.">?</span>
+</span>
+<input id="solarOnlyDebounceV" type="number" value="10" min="5" max="20" step="0.5">
+</label>
+<label class="field" id="solarOnlyDebounceSField">
+<span>Debounce Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of seconds the voltage must remain above the debounce threshold. Only applies when Vin divider is connected.">?</span>
+</span>
+<input id="solarOnlyDebounceSec" type="number" value="30" min="5" max="300">
+</label>
+<label class="field" id="solarOnlyWarmupField">
+<span>Startup Warmup (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Fixed warmup timer used when no Vin divider is installed. The device waits this long after boot before reading sensors.">?</span>
+</span>
+<input id="solarOnlyWarmupSec" type="number" value="60" min="10" max="600">
+</label>
+<label class="field" id="solarOnlySensorGateField">
+<span>Sensor Gate Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage required before sensor readings are taken. 4-20mA sensors typically need at least 11V excitation. Only applies when Vin divider is connected.">?</span>
+</span>
+<input id="solarOnlySensorGateV" type="number" value="11" min="5" max="20" step="0.5">
+</label>
+<label class="field" id="solarOnlySunsetVField">
+<span>Sunset Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="When Vin drops below this and continues declining, the device saves state and prepares for power loss. Only applies when Vin divider is connected.">?</span>
+</span>
+<input id="solarOnlySunsetV" type="number" value="10" min="5" max="20" step="0.5">
+</label>
+<label class="field">
+<span>Sunset Confirm Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="How long voltage must be declining below sunset threshold before triggering shutdown save.">?</span>
+</span>
+<input id="solarOnlySunsetSec" type="number" value="120" min="30" max="600">
+</label>
+<label class="field">
+<span>Opportunistic Report (hours)<span class="tooltip-icon" tabindex="0" data-tooltip="If more than this many hours have passed since the last daily report, send one immediately on startup. For solar-only, reports cannot be scheduled at a fixed time.">?</span>
+</span>
+<input id="solarOnlyReportHours" type="number" value="20" min="6" max="48">
+</label>
+</div>
+<div id="solarOnlyBatFailSection" style="display:none;margin-top:12px;border-top:1px solid var(--card-border);padding-top:12px;">
+<label style="display:flex;align-items:center;gap:8px;font-size:0.9rem;margin-bottom:8px;">
+<input type="checkbox" id="solarOnlyBatFail"> Enable battery failure fallback<span class="tooltip-icon" tabindex="0" data-tooltip="For solar+battery setups: if the battery voltage stays critically low for extended time, automatically switch to solar-only behaviors (opportunistic reporting, sunset protocol).">?</span>
+</label>
+<label class="field">
+<span>Failure Threshold (readings)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of consecutive critical-voltage readings before declaring battery failure.">?</span>
+</span>
+<input id="solarOnlyBatFailCount" type="number" value="10" min="3" max="50">
+</label>
+</div>
+</div>
+<h3>Sensors</h3>
+<div id="sensorsContainer">
+</div>
+<div class="actions" style="margin-bottom: 24px;">
+<button type="button" id="addSensorBtn" class="secondary">+ Add Sensor</button>
+</div>
+<h3>Inputs (Buttons &amp; Switches)</h3>
+<p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Configure physical inputs for actions like clearing relay alarms.</p>
+<div id="inputsContainer">
+</div>
+<div class="actions" style="margin-bottom: 24px;">
+<button type="button" id="addInputBtn" class="secondary">+ Add Input</button>
+</div>
+<div class="actions">
+<button type="submit" id="sendConfigBtn">Save Configuration to Device</button>
+<button type="button" id="retryConfigBtn" class="secondary" style="display:none">Retry Send to Notecard</button>
+<button type="button" id="syncRequestBtn" class="secondary" style="display:none" title="Force the client Notecard to sync inbound notes (useful for weak signal)">Request Client Sync</button>
+</div>
+</form>
+</div>
+</main>
+<div id="toast">
+</div>
+<div id="selectClientModal" class="modal hidden">
+<div class="modal-content">
+<div class="modal-header">
+<h2>Load Configuration</h2>
+<button class="modal-close" onclick="closeSelectClientModal()">&times;</button>
+</div>
+<div id="clientList" class="client-list">
+<div class="empty-state">Loading clients...</div>
+</div>
+</div>
+</div>
+<datalist id="relayTargetSuggestions">
+</datalist>
+<input type="file" id="importFileInput" accept=".json" style="display:none" />
 <script>
 (async () => {
-const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
+const token=localStorage.getItem('tankalarm_token');
+const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};
+if(!o.headers)o.headers={};
+if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};
+async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');
+const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
 const state={paused:false,clients:[]};
+
 const els={toast:document.getElementById('toast'),form:document.getElementById('generatorForm'),productUid:document.getElementById('productUid'),clientUid:document.getElementById('clientUid'),clientList:document.getElementById('clientList'),selectClientModal:document.getElementById('selectClientModal'),loadFromCloudBtn:document.getElementById('loadFromCloudBtn'),siteName:document.getElementById('siteName'),deviceLabel:document.getElementById('deviceLabel'),clientFleet:document.getElementById('clientFleet'),serverFleet:document.getElementById('serverFleet'),sampleMinutes:document.getElementById('sampleMinutes'),dailyEmail:document.getElementById('dailyEmail'),reportTime:document.getElementById('reportTime'),powerSource:document.getElementById('powerSource')};
+
 function showToast(m,e,dur){if(els.toast){els.toast.innerText=m;els.toast.style.background=e==='warn'?'#d97706':e?'#dc2626':'#0284c7';els.toast.classList.add('show');setTimeout(()=>els.toast.classList.remove('show'),dur||3000);}}
 
 const pauseBtn=document.getElementById('pauseBtn');function renderPauseBtn(){if(pauseBtn){pauseBtn.style.display=state.paused?'':'none';}}
-async function loadPauseState(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv){state.paused=!!d.srv.ps;renderPauseBtn();}}catch(e){}}
+async function loadPauseState(){try{const r=await fetch('/api/clients?summary=1');
+const d=await r.json();if(d&&d.srv){state.paused=!!d.srv.ps;renderPauseBtn();}}catch(e){}}
 if(pauseBtn)pauseBtn.addEventListener('click',async()=>{try{const r=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:false})});if(r.ok){state.paused=false;renderPauseBtn();showToast('Resumed');}else throw new Error('Failed');}catch(e){showToast('Error resuming',true);}});
 await loadPauseState();
 window.validatePowerCombination=function(){
@@ -1839,7 +2082,8 @@ window.validatePowerCombination=function(){
   const vin=document.getElementById('vinMonitorEnabled').value==='1';
   const w=document.getElementById('powerCombinationWarning');
   if(!w)return true;
-  let msg='';let block=false;
+  let msg='';
+let block=false;
   if(ps==='solar_modbus_mppt'&&bt==='none'){
     msg='SunSaver / Modbus MPPT chargers require a battery to operate. Select a battery chemistry or change power source.';
     block=true;
@@ -1865,6 +2109,7 @@ window.validatePowerCombination=function(){
   if(msg){w.style.display='block';w.innerHTML=(block?'<strong>Blocked:</strong> ':'<strong>Warning:</strong> ')+msg;w.style.background=block?'#f8d7da':'#fff3cd';w.style.borderColor=block?'#dc3545':'#ffc107';w.style.color=block?'#721c24':'#856404';}else{w.style.display='none';}
   return !block;
 };
+
 window.updatePowerConfigInfo=function(){
   const ps=document.getElementById('powerSource').value||'grid';
   const bt=document.getElementById('batteryType').value||'agm';
@@ -1892,7 +2137,13 @@ window.updatePowerConfigInfo=function(){
   const batFailSec=document.getElementById('solarOnlyBatFailSection');
   if(batFailSec)batFailSec.style.display=(ps.startsWith('solar')&&bt!=='none')?'block':'none';
   validatePowerCombination();
-};window.updateVinCalc=function(){const r1=parseFloat(document.getElementById('vinR1').value)||22;const r2=parseFloat(document.getElementById('vinR2').value)||47;const ratio=r2/(r1+r2);const maxV=(10.0/ratio).toFixed(1);const bleed=(12/(r1+r2)*1000).toFixed(1);document.getElementById('vinCalcInfo').innerHTML='Divider ratio: '+ratio.toFixed(4)+' — Max readable: '+maxV+'V — Quiescent draw at 12V: ~'+bleed+'µA';};
+};
+window.updateVinCalc=function(){const r1=parseFloat(document.getElementById('vinR1').value)||22;
+const r2=parseFloat(document.getElementById('vinR2').value)||47;
+const ratio=r2/(r1+r2);
+const maxV=(10.0/ratio).toFixed(1);
+const bleed=(12/(r1+r2)*1000).toFixed(1);document.getElementById('vinCalcInfo').innerHTML='Divider ratio: '+ratio.toFixed(4)+' — Max readable: '+maxV+'V — Quiescent draw at 12V: ~'+bleed+'µA';};
+
 /* CONSTANTS */
 const sensorTypes=[{value:0,label:'Digital Input(Float Switch)'},{value:1,label:'Analog Input(0-10V)'},{value:2,label:'Current Loop(4-20mA)'},{value:3,label:'Hall Effect RPM'}];
 const currentLoopTypes=[{value:'pressure',label:'Pressure Sensor(Bottom-Mounted)'},{value:'ultrasonic',label:'Ultrasonic Sensor(Top-Mounted)'}];
@@ -1901,71 +2152,567 @@ const optaPins=[{value:0,label:'Opta I1'},{value:1,label:'Opta I2'},{value:2,lab
 const expansionChannels=[{value:0,label:'A0602 Ch1'},{value:1,label:'A0602 Ch2'},{value:2,label:'A0602 Ch3'},{value:3,label:'A0602 Ch4'},{value:4,label:'A0602 Ch5'},{value:5,label:'A0602 Ch6'}];
 const inputActions=[{value:'clear_relays',label:'Clear All Relay Alarms'},{value:'none',label:'Disabled(No Action)'}];
 const inputModes=[{value:'active_low',label:'Active LOW(Button to GND,internal pullup)'},{value:'active_high',label:'Active HIGH(Button to VCC,external pull-down)'}];
-let sensorCount=0;let inputIdCounter=0;
+let sensorCount=0;
+let inputIdCounter=0;
 /* SENSOR CARD HTML */
-function createSensorHtml(id){return `<div class="sensor-card" id="sensor-${id}"><div class="sensor-header"><span class="sensor-title">Sensor #${id+1}</span><button type="button" class="remove-btn" onclick="removeSensor(${id})">Remove</button></div><div class="form-grid"><label class="field"><span>Monitor Type</span><select class="monitor-type" onchange="updateMonitorFields(${id})">${monitorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select></label><label class="field tank-num-field"><span>Display Number (optional)</span><input type="number" class="tank-num" placeholder="e.g. 1, 2, 3"></label><label class="field"><span><span class="name-label">Name</span></span><input type="text" class="tank-name" placeholder="Name"></label><label class="field contents-field"><span>Contents</span><input type="text" class="tank-contents" placeholder="e.g. Diesel, Water"></label><label class="field"><span>Sensor Type</span><select class="sensor-type" onchange="updatePinOptions(${id})">${sensorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select></label><label class="field"><span>Pin / Channel</span><select class="sensor-pin">${optaPins.map(p=>`<option value="${p.value}">${p.label}</option>`).join('')}</select></label><label class="field switch-mode-field" style="display:none;"><span>Switch Mode<span class="tooltip-icon" tabindex="0" data-tooltip="NO(Normally-Open): Switch is open by default, closes when fluid is present. NC(Normally-Closed): Switch is closed by default, opens when fluid is present.">?</span></span><select class="switch-mode"><option value="NO">Normally-Open(NO)</option><option value="NC">Normally-Closed(NC)</option></select></label><label class="field pulses-per-rev-field" style="display:none;"><span>Pulses/Rev</span><input type="number" class="pulses-per-rev" value="1" min="1" max="255"></label><label class="field current-loop-type-field" style="display:none;"><span>4-20mA Sensor Type<span class="tooltip-icon" tabindex="0" data-tooltip="Select the type of 4-20mA sensor: Pressure sensors are mounted near the sensor bottom and measure liquid pressure. Ultrasonic sensors are mounted on top of the sensor and measure distance to the liquid surface.">?</span></span><select class="current-loop-type" onchange="updateCurrentLoopFields(${id})"><option value="pressure">Pressure Sensor(Bottom-Mounted)</option><option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option></select></label><label class="field sensor-range-field" style="display:none;"><span><span class="sensor-range-label">Sensor Range</span><span class="tooltip-icon sensor-range-tooltip" tabindex="0" data-tooltip="Native measurement range of the sensor (e.g., 0-5 PSI for pressure, 0-10m for ultrasonic). This is the range that corresponds to 4-20mA output.">?</span></span><div style="display:flex;gap:8px;align-items:center;"><input type="number" class="sensor-range-min" value="0" step="0.1" style="width:70px;" placeholder="Min"><span>to</span><input type="number" class="sensor-range-max" value="5" step="0.1" style="width:70px;" placeholder="Max"><select class="sensor-range-unit" style="width:70px;"><option value="PSI">PSI</option><option value="bar">bar</option><option value="m">m</option><option value="ft">ft</option><option value="in">in</option><option value="cm">cm</option></select></div></label><label class="field sensor-mount-height-field" style="display:none;"><span><span class="mount-height-label">Sensor Mount Height(in)</span><span class="tooltip-icon mount-height-tooltip" tabindex="0" data-tooltip="For pressure sensors: height of sensor above tank bottom (usually 0-2 inches). For ultrasonic sensors: distance from sensor to tank bottom when empty.">?</span></span><input type="number" class="sensor-mount-height" value="0" step="0.1" min="0"></label><label class="field fluid-type-field" style="display:none;"><span><span>Fluid Type</span><span class="tooltip-icon" tabindex="0" data-tooltip="Specific gravity of the stored fluid. Pick the matching preset, or choose Custom and enter the SG manually. The server's calibration learning will refine this automatically once stick-gauge readings are submitted.">?</span></span><div style="display:flex;gap:8px;align-items:center;"><select class="fluid-type" onchange="updateFluidTypeFields(${id})" style="flex:1;"><option value="water">Water (1.00)</option><option value="diesel">Diesel (0.85)</option><option value="gasoline">Gasoline (0.74)</option><option value="heatingOil">Heating Oil (0.85)</option><option value="propane">Propane / LPG (0.50)</option><option value="brine">Brine (1.20)</option><option value="crudeOil">Crude Oil (0.83)</option><option value="usedOil">Used Oil (0.92)</option><option value="glycol50">Glycol 50% (1.07)</option><option value="def">DEF / AdBlue (1.09)</option><option value="ethanol">Ethanol (0.79)</option><option value="custom">Custom...</option></select><input type="number" class="fluid-sg-custom" step="0.001" min="0.3" max="2.0" placeholder="SG" style="width:80px;display:none;"></div></label><label class="field analog-voltage-field" style="display:none;"><span><span class="analog-voltage-label">Sensor Voltage Range</span><span class="tooltip-icon analog-voltage-tooltip" tabindex="0" data-tooltip="The voltage output range of the analog sensor. Common ranges: 0-10V, 0-5V, 1-5V.">?</span></span><div style="display:flex;gap:8px;align-items:center;"><input type="number" class="analog-voltage-min" value="0" step="0.1" style="width:70px;" placeholder="Min"><span>to</span><input type="number" class="analog-voltage-max" value="10" step="0.1" style="width:70px;" placeholder="Max"><span>V</span></div></label></div><label style="display:flex;align-items:center;gap:6px;margin-top:8px;"><input type="checkbox" class="stuck-detection" checked> Stuck Sensor Detection<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the system flags a sensor as failed if it reports the same reading 10 consecutive times. Disable for sensors where readings naturally stay constant (e.g., gas pressure monitors).">?</span></label><label style="display:flex;align-items:center;gap:6px;margin-top:8px;"><input type="checkbox" class="calibration-enabled" checked> Calibration Learning<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, you can submit manual verification readings on the Calibration page to teach the system the actual relationship between sensor output and measured values. Recommended for tank level sensors. For gas pressure or RPM sensors, disable unless you have reference gauges for comparison.">?</span></label><div class="digital-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);"><strong>Float Switch Mode:</strong> This sensor only detects whether fluid has reached the switch position.<br><br><strong>Wiring Note:</strong> Connect the switch between the input pin and GND. The software uses an internal pull-up resistor.</div><div class="current-loop-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);"><div class="pressure-sensor-info"><strong>Pressure Sensor(Bottom-Mounted):</strong> Measures the pressure of the liquid column above it.<br>- 4mA = Empty tank (0 pressure)<br>- 20mA = Full tank (max pressure)<br>- Sensor Range: The native pressure range (e.g., 0-5 PSI)<br>- Mount Height: Distance from sensor to tank bottom</div><div class="ultrasonic-sensor-info" style="display:none;"><strong>Ultrasonic Sensor(Top-Mounted):</strong> Measures the distance from the sensor to the liquid surface.<br>- 4mA = Full tank (liquid close to sensor)<br>- 20mA = Empty tank (liquid far from sensor)<br>- Sensor Range: The native distance range (e.g., 0-10m)<br>- Sensor Mount Height: Distance from sensor to tank bottom when empty</div></div><button type="button" class="add-section-btn add-alarm-btn" onclick="toggleAlarmSection(${id})">+ Add Alarm</button><div class="collapsible-section alarm-section"><h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;"><span class="alarm-section-title">Alarm Thresholds</span><button type="button" class="remove-btn" onclick="removeAlarmSection(${id})" style="float:right;">Remove Alarm</button></h4><div class="form-grid alarm-thresholds-grid"><div class="field"><span><label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" class="high-alarm-enabled" checked> High Alarm</label></span><input type="number" class="high-alarm" value="100"></div><div class="field"><span><label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" class="low-alarm-enabled" checked> Low Alarm</label></span><input type="number" class="low-alarm" value="20"></div></div><div class="form-grid digital-alarm-grid" style="display:none;"><div class="field" style="grid-column:1 / -1;"><span>Trigger Condition<span class="tooltip-icon" tabindex="0" data-tooltip="Select when the alarm should trigger based on the float switch state.">?</span></span><select class="digital-trigger-state"><option value="activated">When Switch is Activated (fluid detected)</option><option value="not_activated">When Switch is NOT Activated (no fluid)</option></select></div></div></div><button type="button" class="add-section-btn add-relay-btn hidden" onclick="toggleRelaySection(${id})">+ Add Relay Control</button><div class="collapsible-section relay-section"><h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">Relay Switch Control<button type="button" class="remove-btn" onclick="removeRelaySection(${id})" style="float:right;">Remove Relay</button></h4><div class="form-grid"><label class="field"><span>Target Client UID</span><input type="text" class="relay-target" list="relayTargetSuggestions" placeholder="dev:IMEI (optional)"></label><label class="field"><span>Trigger On</span><select class="relay-trigger"><option value="any">Any Alarm (High or Low)</option><option value="high">High Alarm Only</option><option value="low">Low Alarm Only</option></select></label><label class="field"><span>Relay Mode</span><select class="relay-mode" onchange="toggleRelayDurations(${id})"><option value="momentary">Momentary (configurable duration)</option><option value="until_clear">Stay On Until Alarm Clears</option><option value="manual_reset">Stay On Until Manual Server Reset</option></select></label><div class="field"><span>Relay Outputs</span><div style="display:flex;gap:12px;padding:8px 0;"><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-1" value="1"> R1</label><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-2" value="2"> R2</label><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-3" value="4"> R3</label><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-4" value="8"> R4</label></div></div><div class="relay-durations-section" style="grid-column:1 / -1;display:block;"><span style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:8px;display:block;">Momentary Duration per Relay (seconds, 0 = default 30 min):</span><div style="display:flex;gap:12px;flex-wrap:wrap;"><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R1:<input type="number" class="relay-duration-1" value="0" min="0" max="86400" style="width:70px;"></label><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R2:<input type="number" class="relay-duration-2" value="0" min="0" max="86400" style="width:70px;"></label><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R3:<input type="number" class="relay-duration-3" value="0" min="0" max="86400" style="width:70px;"></label><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R4:<input type="number" class="relay-duration-4" value="0" min="0" max="86400" style="width:70px;"></label></div></div><label class="field relay-max-on-section" style="grid-column:1 / -1;display:none;"><span>Safety Max ON Duration (seconds, 0 = no limit)<span class="tooltip-icon" tabindex="0" data-tooltip="Maximum time a relay can stay ON in manual_reset mode. After this duration the relay is forced OFF and a relay_timeout alarm is sent. Set to 0 to disable. Max 604800 (7 days).">?</span></span><input type="number" class="relay-max-on" value="0" min="0" max="604800" style="width:120px;"></label></div></div><button type="button" class="add-section-btn add-sms-btn hidden" onclick="toggleSmsSection(${id})">+ Add SMS Alert</button><div class="collapsible-section sms-section"><h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">SMS Alert Notifications<button type="button" class="remove-btn" onclick="removeSmsSection(${id})" style="float:right;">Remove SMS Alert</button></h4><div class="form-grid"><label class="field" style="grid-column:1 / -1;"><span>Phone Numbers<span class="tooltip-icon" tabindex="0" data-tooltip="Enter phone numbers with country code (e.g., +15551234567). Separate multiple numbers with commas.">?</span></span><input type="text" class="sms-phones" placeholder="+15551234567,+15559876543"></label><label class="field"><span>Trigger On</span><select class="sms-trigger"><option value="any">Any Alarm (High or Low)</option><option value="high">High Alarm Only</option><option value="low">Low Alarm Only</option></select></label><label class="field" style="grid-column:span 2;"><span>Custom Message (optional)</span><input type="text" class="sms-message" placeholder="Tank alarm triggered"></label></div></div></div>`;}
+function createSensorHtml(id){return `<div class="sensor-card" id="sensor-${id}">
+<div class="sensor-header">
+<span class="sensor-title">Sensor #${id+1}</span>
+<button type="button" class="remove-btn" onclick="removeSensor(${id})">Remove</button>
+</div>
+<div class="form-grid">
+<label class="field">
+<span>Monitor Type</span>
+<select class="monitor-type" onchange="updateMonitorFields(${id})">${monitorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select>
+</label>
+<label class="field tank-num-field">
+<span>Display Number (optional)</span>
+<input type="number" class="tank-num" placeholder="e.g. 1, 2, 3">
+</label>
+<label class="field">
+<span>
+<span class="name-label">Name</span>
+</span>
+<input type="text" class="tank-name" placeholder="Name">
+</label>
+<label class="field contents-field">
+<span>Contents</span>
+<input type="text" class="tank-contents" placeholder="e.g. Diesel, Water">
+</label>
+<label class="field">
+<span>Sensor Type</span>
+<select class="sensor-type" onchange="updatePinOptions(${id})">${sensorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select>
+</label>
+<label class="field">
+<span>Pin / Channel</span>
+<select class="sensor-pin">${optaPins.map(p=>`<option value="${p.value}">${p.label}</option>`).join('')}</select>
+</label>
+<label class="field switch-mode-field" style="display:none;">
+<span>Switch Mode<span class="tooltip-icon" tabindex="0" data-tooltip="NO(Normally-Open): Switch is open by default, closes when fluid is present. NC(Normally-Closed): Switch is closed by default, opens when fluid is present.">?</span>
+</span>
+<select class="switch-mode">
+<option value="NO">Normally-Open(NO)</option>
+<option value="NC">Normally-Closed(NC)</option>
+</select>
+</label>
+<label class="field pulses-per-rev-field" style="display:none;">
+<span>Pulses/Rev</span>
+<input type="number" class="pulses-per-rev" value="1" min="1" max="255">
+</label>
+<label class="field current-loop-type-field" style="display:none;">
+<span>4-20mA Sensor Type<span class="tooltip-icon" tabindex="0" data-tooltip="Select the type of 4-20mA sensor: Pressure sensors are mounted near the sensor bottom and measure liquid pressure. Ultrasonic sensors are mounted on top of the sensor and measure distance to the liquid surface.">?</span>
+</span>
+<select class="current-loop-type" onchange="updateCurrentLoopFields(${id})">
+<option value="pressure">Pressure Sensor(Bottom-Mounted)</option>
+<option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option>
+</select>
+</label>
+<label class="field sensor-range-field" style="display:none;">
+<span>
+<span class="sensor-range-label">Sensor Range</span>
+<span class="tooltip-icon sensor-range-tooltip" tabindex="0" data-tooltip="Native measurement range of the sensor (e.g., 0-5 PSI for pressure, 0-10m for ultrasonic). This is the range that corresponds to 4-20mA output.">?</span>
+</span>
+<div style="display:flex;gap:8px;align-items:center;">
+<input type="number" class="sensor-range-min" value="0" step="0.1" style="width:70px;" placeholder="Min">
+<span>to</span>
+<input type="number" class="sensor-range-max" value="5" step="0.1" style="width:70px;" placeholder="Max">
+<select class="sensor-range-unit" style="width:70px;">
+<option value="PSI">PSI</option>
+<option value="bar">bar</option>
+<option value="m">m</option>
+<option value="ft">ft</option>
+<option value="in">in</option>
+<option value="cm">cm</option>
+</select>
+</div>
+</label>
+<label class="field sensor-mount-height-field" style="display:none;">
+<span>
+<span class="mount-height-label">Sensor Mount Height(in)</span>
+<span class="tooltip-icon mount-height-tooltip" tabindex="0" data-tooltip="For pressure sensors: height of sensor above tank bottom (usually 0-2 inches). For ultrasonic sensors: distance from sensor to tank bottom when empty.">?</span>
+</span>
+<input type="number" class="sensor-mount-height" value="0" step="0.1" min="0">
+</label>
+<label class="field fluid-type-field" style="display:none;">
+<span>
+<span>Fluid Type</span>
+<span class="tooltip-icon" tabindex="0" data-tooltip="Specific gravity of the stored fluid. Pick the matching preset, or choose Custom and enter the SG manually. The server's calibration learning will refine this automatically once stick-gauge readings are submitted.">?</span>
+</span>
+<div style="display:flex;gap:8px;align-items:center;">
+<select class="fluid-type" onchange="updateFluidTypeFields(${id})" style="flex:1;">
+<option value="water">Water (1.00)</option>
+<option value="diesel">Diesel (0.85)</option>
+<option value="gasoline">Gasoline (0.74)</option>
+<option value="heatingOil">Heating Oil (0.85)</option>
+<option value="propane">Propane / LPG (0.50)</option>
+<option value="brine">Brine (1.20)</option>
+<option value="crudeOil">Crude Oil (0.83)</option>
+<option value="usedOil">Used Oil (0.92)</option>
+<option value="glycol50">Glycol 50% (1.07)</option>
+<option value="def">DEF / AdBlue (1.09)</option>
+<option value="ethanol">Ethanol (0.79)</option>
+<option value="custom">Custom...</option>
+</select>
+<input type="number" class="fluid-sg-custom" step="0.001" min="0.3" max="2.0" placeholder="SG" style="width:80px;display:none;">
+</div>
+</label>
+<label class="field analog-voltage-field" style="display:none;">
+<span>
+<span class="analog-voltage-label">Sensor Voltage Range</span>
+<span class="tooltip-icon analog-voltage-tooltip" tabindex="0" data-tooltip="The voltage output range of the analog sensor. Common ranges: 0-10V, 0-5V, 1-5V.">?</span>
+</span>
+<div style="display:flex;gap:8px;align-items:center;">
+<input type="number" class="analog-voltage-min" value="0" step="0.1" style="width:70px;" placeholder="Min">
+<span>to</span>
+<input type="number" class="analog-voltage-max" value="10" step="0.1" style="width:70px;" placeholder="Max">
+<span>V</span>
+</div>
+</label>
+<label class="field pwm-gating-enabled-field" style="display:none;">
+<span>
+<span>PWM Power Gating</span>
+<span class="tooltip-icon" tabindex="0" data-tooltip="Enable solid-state transmitter power gating using a high-side transistor driver (P1-P4) on the A0602 module. Controls low-power sensor switching.">?</span>
+</span>
+<select class="pwm-gating-enabled" onchange="updatePwmGatingVisibility(${id})">
+<option value="false">Disabled</option>
+<option value="true">Enabled (Transistor Switch)</option>
+</select>
+</label>
+<label class="field pwm-gating-channel-field" style="display:none;">
+<span>
+<span>Gating Output Pin</span>
+<span class="tooltip-icon" tabindex="0" data-tooltip="Select the transistor output terminal (P1-P4) used to gate power to this transmitter on the A0602 module. NOTE: Max switch current is 100mA.">?</span>
+</span>
+<select class="pwm-gating-channel">
+<option value="0">Terminal P1 (Ch 0)</option>
+<option value="1">Terminal P2 (Ch 1)</option>
+<option value="2">Terminal P3 (Ch 2)</option>
+<option value="3">Terminal P4 (Ch 3)</option>
+</select>
+</label>
+<label class="field pwm-gating-warmup-field" style="display:none;">
+<span>
+<span>Warmup Delay (ms)</span>
+<span class="tooltip-icon" tabindex="0" data-tooltip="Time in milliseconds to wait after enabling the power switch before reading the sensor. This avoids transients and allows the transmitter circuit to stabilize (e.g. 3000ms).">?</span>
+</span>
+<input type="number" class="pwm-gating-warmup" value="3000" min="0" step="50">
+</label>
+<label class="field pwm-gating-sample-delay-field" style="display:none;">
+<span>
+<span>Sample Settling Delay (ms)</span>
+<span class="tooltip-icon" tabindex="0" data-tooltip="Delay inside the averaging loop (in milliseconds) between individual samples (e.g. 5ms).">?</span>
+</span>
+<input type="number" class="pwm-gating-sample-delay" value="5" min="0" step="1">
+</label>
+</div>
+<label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
+<input type="checkbox" class="stuck-detection" checked> Stuck Sensor Detection<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the system flags a sensor as failed if it reports the same reading 10 consecutive times. Disable for sensors where readings naturally stay constant (e.g., gas pressure monitors).">?</span>
+</label>
+<label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
+<input type="checkbox" class="calibration-enabled" checked> Calibration Learning<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, you can submit manual verification readings on the Calibration page to teach the system the actual relationship between sensor output and measured values. Recommended for tank level sensors. For gas pressure or RPM sensors, disable unless you have reference gauges for comparison.">?</span>
+</label>
+<div class="digital-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);">
+<strong>Float Switch Mode:</strong> This sensor only detects whether fluid has reached the switch position.<br>
+<br>
+<strong>Wiring Note:</strong> Connect the switch between the input pin and GND. The software uses an internal pull-up resistor.</div>
+<div class="current-loop-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);">
+<div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.1);"><strong style="color:var(--secondary);">Power Gating Warning:</strong> A0602 outputs P1-P4 (high-side transistor controls) support a maximum of <strong>100mA</strong> peak current. Ensure your transmitter/sensor power draw does not exceed this limit.</div>
+<div class="pressure-sensor-info">
+<strong>Pressure Sensor(Bottom-Mounted):</strong> Measures the pressure of the liquid column above it.<br>- 4mA = Empty tank (0 pressure)<br>- 20mA = Full tank (max pressure)<br>- Sensor Range: The native pressure range (e.g., 0-5 PSI)<br>- Mount Height: Distance from sensor to tank bottom</div>
+<div class="ultrasonic-sensor-info" style="display:none;">
+<strong>Ultrasonic Sensor(Top-Mounted):</strong> Measures the distance from the sensor to the liquid surface.<br>- 4mA = Full tank (liquid close to sensor)<br>- 20mA = Empty tank (liquid far from sensor)<br>- Sensor Range: The native distance range (e.g., 0-10m)<br>- Sensor Mount Height: Distance from sensor to tank bottom when empty</div>
+</div>
+<button type="button" class="add-section-btn add-alarm-btn" onclick="toggleAlarmSection(${id})">+ Add Alarm</button>
+<div class="collapsible-section alarm-section">
+<h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">
+<span class="alarm-section-title">Alarm Thresholds</span>
+<button type="button" class="remove-btn" onclick="removeAlarmSection(${id})" style="float:right;">Remove Alarm</button>
+</h4>
+<div class="form-grid alarm-thresholds-grid">
+<div class="field">
+<span>
+<label style="display:flex;align-items:center;gap:6px;">
+<input type="checkbox" class="high-alarm-enabled" checked> High Alarm</label>
+</span>
+<input type="number" class="high-alarm" value="100">
+</div>
+<div class="field">
+<span>
+<label style="display:flex;align-items:center;gap:6px;">
+<input type="checkbox" class="low-alarm-enabled" checked> Low Alarm</label>
+</span>
+<input type="number" class="low-alarm" value="20">
+</div>
+</div>
+<div class="form-grid digital-alarm-grid" style="display:none;">
+<div class="field" style="grid-column:1 / -1;">
+<span>Trigger Condition<span class="tooltip-icon" tabindex="0" data-tooltip="Select when the alarm should trigger based on the float switch state.">?</span>
+</span>
+<select class="digital-trigger-state">
+<option value="activated">When Switch is Activated (fluid detected)</option>
+<option value="not_activated">When Switch is NOT Activated (no fluid)</option>
+</select>
+</div>
+</div>
+</div>
+<button type="button" class="add-section-btn add-relay-btn hidden" onclick="toggleRelaySection(${id})">+ Add Relay Control</button>
+<div class="collapsible-section relay-section">
+<h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">Relay Switch Control<button type="button" class="remove-btn" onclick="removeRelaySection(${id})" style="float:right;">Remove Relay</button>
+</h4>
+<div class="form-grid">
+<label class="field">
+<span>Target Client UID</span>
+<input type="text" class="relay-target" list="relayTargetSuggestions" placeholder="dev:IMEI (optional)">
+</label>
+<label class="field">
+<span>Trigger On</span>
+<select class="relay-trigger">
+<option value="any">Any Alarm (High or Low)</option>
+<option value="high">High Alarm Only</option>
+<option value="low">Low Alarm Only</option>
+</select>
+</label>
+<label class="field">
+<span>Relay Mode</span>
+<select class="relay-mode" onchange="toggleRelayDurations(${id})">
+<option value="momentary">Momentary (configurable duration)</option>
+<option value="until_clear">Stay On Until Alarm Clears</option>
+<option value="manual_reset">Stay On Until Manual Server Reset</option>
+</select>
+</label>
+<div class="field">
+<span>Relay Outputs</span>
+<div style="display:flex;gap:12px;padding:8px 0;">
+<label style="display:flex;align-items:center;gap:4px;">
+<input type="checkbox" class="relay-1" value="1"> R1</label>
+<label style="display:flex;align-items:center;gap:4px;">
+<input type="checkbox" class="relay-2" value="2"> R2</label>
+<label style="display:flex;align-items:center;gap:4px;">
+<input type="checkbox" class="relay-3" value="4"> R3</label>
+<label style="display:flex;align-items:center;gap:4px;">
+<input type="checkbox" class="relay-4" value="8"> R4</label>
+</div>
+</div>
+<div class="relay-durations-section" style="grid-column:1 / -1;display:block;">
+<span style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:8px;display:block;">Momentary Duration per Relay (seconds, 0 = default 30 min):</span>
+<div style="display:flex;gap:12px;flex-wrap:wrap;">
+<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R1:<input type="number" class="relay-duration-1" value="0" min="0" max="86400" style="width:70px;">
+</label>
+<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R2:<input type="number" class="relay-duration-2" value="0" min="0" max="86400" style="width:70px;">
+</label>
+<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R3:<input type="number" class="relay-duration-3" value="0" min="0" max="86400" style="width:70px;">
+</label>
+<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R4:<input type="number" class="relay-duration-4" value="0" min="0" max="86400" style="width:70px;">
+</label>
+</div>
+</div>
+<label class="field relay-max-on-section" style="grid-column:1 / -1;display:none;">
+<span>Safety Max ON Duration (seconds, 0 = no limit)<span class="tooltip-icon" tabindex="0" data-tooltip="Maximum time a relay can stay ON in manual_reset mode. After this duration the relay is forced OFF and a relay_timeout alarm is sent. Set to 0 to disable. Max 604800 (7 days).">?</span>
+</span>
+<input type="number" class="relay-max-on" value="0" min="0" max="604800" style="width:120px;">
+</label>
+</div>
+</div>
+<button type="button" class="add-section-btn add-sms-btn hidden" onclick="toggleSmsSection(${id})">+ Add SMS Alert</button>
+<div class="collapsible-section sms-section">
+<h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">SMS Alert Notifications<button type="button" class="remove-btn" onclick="removeSmsSection(${id})" style="float:right;">Remove SMS Alert</button>
+</h4>
+<div class="form-grid">
+<label class="field" style="grid-column:1 / -1;">
+<span>Phone Numbers<span class="tooltip-icon" tabindex="0" data-tooltip="Enter phone numbers with country code (e.g., +15551234567). Separate multiple numbers with commas.">?</span>
+</span>
+<input type="text" class="sms-phones" placeholder="+15551234567,+15559876543">
+</label>
+<label class="field">
+<span>Trigger On</span>
+<select class="sms-trigger">
+<option value="any">Any Alarm (High or Low)</option>
+<option value="high">High Alarm Only</option>
+<option value="low">Low Alarm Only</option>
+</select>
+</label>
+<label class="field" style="grid-column:span 2;">
+<span>Custom Message (optional)</span>
+<input type="text" class="sms-message" placeholder="Tank alarm triggered">
+</label>
+</div>
+</div>
+</div>`;}
 /* SENSOR FUNCTIONS */
 function normalizeBulletText(root){if(!root)return;root.querySelectorAll('.current-loop-sensor-info').forEach(el=>{el.innerHTML=el.innerHTML.replace(/[^\x20-\x7E]+/g,'-');});}
-function ensureSensorGuidance(card){if(!card)return;const alarmGrid=card.querySelector('.alarm-thresholds-grid');if(alarmGrid&&!card.querySelector('.alarm-guidance-note')){const note=document.createElement('div');note.className='alarm-guidance-note';note.style.cssText='grid-column:1 / -1;background:var(--chip);border:1px solid var(--card-border);padding:10px 12px;font-size:0.85rem;color:var(--muted);display:none;';alarmGrid.appendChild(note);}const relaySection=card.querySelector('.relay-durations-section');if(relaySection&&!card.querySelector('.relay-timing-note')){const note=document.createElement('div');note.className='relay-timing-note';note.style.cssText='margin-top:8px;font-size:0.82rem;color:var(--muted);';note.textContent='Momentary relay timers turn off on the next main-loop pass after expiry. Add a small safety margin if you need a tighter pulse width.';relaySection.appendChild(note);}}
-function updateSensorGuidance(id){const card=document.getElementById(`sensor-${id}`);if(!card)return;ensureSensorGuidance(card);const note=card.querySelector('.alarm-guidance-note');if(!note)return;const type=parseInt(card.querySelector('.sensor-type').value,10);const isAnalog=(type!==0&&type!==2&&type!==3);if(isAnalog){note.textContent='Analog voltage thresholds are evaluated in converted inches. Keep hysteresis at 1.0 inch or higher unless you have field-tested noise margins; generated configs default to 2.0 inches.';note.style.display='block';}else{note.style.display='none';}}
-function addSensor(){const container=document.getElementById('sensorsContainer');const div=document.createElement('div');div.innerHTML=createSensorHtml(sensorCount);container.appendChild(div.firstElementChild);normalizeBulletText(div.firstElementChild);ensureSensorGuidance(div.firstElementChild);updateSensorTypeFields(sensorCount);sensorCount++;}
+function ensureSensorGuidance(card){if(!card)return;
+const alarmGrid=card.querySelector('.alarm-thresholds-grid');if(alarmGrid&&!card.querySelector('.alarm-guidance-note')){const note=document.createElement('div');note.className='alarm-guidance-note';note.style.cssText='grid-column:1 / -1;background:var(--chip);border:1px solid var(--card-border);padding:10px 12px;font-size:0.85rem;color:var(--muted);display:none;';alarmGrid.appendChild(note);}const relaySection=card.querySelector('.relay-durations-section');if(relaySection&&!card.querySelector('.relay-timing-note')){const note=document.createElement('div');note.className='relay-timing-note';note.style.cssText='margin-top:8px;font-size:0.82rem;color:var(--muted);';note.textContent='Momentary relay timers turn off on the next main-loop pass after expiry. Add a small safety margin if you need a tighter pulse width.';relaySection.appendChild(note);}}
+function updateSensorGuidance(id){const card=document.getElementById(`sensor-${id}`);if(!card)return;ensureSensorGuidance(card);
+const note=card.querySelector('.alarm-guidance-note');if(!note)return;
+const type=parseInt(card.querySelector('.sensor-type').value,10);
+const isAnalog=(type!==0&&type!==2&&type!==3);if(isAnalog){note.textContent='Analog voltage thresholds are evaluated in converted inches. Keep hysteresis at 1.0 inch or higher unless you have field-tested noise margins; generated configs default to 2.0 inches.';note.style.display='block';}else{note.style.display='none';}}
+function addSensor(){const container=document.getElementById('sensorsContainer');
+const div=document.createElement('div');div.innerHTML=createSensorHtml(sensorCount);container.appendChild(div.firstElementChild);normalizeBulletText(div.firstElementChild);ensureSensorGuidance(div.firstElementChild);updateSensorTypeFields(sensorCount);sensorCount++;}
 window.removeSensor=function(id){const el=document.getElementById(`sensor-${id}`);if(el)el.remove();};
-window.toggleAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);const alarmSection=card.querySelector('.alarm-section');const addAlarmBtn=card.querySelector('.add-alarm-btn');const addRelayBtn=card.querySelector('.add-relay-btn');const addSmsBtn=card.querySelector('.add-sms-btn');alarmSection.classList.add('visible');addAlarmBtn.classList.add('hidden');addRelayBtn.classList.remove('hidden');addSmsBtn.classList.remove('hidden');};
-window.removeAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);const alarmSection=card.querySelector('.alarm-section');const addAlarmBtn=card.querySelector('.add-alarm-btn');const addRelayBtn=card.querySelector('.add-relay-btn');const addSmsBtn=card.querySelector('.add-sms-btn');const relaySection=card.querySelector('.relay-section');const smsSection=card.querySelector('.sms-section');alarmSection.classList.remove('visible');addAlarmBtn.classList.remove('hidden');addRelayBtn.classList.add('hidden');addSmsBtn.classList.add('hidden');relaySection.classList.remove('visible');smsSection.classList.remove('visible');card.querySelector('.high-alarm').value='100';card.querySelector('.low-alarm').value='20';card.querySelector('.high-alarm-enabled').checked=true;card.querySelector('.low-alarm-enabled').checked=true;card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
-window.toggleRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);const relaySection=card.querySelector('.relay-section');const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.add('visible');addBtn.classList.add('hidden');};
-window.removeRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);const relaySection=card.querySelector('.relay-section');const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});['relay-duration-1','relay-duration-2','relay-duration-3','relay-duration-4'].forEach(cls=>{card.querySelector('.'+cls).value='0';});card.querySelector('.relay-max-on').value='0';card.querySelector('.relay-durations-section').style.display='block';card.querySelector('.relay-max-on-section').style.display='none';};
-window.toggleSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);const smsSection=card.querySelector('.sms-section');const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.add('visible');addBtn.classList.add('hidden');};
-window.removeSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);const smsSection=card.querySelector('.sms-section');const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
-window.toggleRelayDurations=function(id){const card=document.getElementById(`sensor-${id}`);const relayMode=card.querySelector('.relay-mode').value;const durationsSection=card.querySelector('.relay-durations-section');const maxOnSection=card.querySelector('.relay-max-on-section');if(relayMode==='momentary'){durationsSection.style.display='block';maxOnSection.style.display='none';}else if(relayMode==='manual_reset'){durationsSection.style.display='none';maxOnSection.style.display='flex';}else{durationsSection.style.display='none';maxOnSection.style.display='none';}};
-window.updateMonitorFields=function(id){const card=document.getElementById(`sensor-${id}`);const type=card.querySelector('.monitor-type').value;const numField=card.querySelector('.tank-num-field');const numFieldLabel=numField.querySelector('span');const nameLabel=card.querySelector('.name-label');const sensorTypeSelect=card.querySelector('.sensor-type');const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');const contentsField=card.querySelector('.contents-field');const calCheckbox=card.querySelector('.calibration-enabled');if(type==='gas'){numField.style.display='flex';numFieldLabel.textContent='Display Number (optional)';nameLabel.textContent='System Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';sensorTypeSelect.value='2';calCheckbox.checked=false;updatePinOptions(id);}else if(type==='rpm'){numField.style.display='flex';numFieldLabel.textContent='Engine Number (optional)';nameLabel.textContent='Engine Name';pulsesPerRevField.style.display='flex';contentsField.style.display='none';sensorTypeSelect.value='3';calCheckbox.checked=false;updatePinOptions(id);}else{numField.style.display='flex';numFieldLabel.textContent='Tank Number (optional)';nameLabel.textContent='Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';calCheckbox.checked=true;}updateSensorTypeFields(id);};
-window.updatePinOptions=function(id){const card=document.getElementById(`sensor-${id}`);const typeSelect=card.querySelector('.sensor-type');const pinSelect=card.querySelector('.sensor-pin');const type=parseInt(typeSelect.value);pinSelect.innerHTML='';let options=[];if(type===2){options=expansionChannels;}else{options=optaPins;}options.forEach(opt=>{const option=document.createElement('option');option.value=opt.value;option.textContent=opt.label;pinSelect.appendChild(option);});updateSensorTypeFields(id);};
-window.updateSensorTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);const type=parseInt(card.querySelector('.sensor-type').value);const digitalInfoBox=card.querySelector('.digital-sensor-info');const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');const alarmThresholdsGrid=card.querySelector('.alarm-thresholds-grid');const digitalAlarmGrid=card.querySelector('.digital-alarm-grid');const alarmSectionTitle=card.querySelector('.alarm-section-title');const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');const switchModeField=card.querySelector('.switch-mode-field');const currentLoopTypeField=card.querySelector('.current-loop-type-field');const sensorMountHeightField=card.querySelector('.sensor-mount-height-field');const sensorRangeField=card.querySelector('.sensor-range-field');const analogVoltageField=card.querySelector('.analog-voltage-field');if(type===0){digitalInfoBox.style.display='block';currentLoopInfoBox.style.display='none';switchModeField.style.display='flex';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';alarmThresholdsGrid.style.display='none';digitalAlarmGrid.style.display='grid';alarmSectionTitle.textContent='Float Switch Alarm';pulsesPerRevField.style.display='none';}else if(type===2){const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='block';switchModeField.style.display='none';analogVoltageField.style.display='none';const loopTypeSelect=card.querySelector('.current-loop-type');if(monitorType==='tank'){currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor(Bottom-Mounted)</option><option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option>';sensorMountHeightField.style.display='flex';sensorRangeField.style.display='flex';}else if(monitorType==='gas'){currentLoopTypeField.style.display='none';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}else{currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';updateCurrentLoopFields(id);}else if(type===3){digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='flex';}else{const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';analogVoltageField.style.display='flex';sensorRangeField.style.display='flex';if(monitorType==='tank'){sensorMountHeightField.style.display='flex';}else{sensorMountHeightField.style.display='none';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';}updateSensorGuidance(id);updateFluidVisibility(id);};
-window.updateCurrentLoopFields=function(id){const card=document.getElementById(`sensor-${id}`);const currentLoopType=card.querySelector('.current-loop-type').value;const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');const pressureInfo=currentLoopInfoBox.querySelector('.pressure-sensor-info');const ultrasonicInfo=currentLoopInfoBox.querySelector('.ultrasonic-sensor-info');const mountHeightLabel=card.querySelector('.mount-height-label');const mountHeightTooltip=card.querySelector('.mount-height-tooltip');const sensorRangeLabel=card.querySelector('.sensor-range-label');const sensorRangeTooltip=card.querySelector('.sensor-range-tooltip');const sensorRangeUnit=card.querySelector('.sensor-range-unit');const sensorRangeMax=card.querySelector('.sensor-range-max');if(currentLoopType==='ultrasonic'){pressureInfo.style.display='none';ultrasonicInfo.style.display='block';mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Distance from the ultrasonic sensor to the sensor bottom when empty.');sensorRangeLabel.textContent='Sensor Range';sensorRangeTooltip.setAttribute('data-tooltip','Native distance range of the ultrasonic sensor (e.g., 0-10m).');sensorRangeUnit.value='m';sensorRangeMax.value='10';}else{const monitorType=card.querySelector('.monitor-type').value;pressureInfo.style.display='block';ultrasonicInfo.style.display='none';if(monitorType==='gas'){sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor that maps to 4-20mA output.');}else{mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Height of the pressure sensor above the sensor bottom (usually 0-2 inches).');sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor (e.g., 0-5 PSI).');}sensorRangeLabel.textContent='Sensor Range';sensorRangeUnit.value='PSI';sensorRangeMax.value='5';}updateFluidVisibility(id);};
-window.updateFluidTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);const sel=card.querySelector('.fluid-type');const customInput=card.querySelector('.fluid-sg-custom');if(!sel||!customInput)return;customInput.style.display=(sel.value==='custom')?'inline-block':'none';};
-window.updateFluidVisibility=function(id){const card=document.getElementById(`sensor-${id}`);const fluidField=card.querySelector('.fluid-type-field');if(!fluidField)return;const monitorType=card.querySelector('.monitor-type').value;const type=parseInt(card.querySelector('.sensor-type').value);let show=false;if(monitorType==='tank'){if(type===2){const lt=card.querySelector('.current-loop-type').value;if(lt==='pressure')show=true;}else if(type!==0&&type!==3){show=true;}}fluidField.style.display=show?'flex':'none';if(show)updateFluidTypeFields(id);};
+
+window.toggleAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);
+const alarmSection=card.querySelector('.alarm-section');
+const addAlarmBtn=card.querySelector('.add-alarm-btn');
+const addRelayBtn=card.querySelector('.add-relay-btn');
+const addSmsBtn=card.querySelector('.add-sms-btn');alarmSection.classList.add('visible');addAlarmBtn.classList.add('hidden');addRelayBtn.classList.remove('hidden');addSmsBtn.classList.remove('hidden');};
+
+window.removeAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);
+const alarmSection=card.querySelector('.alarm-section');
+const addAlarmBtn=card.querySelector('.add-alarm-btn');
+const addRelayBtn=card.querySelector('.add-relay-btn');
+const addSmsBtn=card.querySelector('.add-sms-btn');
+const relaySection=card.querySelector('.relay-section');
+const smsSection=card.querySelector('.sms-section');alarmSection.classList.remove('visible');addAlarmBtn.classList.remove('hidden');addRelayBtn.classList.add('hidden');addSmsBtn.classList.add('hidden');relaySection.classList.remove('visible');smsSection.classList.remove('visible');card.querySelector('.high-alarm').value='100';card.querySelector('.low-alarm').value='20';card.querySelector('.high-alarm-enabled').checked=true;card.querySelector('.low-alarm-enabled').checked=true;card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
+
+window.toggleRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);
+const relaySection=card.querySelector('.relay-section');
+const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.add('visible');addBtn.classList.add('hidden');};
+
+window.removeRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);
+const relaySection=card.querySelector('.relay-section');
+const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});['relay-duration-1','relay-duration-2','relay-duration-3','relay-duration-4'].forEach(cls=>{card.querySelector('.'+cls).value='0';});card.querySelector('.relay-max-on').value='0';card.querySelector('.relay-durations-section').style.display='block';card.querySelector('.relay-max-on-section').style.display='none';};
+
+window.toggleSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);
+const smsSection=card.querySelector('.sms-section');
+const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.add('visible');addBtn.classList.add('hidden');};
+
+window.removeSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);
+const smsSection=card.querySelector('.sms-section');
+const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
+
+window.toggleRelayDurations=function(id){const card=document.getElementById(`sensor-${id}`);
+const relayMode=card.querySelector('.relay-mode').value;
+const durationsSection=card.querySelector('.relay-durations-section');
+const maxOnSection=card.querySelector('.relay-max-on-section');if(relayMode==='momentary'){durationsSection.style.display='block';maxOnSection.style.display='none';}else if(relayMode==='manual_reset'){durationsSection.style.display='none';maxOnSection.style.display='flex';}else{durationsSection.style.display='none';maxOnSection.style.display='none';}};
+
+window.updateMonitorFields=function(id){const card=document.getElementById(`sensor-${id}`);
+const type=card.querySelector('.monitor-type').value;
+const numField=card.querySelector('.tank-num-field');
+const numFieldLabel=numField.querySelector('span');
+const nameLabel=card.querySelector('.name-label');
+const sensorTypeSelect=card.querySelector('.sensor-type');
+const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');
+const contentsField=card.querySelector('.contents-field');
+const calCheckbox=card.querySelector('.calibration-enabled');if(type==='gas'){numField.style.display='flex';numFieldLabel.textContent='Display Number (optional)';nameLabel.textContent='System Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';sensorTypeSelect.value='2';calCheckbox.checked=false;updatePinOptions(id);}else if(type==='rpm'){numField.style.display='flex';numFieldLabel.textContent='Engine Number (optional)';nameLabel.textContent='Engine Name';pulsesPerRevField.style.display='flex';contentsField.style.display='none';sensorTypeSelect.value='3';calCheckbox.checked=false;updatePinOptions(id);}else{numField.style.display='flex';numFieldLabel.textContent='Tank Number (optional)';nameLabel.textContent='Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';calCheckbox.checked=true;}updateSensorTypeFields(id);};
+
+window.updatePinOptions=function(id){const card=document.getElementById(`sensor-${id}`);
+const typeSelect=card.querySelector('.sensor-type');
+const pinSelect=card.querySelector('.sensor-pin');
+const type=parseInt(typeSelect.value);pinSelect.innerHTML='';
+let options=[];if(type===2){options=expansionChannels;}else{options=optaPins;}options.forEach(opt=>{const option=document.createElement('option');option.value=opt.value;option.textContent=opt.label;pinSelect.appendChild(option);});updateSensorTypeFields(id);};
+
+window.updatePwmGatingVisibility=function(id){const card=document.getElementById(`sensor-${id}`);if(!card)return;const isPwmSelect=card.querySelector('.pwm-gating-enabled');if(!isPwmSelect)return;const gatingEnabled=isPwmSelect.value==='true';const type=parseInt(card.querySelector('.sensor-type').value);const showGatingFields=type===2&&gatingEnabled;card.querySelector('.pwm-gating-channel-field').style.display=showGatingFields?'flex':'none';card.querySelector('.pwm-gating-warmup-field').style.display=showGatingFields?'flex':'none';card.querySelector('.pwm-gating-sample-delay-field').style.display=showGatingFields?'flex':'none';};
+
+window.updateSensorTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);
+const type=parseInt(card.querySelector('.sensor-type').value);
+const digitalInfoBox=card.querySelector('.digital-sensor-info');
+const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');
+const alarmThresholdsGrid=card.querySelector('.alarm-thresholds-grid');
+const digitalAlarmGrid=card.querySelector('.digital-alarm-grid');
+const alarmSectionTitle=card.querySelector('.alarm-section-title');
+const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');
+const switchModeField=card.querySelector('.switch-mode-field');
+const currentLoopTypeField=card.querySelector('.current-loop-type-field');
+const sensorMountHeightField=card.querySelector('.sensor-mount-height-field');
+const sensorRangeField=card.querySelector('.sensor-range-field');
+const analogVoltageField=card.querySelector('.analog-voltage-field');
+const pwmGatingEnabledField=card.querySelector('.pwm-gating-enabled-field');if(type===0){digitalInfoBox.style.display='block';currentLoopInfoBox.style.display='none';switchModeField.style.display='flex';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';pwmGatingEnabledField.style.display='none';card.querySelector('.pwm-gating-channel-field').style.display='none';card.querySelector('.pwm-gating-warmup-field').style.display='none';card.querySelector('.pwm-gating-sample-delay-field').style.display='none';alarmThresholdsGrid.style.display='none';digitalAlarmGrid.style.display='grid';alarmSectionTitle.textContent='Float Switch Alarm';pulsesPerRevField.style.display='none';}else if(type===2){const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='block';switchModeField.style.display='none';analogVoltageField.style.display='none';pwmGatingEnabledField.style.display='flex';updatePwmGatingVisibility(id);
+const loopTypeSelect=card.querySelector('.current-loop-type');if(monitorType==='tank'){currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor(Bottom-Mounted)</option>
+<option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option>';sensorMountHeightField.style.display='flex';sensorRangeField.style.display='flex';}else if(monitorType==='gas'){currentLoopTypeField.style.display='none';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}else{currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';updateCurrentLoopFields(id);}else if(type===3){digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';pwmGatingEnabledField.style.display='none';card.querySelector('.pwm-gating-channel-field').style.display='none';card.querySelector('.pwm-gating-warmup-field').style.display='none';card.querySelector('.pwm-gating-sample-delay-field').style.display='none';alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='flex';}else{const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';analogVoltageField.style.display='flex';sensorRangeField.style.display='flex';pwmGatingEnabledField.style.display='none';card.querySelector('.pwm-gating-channel-field').style.display='none';card.querySelector('.pwm-gating-warmup-field').style.display='none';card.querySelector('.pwm-gating-sample-delay-field').style.display='none';if(monitorType==='tank'){sensorMountHeightField.style.display='flex';}else{sensorMountHeightField.style.display='none';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';}updateSensorGuidance(id);updateFluidVisibility(id);};
+
+window.updateCurrentLoopFields=function(id){const card=document.getElementById(`sensor-${id}`);
+const currentLoopType=card.querySelector('.current-loop-type').value;
+const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');
+const pressureInfo=currentLoopInfoBox.querySelector('.pressure-sensor-info');
+const ultrasonicInfo=currentLoopInfoBox.querySelector('.ultrasonic-sensor-info');
+const mountHeightLabel=card.querySelector('.mount-height-label');
+const mountHeightTooltip=card.querySelector('.mount-height-tooltip');
+const sensorRangeLabel=card.querySelector('.sensor-range-label');
+const sensorRangeTooltip=card.querySelector('.sensor-range-tooltip');
+const sensorRangeUnit=card.querySelector('.sensor-range-unit');
+const sensorRangeMax=card.querySelector('.sensor-range-max');if(currentLoopType==='ultrasonic'){pressureInfo.style.display='none';ultrasonicInfo.style.display='block';mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Distance from the ultrasonic sensor to the sensor bottom when empty.');sensorRangeLabel.textContent='Sensor Range';sensorRangeTooltip.setAttribute('data-tooltip','Native distance range of the ultrasonic sensor (e.g., 0-10m).');sensorRangeUnit.value='m';sensorRangeMax.value='10';}else{const monitorType=card.querySelector('.monitor-type').value;pressureInfo.style.display='block';ultrasonicInfo.style.display='none';if(monitorType==='gas'){sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor that maps to 4-20mA output.');}else{mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Height of the pressure sensor above the sensor bottom (usually 0-2 inches).');sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor (e.g., 0-5 PSI).');}sensorRangeLabel.textContent='Sensor Range';sensorRangeUnit.value='PSI';sensorRangeMax.value='5';}updateFluidVisibility(id);};
+
+window.updateFluidTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);
+const sel=card.querySelector('.fluid-type');
+const customInput=card.querySelector('.fluid-sg-custom');if(!sel||!customInput)return;customInput.style.display=(sel.value==='custom')?'inline-block':'none';};
+
+window.updateFluidVisibility=function(id){const card=document.getElementById(`sensor-${id}`);
+const fluidField=card.querySelector('.fluid-type-field');if(!fluidField)return;
+const monitorType=card.querySelector('.monitor-type').value;
+const type=parseInt(card.querySelector('.sensor-type').value);
+let show=false;if(monitorType==='tank'){if(type===2){const lt=card.querySelector('.current-loop-type').value;if(lt==='pressure')show=true;}else if(type!==0&&type!==3){show=true;}}fluidField.style.display=show?'flex':'none';if(show)updateFluidTypeFields(id);};
+
 document.getElementById('addSensorBtn').addEventListener('click',addSensor);
 /* INPUTS */
-function addInput(){const id=inputIdCounter++;const container=document.getElementById('inputsContainer');const card=document.createElement('div');card.className='sensor-card';card.id=`input-${id}`;card.innerHTML=`<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><h4 style="margin:0;font-size:1rem;">Input ${id+1}</h4><button type="button" class="remove-btn" onclick="removeInput(${id})">Remove</button></div><div class="form-grid"><label class="field"><span>Input Name</span><input type="text" class="input-name" placeholder="Clear Button" value="Clear Button"></label><label class="field"><span>Pin Number<span class="tooltip-icon" tabindex="0" data-tooltip="Arduino Opta pin number for the input.">?</span></span><input type="number" class="input-pin" value="0" min="0" max="99"></label><label class="field"><span>Input Mode<span class="tooltip-icon" tabindex="0" data-tooltip="Active LOW: Button connects pin to GND, uses internal pull-up. Active HIGH: Button connects pin to VCC, requires external pull-down.">?</span></span><select class="input-mode">${inputModes.map(m=>`<option value="${m.value}">${m.label}</option>`).join('')}</select></label><label class="field"><span>Action<span class="tooltip-icon" tabindex="0" data-tooltip="What happens when this input is activated.">?</span></span><select class="input-action">${inputActions.map(a=>`<option value="${a.value}">${a.label}</option>`).join('')}</select></label></div>`;container.appendChild(card);}
+function addInput(){const id=inputIdCounter++;
+const container=document.getElementById('inputsContainer');
+const card=document.createElement('div');card.className='sensor-card';card.id=`input-${id}`;card.innerHTML=`<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+<h4 style="margin:0;font-size:1rem;">Input ${id+1}</h4>
+<button type="button" class="remove-btn" onclick="removeInput(${id})">Remove</button>
+</div>
+<div class="form-grid">
+<label class="field">
+<span>Input Name</span>
+<input type="text" class="input-name" placeholder="Clear Button" value="Clear Button">
+</label>
+<label class="field">
+<span>Pin Number<span class="tooltip-icon" tabindex="0" data-tooltip="Arduino Opta pin number for the input.">?</span>
+</span>
+<input type="number" class="input-pin" value="0" min="0" max="99">
+</label>
+<label class="field">
+<span>Input Mode<span class="tooltip-icon" tabindex="0" data-tooltip="Active LOW: Button connects pin to GND, uses internal pull-up. Active HIGH: Button connects pin to VCC, requires external pull-down.">?</span>
+</span>
+<select class="input-mode">${inputModes.map(m=>`<option value="${m.value}">${m.label}</option>`).join('')}</select>
+</label>
+<label class="field">
+<span>Action<span class="tooltip-icon" tabindex="0" data-tooltip="What happens when this input is activated.">?</span>
+</span>
+<select class="input-action">${inputActions.map(a=>`<option value="${a.value}">${a.label}</option>`).join('')}</select>
+</label>
+</div>`;container.appendChild(card);}
 window.removeInput=function(id){const card=document.getElementById(`input-${id}`);if(card)card.remove();};
+
 document.getElementById('addInputBtn').addEventListener('click',addInput);
 /* CONFIG COLLECTION */
 function sensorKeyFromValue(value){switch(value){case 0:return 'digital';case 2:return 'current';case 3:return 'rpm';default:return 'analog';}}
-function collectConfig(){if(!validatePowerCombination()){showToast('Invalid power/battery combination — see warning above',true);return null;}const sMinutes=Math.max(1,Math.min(1440,parseInt(document.getElementById('sampleMinutes').value,10)||30));const time=(document.getElementById('reportTime').value||'05:00').split(':');const reportHour=parseInt(time[0])||5;const reportMinute=parseInt(time[1])||0;const psRaw=document.getElementById('powerSource').value||'grid';const btStr=document.getElementById('batteryType').value||'agm';const bvNominal=parseInt(document.getElementById('batteryVoltage').value,10)||12;const hasVin=document.getElementById('vinMonitorEnabled').value==='1';const isSolarOnly=(btStr==='none'&&psRaw.startsWith('solar'));/* battery type enum value matching TankAlarm_Battery.h (chemistry only) */const btEnumMap={'none':0,'agm':1,'flooded':2,'gel':3,'sla':4,'lifepo4':5,'li_ion':6,'lipo':7,'custom':8};const btEnum=btEnumMap[btStr]!==undefined?btEnumMap[btStr]:1;const cfg={productUid:document.getElementById('productUid').value.trim(),deviceUid:(document.getElementById('clientUid').value||'').trim(),site:document.getElementById('siteName').value.trim(),deviceLabel:document.getElementById('deviceLabel').value.trim()||'Unconfigured Client',clientFleet:(document.getElementById('clientFleet').value||'').trim(),serverFleet:document.getElementById('serverFleet').value.trim()||'tankalarm-server',sampleSeconds:sMinutes*60,reportHour:reportHour,reportMinute:reportMinute,dailyEmail:document.getElementById('dailyEmail').value.trim(),powerSupply:psRaw,solarPowered:psRaw.startsWith('solar'),mpptEnabled:psRaw.includes('mppt'),solarCharger:{enabled:psRaw==='solar_modbus_mppt'},batteryConfig:{enabled:btStr!=='none',batteryType:btEnum,batteryTypeName:btStr,nominalVoltage:(btStr==='none'||btStr==='lipo')?0:bvNominal},vinMonitor:{enabled:hasVin,pin:hasVin?parseInt(document.getElementById('vinPin').value)||0:0,r1Kohm:hasVin?parseFloat(document.getElementById('vinR1').value)||22:22,r2Kohm:hasVin?parseFloat(document.getElementById('vinR2').value)||47:47},solarOnlyConfig:{enabled:isSolarOnly,startupDebounceVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlyDebounceV').value)||10:10,startupDebounceSec:(isSolarOnly&&hasVin)?parseInt(document.getElementById('solarOnlyDebounceSec').value)||30:30,startupWarmupSec:(isSolarOnly&&!hasVin)?parseInt(document.getElementById('solarOnlyWarmupSec').value)||60:60,sensorGateVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySensorGateV').value)||11:11,sunsetVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySunsetV').value)||10:10,sunsetConfirmSec:isSolarOnly?parseInt(document.getElementById('solarOnlySunsetSec').value)||120:120,opportunisticReportHours:isSolarOnly?parseInt(document.getElementById('solarOnlyReportHours').value)||20:20,batteryFailureFallback:(!isSolarOnly&&psRaw.startsWith('solar')&&btStr!=='none')?!!document.getElementById('solarOnlyBatFail').checked:false,batteryFailureThreshold:parseInt(document.getElementById('solarOnlyBatFailCount').value)||10},sensors:[],clearButtonPin:-1,clearButtonActiveHigh:false};
+function collectConfig(){if(!validatePowerCombination()){showToast('Invalid power/battery combination — see warning above',true);return null;}const sMinutes=Math.max(1,Math.min(1440,parseInt(document.getElementById('sampleMinutes').value,10)||30));
+const time=(document.getElementById('reportTime').value||'05:00').split(':');
+const reportHour=parseInt(time[0])||5;
+const reportMinute=parseInt(time[1])||0;
+const psRaw=document.getElementById('powerSource').value||'grid';
+const btStr=document.getElementById('batteryType').value||'agm';
+const bvNominal=parseInt(document.getElementById('batteryVoltage').value,10)||12;
+const hasVin=document.getElementById('vinMonitorEnabled').value==='1';
+const isSolarOnly=(btStr==='none'&&psRaw.startsWith('solar'));/* battery type enum value matching TankAlarm_Battery.h (chemistry only) */const btEnumMap={'none':0,'agm':1,'flooded':2,'gel':3,'sla':4,'lifepo4':5,'li_ion':6,'lipo':7,'custom':8};
+
+const btEnum=btEnumMap[btStr]!==undefined?btEnumMap[btStr]:1;
+const cfg={productUid:document.getElementById('productUid').value.trim(),deviceUid:(document.getElementById('clientUid').value||'').trim(),site:document.getElementById('siteName').value.trim(),deviceLabel:document.getElementById('deviceLabel').value.trim()||'Unconfigured Client',clientFleet:(document.getElementById('clientFleet').value||'').trim(),serverFleet:document.getElementById('serverFleet').value.trim()||'tankalarm-server',sampleSeconds:sMinutes*60,reportHour:reportHour,reportMinute:reportMinute,dailyEmail:document.getElementById('dailyEmail').value.trim(),powerSupply:psRaw,solarPowered:psRaw.startsWith('solar'),mpptEnabled:psRaw.includes('mppt'),solarCharger:{enabled:psRaw==='solar_modbus_mppt'},batteryConfig:{enabled:btStr!=='none',batteryType:btEnum,batteryTypeName:btStr,nominalVoltage:(btStr==='none'||btStr==='lipo')?0:bvNominal},vinMonitor:{enabled:hasVin,pin:hasVin?parseInt(document.getElementById('vinPin').value)||0:0,r1Kohm:hasVin?parseFloat(document.getElementById('vinR1').value)||22:22,r2Kohm:hasVin?parseFloat(document.getElementById('vinR2').value)||47:47},solarOnlyConfig:{enabled:isSolarOnly,startupDebounceVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlyDebounceV').value)||10:10,startupDebounceSec:(isSolarOnly&&hasVin)?parseInt(document.getElementById('solarOnlyDebounceSec').value)||30:30,startupWarmupSec:(isSolarOnly&&!hasVin)?parseInt(document.getElementById('solarOnlyWarmupSec').value)||60:60,sensorGateVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySensorGateV').value)||11:11,sunsetVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySunsetV').value)||10:10,sunsetConfirmSec:isSolarOnly?parseInt(document.getElementById('solarOnlySunsetSec').value)||120:120,opportunisticReportHours:isSolarOnly?parseInt(document.getElementById('solarOnlyReportHours').value)||20:20,batteryFailureFallback:(!isSolarOnly&&psRaw.startsWith('solar')&&btStr!=='none')?!!document.getElementById('solarOnlyBatFail').checked:false,batteryFailureThreshold:parseInt(document.getElementById('solarOnlyBatFailCount').value)||10},sensors:[],clearButtonPin:-1,clearButtonActiveHigh:false};
+
 const sensorCards=document.querySelectorAll('#sensorsContainer .sensor-card');if(!sensorCards.length){showToast('Add at least one sensor',true);return null;}
-sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monitor-type').value;const type=parseInt(card.querySelector('.sensor-type').value);const pin=parseInt(card.querySelector('.sensor-pin').value);let userNum=parseInt(card.querySelector('.tank-num').value)||0;let name=card.querySelector('.tank-name').value;const contents=card.querySelector('.tank-contents')?.value||'';if(monitorType==='gas'){if(!name)name=`Gas System ${userNum||index+1}`;}else if(monitorType==='rpm'){if(!name)name=`Engine ${userNum||index+1}`;}else{if(!name)name=`Tank ${userNum||index+1}`;}const sensor=sensorKeyFromValue(type);const pulsesPerRev=Math.max(1,Math.min(255,parseInt(card.querySelector('.pulses-per-rev').value)||1));const switchMode=card.querySelector('.switch-mode').value;const alarmSectionVisible=card.querySelector('.alarm-section').classList.contains('visible');const highAlarmEnabled=card.querySelector('.high-alarm-enabled').checked;const lowAlarmEnabled=card.querySelector('.low-alarm-enabled').checked;const highAlarmValue=card.querySelector('.high-alarm').value;const lowAlarmValue=card.querySelector('.low-alarm').value;const tank={id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};if(sensor==='digital'){tank.digitalSwitchMode=switchMode;}let sUnit='';if(sensor==='current'){const currentLoopType=card.querySelector('.current-loop-type').value;const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';tank.currentLoopType=currentLoopType;tank.sensorMountHeight=sensorMountHeight;tank.sensorRangeMin=sMin;tank.sensorRangeMax=sMax;tank.sensorRangeUnit=sUnit;}else if(sensor==='analog'){const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';tank.sensorMountHeight=sensorMountHeight;tank.sensorRangeMin=sMin;tank.sensorRangeMax=sMax;tank.sensorRangeUnit=sUnit;tank.analogVoltageMin=parseFloat(card.querySelector('.analog-voltage-min').value)||0;tank.analogVoltageMax=parseFloat(card.querySelector('.analog-voltage-max').value)||10;}if(monitorType==='tank'){const fluidSel=card.querySelector('.fluid-type');if(fluidSel){const fluidType=fluidSel.value;tank.fluidType=fluidType;if(fluidType==='custom'){const customSg=parseFloat(card.querySelector('.fluid-sg-custom').value);if(!isNaN(customSg)&&customSg>=0.3&&customSg<=2.0){tank.fluidSpecificGravity=customSg;}}}}if(monitorType==='gas'){tank.measurementUnit=sUnit?sUnit.toLowerCase():'psi';}else if(monitorType==='rpm'){tank.measurementUnit='rpm';}else if(monitorType==='flow'){tank.measurementUnit='gpm';}if(alarmSectionVisible){if(sensor==='digital'){const digitalTriggerState=card.querySelector('.digital-trigger-state').value;tank.digitalTrigger=digitalTriggerState;if(digitalTriggerState==='activated'){tank.highAlarm=1;}else{tank.lowAlarm=0;}tank.alarmsEnabled=true;tank.alarmSms=true;}else if(highAlarmEnabled||lowAlarmEnabled){if(highAlarmEnabled&&highAlarmValue!==''){const v=parseFloat(highAlarmValue);if(!isNaN(v))tank.highAlarm=v;}if(lowAlarmEnabled&&lowAlarmValue!==''){const v=parseFloat(lowAlarmValue);if(!isNaN(v))tank.lowAlarm=v;}tank.alarmsEnabled=true;tank.alarmSms=true;}else{tank.alarmsEnabled=false;tank.alarmSms=false;}}else{tank.alarmsEnabled=false;tank.alarmSms=false;}if(sensor==='rpm'){tank.pulsesPerRev=pulsesPerRev;}const relaySectionVisible=card.querySelector('.relay-section').classList.contains('visible');if(relaySectionVisible){let relayMask=0;['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{const cb=card.querySelector('.'+cls);if(cb.checked)relayMask|=parseInt(cb.value);});const relayTarget=card.querySelector('.relay-target').value.trim();const relayTrigger=card.querySelector('.relay-trigger').value;const relayMode=card.querySelector('.relay-mode').value;if(relayTarget){tank.relayTargetClient=relayTarget;tank.relayMask=relayMask;tank.relayTrigger=relayTrigger;tank.relayMode=relayMode;if(relayMode==='momentary'){tank.relayMomentaryDurations=[parseInt(card.querySelector('.relay-duration-1').value)||0,parseInt(card.querySelector('.relay-duration-2').value)||0,parseInt(card.querySelector('.relay-duration-3').value)||0,parseInt(card.querySelector('.relay-duration-4').value)||0];}if(relayMode==='manual_reset'){const maxOn=parseInt(card.querySelector('.relay-max-on').value)||0;if(maxOn>0)tank.relayMaxOnSeconds=Math.min(maxOn,604800);}}}const smsSectionVisible=card.querySelector('.sms-section').classList.contains('visible');if(smsSectionVisible){const smsPhones=card.querySelector('.sms-phones').value.trim();const smsTrigger=card.querySelector('.sms-trigger').value;const smsMessage=card.querySelector('.sms-message').value.trim();if(smsPhones){const phoneArray=smsPhones.split(',').map(p=>p.trim()).filter(p=>p.length>0);if(phoneArray.length>0){tank.smsAlert={phones:phoneArray,trigger:smsTrigger,message:smsMessage||'Tank alarm triggered'};}}}cfg.sensors.push(tank);});
-const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
+sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monitor-type').value;
+const type=parseInt(card.querySelector('.sensor-type').value);
+const pin=parseInt(card.querySelector('.sensor-pin').value);
+let userNum=parseInt(card.querySelector('.tank-num').value)||0;
+let name=card.querySelector('.tank-name').value;
+const contents=card.querySelector('.tank-contents')?.value||'';if(monitorType==='gas'){if(!name)name=`Gas System ${userNum||index+1}`;}else if(monitorType==='rpm'){if(!name)name=`Engine ${userNum||index+1}`;}else{if(!name)name=`Tank ${userNum||index+1}`;}const sensor=sensorKeyFromValue(type);
+const pulsesPerRev=Math.max(1,Math.min(255,parseInt(card.querySelector('.pulses-per-rev').value)||1));
+const switchMode=card.querySelector('.switch-mode').value;
+const alarmSectionVisible=card.querySelector('.alarm-section').classList.contains('visible');
+const highAlarmEnabled=card.querySelector('.high-alarm-enabled').checked;
+const lowAlarmEnabled=card.querySelector('.low-alarm-enabled').checked;
+const highAlarmValue=card.querySelector('.high-alarm').value;
+const lowAlarmValue=card.querySelector('.low-alarm').value;
+const tank={
+id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};
+if(sensor==='digital'){tank.digitalSwitchMode=switchMode;}let sUnit='';if(sensor==='current'){const currentLoopType=card.querySelector('.current-loop-type').value;
+const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;
+const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;
+const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';
+tank.currentLoopType=currentLoopType;
+tank.sensorMountHeight=sensorMountHeight;
+tank.sensorRangeMin=sMin;
+tank.sensorRangeMax=sMax;
+tank.sensorRangeUnit=sUnit;
+const isPwmEnabled=card.querySelector('.pwm-gating-enabled').value==='true';
+tank.pwmGatingEnabled=isPwmEnabled;
+tank.pwmGatingChannel=isPwmEnabled?parseInt(card.querySelector('.pwm-gating-channel').value)||0:0;
+tank.pwmGatingWarmup=isPwmEnabled?parseInt(card.querySelector('.pwm-gating-warmup').value)||3000:0;
+tank.pwmGatingSampleDelay=isPwmEnabled?parseInt(card.querySelector('.pwm-gating-sample-delay').value)||300:0;}else if(sensor==='analog'){const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;
+const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;
+const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';
+tank.sensorMountHeight=sensorMountHeight;
+tank.sensorRangeMin=sMin;
+tank.sensorRangeMax=sMax;
+tank.sensorRangeUnit=sUnit;
+tank.analogVoltageMin=parseFloat(card.querySelector('.analog-voltage-min').value)||0;
+tank.analogVoltageMax=parseFloat(card.querySelector('.analog-voltage-max').value)||10;}if(monitorType==='tank'){const fluidSel=card.querySelector('.fluid-type');if(fluidSel){const fluidType=fluidSel.value;
+tank.fluidType=fluidType;if(fluidType==='custom'){const customSg=parseFloat(card.querySelector('.fluid-sg-custom').value);if(!isNaN(customSg)&&customSg>=0.3&&customSg<=2.0){tank.fluidSpecificGravity=customSg;}}}}if(monitorType==='gas'){tank.measurementUnit=sUnit?sUnit.toLowerCase():'psi';}else if(monitorType==='rpm'){tank.measurementUnit='rpm';}else if(monitorType==='flow'){tank.measurementUnit='gpm';}if(alarmSectionVisible){if(sensor==='digital'){const digitalTriggerState=card.querySelector('.digital-trigger-state').value;
+tank.digitalTrigger=digitalTriggerState;if(digitalTriggerState==='activated'){tank.highAlarm=1;}else{tank.lowAlarm=0;}tank.alarmsEnabled=true;
+tank.alarmSms=true;}else if(highAlarmEnabled||lowAlarmEnabled){if(highAlarmEnabled&&highAlarmValue!==''){const v=parseFloat(highAlarmValue);if(!isNaN(v))tank.highAlarm=v;}if(lowAlarmEnabled&&lowAlarmValue!==''){const v=parseFloat(lowAlarmValue);if(!isNaN(v))tank.lowAlarm=v;}tank.alarmsEnabled=true;
+tank.alarmSms=true;}else{tank.alarmsEnabled=false;
+tank.alarmSms=false;}}else{tank.alarmsEnabled=false;
+tank.alarmSms=false;}if(sensor==='rpm'){tank.pulsesPerRev=pulsesPerRev;}const relaySectionVisible=card.querySelector('.relay-section').classList.contains('visible');if(relaySectionVisible){let relayMask=0;['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{const cb=card.querySelector('.'+cls);if(cb.checked)relayMask|=parseInt(cb.value);});
+const relayTarget=card.querySelector('.relay-target').value.trim();
+const relayTrigger=card.querySelector('.relay-trigger').value;
+const relayMode=card.querySelector('.relay-mode').value;if(relayTarget){tank.relayTargetClient=relayTarget;
+tank.relayMask=relayMask;
+tank.relayTrigger=relayTrigger;
+tank.relayMode=relayMode;if(relayMode==='momentary'){tank.relayMomentaryDurations=[parseInt(card.querySelector('.relay-duration-1').value)||0,parseInt(card.querySelector('.relay-duration-2').value)||0,parseInt(card.querySelector('.relay-duration-3').value)||0,parseInt(card.querySelector('.relay-duration-4').value)||0];}if(relayMode==='manual_reset'){const maxOn=parseInt(card.querySelector('.relay-max-on').value)||0;if(maxOn>0)tank.relayMaxOnSeconds=Math.min(maxOn,604800);}}}const smsSectionVisible=card.querySelector('.sms-section').classList.contains('visible');if(smsSectionVisible){const smsPhones=card.querySelector('.sms-phones').value.trim();
+const smsTrigger=card.querySelector('.sms-trigger').value;
+const smsMessage=card.querySelector('.sms-message').value.trim();if(smsPhones){const phoneArray=smsPhones.split(',').map(p=>p.trim()).filter(p=>p.length>0);if(phoneArray.length>0){tank.smsAlert={phones:phoneArray,trigger:smsTrigger,message:smsMessage||'Tank alarm triggered'};
+}}}cfg.sensors.push(tank);});
+const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');
+let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
 /* SUBMIT & DOWNLOAD */
 const retryBtn=document.getElementById('retryConfigBtn');
-async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}}catch(err){showToast('Error: '+err.message,true);}}
-async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;
+const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});
+const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});
+const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
 retryBtn.addEventListener('click',retryConfig);
 const syncBtn=document.getElementById('syncRequestBtn');
-async function requestSync(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID required',true);return;}try{const res=await fetch('/api/sync-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});const t=await res.text();if(res.ok){showToast(t||'Sync request sent');syncBtn.style.display='none';}else{showToast(t||'Sync request failed',true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function requestSync(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID required',true);return;}try{const res=await fetch('/api/sync-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});
+const t=await res.text();if(res.ok){showToast(t||'Sync request sent');syncBtn.style.display='none';}else{showToast(t||'Sync request failed',true);}}catch(err){showToast('Error: '+err.message,true);}}
 if(syncBtn)syncBtn.addEventListener('click',requestSync);
 if(els.form)els.form.addEventListener('submit',submitConfig);
-document.getElementById('downloadBtn').addEventListener('click',()=>{const cfg=collectConfig();if(!cfg)return;const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='client_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);});
+document.getElementById('downloadBtn').addEventListener('click',()=>{const cfg=collectConfig();if(!cfg)return;
+const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});
+const url=URL.createObjectURL(blob);
+const a=document.createElement('a');a.href=url;a.download='client_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);});
 /* LOAD CONFIG */
-window.loadConfig=function(c){if(els.siteName)els.siteName.value=c.site||'';if(els.clientUid)els.clientUid.value=c.deviceUid||'';if(els.deviceLabel)els.deviceLabel.value=c.deviceLabel||'';if(els.clientFleet)els.clientFleet.value=c.clientFleet||'';if(els.productUid)els.productUid.value=c.productUid||'';if(els.sampleMinutes)els.sampleMinutes.value=(c.sampleSeconds||1800)/60;if(els.dailyEmail)els.dailyEmail.value=c.dailyEmail||'';const h=String(c.reportHour||5).padStart(2,'0');const m=String(c.reportMinute||0).padStart(2,'0');if(els.reportTime)els.reportTime.value=`${h}:${m}`;
+window.loadConfig=function(c){if(els.siteName)els.siteName.value=c.site||'';if(els.clientUid)els.clientUid.value=c.deviceUid||'';if(els.deviceLabel)els.deviceLabel.value=c.deviceLabel||'';if(els.clientFleet)els.clientFleet.value=c.clientFleet||'';if(els.productUid)els.productUid.value=c.productUid||'';if(els.sampleMinutes)els.sampleMinutes.value=(c.sampleSeconds||1800)/60;if(els.dailyEmail)els.dailyEmail.value=c.dailyEmail||'';
+const h=String(c.reportHour||5).padStart(2,'0');
+const m=String(c.reportMinute||0).padStart(2,'0');if(els.reportTime)els.reportTime.value=`${h}:${m}`;
 /* Power model: powerSupply + batteryConfig.batteryType + batteryConfig.nominalVoltage + vinMonitor.enabled */
 let psSel=c.powerSupply||'grid';
-let btSel='agm';let bvSel=12;let vinSel=(c.vinMonitor&&c.vinMonitor.enabled)?'1':'0';
+let btSel='agm';
+let bvSel=12;
+let vinSel=(c.vinMonitor&&c.vinMonitor.enabled)?'1':'0';
 if(c.batteryConfig&&c.batteryConfig.batteryTypeName){btSel=c.batteryConfig.batteryTypeName;bvSel=c.batteryConfig.nominalVoltage||12;}
-else if(c.batteryConfig&&typeof c.batteryConfig.batteryType==='number'){const revMap={0:'none',1:'agm',2:'flooded',3:'gel',4:'sla',5:'lifepo4',6:'li_ion',7:'lipo',8:'custom'};btSel=revMap[c.batteryConfig.batteryType]||'agm';bvSel=c.batteryConfig.nominalVoltage||12;if(!c.batteryConfig.enabled)btSel='none';}
+else if(c.batteryConfig&&typeof c.batteryConfig.batteryType==='number'){const revMap={0:'none',1:'agm',2:'flooded',3:'gel',4:'sla',5:'lifepo4',6:'li_ion',7:'lipo',8:'custom'};
+btSel=revMap[c.batteryConfig.batteryType]||'agm';bvSel=c.batteryConfig.nominalVoltage||12;if(!c.batteryConfig.enabled)btSel='none';}
 const psEl=document.getElementById('powerSource');if(psEl)psEl.value=psSel;
 const btEl=document.getElementById('batteryType');if(btEl)btEl.value=btSel;
 const bvEl=document.getElementById('batteryVoltage');if(bvEl)bvEl.value=String(bvSel||12);
 const vinEl=document.getElementById('vinMonitorEnabled');if(vinEl)vinEl.value=vinSel;
 updatePowerConfigInfo();
-if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin').value=c.vinMonitor.pin;if(c.vinMonitor.r1Kohm!==undefined)document.getElementById('vinR1').value=c.vinMonitor.r1Kohm;if(c.vinMonitor.r2Kohm!==undefined)document.getElementById('vinR2').value=c.vinMonitor.r2Kohm;updateVinCalc();}if(c.solarOnlyConfig){const so=c.solarOnlyConfig;if(so.startupDebounceVoltage!==undefined)document.getElementById('solarOnlyDebounceV').value=so.startupDebounceVoltage;if(so.startupDebounceSec!==undefined)document.getElementById('solarOnlyDebounceSec').value=so.startupDebounceSec;if(so.startupWarmupSec!==undefined)document.getElementById('solarOnlyWarmupSec').value=so.startupWarmupSec;if(so.sensorGateVoltage!==undefined)document.getElementById('solarOnlySensorGateV').value=so.sensorGateVoltage;if(so.sunsetVoltage!==undefined)document.getElementById('solarOnlySunsetV').value=so.sunsetVoltage;if(so.sunsetConfirmSec!==undefined)document.getElementById('solarOnlySunsetSec').value=so.sunsetConfirmSec;if(so.opportunisticReportHours!==undefined)document.getElementById('solarOnlyReportHours').value=so.opportunisticReportHours;if(so.batteryFailureFallback!==undefined)document.getElementById('solarOnlyBatFail').checked=so.batteryFailureFallback;if(so.batteryFailureThreshold!==undefined)document.getElementById('solarOnlyBatFailCount').value=so.batteryFailureThreshold;}document.getElementById('sensorsContainer').innerHTML='';sensorCount=0;if(c.sensors)c.sensors.forEach(t=>{addSensor();const card=document.getElementById(`sensor-${sensorCount-1}`);if(card){const monitorSel=card.querySelector('.monitor-type');if(t.monitorType){monitorSel.value=t.monitorType;}else if(t.name&&t.name.match(/gas/i)){monitorSel.value='gas';}else if(t.sensor==='rpm'){monitorSel.value='rpm';}else{monitorSel.value='tank';}updateMonitorFields(sensorCount-1);card.querySelector('.tank-num').value=t.userNumber||'';card.querySelector('.tank-name').value=t.name||'';card.querySelector('.tank-contents').value=t.contents||'';const sensorVal=t.sensor==='digital'?0:(t.sensor==='current'?2:(t.sensor==='rpm'?3:1));card.querySelector('.sensor-type').value=sensorVal;updatePinOptions(sensorCount-1);if(t.sensor==='current'){card.querySelector('.sensor-pin').value=t.loopChannel||0;}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.currentLoopType)card.querySelector('.current-loop-type').value=t.currentLoopType;if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms){toggleAlarmSection(sensorCount-1);if(t.highAlarm!==undefined){card.querySelector('.high-alarm').value=t.highAlarm;card.querySelector('.high-alarm-enabled').checked=true;}if(t.lowAlarm!==undefined){card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.low-alarm-enabled').checked=true;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}if(t.smsAlert&&t.smsAlert.phones){toggleSmsSection(sensorCount-1);card.querySelector('.sms-phones').value=t.smsAlert.phones.join(',');if(t.smsAlert.trigger)card.querySelector('.sms-trigger').value=t.smsAlert.trigger;if(t.smsAlert.message)card.querySelector('.sms-message').value=t.smsAlert.message;}updateSensorTypeFields(sensorCount-1);if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');const fIn=card.querySelector('.fluid-sg-custom');if(fSel&&fIn){fSel.value='custom';fIn.value=t.fluidSpecificGravity;updateFluidTypeFields(sensorCount-1);}}updateFluidVisibility(sensorCount-1);}});showToast('Configuration loaded');};
+if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin').value=c.vinMonitor.pin;if(c.vinMonitor.r1Kohm!==undefined)document.getElementById('vinR1').value=c.vinMonitor.r1Kohm;if(c.vinMonitor.r2Kohm!==undefined)document.getElementById('vinR2').value=c.vinMonitor.r2Kohm;updateVinCalc();}if(c.solarOnlyConfig){const so=c.solarOnlyConfig;if(so.startupDebounceVoltage!==undefined)document.getElementById('solarOnlyDebounceV').value=so.startupDebounceVoltage;if(so.startupDebounceSec!==undefined)document.getElementById('solarOnlyDebounceSec').value=so.startupDebounceSec;if(so.startupWarmupSec!==undefined)document.getElementById('solarOnlyWarmupSec').value=so.startupWarmupSec;if(so.sensorGateVoltage!==undefined)document.getElementById('solarOnlySensorGateV').value=so.sensorGateVoltage;if(so.sunsetVoltage!==undefined)document.getElementById('solarOnlySunsetV').value=so.sunsetVoltage;if(so.sunsetConfirmSec!==undefined)document.getElementById('solarOnlySunsetSec').value=so.sunsetConfirmSec;if(so.opportunisticReportHours!==undefined)document.getElementById('solarOnlyReportHours').value=so.opportunisticReportHours;if(so.batteryFailureFallback!==undefined)document.getElementById('solarOnlyBatFail').checked=so.batteryFailureFallback;if(so.batteryFailureThreshold!==undefined)document.getElementById('solarOnlyBatFailCount').value=so.batteryFailureThreshold;}document.getElementById('sensorsContainer').innerHTML='';sensorCount=0;if(c.sensors)c.sensors.forEach(t=>{addSensor();
+const card=document.getElementById(`sensor-${sensorCount-1}`);if(card){const monitorSel=card.querySelector('.monitor-type');if(t.monitorType){monitorSel.value=t.monitorType;}else if(t.name&&t.name.match(/gas/i)){monitorSel.value='gas';}else if(t.sensor==='rpm'){monitorSel.value='rpm';}else{monitorSel.value='tank';}updateMonitorFields(sensorCount-1);card.querySelector('.tank-num').value=t.userNumber||'';card.querySelector('.tank-name').value=t.name||'';card.querySelector('.tank-contents').value=t.contents||'';
+const sensorVal=t.sensor==='digital'?0:(t.sensor==='current'?2:(t.sensor==='rpm'?3:1));card.querySelector('.sensor-type').value=sensorVal;updatePinOptions(sensorCount-1);if(t.sensor==='current'){card.querySelector('.sensor-pin').value=t.loopChannel||0;
+card.querySelector('.pwm-gating-enabled').value=t.pwmGatingEnabled?'true':'false';
+card.querySelector('.pwm-gating-channel').value=t.pwmGatingChannel!==undefined?t.pwmGatingChannel:0;
+card.querySelector('.pwm-gating-warmup').value=t.pwmGatingWarmup!==undefined?t.pwmGatingWarmup:3000;
+card.querySelector('.pwm-gating-sample-delay').value=t.pwmGatingSampleDelay!==undefined?t.pwmGatingSampleDelay:300;
+updatePwmGatingVisibility(sensorCount-1);}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.currentLoopType)card.querySelector('.current-loop-type').value=t.currentLoopType;if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms){toggleAlarmSection(sensorCount-1);if(t.highAlarm!==undefined){card.querySelector('.high-alarm').value=t.highAlarm;card.querySelector('.high-alarm-enabled').checked=true;}if(t.lowAlarm!==undefined){card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.low-alarm-enabled').checked=true;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}if(t.smsAlert&&t.smsAlert.phones){toggleSmsSection(sensorCount-1);card.querySelector('.sms-phones').value=t.smsAlert.phones.join(',');if(t.smsAlert.trigger)card.querySelector('.sms-trigger').value=t.smsAlert.trigger;if(t.smsAlert.message)card.querySelector('.sms-message').value=t.smsAlert.message;}updateSensorTypeFields(sensorCount-1);if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');
+const fIn=card.querySelector('.fluid-sg-custom');if(fSel&&fIn){fSel.value='custom';fIn.value=t.fluidSpecificGravity;updateFluidTypeFields(sensorCount-1);}}updateFluidVisibility(sensorCount-1);}});showToast('Configuration loaded');};
+
 /* CLOUD & IMPORT */
 function closeSelectClientModal(){els.selectClientModal.classList.add('hidden');}window.closeSelectClientModal=closeSelectClientModal;
-els.loadFromCloudBtn.addEventListener('click',async()=>{els.selectClientModal.classList.remove('hidden');els.clientList.innerHTML='Loading...';try{const r=await fetch('/api/clients?summary=1');const d=await r.json();const clients=d.cs||[];els.clientList.innerHTML=clients.map(c=>{const uid=c.c||'';const label=c.n||uid;const site=c.s||'';return `<div class="client-item" onclick="fetchClientConfig('${escapeHtml(uid)}')"><strong>${escapeHtml(label)}</strong> (${escapeHtml(uid)})<br>${escapeHtml(site)}</div>`;}).join('');}catch(e){els.clientList.innerHTML='Error loading clients';}});
-window.fetchClientConfig=async(uid)=>{closeSelectClientModal();try{const r=await fetch('/api/client?uid='+encodeURIComponent(uid));if(!r.ok)throw new Error('Failed');const c=await r.json();if(els.clientUid)els.clientUid.value=uid;if(c.config)loadConfig(c.config);else showToast('No config found for client',true);}catch(e){showToast('Error loading config',true);}};
-const importInput=document.getElementById('importFileInput');document.getElementById('importBtn').addEventListener('click',()=>importInput.click());importInput.addEventListener('change',(e)=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=(evt)=>{try{loadConfig(JSON.parse(evt.target.result));}catch(err){showToast('Invalid JSON',true);}};r.readAsText(f);});
+els.loadFromCloudBtn.addEventListener('click',async()=>{els.selectClientModal.classList.remove('hidden');els.clientList.innerHTML='Loading...';try{const r=await fetch('/api/clients?summary=1');
+const d=await r.json();
+const clients=d.cs||[];els.clientList.innerHTML=clients.map(c=>{const uid=c.c||'';
+const label=c.n||uid;
+const site=c.s||'';return `<div class="client-item" onclick="fetchClientConfig('${escapeHtml(uid)}')">
+<strong>${escapeHtml(label)}</strong> (${escapeHtml(uid)})<br>${escapeHtml(site)}</div>`;}).join('');}catch(e){els.clientList.innerHTML='Error loading clients';}});
+window.fetchClientConfig=async(uid)=>{closeSelectClientModal();try{const r=await fetch('/api/client?uid='+encodeURIComponent(uid));if(!r.ok)throw new Error('Failed');
+const c=await r.json();if(els.clientUid)els.clientUid.value=uid;if(c.config)loadConfig(c.config);else showToast('No config found for client',true);}catch(e){showToast('Error loading config',true);}};
+
+const importInput=document.getElementById('importFileInput');document.getElementById('importBtn').addEventListener('click',()=>importInput.click());importInput.addEventListener('change',(e)=>{const f=e.target.files[0];if(!f)return;
+const r=new FileReader();r.onload=(evt)=>{try{loadConfig(JSON.parse(evt.target.result));}catch(err){showToast('Invalid JSON',true);}};
+r.readAsText(f);});
 function getQueryParam(name){const params=new URLSearchParams(window.location.search);return params.get(name)||'';}
-async function basicInit(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv&&d.srv.pu)els.productUid.value=d.srv.pu;if(d&&d.srv&&d.srv.cf)els.clientFleet.value=d.srv.cf;window._siteClients=d;populateRelayTargets(d);}catch(e){}const urlUid=getQueryParam('uid');if(urlUid&&els.clientUid)els.clientUid.value=urlUid;const urlSite=getQueryParam('site');if(urlSite&&els.siteName)els.siteName.value=urlSite;if(urlUid){await fetchClientConfig(urlUid);}else{addSensor();}}function populateRelayTargets(d){const dl=document.getElementById('relayTargetSuggestions');if(!dl||!d||!d.cs)return;const seen=new Set();d.cs.forEach(c=>{const uid=c.c||'';if(uid&&!seen.has(uid)){seen.add(uid);const opt=document.createElement('option');const label=c.n||c.s||'';opt.value=uid;opt.label=label?label+' ('+uid+')':uid;dl.appendChild(opt);}});}basicInit();
+async function basicInit(){try{const r=await fetch('/api/clients?summary=1');
+const d=await r.json();if(d&&d.srv&&d.srv.pu)els.productUid.value=d.srv.pu;if(d&&d.srv&&d.srv.cf)els.clientFleet.value=d.srv.cf;window._siteClients=d;populateRelayTargets(d);}catch(e){}const urlUid=getQueryParam('uid');if(urlUid&&els.clientUid)els.clientUid.value=urlUid;
+const urlSite=getQueryParam('site');if(urlSite&&els.siteName)els.siteName.value=urlSite;if(urlUid){await fetchClientConfig(urlUid);}else{addSensor();}}function populateRelayTargets(d){const dl=document.getElementById('relayTargetSuggestions');if(!dl||!d||!d.cs)return;
+const seen=new Set();d.cs.forEach(c=>{const uid=c.c||'';if(uid&&!seen.has(uid)){seen.add(uid);
+const opt=document.createElement('option');
+const label=c.n||c.s||'';opt.value=uid;opt.label=label?label+' ('+uid+')':uid;dl.appendChild(opt);}});}basicInit();
 })();
-</script></body></html>)HTML";
+</script>
+</body>
+</html>)HTML";
 
 static const char SERIAL_MONITOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Serial Monitor - Tank Alarm Server</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Serial Output</h2><div class="controls"><button id="refreshServerBtn">Refresh Server Logs</button><button class="secondary" id="clearServerBtn">Clear Display</button><span style="color: var(--muted); font-size: 0.9rem;">Auto-refreshes every 5 seconds</span></div><div class="log-container" id="serverLogs"><div class="empty-state">Loading server logs...</div></div></div><div class="card"><h2>Client Serial Output</h2><div class="controls-grid"><label class="control-group"><span>Site Filter</span><select id="siteSelect"><option value="all">All sites</option></select></label><label class="control-group"><span>Client</span><select id="clientSelect"><option value="">-- Select a client --</option></select></label><)HTML" R"HTML(div class="control-group compact" style="flex: 1 1 340px;"><button id="pinClientBtn" disabled>Add Client Panel</button><button id="pinSiteBtn" class="secondary" disabled>Add Site Clients</button><button id="clearClientBtn" class="secondary">Clear Panels</button></div></div><div class="panel-grid" id="clientPanels"><div class="empty-state">Pin one or more clients to view their serial output alongside the server.</div></div></div></main><div id="toast"></div><script>(async () => {const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);/* PAUSE LOGIC */const pause_els={btn:document.getElementById('pauseBtn'),toast:document.getElementById('toast')};
 const pause_state={paused:false};if(pause_els.btn)pause_els.btn.addEventListener('click',togglePauseFlow);if(pause_els.btn)pause_els.btn.addEventListener('mouseenter',()=>{if(pause_state.paused)pause_els.btn.textContent='Resume';});if(pause_els.btn)pause_els.btn.addEventListener('mouseleave',()=>{renderPauseBtn();});await fetch('/api/clients?summary=1').then(r=>r.json()).then(d=>{if(d&&d.srv){pause_state.paused=!!d.srv.ps;renderPauseBtn();}}).catch(e=>console.error('Failed to load pause state',e));

@@ -218,6 +218,68 @@ static inline I2CScanResult tankalarm_scanI2CBus(
 }
 
 // ============================================================================
+// PWM / Output Gating (A0602 Expansion)
+// ============================================================================
+
+/**
+ * Configure and trigger a PWM output on the A0602 expansion module over raw I2C.
+ * Used for ultra-low-power solid-state power gating of connected transmitters.
+ *
+ * @param ch        PWM channel index (0-3 representing physical terminals P1-P4)
+ * @param period    PWM period in microseconds (set to 0 to disable / pull LOW)
+ * @param pulse     PWM pulse (high time) in microseconds (e.g. 10ms period with 9.99ms pulse for ON)
+ * @param i2cAddr   I2C address of the A0602 module
+ * @return True if message was successfully received and acknowledged, false otherwise
+ */
+static inline bool tankalarm_setPwm(
+    uint8_t ch,
+    uint32_t period,
+    uint32_t pulse,
+    uint8_t i2cAddr
+) {
+  uint8_t buf[13];
+  
+  // Header: command set, argument PWM set, payload length 9 bytes
+  buf[0] = 0x01; // BP_CMD_SET
+  buf[1] = 0x13; // ARG_OA_SET_PWM
+  buf[2] = 0x09; // LEN_OA_SET_PWM
+  
+  // Payload:
+  buf[3] = ch;   // Channel index (e.g. 0 for P1)
+  
+  // Period (uint32_t, little-endian)
+  buf[4] = (uint8_t)(period & 0xFF);
+  buf[5] = (uint8_t)((period >> 8) & 0xFF);
+  buf[6] = (uint8_t)((period >> 16) & 0xFF);
+  buf[7] = (uint8_t)((period >> 24) & 0xFF);
+  
+  // Pulse width (uint32_t, little-endian)
+  buf[8] = (uint8_t)(pulse & 0xFF);
+  buf[9] = (uint8_t)((pulse >> 8) & 0xFF);
+  buf[10] = (uint8_t)((pulse >> 16) & 0xFF);
+  buf[11] = (uint8_t)((pulse >> 24) & 0xFF);
+  
+  // Computation of standard CRC8 using polynomial 0x07 with 0x00 start value
+  uint8_t crc = 0x00;
+  for (uint8_t i = 0; i < 12; i++) {
+    crc ^= buf[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      if (crc & 0x80) {
+        crc = (crc << 1) ^ 0x07;
+      } else {
+        crc <<= 1;
+      }
+    }
+  }
+  buf[12] = crc;
+
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(buf, 13);
+  uint8_t err = Wire.endTransmission();
+  return (err == 0);
+}
+
+// ============================================================================
 // Current Loop Reading (A0602 Expansion)
 // ============================================================================
 

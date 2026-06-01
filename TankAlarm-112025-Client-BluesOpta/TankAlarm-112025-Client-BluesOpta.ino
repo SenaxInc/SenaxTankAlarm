@@ -598,6 +598,10 @@ struct MonitorConfig {
   float sensorRangeMin;    // Minimum native sensor range (e.g., 0 for 0-5 PSI or 0-10m)
   float sensorRangeMax;    // Maximum native sensor range (e.g., 5 for 0-5 PSI, 10 for 0-10m)
   char sensorRangeUnit[8]; // Unit for sensor range: "PSI", "bar", "m", "ft", "in", etc.
+  bool pwmGatingEnabled;       // Gating control via high-side transistor enabled
+  int16_t pwmGatingChannel;    // Transistor output channel pin index (0 = P1, 1 = P2, 2 = P3, 3 = P4)
+  uint32_t pwmGatingWarmup;    // Time in milliseconds for physical Loop power-up stabilization (3000ms by default)
+  uint16_t pwmGatingSampleDelay; // Delay in milliseconds within the average sampling loop (e.g. 5ms or 300ms)
   // Fluid characterization (for liquid tanks; ignored for OBJECT_GAS / non-tank objects).
   // Used as the fallback SG before the server's calibration learning takes over.
   FluidType fluidType;             // Fluid preset (default FLUID_WATER)
@@ -2299,6 +2303,10 @@ static void createDefaultConfig(ClientConfig &cfg) {
   cfg.monitors[0].sensorRangeMin = 0.0f;    // Default: 0 (e.g., 0 PSI or 0 meters)
   cfg.monitors[0].sensorRangeMax = 5.0f;    // Default: 5 (e.g., 5 PSI for typical pressure sensor)
   strlcpy(cfg.monitors[0].sensorRangeUnit, "PSI", sizeof(cfg.monitors[0].sensorRangeUnit)); // Default: PSI
+  cfg.monitors[0].pwmGatingEnabled = true;  // Default: gating enabled on P1 for current loop backward compat
+  cfg.monitors[0].pwmGatingChannel = 0;     // Default: P1
+  cfg.monitors[0].pwmGatingWarmup = 3000;   // Default: 3000ms stabilization delay
+  cfg.monitors[0].pwmGatingSampleDelay = 300; // Default: 300ms sensor read/debounce delay
   cfg.monitors[0].analogVoltageMin = 0.0f;  // Default: 0V (for 0-10V sensors)
   cfg.monitors[0].analogVoltageMax = 10.0f; // Default: 10V (for 0-10V sensors)
   cfg.monitors[0].fluidType = FLUID_WATER;       // Default fluid: water (SG 1.0)
@@ -2423,6 +2431,10 @@ static void initMonitorDefaults(MonitorConfig &mon, uint8_t index) {
   mon.sensorRangeMin = 0.0f;
   mon.sensorRangeMax = 5.0f;
   strlcpy(mon.sensorRangeUnit, "PSI", sizeof(mon.sensorRangeUnit));
+  mon.pwmGatingEnabled = true;  // Default: gating enabled on P1 for current loop backward compat
+  mon.pwmGatingChannel = 0;     // Default: P1
+  mon.pwmGatingWarmup = 3000;   // Default: 3000ms stabilization delay
+  mon.pwmGatingSampleDelay = 300; // Default: 300ms sensor read/debounce delay
   mon.analogVoltageMin = 0.0f;
   mon.analogVoltageMax = 10.0f;
 
@@ -2608,6 +2620,20 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
 
   if (t["sensorMountHeight"].is<float>()) {
     mon.sensorMountHeight = fmaxf(0.0f, t["sensorMountHeight"].as<float>());
+  }
+
+  // ---- PWM Gating control ----
+  if (t.containsKey("pwmGatingEnabled")) {
+    mon.pwmGatingEnabled = t["pwmGatingEnabled"].as<bool>();
+  }
+  if (t["pwmGatingChannel"].is<int>()) {
+    mon.pwmGatingChannel = t["pwmGatingChannel"].as<int>();
+  }
+  if (t["pwmGatingWarmup"].is<uint32_t>()) {
+    mon.pwmGatingWarmup = t["pwmGatingWarmup"].as<uint32_t>();
+  }
+  if (t["pwmGatingSampleDelay"].is<uint16_t>()) {
+    mon.pwmGatingSampleDelay = t["pwmGatingSampleDelay"].as<uint16_t>();
   }
 
   // ---- Sensor range ----
@@ -3122,6 +3148,11 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     }
     // Save sensor mount height (for calibration)
     t["sensorMountHeight"] = cfg.monitors[i].sensorMountHeight;
+    // Save PWM Gating configurations
+    t["pwmGatingEnabled"] = cfg.monitors[i].pwmGatingEnabled;
+    t["pwmGatingChannel"] = cfg.monitors[i].pwmGatingChannel;
+    t["pwmGatingWarmup"] = cfg.monitors[i].pwmGatingWarmup;
+    t["pwmGatingSampleDelay"] = cfg.monitors[i].pwmGatingSampleDelay;
     // Save sensor native range settings
     t["sensorRangeMin"] = cfg.monitors[i].sensorRangeMin;
     t["sensorRangeMax"] = cfg.monitors[i].sensorRangeMax;
@@ -4769,6 +4800,24 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     return 0.0f;
   }
 
+  // Resolve current-loop expansion module address
+  uint8_t i2cAddr = gConfig.currentLoopI2cAddress;
+  if (i2cAddr < 0x08 || i2cAddr > 0x77 || i2cAddr == NOTECARD_I2C_ADDRESS) {
+    i2cAddr = CURRENT_LOOP_I2C_ADDRESS;
+  }
+
+  // Enable solid-state power gating by pulling physical terminal HIGH (transistor ON)
+  if (cfg.pwmGatingEnabled) {
+    bool pwmOnSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 10000, 9999, i2cAddr);
+    if (pwmOnSuccess) {
+      delay(cfg.pwmGatingWarmup); // Stabilization delay for sensor power circuit
+    } else {
+      Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
+      Serial.print(cfg.pwmGatingChannel + 1);
+      Serial.println(F(" via I2C"));
+    }
+  }
+
   // BugFix v1.6.2 (M-1): Multi-sample averaging for current-loop sensors.
   // I2C reads are slower than ADC, so we use 4 samples (vs 8 for analog).
   const uint8_t numSamples = 4;
@@ -4781,7 +4830,17 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       validSamples++;
     }
     if (s < numSamples - 1) {
-      delay(5);
+      delay(cfg.pwmGatingEnabled ? cfg.pwmGatingSampleDelay : 5);
+    }
+  }
+
+  // Turn off sensor power gating once readings complete to achieve low-power gating (transistor OFF)
+  if (cfg.pwmGatingEnabled) {
+    bool pwmOffSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+    if (!pwmOffSuccess) {
+      Serial.print(F("WARNING: Failed to disable sensor power gating on P"));
+      Serial.print(cfg.pwmGatingChannel + 1);
+      Serial.println(F(" via I2C"));
     }
   }
 
