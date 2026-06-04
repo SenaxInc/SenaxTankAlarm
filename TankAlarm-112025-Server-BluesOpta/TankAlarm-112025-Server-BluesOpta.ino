@@ -484,6 +484,7 @@ struct ClientMetadata {
   // Last system-level alarm (solar/battery/power) — stored here, not on SensorRecord
   char lastSystemAlarmType[16];  // "solar", "battery", "power", or ""
   double lastSystemAlarmEpoch;   // When the last system alarm was received
+  double lastSystemSmsEpoch;     // When the last system-alarm SMS was sent (per-client rate limit)
   // Cellular signal strength (from client daily reports)
   int8_t signalBars;         // 0-4 bars, -1 = unknown
   int16_t signalRssi;        // RSSI in dBm
@@ -3062,7 +3063,7 @@ static void handleConfigRetryPost(EthernetClient &client, const String &body);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static float convertMaToLevelWithTemp(const char *clientUid, uint8_t sensorIndex, float mA, float currentTempF);
-static float convertVoltageToLevel(const char *clientUid, uint8_t sensorIndex, float voltage);
+static float resolveLevel(const char *clientUid, uint8_t sensorIndex, const char *sensorType, JsonObjectConst src);
 static ClientMetadata *findClientMetadata(const char *clientUid);
 static ClientMetadata *findOrCreateClientMetadata(const char *clientUid);
 static bool checkSmsRateLimit(SensorRecord *rec, bool bypassMinimumInterval = false);
@@ -11530,10 +11531,45 @@ static bool sendConfigViaNotecard(const char *clientUid, const char *jsonPayload
   return true;
 }
 
+// Inject the server's learned per-sensor calibration into a config document before it is
+// dispatched to the client (v1.6.15 calibration sync, P1-5). The client applies these
+// coefficients locally so its self-describing "lvl" matches what the server would compute,
+// and echoes the calibration version ("cv") back so the server can detect a stale client.
+// Pushing the fitted slope/offset (and temperature coefficient, when a current temperature is
+// known) keeps both sides in agreement by construction.
+static void injectCalibrationIntoConfig(const char *clientUid, JsonDocument &doc) {
+  JsonArray sensors = doc["sensors"].as<JsonArray>();
+  if (sensors.isNull()) return;
+  float tempF = getCachedTemperature(clientUid);
+  bool tempValid = (tempF > TEMPERATURE_UNAVAILABLE + 1.0f);
+  for (JsonObject t : sensors) {
+    uint8_t sensorIdx = t["number"] | (uint8_t)0;
+    if (sensorIdx == 0) continue;
+    SensorCalibration *cal = findSensorCalibration(clientUid, sensorIdx);
+    if (cal && cal->hasLearnedCalibration) {
+      t["calHasCal"] = true;
+      t["calSlope"] = cal->learnedSlope;
+      t["calOffset"] = cal->learnedOffset;
+      // Only send a non-zero temperature coefficient when we have a current temperature to
+      // anchor it; otherwise the client cannot evaluate the term consistently with the server.
+      t["calTempCoef"] = (cal->hasTempCompensation && tempValid) ? cal->learnedTempCoef : 0.0f;
+      t["calTempF"] = tempValid ? tempF : TEMP_REFERENCE_F;
+      t["calVersion"] = (uint32_t)cal->lastCalibrationEpoch;
+    }
+  }
+}
+
 static ConfigDispatchStatus dispatchClientConfig(const char *clientUid, JsonVariantConst cfgObj) {
   // Use static buffer to avoid 8KB stack allocation (Mbed OS stack is only 4-8KB)
   static char buffer[8192];
-  size_t len = serializeJson(cfgObj, buffer, sizeof(buffer));
+  // Copy the (immutable) inbound config into a mutable document so the server's learned
+  // calibration can be injected before serialization/caching (P1-5). This temporarily
+  // doubles the config in heap; the Opta's STM32H7 has ample RAM for an ~8KB payload.
+  static JsonDocument augmented;
+  augmented.clear();
+  augmented.set(cfgObj);
+  injectCalibrationIntoConfig(clientUid, augmented);
+  size_t len = serializeJson(augmented, buffer, sizeof(buffer));
   if (len == 0 || len >= sizeof(buffer)) {
     Serial.println(F("Client config payload too large"));
     return ConfigDispatchStatus::PayloadTooLarge;
@@ -11924,28 +11960,9 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
     rec->sensorVoltage = (voltage > 0.0f) ? voltage : 0.0f;
   }
   
-  // Get level/value reading based on sensor type
-  float newLevel = 0.0f;
-  bool isCurrentLoop = (strcmp(rec->sensorType, "currentLoop") == 0);
-  bool isAnalog = (strcmp(rec->sensorType, "analog") == 0);
-  bool isDigital = (strcmp(rec->sensorType, "digital") == 0);
-  bool isPulse = (strcmp(rec->sensorType, "pulse") == 0);
-  
-  if (isCurrentLoop && mA >= 4.0f) {
-    // Current-loop sensor: convert raw mA to level using config
-    // Use temperature compensation if available
-    float currentTemp = getCachedTemperature(clientUid);
-    newLevel = convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
-  } else if (isAnalog && voltage > 0.0f) {
-    // Analog voltage sensor: convert raw voltage to level using config
-    newLevel = convertVoltageToLevel(clientUid, sensorIndex, voltage);
-  } else if (isDigital && doc["fl"]) {
-    // Digital float switch: use fl field
-    newLevel = doc["fl"].as<float>();
-  } else if (isPulse && doc["rm"]) {
-    // Pulse/RPM sensor: use rm field
-    newLevel = doc["rm"].as<float>();
-  }
+  // Resolve the display level. The client sends a self-describing "lvl"; the server only
+  // re-derives from raw mA when its learned calibration is newer than the client's cv.
+  float newLevel = resolveLevel(clientUid, sensorIndex, rec->sensorType, doc.as<JsonObjectConst>());
   
   double now = (epoch > 0.0) ? epoch : currentEpoch();
   
@@ -11967,8 +11984,8 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // Record telemetry snapshot for historical charting
   // Get site name and tank height for history record
   const char *siteName = doc["s"] | "";
-  float recordHeight = doc["h"].as<float>();
-  if (recordHeight <= 0) recordHeight = 48.0f; // Default tank height
+  float recordHeight = doc["cap"] | (doc["h"] | 0.0f);
+  if (recordHeight <= 0) recordHeight = 48.0f; // Default only if neither cap nor h present
   
   // Get voltage from client metadata if available
   float vinVoltage = 0.0f;
@@ -12004,29 +12021,39 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     // SMS for system alarms if client flagged as critical (se=true)
     // BugFix v1.6.2 (I-14): Rate-limit system alarm SMS — they previously bypassed
     // the per-sensor rate limiter, allowing SMS floods from rapid power transitions.
-    static double sLastSystemSmsSentEpoch = 0.0;
+    // v1.6.15 (P1-4): rate-limit per-client (stored on ClientMetadata) instead of a single
+    // fleet-wide static, so one chatty client can no longer suppress alarms from others.
     bool smsRequested = doc["se"] | false;
     if (smsRequested) {
       double smsNow = currentEpoch();
-      if (smsNow - sLastSystemSmsSentEpoch >= MIN_SMS_ALERT_INTERVAL_SECONDS) {
+      double lastSms = meta ? meta->lastSystemSmsEpoch : 0.0;
+      if (smsNow - lastSms >= MIN_SMS_ALERT_INTERVAL_SECONDS) {
         const char *siteName = doc["s"] | "";
         char message[160];
+        int written = 0;
         if (strcmp(type, "solar") == 0) {
           const char *alert = doc["alert"] | "unknown";
           float bv = doc["bv"] | 0.0f;
-          snprintf(message, sizeof(message), "%s Solar: %s (%.1fV)", siteName, alert, bv);
+          written = snprintf(message, sizeof(message), "%s Solar: %s (%.1fV)", siteName, alert, bv);
         } else if (strcmp(type, "battery") == 0) {
           const char *alert = doc["alert"] | "unknown";
           float v = doc["v"] | 0.0f;
-          snprintf(message, sizeof(message), "%s Battery: %s (%.1fV)", siteName, alert, v);
+          written = snprintf(message, sizeof(message), "%s Battery: %s (%.1fV)", siteName, alert, v);
         } else if (strcmp(type, "power") == 0) {
           const char *from = doc["from"] | "?";
           const char *to = doc["to"] | "?";
           float v = doc["v"] | 0.0f;
-          snprintf(message, sizeof(message), "%s Power: %s->%s (%.1fV)", siteName, from, to, v);
+          written = snprintf(message, sizeof(message), "%s Power: %s->%s (%.1fV)", siteName, from, to, v);
+        }
+        // W-4: if the formatted message was truncated, fall back to a compact, safe message.
+        if (written < 0 || written >= (int)sizeof(message)) {
+          snprintf(message, sizeof(message), "System alert: %s", type);
         }
         sendSmsAlert(message);
-        sLastSystemSmsSentEpoch = smsNow;
+        if (meta) {
+          meta->lastSystemSmsEpoch = smsNow;
+          gClientMetadataDirty = true;
+        }
       } else {
         Serial.println(F("System alarm SMS suppressed by rate limit"));
       }
@@ -12080,23 +12107,18 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     rec->sensorVoltage = (voltage > 0.0f) ? voltage : 0.0f;
   }
   
-  // Get level - convert from raw sensor data if no level provided
-  float level = 0.0f;
-  bool isCurrentLoop = (strcmp(rec->sensorType, "currentLoop") == 0);
-  bool isAnalog = (strcmp(rec->sensorType, "analog") == 0);
-  bool isDigital = (strcmp(rec->sensorType, "digital") == 0);
-  bool isPulse = (strcmp(rec->sensorType, "pulse") == 0);
-  
-  if (isCurrentLoop && mA >= 4.0f) {
-    float currentTemp = getCachedTemperature(clientUid);
-    level = convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
-  } else if (isAnalog && voltage > 0.0f) {
-    level = convertVoltageToLevel(clientUid, sensorIndex, voltage);
-  } else if (isDigital && doc["fl"]) {
-    level = doc["fl"].as<float>();
-  } else if (isPulse && doc["rm"]) {
-    level = doc["rm"].as<float>();
+  // Self-describing alarm decode: if the registry was evicted/rebooted, recover the sensor
+  // interface type from the note's "st" so resolveLevel can reconcile correctly even with no
+  // prior registry state (P1-3).
+  const char *stField = doc["st"] | "";
+  if (stField && stField[0] != '\0' && rec->sensorType[0] == '\0') {
+    if (strcmp(stField, "rpm") == 0) strlcpy(rec->sensorType, "pulse", sizeof(rec->sensorType));
+    else strlcpy(rec->sensorType, stField, sizeof(rec->sensorType));
   }
+
+  // Resolve the display level (trusts the client's self-describing "lvl" unless its
+  // calibration version is stale, in which case the server re-applies its coefficients).
+  float level = resolveLevel(clientUid, sensorIndex, rec->sensorType, doc.as<JsonObjectConst>());
   
   bool isDiagnostic = (strcmp(type, "sensor-fault") == 0) ||
                       (strcmp(type, "sensor-stuck") == 0) ||
@@ -12139,8 +12161,12 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     float alarmVin = 0.0f;
     ClientMetadata *alarmMeta = findOrCreateClientMetadata(clientUid);
     if (alarmMeta) alarmVin = alarmMeta->vinVoltage;
+    // Use the client-reported capacity (cap) as the immutable tank height, never the
+    // current level. Falls back to 48 in only if the note predates self-describing payloads.
+    float alarmCap = doc["cap"] | 0.0f;
+    if (alarmCap <= 0.0f) alarmCap = 48.0f;
     recordTelemetrySnapshot(clientUid, alarmSiteName, sensorIndex,
-                            rec->levelInches, level, alarmVin);
+                            alarmCap, level, alarmVin);
   }
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   gSensorRegistryDirty = true;
@@ -12466,23 +12492,9 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       rec->sensorVoltage = (voltage > 0.0f) ? voltage : 0.0f;
     }
     
-    // Get level - convert from raw sensor data if no level provided
-    float newLevel = 0.0f;
-    bool isCurrentLoop = (strcmp(rec->sensorType, "currentLoop") == 0);
-    bool isAnalog = (strcmp(rec->sensorType, "analog") == 0);
-    bool isDigital = (strcmp(rec->sensorType, "digital") == 0);
-    bool isPulse = (strcmp(rec->sensorType, "pulse") == 0);
-    
-    if (isCurrentLoop && mA >= 4.0f) {
-      float currentTemp = getCachedTemperature(clientUid);
-      newLevel = convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
-    } else if (isAnalog && voltage > 0.0f) {
-      newLevel = convertVoltageToLevel(clientUid, sensorIndex, voltage);
-    } else if (isDigital && t["fl"]) {
-      newLevel = t["fl"].as<float>();
-    } else if (isPulse && t["rm"]) {
-      newLevel = t["rm"].as<float>();
-    }
+    // Resolve the display level (trusts the client's self-describing "lvl" unless its
+    // calibration version is stale). handleDaily already set rec->sensorType from t["st"].
+    float newLevel = resolveLevel(clientUid, sensorIndex, rec->sensorType, t);
     
     double now = (epoch > 0.0) ? epoch : currentEpoch();
     
@@ -12505,8 +12517,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     // Record historical snapshot from daily report so sparklines/charts have data
     // even when change-based telemetry is disabled (levelChangeThreshold = 0)
     if (newLevel > 0.0f) {
+      // Use client-reported capacity (cap) as the immutable tank height, never the level.
+      float dailyCap = t["cap"] | 0.0f;
+      if (dailyCap <= 0.0f) dailyCap = 48.0f;
       recordTelemetrySnapshot(clientUid, siteName, sensorIndex,
-                              rec->levelInches, newLevel, vinVoltage);
+                              dailyCap, newLevel, vinVoltage);
     }
   }
 
@@ -13279,160 +13294,52 @@ static float convertMaToLevelWithTemp(const char *clientUid, uint8_t sensorIndex
     return level;
   }
   
-  // No calibration available - use theoretical calculation from config
-  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
-  if (!snap || strlen(snap->payload) == 0) {
-    // No config snapshot available - use simple linear 4-20mA mapping
-    // Assume 0-100 range as fallback
-    float level = ((mA - 4.0f) / 16.0f) * 100.0f;
-    if (level < 0.0f) level = 0.0f;
-    return level;
-  }
-  
-  // Parse the config snapshot to find the sensor settings
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, snap->payload);
-  if (err) {
-    float level = ((mA - 4.0f) / 16.0f) * 100.0f;
-    if (level < 0.0f) level = 0.0f;
-    return level;  // Fallback
-  }
-  
-  // Find the sensor in the config
-  JsonArray sensors = doc["sensors"];
-  if (!sensors) {
-    float level = ((mA - 4.0f) / 16.0f) * 100.0f;
-    if (level < 0.0f) level = 0.0f;
-    return level;  // Fallback
-  }
-  
-  for (JsonVariant t : sensors) {
-    uint8_t tn = t["number"] | 0;
-    if (tn == sensorIndex) {
-      // Found the sensor - get sensor range settings
-      float rangeMin = t["sensorRangeMin"] | 0.0f;
-      float rangeMax = t["sensorRangeMax"] | 5.0f;  // Default 0-5 PSI
-      float mountHeight = t["sensorMountHeight"] | 0.0f;
-      const char *currentLoopType = t["currentLoopType"] | "pressure";
-      const char *monitorType = t["monitorType"] | "tank";
-      const char *rangeUnit = t["sensorRangeUnit"] | "PSI";
-      // Fluid characterization (added 2026-04 for non-water tanks).
-      // SG defaults to 1.0 (water). When > 0, divides the PSI->inches conversion so
-      // diesel/propane/brine/etc. report correct head height before learned calibration
-      // takes over. Falls back to water if missing/implausible.
-      float fluidSg = t["fluidSpecificGravity"] | 0.0f;
-      if (fluidSg < 0.3f || fluidSg > 2.0f) {
-        // Try to derive from preset name. If missing, default water.
-        const char *fluidTypeName = t["fluidType"] | "water";
-        if      (strcmp(fluidTypeName, "diesel") == 0)       fluidSg = 0.85f;
-        else if (strcmp(fluidTypeName, "gasoline") == 0)     fluidSg = 0.74f;
-        else if (strcmp(fluidTypeName, "heatingOil") == 0)   fluidSg = 0.85f;
-        else if (strcmp(fluidTypeName, "propane") == 0 || strcmp(fluidTypeName, "lpg") == 0) fluidSg = 0.50f;
-        else if (strcmp(fluidTypeName, "brine") == 0)        fluidSg = 1.20f;
-        else if (strcmp(fluidTypeName, "crudeOil") == 0)     fluidSg = 0.83f;
-        else if (strcmp(fluidTypeName, "usedOil") == 0)      fluidSg = 0.92f;
-        else if (strcmp(fluidTypeName, "glycol50") == 0)     fluidSg = 1.07f;
-        else if (strcmp(fluidTypeName, "def") == 0 || strcmp(fluidTypeName, "adblue") == 0) fluidSg = 1.09f;
-        else if (strcmp(fluidTypeName, "ethanol") == 0)      fluidSg = 0.79f;
-        else                                                  fluidSg = 1.00f;
-      }
-
-      // Calculate the fraction within 4-20mA range
-      float fraction = (mA - 4.0f) / 16.0f;
-
-      float sensorValue;
-      if (strcmp(currentLoopType, "ultrasonic") == 0) {
-        // Ultrasonic: 4mA = full (rangeMin distance), 20mA = empty (rangeMax distance)
-        // Level = mountHeight - distance
-        float distance = rangeMin + fraction * (rangeMax - rangeMin);
-        sensorValue = mountHeight - distance;
-        if (sensorValue < 0.0f) sensorValue = 0.0f;
-      } else if (strcmp(monitorType, "gas") == 0) {
-        // Gas pressure monitor: report raw pressure in its native unit (PSI/bar/...).
-        // No PSI->inches conversion, no mount-height add. Mirrors the client's gas path.
-        sensorValue = rangeMin + fraction * (rangeMax - rangeMin);
-        if (sensorValue < 0.0f) sensorValue = 0.0f;
-      } else {
-        // Pressure sensor on a liquid tank: convert PSI (or other pressure unit) to
-        // inches of fluid, dividing by SG so non-water fluids size correctly.
-        float pressure = rangeMin + fraction * (rangeMax - rangeMin);
-        float pressureFactor = 27.68f; // PSI -> inches of water
-        if      (strcmp(rangeUnit, "bar") == 0)   pressureFactor = 401.46f;
-        else if (strcmp(rangeUnit, "kPa") == 0)   pressureFactor = 4.0146f;
-        else if (strcmp(rangeUnit, "mbar") == 0)  pressureFactor = 0.40146f;
-        else if (strcmp(rangeUnit, "inH2O") == 0) pressureFactor = 1.0f;
-        sensorValue = (pressure * pressureFactor) / fluidSg + mountHeight;
-        if (sensorValue < 0.0f) sensorValue = 0.0f;
-      }
-      return sensorValue;
-    }
-  }
-  
-  // Sensor not found in config - use fallback
-  float level = ((mA - 4.0f) / 16.0f) * 100.0f;
-  if (level < 0.0f) level = 0.0f;
-  return level;
+  // No learned calibration available. Under the v1.6.15 conversion architecture the client
+  // sends a self-describing level ("lvl"), so the server no longer re-derives the level
+  // theoretically here. This is only reached defensively (e.g. resolveLevel called for a
+  // sensor without calibration); return 0 so the caller falls back to the client's level.
+  return 0.0f;
 }
 
-// Convert raw voltage reading to level/value using sensor config from client config snapshot
-// Returns the computed level, or 0.0 if config not found or invalid voltage
-static float convertVoltageToLevel(const char *clientUid, uint8_t sensorIndex, float voltage) {
-  if (voltage < 0.0f || voltage > 12.0f) {
-    return 0.0f;  // Invalid voltage reading (allow up to 12V for headroom)
-  }
-  
-  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
-  if (!snap || strlen(snap->payload) == 0) {
-    // No config snapshot available - use simple linear 0-10V mapping
-    // Assume 0-100 range as fallback
-    return (voltage / 10.0f) * 100.0f;
-  }
-  
-  // Parse the config snapshot to find the sensor settings
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, snap->payload);
-  if (err) {
-    return (voltage / 10.0f) * 100.0f;  // Fallback
-  }
-  
-  // Find the sensor in the config
-  JsonArray sensors = doc["sensors"];
-  if (!sensors) {
-    return (voltage / 10.0f) * 100.0f;  // Fallback
-  }
-  
-  for (JsonVariant t : sensors) {
-    uint8_t tn = t["number"] | 0;
-    if (tn == sensorIndex) {
-      // Found the sensor - get sensor range settings
-      float voltageMin = t["analogVoltageMin"] | 0.0f;   // e.g., 0V or 1V
-      float voltageMax = t["analogVoltageMax"] | 10.0f;  // e.g., 10V or 5V
-      float rangeMin = t["sensorRangeMin"] | 0.0f;       // e.g., 0 PSI
-      float rangeMax = t["sensorRangeMax"] | 100.0f;     // e.g., 100 inches or 5 PSI
-      float mountHeight = t["sensorMountHeight"] | 0.0f;
-      
-      // Validate voltage range
-      float voltageRange = voltageMax - voltageMin;
-      if (voltageRange <= 0.0f) {
-        return (voltage / 10.0f) * 100.0f;  // Invalid config fallback
+// Resolve the display level for an inbound note (telemetry/alarm/daily).
+//
+// The client now ships a self-describing level ("lvl") it computed locally, the raw reading
+// (ma/vt/fl/rm), and the calibration version ("cv") it applied. The server reconciles:
+//   - Current-loop sensor WITH a server learned calibration AND the client's cv is stale
+//     (it has not yet received the latest coefficients) → the server re-applies its own
+//     coefficients to the raw mA so the dashboard stays correct until the client catches up.
+//   - Otherwise → trust the client's "lvl" directly (it is already calibrated, or there is
+//     no calibration to apply). No theoretical reconversion.
+//   - No "lvl" present (legacy/registration notes) → fall back to fl/rm.
+static float resolveLevel(const char *clientUid, uint8_t sensorIndex,
+                          const char *sensorType, JsonObjectConst src) {
+  bool isCurrentLoop = (sensorType && strcmp(sensorType, "currentLoop") == 0);
+  float mA = src["ma"] | (src["sensorMa"] | 0.0f);
+  uint32_t clientCv = src["cv"] | (uint32_t)0;
+
+  if (isCurrentLoop && mA >= 4.0f) {
+    SensorCalibration *cal = findSensorCalibration(clientUid, sensorIndex);
+    if (cal && cal->hasLearnedCalibration) {
+      uint32_t serverCv = (uint32_t)cal->lastCalibrationEpoch;
+      if (clientCv != serverCv) {
+        // Client has not applied the current calibration yet — server is authoritative.
+        float currentTemp = getCachedTemperature(clientUid);
+        return convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
       }
-      
-      // Calculate the fraction within the voltage range
-      float fraction = (voltage - voltageMin) / voltageRange;
-      if (fraction < 0.0f) fraction = 0.0f;
-      if (fraction > 1.0f) fraction = 1.0f;
-      
-      // Map voltage to sensor's native range
-      float sensorValue = rangeMin + fraction * (rangeMax - rangeMin);
-      
-      // Add mount height offset (for pressure sensors measuring liquid column)
-      // Note: for pure pressure monitoring applications, mountHeight is typically 0
-      return sensorValue + mountHeight;
     }
   }
-  
-  // Sensor not found in config - use fallback
-  return (voltage / 10.0f) * 100.0f;
+
+  // Trust the client-computed level when present.
+  if (!src["lvl"].isNull()) {
+    float lvl = src["lvl"].as<float>();
+    if (lvl < 0.0f) lvl = 0.0f;
+    return lvl;
+  }
+
+  // Legacy / no-lvl fallback (digital float, pulse, or registration notes).
+  if (!src["fl"].isNull()) return src["fl"].as<float>();
+  if (!src["rm"].isNull()) return src["rm"].as<float>();
+  return 0.0f;
 }
 
 // ============================================================================
@@ -16544,6 +16451,23 @@ static void recalculateCalibration(SensorCalibration *cal) {
 #endif
 }
 
+// Re-push the client's cached configuration so freshly learned calibration coefficients reach
+// the device (v1.6.15 calibration sync, P1-5). dispatchClientConfig re-injects the current
+// calibration and bumps the calibration version, so once the client ACKs it will echo the new
+// "cv" and the server stops overriding its level.
+static void redispatchConfigWithCalibration(const char *clientUid) {
+  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (!snap || snap->payload[0] == '\0') return;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, snap->payload);
+  if (err) {
+    Serial.print(F("Calibration re-dispatch: failed to parse cached config: "));
+    Serial.println(err.c_str());
+    return;
+  }
+  dispatchClientConfig(clientUid, doc.as<JsonVariantConst>());
+}
+
 static void saveCalibrationEntry(const char *clientUid, uint8_t sensorIndex, double timestamp, 
                                   float sensorReading, float verifiedLevelInches, float temperatureF, const char *notes) {
 #ifdef FILESYSTEM_AVAILABLE
@@ -16573,6 +16497,11 @@ static void saveCalibrationEntry(const char *clientUid, uint8_t sensorIndex, dou
     // recalculateCalibration will read the file and update entryCount
     recalculateCalibration(cal);
     saveCalibrationData();
+    // Push the freshly fitted coefficients to the client so its locally-computed level matches
+    // the server (P1-5). Only worth a config round-trip once we actually have a calibration.
+    if (cal->hasLearnedCalibration) {
+      redispatchConfigWithCalibration(clientUid);
+    }
   }
 #endif
 }

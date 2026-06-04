@@ -234,6 +234,12 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define SENSOR_FAILURE_THRESHOLD 5  // 5 consecutive read failures = sensor failed
 #endif
 
+#ifndef CURRENT_LOOP_FAULT_MA
+// Below this current the 4-20mA loop is treated as broken/disconnected (live-zero fault).
+// A healthy transmitter never drives below ~3.8mA; 3.6mA leaves margin for sampling noise.
+#define CURRENT_LOOP_FAULT_MA 3.6f
+#endif
+
 #ifndef MAX_ALARMS_PER_HOUR
 #define MAX_ALARMS_PER_HOUR 10  // Maximum alarms per monitor per hour
 #endif
@@ -606,6 +612,17 @@ struct MonitorConfig {
   // Used as the fallback SG before the server's calibration learning takes over.
   FluidType fluidType;             // Fluid preset (default FLUID_WATER)
   float fluidSpecificGravity;      // Manual SG override; only used when fluidType == FLUID_CUSTOM
+  // Server-pushed learned calibration (current-loop sensors only). When hasLearnedCalibration
+  // is set, the client applies level = calSlope*mA + calOffset + calTempCoef*(calTempF-70)
+  // instead of the theoretical conversion, so the client's level (and therefore its alarm
+  // thresholds) match the server's calibrated display. calVersion (cv) is echoed back in
+  // every note so the server knows which calibration the client used.
+  bool hasLearnedCalibration;      // True once the server has pushed a learned calibration
+  float calSlope;                  // Learned inches per mA
+  float calOffset;                 // Learned offset (inches)
+  float calTempCoef;               // Temp coefficient (inches per °F from 70°F); 0 = no temp comp
+  float calTempF;                  // Server-pushed temperature for tempCoef (°F); used only when calTempCoef != 0
+  uint32_t calVersion;             // Calibration version (cv) echoed back to the server
   // Analog voltage sensor settings (for sensors like Dwyer 626 with voltage output)
   float analogVoltageMin;  // Minimum voltage output (e.g., 0.0 for 0-10V, 1.0 for 1-5V)
   float analogVoltageMax;  // Maximum voltage output (e.g., 10.0 for 0-10V, 5.0 for 1-5V)
@@ -1243,7 +1260,7 @@ static void sendRegistration(const char *reason);
 static void sendAlarm(uint8_t idx, const char *alarmType, float inches);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
-static void publishNote(const char *fileName, const JsonDocument &doc, bool syncNow);
+static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
 static void bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow);
 static void flushBufferedNotes();
 static void pruneNoteBufferIfNeeded();
@@ -2311,6 +2328,12 @@ static void createDefaultConfig(ClientConfig &cfg) {
   cfg.monitors[0].analogVoltageMax = 10.0f; // Default: 10V (for 0-10V sensors)
   cfg.monitors[0].fluidType = FLUID_WATER;       // Default fluid: water (SG 1.0)
   cfg.monitors[0].fluidSpecificGravity = 0.0f;   // 0 = use preset for fluidType
+  cfg.monitors[0].hasLearnedCalibration = false; // No server-pushed calibration yet
+  cfg.monitors[0].calSlope = 0.0f;
+  cfg.monitors[0].calOffset = 0.0f;
+  cfg.monitors[0].calTempCoef = 0.0f;
+  cfg.monitors[0].calTempF = 0.0f;
+  cfg.monitors[0].calVersion = 0;
   strlcpy(cfg.monitors[0].measurementUnit, "inches", sizeof(cfg.monitors[0].measurementUnit)); // Default: inches
   cfg.monitors[0].expectedPulseRate = 0.0f; // Default: not configured (0 = no baseline)
   cfg.monitors[0].stuckDetectionEnabled = false; // Default: off (opt-in via config)
@@ -2441,6 +2464,12 @@ static void initMonitorDefaults(MonitorConfig &mon, uint8_t index) {
   // Fluid characterization defaults (water, no manual SG override)
   mon.fluidType = FLUID_WATER;
   mon.fluidSpecificGravity = 0.0f;
+  mon.hasLearnedCalibration = false;
+  mon.calSlope = 0.0f;
+  mon.calOffset = 0.0f;
+  mon.calTempCoef = 0.0f;
+  mon.calTempF = 0.0f;
+  mon.calVersion = 0;
 
   // Stuck sensor detection
   mon.stuckDetectionEnabled = true;
@@ -2659,6 +2688,26 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
     } else if (sg == 0.0f) {
       mon.fluidSpecificGravity = 0.0f;  // 0 = use preset table value
     }
+  }
+
+  // ---- Server-pushed learned calibration (current-loop sensors) ----
+  // The server fits the regression and pushes the coefficients (plus the version cv and the
+  // temperature it used) so the client applies the same calibrated level locally — keeping
+  // the client's alarm thresholds aligned with the server's calibrated display.
+  if (t["calHasCal"].is<bool>() && t["calHasCal"].as<bool>()) {
+    mon.hasLearnedCalibration = true;
+    mon.calSlope = t["calSlope"] | 0.0f;
+    mon.calOffset = t["calOffset"] | 0.0f;
+    mon.calTempCoef = t["calTempCoef"] | 0.0f;
+    mon.calTempF = t["calTempF"] | 0.0f;
+    mon.calVersion = t["calVersion"] | (uint32_t)0;
+  } else {
+    mon.hasLearnedCalibration = false;
+    mon.calSlope = 0.0f;
+    mon.calOffset = 0.0f;
+    mon.calTempCoef = 0.0f;
+    mon.calTempF = 0.0f;
+    mon.calVersion = 0;
   }
 
   // ---- Measurement unit (for display/reporting) ----
@@ -3161,6 +3210,15 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     t["fluidType"] = fluidTypeName(cfg.monitors[i].fluidType);
     if (cfg.monitors[i].fluidSpecificGravity > 0.0f) {
       t["fluidSpecificGravity"] = cfg.monitors[i].fluidSpecificGravity;
+    }
+    // Persist server-pushed learned calibration so it survives reboots until the next push.
+    if (cfg.monitors[i].hasLearnedCalibration) {
+      t["calHasCal"] = true;
+      t["calSlope"] = cfg.monitors[i].calSlope;
+      t["calOffset"] = cfg.monitors[i].calOffset;
+      t["calTempCoef"] = cfg.monitors[i].calTempCoef;
+      t["calTempF"] = cfg.monitors[i].calTempF;
+      t["calVersion"] = cfg.monitors[i].calVersion;
     }
     // Save analog voltage range settings
     t["analogVoltageMin"] = cfg.monitors[i].analogVoltageMin;
@@ -4573,6 +4631,29 @@ static bool validateSensorReading(uint8_t idx, float reading) {
     return false;
   }
 
+  // Reject non-finite readings (NaN/inf) up front. A NaN compares false against every
+  // bound below, so without this gate a faulted reading (e.g. an under-range current loop
+  // returning NAN, or a degenerate linearMap) would slip through as "valid".
+  if (!isfinite(reading)) {
+    MonitorRuntime &nfState = gMonitorState[idx];
+    nfState.consecutiveFailures++;
+    if (nfState.consecutiveFailures >= SENSOR_FAILURE_THRESHOLD && !nfState.sensorFailed) {
+      nfState.sensorFailed = true;
+      Serial.print(F("Non-finite sensor reading for monitor "));
+      Serial.println(gConfig.monitors[idx].name);
+      if (checkAlarmRateLimit(idx, "sensor-fault")) {
+        JsonDocument doc;
+        doc["c"] = gDeviceUID;
+        doc["s"] = gConfig.siteName;
+        doc["k"] = gConfig.monitors[idx].sensorIndex;
+        doc["y"] = "sensor-fault";
+        doc["t"] = currentEpoch();
+        publishNote(ALARM_FILE, doc, true);
+      }
+    }
+    return false;
+  }
+
   const MonitorConfig &cfg = gConfig.monitors[idx];
   MonitorRuntime &state = gMonitorState[idx];
 
@@ -4808,9 +4889,32 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
 
   // Enable solid-state power gating by pulling physical terminal HIGH (transistor ON)
   if (cfg.pwmGatingEnabled) {
-    bool pwmOnSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 10000, 9999, i2cAddr);
+    // The I2C ACK only confirms the command was received, not that the rail came up.
+    // Retry the enable a couple of times so a transient bus NACK doesn't leave the
+    // transmitter unpowered (which would read as an under-range / sensor fault).
+    bool pwmOnSuccess = false;
+    for (uint8_t attempt = 0; attempt < 3 && !pwmOnSuccess; ++attempt) {
+      if (attempt > 0) delay(5);
+      pwmOnSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 10000, 9999, i2cAddr);
+    }
     if (pwmOnSuccess) {
-      delay(cfg.pwmGatingWarmup); // Stabilization delay for sensor power circuit
+      // Feed the watchdog across the (multi-second) warmup so several current-loop
+      // monitors read sequentially in one loop() pass can't starve the watchdog.
+      // Chunk the stabilization delay and kick between chunks.
+      uint32_t remaining = cfg.pwmGatingWarmup;
+      const uint32_t chunk = 1000; // 1s slices keep us well inside the WDT window
+      while (remaining > 0) {
+        uint32_t slice = (remaining > chunk) ? chunk : remaining;
+        delay(slice);
+        remaining -= slice;
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+        mbedWatchdog.kick();
+  #else
+        IWatchdog.reload();
+  #endif
+#endif
+      }
     } else {
       Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
       Serial.print(cfg.pwmGatingChannel + 1);
@@ -4831,6 +4935,16 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
     if (s < numSamples - 1) {
       delay(cfg.pwmGatingEnabled ? cfg.pwmGatingSampleDelay : 5);
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+      // Inter-sample debounce can be long (e.g. 300ms x3) when gating is on; kick the WDT.
+      if (cfg.pwmGatingEnabled) {
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+        mbedWatchdog.kick();
+  #else
+        IWatchdog.reload();
+  #endif
+      }
+#endif
     }
   }
 
@@ -4853,6 +4967,28 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
 
   // Store raw mA reading for telemetry
   gMonitorState[idx].currentSensorMa = milliamps;
+
+  // Live-zero fault: a 4-20mA loop reading below ~3.6mA means the loop is open/broken or the
+  // transmitter is unpowered. Return NAN so validateSensorReading() escalates a sensor-fault
+  // instead of reporting a plausible-but-wrong level. This guard sits BEFORE the calibration
+  // branch so it protects both the learned-calibration and theoretical paths (a learned fit
+  // would otherwise resolve 0mA to calOffset, a healthy-looking static depth). Gas pressure
+  // monitors report raw pressure and can legitimately sit low, so they are exempt.
+  if (cfg.objectType != OBJECT_GAS && milliamps < CURRENT_LOOP_FAULT_MA) {
+    return NAN;
+  }
+
+  // Server-pushed learned calibration overrides the theoretical conversion so the client's
+  // level (and alarm thresholds) match the server's calibrated display. Skips gas, which
+  // reports raw pressure rather than a fluid level.
+  if (cfg.hasLearnedCalibration && cfg.objectType != OBJECT_GAS) {
+    float level = cfg.calSlope * milliamps + cfg.calOffset;
+    if (cfg.calTempCoef != 0.0f) {
+      level += cfg.calTempCoef * (cfg.calTempF - 70.0f);
+    }
+    if (level < 0.0f) level = 0.0f;
+    return level;
+  }
 
   // Handle different 4-20mA sensor types using native sensor range
   float levelInches;
@@ -5188,6 +5324,55 @@ static void sendRegistration(const char *reason) {
   Serial.println(F("Registration note sent"));
 }
 
+// Writes the unified, self-describing sensor payload shared by telemetry, alarm, and daily
+// notes. Emits object type (ot), measurement unit (mu), sensor interface (st), the raw
+// reading (ma/vt/fl/rm) for the server's learned-calibration input, the client-computed
+// level (lvl), the capacity/full-scale (cap), and the calibration version (cv) the client
+// applied. The server trusts lvl when cv matches its own calibration; raw is kept so the
+// server can re-derive the level when the client's cv is stale.
+static void buildSensorObject(JsonObject o, uint8_t idx) {
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  MonitorRuntime &state = gMonitorState[idx];
+
+  switch (cfg.objectType) {
+    case OBJECT_ENGINE: o["ot"] = "engine"; break;
+    case OBJECT_PUMP:   o["ot"] = "pump";   break;
+    case OBJECT_GAS:    o["ot"] = "gas";    break;
+    case OBJECT_FLOW:   o["ot"] = "flow";   break;
+    default:            o["ot"] = "tank";   break;
+  }
+  if (cfg.measurementUnit[0] != '\0') {
+    o["mu"] = cfg.measurementUnit;
+  }
+
+  switch (cfg.sensorInterface) {
+    case SENSOR_DIGITAL:
+      o["st"] = "digital";
+      o["fl"] = roundTo(state.currentInches, 1);  // 1.0 or 0.0 (float switch state)
+      break;
+    case SENSOR_CURRENT_LOOP:
+      o["st"] = "currentLoop";
+      if (state.currentSensorMa >= 4.0f) o["ma"] = roundTo(state.currentSensorMa, 2);
+      break;
+    case SENSOR_ANALOG:
+      o["st"] = "analog";
+      if (state.currentSensorVoltage > 0.0f) o["vt"] = roundTo(state.currentSensorVoltage, 3);
+      break;
+    case SENSOR_PULSE:
+    default:
+      o["st"] = "pulse";
+      o["rm"] = roundTo(state.currentInches, 1);
+      break;
+  }
+
+  // Self-describing level + capacity so every note decodes with zero registry state.
+  o["lvl"] = roundTo(state.currentInches, 1);
+  o["cap"] = roundTo(getMonitorHeight(cfg), 1);
+  if (cfg.hasLearnedCalibration) {
+    o["cv"] = cfg.calVersion;
+  }
+}
+
 static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   if (idx >= gConfig.monitorCount) {
     return;
@@ -5203,43 +5388,9 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   doc["n"] = cfg.name;
   if (cfg.userNumber > 0) doc["un"] = cfg.userNumber;
 
-  // Include object type and measurement unit so server/dashboard can display correctly
-  switch (cfg.objectType) {
-    case OBJECT_ENGINE: doc["ot"] = "engine"; break;
-    case OBJECT_PUMP:   doc["ot"] = "pump";   break;
-    case OBJECT_GAS:    doc["ot"] = "gas";    break;
-    case OBJECT_FLOW:   doc["ot"] = "flow";   break;
-    default:            doc["ot"] = "tank";   break;
-  }
-  if (cfg.measurementUnit[0] != '\0') {
-    doc["mu"] = cfg.measurementUnit;
-  }
-  
-  // Include sensor interface type and type-specific raw data only
-  // Server converts to display units using its stored config
-  switch (cfg.sensorInterface) {
-    case SENSOR_DIGITAL:
-      doc["st"] = "digital";
-      doc["fl"] = state.currentInches;  // 1.0 or 0.0 (float switch state)
-      break;
-    case SENSOR_CURRENT_LOOP:
-      doc["st"] = "currentLoop";
-      if (state.currentSensorMa >= 4.0f) {
-        doc["ma"] = roundTo(state.currentSensorMa, 2);
-      }
-      break;
-    case SENSOR_ANALOG:
-      doc["st"] = "analog";
-      if (state.currentSensorVoltage > 0.0f) {
-        doc["vt"] = roundTo(state.currentSensorVoltage, 3);
-      }
-      break;
-    case SENSOR_PULSE:
-    default:
-      doc["st"] = "pulse";
-      doc["rm"] = roundTo(state.currentInches, 1);
-      break;
-  }
+  // Object type, measurement unit, sensor type, raw reading, lvl, cap, cv
+  buildSensorObject(doc.as<JsonObject>(), idx);
+
   doc["r"] = reason;
   // Use acquisition time so stale/reused values do not get a fresh timestamp.
   doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
@@ -5479,32 +5630,9 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
     doc["k"] = cfg.sensorIndex;
     if (cfg.userNumber > 0) doc["un"] = cfg.userNumber;
     doc["y"] = alarmType;
-    // Include object type and measurement unit for correct dashboard display
-    switch (cfg.objectType) {
-      case OBJECT_ENGINE: doc["ot"] = "engine"; break;
-      case OBJECT_PUMP:   doc["ot"] = "pump";   break;
-      case OBJECT_GAS:    doc["ot"] = "gas";    break;
-      case OBJECT_FLOW:   doc["ot"] = "flow";   break;
-      default:            doc["ot"] = "tank";   break;
-    }
-    if (cfg.measurementUnit[0] != '\0') {
-      doc["mu"] = cfg.measurementUnit;
-    }
-    
-    // Send sensor-type-appropriate raw data only
-    if (cfg.sensorInterface == SENSOR_CURRENT_LOOP) {
-      if (state.currentSensorMa >= 4.0f) {
-        doc["ma"] = roundTo(state.currentSensorMa, 2);
-      }
-    } else if (cfg.sensorInterface == SENSOR_ANALOG) {
-      if (state.currentSensorVoltage > 0.0f) {
-        doc["vt"] = roundTo(state.currentSensorVoltage, 3);
-      }
-    } else if (cfg.sensorInterface == SENSOR_DIGITAL) {
-      doc["fl"] = roundTo(inches, 1);
-    } else {
-      doc["rm"] = roundTo(inches, 1);
-    }
+    // Object type, measurement unit, sensor type, raw reading, lvl, cap, cv
+    buildSensorObject(doc.as<JsonObject>(), idx);
+
     doc["th"] = roundTo(cfg.highAlarmThreshold, 1);
     doc["tl"] = roundTo(cfg.lowAlarmThreshold, 1);
     if (allowSmsEscalation) {
@@ -6975,42 +7103,11 @@ static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t moni
   t["n"] = cfg.name;                              // label/name
   t["k"] = cfg.sensorIndex;                     // monitor number
   if (cfg.userNumber > 0) t["un"] = cfg.userNumber;
-  
-  // Include object type in daily report (server's metadata refresh after restarts)
-  switch (cfg.objectType) {
-    case OBJECT_TANK:   t["ot"] = "tank";   break;
-    case OBJECT_ENGINE: t["ot"] = "engine"; break;
-    case OBJECT_PUMP:   t["ot"] = "pump";   break;
-    case OBJECT_GAS:    t["ot"] = "gas";    break;
-    case OBJECT_FLOW:   t["ot"] = "flow";   break;
-    default:            t["ot"] = "custom"; break;
-  }
-  
-  // Include measurement unit in daily (server refresh, omitted from frequent telemetry/alarms)
-  if (strlen(cfg.measurementUnit) > 0) {
-    t["mu"] = cfg.measurementUnit;
-  }
-  
-  // Send sensor-type-appropriate raw data - server converts using config
-  if (cfg.sensorInterface == SENSOR_CURRENT_LOOP) {
-    // Current loop: send raw mA only - server converts to display units
-    if (state.currentSensorMa >= 4.0f) {
-      t["ma"] = roundTo(state.currentSensorMa, 2);
-    }
-  } else if (cfg.sensorInterface == SENSOR_ANALOG) {
-    // Analog voltage: send raw voltage only - server converts to display units
-    if (state.currentSensorVoltage > 0.0f) {
-      t["vt"] = roundTo(state.currentSensorVoltage, 3);
-    }
-  } else if (cfg.sensorInterface == SENSOR_DIGITAL) {
-    // Digital float switch: send float state
-    t["fl"] = roundTo(state.currentInches, 1);
-  } else {
-    // Pulse/RPM: send value
-    t["rm"] = roundTo(state.currentInches, 1);
-  }
-  // Note: sensor type (st), alarm thresholds (high/low), and email are
-  // already known by the server from telemetry and config - not sent in daily
+
+  // Object type, measurement unit, sensor type, raw reading, lvl, cap, cv.
+  // Every daily monitor is now self-describing so the server can decode it with
+  // zero registry state after a restart.
+  buildSensorObject(t, monitorIndex);
 
   if (measureJson(doc) > payloadLimit) {
     size_t currentSize = array.size();
@@ -7147,10 +7244,16 @@ static void trimTelemetryOutbox() {
   }
 }
 
-static void publishNote(const char *fileName, const JsonDocument &doc, bool syncNow) {
+static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   // Build serialized payload once for both live send and buffering
   // fileName is already a plain .qo notefile name (e.g., "telemetry.qo")
   // Cross-device routing is handled by Notehub Routes — no fleet: prefix needed
+
+  // Stamp the schema version INTO the document before serialization so it is native to the
+  // payload. This guarantees _sv survives the offline flash buffer and flushBufferedNotes()
+  // (which re-send the serialized string verbatim) — previously _sv was added to the CJSON
+  // body only on the live path and was lost for any buffered/flushed note.
+  doc["_sv"] = NOTEFILE_SCHEMA_VERSION;
 
   // Measure JSON first to handle oversized payloads via dynamic allocation
   size_t needed = measureJson(doc);
@@ -7216,8 +7319,8 @@ static void publishNote(const char *fileName, const JsonDocument &doc, bool sync
     return;
   }
 
-  // Stamp schema version for forward-compatibility detection
-  JAddNumberToObject(body, "_sv", NOTEFILE_SCHEMA_VERSION);
+  // _sv is already present in the serialized payload (stamped into doc above), so no
+  // post-serialization stamp is needed here.
 
   JAddItemToObject(req, "body", body);
 
