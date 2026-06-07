@@ -282,7 +282,7 @@ int getSampleInterval() {
       "config_updated",    // New config received
       "error_occurred"     // System fault
     ],
-    "levelChangeThreshold": 2.0,   // Inches
+    "reportThreshold": 2.0,   // Per-sensor, in the sensor's own unit
     "maxIntervalSeconds": 14400,   // Force update every 4 hours minimum
     "retryOnFailure": true
   }

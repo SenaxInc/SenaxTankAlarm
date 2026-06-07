@@ -980,10 +980,17 @@ static SensorRecord *findSensorByHash(const char *clientUid, uint8_t sensorIndex
   return nullptr;  // Table full (should not happen)
 }
 
+// Per-client cached config snapshot. payload holds the compact JSON config pushed to the
+// client. Sized to fit multi-sensor configs that include learned-calibration coefficients
+// and custom labels — the previous 1536-byte limit could reject ~6-8 sensor configs and
+// block dispatch entirely (cacheClientConfigFromBuffer rejects payloads >= sizeof(payload)).
+// The cache line buffers in save/load are kept in sync via CLIENT_CONFIG_CACHE_LINE_MAX.
+#define CLIENT_CONFIG_SNAPSHOT_PAYLOAD_MAX 4096
+#define CLIENT_CONFIG_CACHE_LINE_MAX (CLIENT_CONFIG_SNAPSHOT_PAYLOAD_MAX + 256)
 struct ClientConfigSnapshot {
   char uid[48];
   char site[32];
-  char payload[1536];
+  char payload[CLIENT_CONFIG_SNAPSHOT_PAYLOAD_MAX];
   bool pendingDispatch;      // true when Notecard send failed and needs retry (persisted)
   char configVersion[16];    // Config version hash for ACK tracking
   double lastAckEpoch;       // When last config ACK was received from client
@@ -2314,6 +2321,13 @@ function createSensorHtml(id){return `<div class="sensor-card" id="sensor-${id}"
 <label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
 <input type="checkbox" class="calibration-enabled" checked> Calibration Learning<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, you can submit manual verification readings on the Calibration page to teach the system the actual relationship between sensor output and measured values. Recommended for tank level sensors. For gas pressure or RPM sensors, disable unless you have reference gauges for comparison.">?</span>
 </label>
+<label class="field" style="margin-top:8px;">
+<span>
+<span>Report on Change</span>
+<span class="tooltip-icon" tabindex="0" data-tooltip="Send a telemetry update whenever the reading changes by at least this amount, in the sensor's own unit (inches for tanks, PSI for gas, RPM for engines, GPM for flow). 0 = only baseline, daily reports, and alarms (saves cellular data and battery).">?</span>
+</span>
+<input type="number" class="report-threshold" value="0" min="0" step="0.1">
+</label>
 <div class="digital-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);">
 <strong>Float Switch Mode:</strong> This sensor only detects whether fluid has reached the switch position.<br>
 <br>
@@ -2607,7 +2621,7 @@ const lowAlarmEnabled=card.querySelector('.low-alarm-enabled').checked;
 const highAlarmValue=card.querySelector('.high-alarm').value;
 const lowAlarmValue=card.querySelector('.low-alarm').value;
 const tank={
-id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};
+id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,reportThreshold:parseFloat(card.querySelector('.report-threshold')?.value)||0,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};
 if(sensor==='digital'){tank.digitalSwitchMode=switchMode;}let sUnit='';if(sensor==='current'){const currentLoopType=card.querySelector('.current-loop-type').value;
 const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;
 const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;
@@ -2688,7 +2702,7 @@ card.querySelector('.pwm-gating-enabled').value=t.pwmGatingEnabled?'true':'false
 card.querySelector('.pwm-gating-channel').value=t.pwmGatingChannel!==undefined?t.pwmGatingChannel:0;
 card.querySelector('.pwm-gating-warmup').value=t.pwmGatingWarmup!==undefined?t.pwmGatingWarmup:3000;
 card.querySelector('.pwm-gating-sample-delay').value=t.pwmGatingSampleDelay!==undefined?t.pwmGatingSampleDelay:300;
-updatePwmGatingVisibility(sensorCount-1);}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.currentLoopType)card.querySelector('.current-loop-type').value=t.currentLoopType;if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms){toggleAlarmSection(sensorCount-1);if(t.highAlarm!==undefined){card.querySelector('.high-alarm').value=t.highAlarm;card.querySelector('.high-alarm-enabled').checked=true;}if(t.lowAlarm!==undefined){card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.low-alarm-enabled').checked=true;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}if(t.smsAlert&&t.smsAlert.phones){toggleSmsSection(sensorCount-1);card.querySelector('.sms-phones').value=t.smsAlert.phones.join(',');if(t.smsAlert.trigger)card.querySelector('.sms-trigger').value=t.smsAlert.trigger;if(t.smsAlert.message)card.querySelector('.sms-message').value=t.smsAlert.message;}updateSensorTypeFields(sensorCount-1);if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');
+updatePwmGatingVisibility(sensorCount-1);}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.currentLoopType)card.querySelector('.current-loop-type').value=t.currentLoopType;if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.reportThreshold!==undefined)card.querySelector('.report-threshold').value=t.reportThreshold;if(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms){toggleAlarmSection(sensorCount-1);if(t.highAlarm!==undefined){card.querySelector('.high-alarm').value=t.highAlarm;card.querySelector('.high-alarm-enabled').checked=true;}if(t.lowAlarm!==undefined){card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.low-alarm-enabled').checked=true;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}if(t.smsAlert&&t.smsAlert.phones){toggleSmsSection(sensorCount-1);card.querySelector('.sms-phones').value=t.smsAlert.phones.join(',');if(t.smsAlert.trigger)card.querySelector('.sms-trigger').value=t.smsAlert.trigger;if(t.smsAlert.message)card.querySelector('.sms-message').value=t.smsAlert.message;}updateSensorTypeFields(sensorCount-1);if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');
 const fIn=card.querySelector('.fluid-sg-custom');if(fSel&&fIn){fSel.value='custom';fIn.value=t.fluidSpecificGravity;updateFluidTypeFields(sensorCount-1);}}updateFluidVisibility(sensorCount-1);}});showToast('Configuration loaded');};
 
 /* CLOUD & IMPORT */
@@ -7909,23 +7923,31 @@ static void pruneHotTierIfNeeded() {
   // Prune old telemetry snapshots from each sensor
   for (uint8_t i = 0; i < gSensorHistoryCount; i++) {
     SensorHourlyHistory &hist = gSensorHistory[i];
+    if (hist.snapshotCount == 0) continue;
+
+    // Compact survivors into a contiguous block starting at physical index 0. We do NOT
+    // assume timestamps are monotonic: a clock correction (or a pre-time-sync entry) could
+    // otherwise make the failing entries non-contiguous, and a count-only shrink would then
+    // drop the wrong (newest) snapshots. Copying survivors in logical order and rebasing
+    // writeIndex keeps the ring buffer correct regardless of timestamp ordering.
+    static TelemetrySnapshot survivors[MAX_HOURLY_HISTORY_PER_SENSOR];
     uint16_t newCount = 0;
-    
-    // Keep only snapshots newer than cutoff
     for (uint16_t j = 0; j < hist.snapshotCount; j++) {
       uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
       if (hist.snapshots[idx].timestamp >= cutoffEpoch) {
-        newCount++;
+        survivors[newCount++] = hist.snapshots[idx];
       } else {
         pruned++;
       }
     }
-    
-    // Update count — this is correct because timestamps are monotonically
-    // increasing, so all pruned entries are contiguous at the start of the
-    // logical sequence. Reducing snapshotCount shifts the logical start
-    // forward while writeIndex remains valid for the next write.
+    if (newCount == hist.snapshotCount) {
+      continue;  // nothing pruned for this sensor; leave the ring buffer untouched
+    }
+    for (uint16_t j = 0; j < newCount; j++) {
+      hist.snapshots[j] = survivors[j];
+    }
     hist.snapshotCount = newCount;
+    hist.writeIndex = newCount % MAX_HOURLY_HISTORY_PER_SENSOR;
   }
   
   // Prune old alarms (keep alarms for longer - 30 days)
@@ -11810,8 +11832,26 @@ static void processNotefile(const char *fileName, void (*handler)(JsonDocument &
       DeserializationError err = deserializeJson(doc, json);
       NoteFree(json);
       if (!err) {
-        handler(doc, epoch);
-        processedOk = true;
+        // Central schema gate: reject notes stamped with a newer schema than this
+        // firmware understands. Such notes parse fine as JSON but their field
+        // semantics are unknown, so handing them to a handler could misinterpret
+        // data. They are deleted (treated as processed) with a prominent log so the
+        // queue is not blocked; deploy a newer server to consume them.
+        int noteSchema = doc["_sv"] | 0;
+        if (noteSchema > NOTEFILE_SCHEMA_VERSION) {
+          Serial.print(F("Rejecting future-schema note in "));
+          Serial.print(fileName);
+          Serial.print(F(" (_sv="));
+          Serial.print(noteSchema);
+          Serial.print(F(" > "));
+          Serial.print(NOTEFILE_SCHEMA_VERSION);
+          Serial.println(F(") — server upgrade required"));
+          addServerSerialLog("Rejected future-schema note", "warn", "schema");
+          processedOk = true;  // delete; cannot safely interpret
+        } else {
+          handler(doc, epoch);
+          processedOk = true;
+        }
       } else {
         Serial.print(F("Skipping malformed note in "));
         Serial.print(fileName);
@@ -12021,6 +12061,14 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
 static void handleAlarm(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   const char *type = doc["y"] | "";
+
+  // Validate the source UID before creating any state (sensor record OR metadata).
+  // The sensor path is guarded by upsertSensorRecord, but the system-alarm path below
+  // creates ClientMetadata directly — without this gate a malformed/spoofed UID could
+  // consume a metadata slot and evict a legitimate client.
+  if (!isValidClientUid(clientUid)) {
+    return;
+  }
 
   // System alarms (solar/battery/power) don't reference a specific sensor.
   // Store on ClientMetadata instead of creating a phantom sensorIndex=0 SensorRecord.
@@ -12302,7 +12350,10 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
 
 static void handleDaily(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
-  if (!clientUid || strlen(clientUid) == 0) {
+  // Daily reports aggregate 24h of sensor data and create ClientMetadata directly, so
+  // apply the same UID format validation used by the sensor-record path rather than only
+  // checking for an empty string.
+  if (!isValidClientUid(clientUid)) {
     return;
   }
   
@@ -12375,7 +12426,14 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   // If the original alarm note was lost due to weak signal, detect active
   // alarms here and cross-reference with server-side SensorRecord state.
   JsonArray dailyAlarms = doc["alarms"];
-  if (isFirstPart && dailyAlarms) {
+  int dailySchema = doc["_sv"] | 0;
+  // Run reconciliation when the report carries an alarms array OR when a schema-2+ client
+  // omitted it. Schema-2 clients always include the array when any alarm is active, so an
+  // absent/empty array on a first part means "no active alarms" — any server-side alarm for
+  // this client is therefore orphaned (its clear note was lost) and must be reconciled.
+  // The schema gate avoids misreading legacy (pre-schema) daily reports that never sent it.
+  bool runAlarmReconcile = isFirstPart && (dailyAlarms || dailySchema >= 2);
+  if (runAlarmReconcile) {
     for (JsonObject a : dailyAlarms) {
       uint8_t sensorIdx = a["k"] | 0;
       bool hiAlarm = a["hi"] | false;
@@ -12536,7 +12594,7 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
-    // even when change-based telemetry is disabled (levelChangeThreshold = 0)
+    // even when change-based telemetry is disabled (per-monitor reportThreshold = 0)
     if (newLevel > 0.0f) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
@@ -12717,6 +12775,15 @@ static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorInd
   // Validate UID length to prevent silent truncation issues
   if (!isValidClientUid(clientUid)) {
     Serial.println(F("ERROR: Invalid client UID, skipping sensor record"));
+    return nullptr;
+  }
+
+  // Bound the sensor index. A note that omits "k" deserializes to 0, and a garbled note
+  // could carry any 0-255 value; reject implausible indices so they cannot pollute the
+  // registry or consume slots toward MAX_SENSOR_RECORDS.
+  if (sensorIndex >= MAX_SENSOR_RECORDS) {
+    Serial.print(F("ERROR: Sensor index out of range: "));
+    Serial.println(sensorIndex);
     return nullptr;
   }
   
@@ -13342,8 +13409,15 @@ static float resolveLevel(const char *clientUid, uint8_t sensorIndex,
     SensorCalibration *cal = findSensorCalibration(clientUid, sensorIndex);
     if (cal && cal->hasLearnedCalibration) {
       uint32_t serverCv = (uint32_t)cal->lastCalibrationEpoch;
-      if (clientCv != serverCv) {
-        // Client has not applied the current calibration yet — server is authoritative.
+      // Re-derive the level from raw mA (with live temperature) when EITHER:
+      //  (a) the client has not applied the latest coefficients yet (cv stale), OR
+      //  (b) this sensor uses temperature compensation. The client only carries a static
+      //      calTempF snapshot from config-push time, so applying live server temperature
+      //      here keeps the level accurate across the day and avoids a display jump when
+      //      the client's cv catches up and the server would otherwise trust its static lvl.
+      bool clientStale = (clientCv != serverCv);
+      bool liveTempComp = (cal->hasTempCompensation && cal->learnedTempCoef != 0.0f);
+      if (clientStale || liveTempComp) {
         float currentTemp = getCachedTemperature(clientUid);
         return convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
       }
@@ -14578,11 +14652,11 @@ static void saveClientConfigSnapshots() {
     }
     
     // Accumulate output into a buffer first, then write atomically.
-    // Each line: uid(48) + tab + payload(1536) + tab + flag(1) + tab
-    //            + version(16) + tab + epoch(14) + tab + status(16)
-    //            + tab + dispatchAttempts(3) + tab + dispatchEpoch(14) + newline
-    // ≈ 1660 bytes per entry. Reserve generously.
-    const size_t bufSize = (size_t)gClientConfigCount * 1700 + 64;
+    // Each line: uid + tab + payload + tab + flag + tab + version + tab + epoch + tab
+    //            + status + tab + dispatchAttempts + tab + dispatchEpoch + newline.
+    // CLIENT_CONFIG_CACHE_LINE_MAX tracks the payload size so large configs are not
+    // silently truncated on save. Reserve generously.
+    const size_t bufSize = (size_t)gClientConfigCount * CLIENT_CONFIG_CACHE_LINE_MAX + 64;
     char *buf = (char *)malloc(bufSize);
     if (!buf) {
       Serial.println(F("ERROR: Cannot allocate config cache buffer"));
@@ -14618,7 +14692,7 @@ static void saveClientConfigSnapshots() {
     output.reserve(gClientConfigCount * 1700);
     for (uint8_t i = 0; i < gClientConfigCount; ++i) {
       // Format: uid\tpayload\tpendingDispatch\tconfigVersion\tlastAckEpoch\tlastAckStatus\tdispatchAttempts\tlastDispatchEpoch
-      char line[1700];
+      char line[CLIENT_CONFIG_CACHE_LINE_MAX];
       snprintf(line, sizeof(line), "%s\t%s\t%d\t%s\t%lu\t%s\t%u\t%.0f\n",
                gClientConfigs[i].uid,
                gClientConfigs[i].payload,

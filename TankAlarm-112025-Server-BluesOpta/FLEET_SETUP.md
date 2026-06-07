@@ -49,7 +49,6 @@ The client configuration file (`/client_config.json` on LittleFS) includes:
   "deviceLabel": "Tank-01",
   "serverFleet": "tankalarm-server",
    "sampleSeconds": 1800,
-   "levelChangeThreshold": 0,
   "reportHour": 5,
   "reportMinute": 0,
   "dailyEmail": "reports@example.com",
@@ -67,13 +66,14 @@ The client configuration file (`/client_config.json` on LittleFS) includes:
       "lowAlarm": 20.0,
       "daily": true,
       "alarmSms": true,
-      "upload": true
+      "upload": true,
+      "reportThreshold": 0
     }
   ]
 }
 ```
 
-Server-managed SMS contacts have been removed from the client schema; per-tank `alarmSms` flags now simply request that the server escalate alerts via its own contact list. The `levelChangeThreshold` value (in inches) controls when the client sends change-based telemetry. `0` disables those transmissions, so by default only daily reports and alarms consume data until you enable a per-site threshold via the server console.
+Server-managed SMS contacts have been removed from the client schema; per-tank `alarmSms` flags now simply request that the server escalate alerts via its own contact list. The per-sensor `reportThreshold` value (in that sensor's own unit — inches, PSI, RPM, GPM) controls when the client sends change-based telemetry. `0` disables those transmissions, so by default only daily reports and alarms consume data until you enable a threshold for that sensor via the server console.
 
 **Key field:** `serverFleet` - Must match the server's fleet name in Notehub
 

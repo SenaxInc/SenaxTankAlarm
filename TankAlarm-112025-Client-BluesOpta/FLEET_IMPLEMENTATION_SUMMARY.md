@@ -150,28 +150,27 @@ The Tank Alarm system has been updated to use **Blues Notehub fleet-based device
   "deviceLabel": "Tank-01",
   "serverFleet": "tankalarm-server",
   "sampleSeconds": 1800,
-  "levelChangeThreshold": 0,
   "reportHour": 5,
   "reportMinute": 0,
   "dailyEmail": "reports@example.com",
-  "tanks": [
+  "sensors": [
     {
       "id": "A",
       "name": "Primary Tank",
       "sensor": "analog",
       "primaryPin": 0,
-      "heightInches": 120.0,
       "highAlarm": 100.0,
       "lowAlarm": 20.0,
       "daily": true,
       "alarmSms": true,
-      "upload": true
+      "upload": true,
+      "reportThreshold": 0
     }
   ]
 }
 ```
 
-SMS recipients now reside exclusively in the server configuration. Client-side `alarmSms` flags simply signal whether a tank should request SMS escalation when it triggers an alarm. The new `levelChangeThreshold` key (in inches) is optional; leave it at `0` to suppress change-based telemetry or set a value via the server console to resume delta-triggered reports for that site.
+SMS recipients now reside exclusively in the server configuration. Client-side `alarmSms` flags simply signal whether a tank should request SMS escalation when it triggers an alarm. The per-sensor `reportThreshold` field (in that sensor's own unit — inches, PSI, RPM, GPM) is optional; leave it at `0` to suppress change-based telemetry or set a value via the server console to resume delta-triggered reports for that sensor.
 
 ### Server Config Example
 ```json

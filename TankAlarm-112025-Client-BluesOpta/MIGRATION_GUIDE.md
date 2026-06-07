@@ -271,12 +271,11 @@ Once verified working:
   "deviceLabel": "Tank-01",
   "serverFleet": "tankalarm-server",
    "sampleSeconds": 1800,
-   "levelChangeThreshold": 0,
   ...
 }
 ```
 
-`levelChangeThreshold` (in inches) lets you opt-in to change-based telemetry per site. Leave it at `0` to disable periodic uploads and rely on alarms/daily reports, or set a threshold (for example `2.5`) via the server UI to resume delta-triggered telemetry.
+`reportThreshold` is now a **per-sensor** field (inside each entry of the `sensors` array), expressed in that sensor's own measurement unit (inches for tanks, PSI for gas, RPM for engines, GPM for flow). Leave it at `0` to disable change-based telemetry for that sensor and rely on alarms/daily reports, or set a value (for example `2.5`) via the server UI to resume delta-triggered telemetry.
 
 ### Server Config (LittleFS: /server_config.json)
 

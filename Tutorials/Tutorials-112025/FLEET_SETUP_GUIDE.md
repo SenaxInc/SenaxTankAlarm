@@ -719,7 +719,7 @@ Each region operates independently with its own fleet.
 
 **Techniques:**
 1. **Event-Based Reporting:**
-   - Set `levelChangeThreshold` > 0
+   - Set a per-sensor `reportThreshold` > 0
    - Only report on significant changes
    - Can reduce traffic by 50-70%
 
@@ -970,11 +970,10 @@ For advanced scenarios beyond standard fleets:
   "deviceLabel": "string",       // Device identifier
   "serverFleet": "string",       // Target fleet (must match server)
   "sampleSeconds": number,       // Sample interval
-  "levelChangeThreshold": number, // Event threshold (inches)
   "reportHour": number,          // Daily report hour (0-23)
   "reportMinute": number,        // Daily report minute (0-59)
   "dailyEmail": "string",        // Email for reports
-  "tanks": [ /* array of tank configs */ ]
+  "sensors": [ /* array of sensor configs; each may set "reportThreshold": number in its own unit (0 = off) */ ]
 }
 ```
 

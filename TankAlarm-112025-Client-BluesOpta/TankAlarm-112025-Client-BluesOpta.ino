@@ -206,9 +206,7 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 
 // DEFAULT_SAMPLE_INTERVAL_SEC, DEFAULT_LEVEL_CHANGE_THRESHOLD,
 // DEFAULT_REPORT_HOUR, DEFAULT_REPORT_MINUTE are defined in TankAlarm_Config.h
-// Aliases for backward compatibility within this file:
 #define DEFAULT_SAMPLE_SECONDS          DEFAULT_SAMPLE_INTERVAL_SEC
-#define DEFAULT_LEVEL_CHANGE_THRESHOLD_INCHES DEFAULT_LEVEL_CHANGE_THRESHOLD
 
 #ifndef CURRENT_LOOP_I2C_ADDRESS
 #define CURRENT_LOOP_I2C_ADDRESS 0x64
@@ -262,7 +260,7 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 
 // Config schema versioning — bump when adding/removing fields to detect stale configs
 #ifndef CONFIG_SCHEMA_VERSION
-#define CONFIG_SCHEMA_VERSION 2
+#define CONFIG_SCHEMA_VERSION 3
 #endif
 
 #ifndef MIN_ALARM_INTERVAL_SECONDS
@@ -588,6 +586,10 @@ struct MonitorConfig {
   bool enableDailyReport;  // Include in daily summary
   bool enableAlarmSms;     // Escalate SMS when alarms trigger
   bool enableServerUpload; // Send telemetry to server
+  float reportThreshold;   // Minimum change, in THIS monitor's own measurement unit, before a
+                           // change-based telemetry note is sent. 0 = disabled (baseline + daily +
+                           // alarms only). Unit-agnostic: inches for tanks, PSI for gas, RPM for
+                           // engines, GPM for flow, etc.
   char relayTargetClient[48]; // Client UID to trigger relays on (empty = none)
   uint8_t relayMask;       // Bitmask of relays to trigger (bit 0=relay 1, etc.)
   RelayTrigger relayTrigger; // Which alarm type triggers the relay (any, high, low)
@@ -651,7 +653,6 @@ struct ClientConfig {
   char productUid[64];  // Notehub product UID (configurable for different fleets)
   char dailyEmail[64];
   uint16_t sampleSeconds;
-  float minLevelChangeInches;
   uint8_t reportHour;
   uint8_t reportMinute;
   uint8_t monitorCount;
@@ -693,8 +694,8 @@ struct MonitorRuntime {
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
-  float lastReportedInches;
-  float lastDailySentInches;
+  float lastReportedValue;   // Last value pushed via change-based telemetry (monitor's own unit)
+  float lastDailySentValue;  // Last value included in a daily report (monitor's own unit)
   bool highAlarmLatched;
   bool lowAlarmLatched;
   unsigned long lastSampleMillis;
@@ -1494,8 +1495,8 @@ void setup() {
     gMonitorState[i].currentSensorVoltage = 0.0f;
     gMonitorState[i].lastReadingEpoch = 0.0;
     gMonitorState[i].sampleReused = false;
-    gMonitorState[i].lastReportedInches = -9999.0f;
-    gMonitorState[i].lastDailySentInches = -9999.0f;
+    gMonitorState[i].lastReportedValue = -9999.0f;
+    gMonitorState[i].lastDailySentValue = -9999.0f;
     gMonitorState[i].highAlarmLatched = false;
     gMonitorState[i].lowAlarmLatched = false;
     gMonitorState[i].lastSampleMillis = 0;
@@ -2278,7 +2279,6 @@ static void createDefaultConfig(ClientConfig &cfg) {
   strlcpy(cfg.serverFleet, "tankalarm-server", sizeof(cfg.serverFleet));
   strlcpy(cfg.dailyEmail, "reports@example.com", sizeof(cfg.dailyEmail));
   cfg.sampleSeconds = DEFAULT_SAMPLE_SECONDS;
-  cfg.minLevelChangeInches = DEFAULT_LEVEL_CHANGE_THRESHOLD_INCHES;
   cfg.reportHour = DEFAULT_REPORT_HOUR;
   cfg.reportMinute = DEFAULT_REPORT_MINUTE;
   cfg.monitorCount = 1;
@@ -2305,6 +2305,7 @@ static void createDefaultConfig(ClientConfig &cfg) {
   cfg.monitors[0].enableDailyReport = true;
   cfg.monitors[0].enableAlarmSms = false; // No SMS until explicitly configured
   cfg.monitors[0].enableServerUpload = true;
+  cfg.monitors[0].reportThreshold = DEFAULT_LEVEL_CHANGE_THRESHOLD; // 0 = change-based telemetry off
   cfg.monitors[0].relayTargetClient[0] = '\0'; // No relay target by default
   cfg.monitors[0].relayMask = 0; // No relays triggered by default
   cfg.monitors[0].relayTrigger = RELAY_TRIGGER_ANY; // Default: trigger on any alarm
@@ -2432,6 +2433,7 @@ static void initMonitorDefaults(MonitorConfig &mon, uint8_t index) {
   mon.enableDailyReport = true;
   mon.enableAlarmSms = false; // No SMS until explicitly configured
   mon.enableServerUpload = true;
+  mon.reportThreshold = DEFAULT_LEVEL_CHANGE_THRESHOLD; // 0 = change-based telemetry off
 
   // Relay control
   mon.relayTargetClient[0] = '\0';
@@ -2594,6 +2596,12 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
   if (t["daily"].is<bool>()) mon.enableDailyReport = t["daily"].as<bool>();
   if (t["alarmSms"].is<bool>()) mon.enableAlarmSms = t["alarmSms"].as<bool>();
   if (t["upload"].is<bool>()) mon.enableServerUpload = t["upload"].as<bool>();
+
+  // ---- Change-based telemetry threshold (monitor's own unit; 0 = disabled) ----
+  if (t["reportThreshold"].is<float>()) {
+    float rt = t["reportThreshold"].as<float>();
+    mon.reportThreshold = (rt > 0.0f) ? rt : 0.0f;
+  }
 
   // ---- Relay control ----
   const char *relayTarget = t["relayTargetClient"].as<const char *>();
@@ -2859,10 +2867,6 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
   strlcpy(cfg.productUid, doc["productUid"].as<const char *>() ? doc["productUid"].as<const char *>() : "", sizeof(cfg.productUid));
 
   cfg.sampleSeconds = doc["sampleSeconds"].is<uint16_t>() ? doc["sampleSeconds"].as<uint16_t>() : DEFAULT_SAMPLE_SECONDS;
-  cfg.minLevelChangeInches = doc["levelChangeThreshold"].is<float>() ? doc["levelChangeThreshold"].as<float>() : DEFAULT_LEVEL_CHANGE_THRESHOLD_INCHES;
-  if (cfg.minLevelChangeInches < 0.0f) {
-    cfg.minLevelChangeInches = 0.0f;
-  }
   cfg.reportHour = doc["reportHour"].is<uint8_t>() ? doc["reportHour"].as<uint8_t>() : DEFAULT_REPORT_HOUR;
   cfg.reportMinute = doc["reportMinute"].is<uint8_t>() ? doc["reportMinute"].as<uint8_t>() : DEFAULT_REPORT_MINUTE;
   
@@ -3036,7 +3040,6 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     doc["productUid"] = cfg.productUid;
   }
   doc["sampleSeconds"] = cfg.sampleSeconds;
-  doc["levelChangeThreshold"] = cfg.minLevelChangeInches;
   doc["reportHour"] = cfg.reportHour;
   doc["reportMinute"] = cfg.reportMinute;
   doc["dailyEmail"] = cfg.dailyEmail;
@@ -3160,6 +3163,7 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     t["daily"] = cfg.monitors[i].enableDailyReport;
     t["alarmSms"] = cfg.monitors[i].enableAlarmSms;
     t["upload"] = cfg.monitors[i].enableServerUpload;
+    t["reportThreshold"] = cfg.monitors[i].reportThreshold;
     // Save relay control settings
     t["relayTargetClient"] = cfg.monitors[i].relayTargetClient;
     t["relayMask"] = cfg.monitors[i].relayMask;
@@ -4047,7 +4051,7 @@ static void reinitializeHardware() {
     gMonitorState[i].sensorFailed = false;
     gMonitorState[i].lastValidReading = 0.0f;
     gMonitorState[i].hasLastValidReading = false;
-    gMonitorState[i].lastReportedInches = -9999.0f;
+    gMonitorState[i].lastReportedValue = -9999.0f;
   }
   
   // Re-attach Notecard after Wire reinit
@@ -4061,7 +4065,7 @@ static void reinitializeHardware() {
 
 static void resetTelemetryBaselines() {
   for (uint8_t i = 0; i < MAX_MONITORS; ++i) {
-    gMonitorState[i].lastReportedInches = -9999.0f;
+    gMonitorState[i].lastReportedValue = -9999.0f;
   }
 }
 
@@ -4108,8 +4112,6 @@ static void attemptPendingConfigAckSend() {
 
 static void applyConfigUpdate(const JsonDocument &doc) {
   bool hardwareChanged = false;
-  bool telemetryPolicyChanged = false;
-  float previousThreshold = gConfig.minLevelChangeInches;
   
   if (!doc["site"].isNull()) {
     strlcpy(gConfig.siteName, doc["site"].as<const char *>(), sizeof(gConfig.siteName));
@@ -4137,13 +4139,6 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   }
   if (!doc["sampleSeconds"].isNull()) {
     gConfig.sampleSeconds = doc["sampleSeconds"].as<uint16_t>();
-  }
-  if (!doc["levelChangeThreshold"].isNull()) {
-    gConfig.minLevelChangeInches = doc["levelChangeThreshold"].as<float>();
-    if (gConfig.minLevelChangeInches < 0.0f) {
-      gConfig.minLevelChangeInches = 0.0f;
-    }
-    telemetryPolicyChanged = (fabsf(previousThreshold - gConfig.minLevelChangeInches) > 0.0001f);
   }
   if (!doc["reportHour"].isNull()) {
     gConfig.reportHour = doc["reportHour"].as<uint8_t>();
@@ -4485,8 +4480,6 @@ static void applyConfigUpdate(const JsonDocument &doc) {
     // Reset power state so voltage thresholds are re-evaluated cleanly
     gPowerState = POWER_STATE_NORMAL;
     gPowerStateDebounce = 0;
-  } else if (telemetryPolicyChanged) {
-    resetTelemetryBaselines();
   }
   
   printHardwareRequirements(gConfig);
@@ -4825,7 +4818,7 @@ static float readAnalogSensor(const MonitorConfig &cfg, uint8_t idx) {
 
   // Validate that we have a valid sensor range configured
   if (cfg.sensorRangeMax <= cfg.sensorRangeMin || cfg.analogVoltageMax <= cfg.analogVoltageMin) {
-    return 0.0f; // Invalid configuration
+    return NAN; // Invalid configuration — fault rather than report a plausible-but-fake 0
   }
 
   // Read voltage (Opta A0602 analog inputs: 0-10V mapped to 0-4095)
@@ -4878,7 +4871,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   // Validate that we have a valid sensor range configured
   if (cfg.sensorRangeMax <= cfg.sensorRangeMin) {
     gMonitorState[idx].currentSensorMa = 0.0f;
-    return 0.0f;
+    return NAN; // Invalid configuration — fault rather than report a plausible-but-fake 0
   }
 
   // Resolve current-loop expansion module address
@@ -4960,8 +4953,14 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
 
   float milliamps;
   if (validSamples == 0) {
+    // Total acquisition failure (every I2C sample failed). Returning the previous level here
+    // would mask a disconnected/unpowered transmitter as healthy data. Clear the raw mA so
+    // no stale value is transmitted, and return NAN so validateSensorReading() escalates a
+    // sensor-fault after the failure threshold (sampleMonitors() still reuses the last level
+    // for display continuity).
+    gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
-    return gMonitorState[idx].currentInches; // keep previous on failure
+    return NAN;
   }
   milliamps = total / validSamples;
 
@@ -5074,7 +5073,7 @@ static float readMonitorSensor(uint8_t idx) {
     case SENSOR_ANALOG:       return readAnalogSensor(cfg, idx);
     case SENSOR_CURRENT_LOOP: return readCurrentLoopSensor(cfg, idx);
     case SENSOR_PULSE:        return readPulseSensor(cfg, idx);
-    default:                  return 0.0f;
+    default:                  return NAN;  // Unknown/invalid interface — treat as a fault, not a 0 reading
   }
 }
 
@@ -5112,13 +5111,13 @@ static void sampleMonitors() {
     }
 
     if (gConfig.monitors[i].enableServerUpload && !gMonitorState[i].sensorFailed) {
-      const float threshold = gConfig.minLevelChangeInches;
-      const bool needBaseline = (gMonitorState[i].lastReportedInches < 0.0f);
+      const float threshold = gConfig.monitors[i].reportThreshold;
+      const bool needBaseline = (gMonitorState[i].lastReportedValue < 0.0f);
       const bool thresholdEnabled = (threshold > 0.0f);
-      const bool changeExceeded = thresholdEnabled && (fabs(inches - gMonitorState[i].lastReportedInches) >= threshold);
+      const bool changeExceeded = thresholdEnabled && (fabs(inches - gMonitorState[i].lastReportedValue) >= threshold);
       if (needBaseline || changeExceeded) {
         sendTelemetry(i, "sample", false);
-        gMonitorState[i].lastReportedInches = inches;
+        gMonitorState[i].lastReportedValue = inches;
       }
     }
   }
@@ -5242,14 +5241,23 @@ static void evaluateAlarms(uint8_t idx) {
   }
 
   // Standard analog/current loop sensor alarm evaluation with hysteresis
+  // Clamp hysteresis to be non-negative; a negative value would invert the clear bands.
+  float hyst = (cfg.hysteresisValue > 0.0f) ? cfg.hysteresisValue : 0.0f;
   float highTrigger = cfg.highAlarmThreshold;
-  float highClear = cfg.highAlarmThreshold - cfg.hysteresisValue;
+  float highClear = cfg.highAlarmThreshold - hyst;
   float lowTrigger = cfg.lowAlarmThreshold;
-  float lowClear = cfg.lowAlarmThreshold + cfg.hysteresisValue;
+  float lowClear = cfg.lowAlarmThreshold + hyst;
 
   bool highCondition = state.currentInches >= highTrigger;
   bool lowCondition = state.currentInches <= lowTrigger;
-  bool clearCondition = (state.currentInches < highClear) && (state.currentInches > lowClear);
+  // Decoupled clear conditions: the high alarm clears once the level falls below the high
+  // threshold minus hysteresis; the low alarm clears once the level rises above the low
+  // threshold plus hysteresis. Previously both alarms shared a single mid-band clearCondition
+  // ((x < highClear) && (x > lowClear)); when (highThreshold - lowThreshold) <= 2*hysteresis
+  // that band was empty/inverted and a latched alarm could NEVER clear, and high-alarm
+  // clearing was incorrectly coupled to the (possibly unused) low threshold.
+  bool highClearCondition = state.currentInches < highClear;
+  bool lowClearCondition = state.currentInches > lowClear;
 
   if (firstAlarmSample && restorePersistentRelayAfterBoot(idx, highCondition, !highCondition && lowCondition, sampleNow)) {
     return;
@@ -5266,7 +5274,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.highAlarmDebounceCount = 0;
       sendAlarm(idx, "high", state.currentInches);
     }
-  } else if (state.highAlarmLatched && clearCondition) {
+  } else if (state.highAlarmLatched && highClearCondition) {
     state.highClearDebounceCount++;
     state.highAlarmDebounceCount = 0;
     if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
@@ -5274,7 +5282,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.highClearDebounceCount = 0;
       sendAlarm(idx, "clear", state.currentInches);
     }
-  } else if (!highCondition && !clearCondition) {
+  } else if (!highCondition && !highClearCondition) {
     state.highAlarmDebounceCount = 0;
   }
   if (highCondition) {
@@ -5292,7 +5300,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.lowAlarmDebounceCount = 0;
       sendAlarm(idx, "low", state.currentInches);
     }
-  } else if (state.lowAlarmLatched && clearCondition) {
+  } else if (state.lowAlarmLatched && lowClearCondition) {
     state.lowClearDebounceCount++;
     state.lowAlarmDebounceCount = 0;
     if (state.lowClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
@@ -5300,7 +5308,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.lowClearDebounceCount = 0;
       sendAlarm(idx, "clear", state.currentInches);
     }
-  } else if (!lowCondition && !clearCondition) {
+  } else if (!lowCondition && !lowClearCondition) {
     state.lowAlarmDebounceCount = 0;
   }
   if (lowCondition) {
@@ -5647,7 +5655,11 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
     Serial.println(alarmType);
     
     char logMsg[128];
-    snprintf(logMsg, sizeof(logMsg), "Alarm: %s - %s - %.1fin", cfg.name, alarmType, inches);
+    // Universal (not liquid-level-specific): label the reading with the monitor's own unit
+    // (psi/rpm/gpm/inches) rather than a hardcoded "in" suffix. Falls back to "in" only when
+    // no unit is configured (legacy/bootstrap default).
+    const char *logUnit = (cfg.measurementUnit[0] != '\0') ? cfg.measurementUnit : "in";
+    snprintf(logMsg, sizeof(logMsg), "Alarm: %s - %s - %.1f %s", cfg.name, alarmType, inches, logUnit);
     addSerialLog(logMsg);
   } else {
     Serial.print(F("Network offline - local alarm only for monitor "));
@@ -7008,24 +7020,18 @@ static void sendDailyReport() {
       // Previously, stale latched state from before alarmsEnabled was disabled
       // would be reported, causing phantom alarms on the server dashboard.
       {
-        bool anyAlarmActive = false;
+        // Always emit the alarms array in part 0 (schema 2+), even when empty. An empty
+        // array is an explicit "no active alarms" signal the server uses to reconcile and
+        // clear orphaned alarms whose clear note was lost. Omitting it entirely leaves the
+        // server unable to distinguish "no active alarms" from "no alarm data in this report".
+        JsonArray alarmsArr = doc["alarms"].to<JsonArray>();
         for (uint8_t ai = 0; ai < gConfig.monitorCount; ++ai) {
           if (gConfig.monitors[ai].alarmsEnabled &&
               (gMonitorState[ai].highAlarmLatched || gMonitorState[ai].lowAlarmLatched)) {
-            anyAlarmActive = true;
-            break;
-          }
-        }
-        if (anyAlarmActive) {
-          JsonArray alarmsArr = doc["alarms"].to<JsonArray>();
-          for (uint8_t ai = 0; ai < gConfig.monitorCount; ++ai) {
-            if (gConfig.monitors[ai].alarmsEnabled &&
-                (gMonitorState[ai].highAlarmLatched || gMonitorState[ai].lowAlarmLatched)) {
-              JsonObject a = alarmsArr.add<JsonObject>();
-              a["k"] = gConfig.monitors[ai].sensorIndex;
-              a["hi"] = gMonitorState[ai].highAlarmLatched;
-              a["lo"] = gMonitorState[ai].lowAlarmLatched;
-            }
+            JsonObject a = alarmsArr.add<JsonObject>();
+            a["k"] = gConfig.monitors[ai].sensorIndex;
+            a["hi"] = gMonitorState[ai].highAlarmLatched;
+            a["lo"] = gMonitorState[ai].lowAlarmLatched;
           }
         }
       }
@@ -7033,6 +7039,7 @@ static void sendDailyReport() {
 
     JsonArray sensors = doc["sensors"].to<JsonArray>();
     bool addedMonitor = false;
+    bool partHasMetadata = (part == 0);  // part 0 carries the bulky VIN/solar/signal/alarm block
 
     while (monitorCursor < eligibleCount) {
       uint8_t monitorIdx = eligibleIndices[monitorCursor];
@@ -7040,21 +7047,31 @@ static void sendDailyReport() {
         ++monitorCursor;
         addedMonitor = true;
       } else {
-        if (!addedMonitor) {
-          // Allow a single large entry with minimal headroom so it still publishes.
-          if (appendDailyMonitor(doc, sensors, monitorIdx, DAILY_NOTE_PAYLOAD_LIMIT + 48U)) {
-            ++monitorCursor;
-            addedMonitor = true;
-          } else {
-            Serial.println(F("Daily report entry skipped; payload still exceeds limit"));
-            ++monitorCursor;
-          }
+        // This monitor does not fit in the current part.
+        if (addedMonitor || partHasMetadata) {
+          // The part already has content (a prior monitor and/or part-0 metadata). Publish it
+          // as-is and retry THIS monitor in a fresh, metadata-free part. Crucially we do NOT
+          // advance monitorCursor, so the monitor is never silently dropped — fixing the case
+          // where bulky part-0 metadata could push the first monitor out of the report.
+          break;
+        }
+        // Empty, metadata-free part: this single monitor is too large on its own. Try once
+        // more with minimal headroom; if it still does not fit, skip it to avoid an infinite
+        // loop (a pathological oversized monitor that cannot fit any part).
+        if (appendDailyMonitor(doc, sensors, monitorIdx, DAILY_NOTE_PAYLOAD_LIMIT + 48U)) {
+          ++monitorCursor;
+          addedMonitor = true;
+        } else {
+          Serial.println(F("Daily report entry skipped; single monitor exceeds payload limit"));
+          ++monitorCursor;
         }
         break;
       }
     }
 
-    if (!addedMonitor) {
+    // Publish if the part carries any content: a monitor, or the part-0 metadata block.
+    // A metadata-only part 0 is valid and lets a deferred monitor move to a clean part.
+    if (!addedMonitor && !partHasMetadata) {
       continue;
     }
 
@@ -7117,7 +7134,7 @@ static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t moni
     return false;
   }
 
-  state.lastDailySentInches = state.currentInches;
+  state.lastDailySentValue = state.currentInches;
   return true;
 }
 
@@ -7393,6 +7410,12 @@ static void bufferNoteForRetry(const char *fileName, const char *payload, bool s
 #endif
 }
 
+// Replay line buffer must hold a full buffered note line:
+//   fileName + '\t' + syncFlag + '\t' + payload + newline
+// publishNote() serializes through a 2048-byte static buffer, so size this to cover those
+// payloads. The previous 1024-byte buffer silently skipped larger buffered notes (e.g. daily
+// reports) on replay, losing exactly the backup data weak-signal recovery depends on.
+#define NOTE_REPLAY_LINE_MAX 2304
 static void flushBufferedNotes() {
 #ifdef FILESYSTEM_AVAILABLE
   if (!gNotecardAvailable) {
@@ -7416,7 +7439,7 @@ static void flushBufferedNotes() {
     
     bool wroteFailures = false;
     uint8_t flushCount = 0;
-    char lineBuffer[1024];  // Larger buffer to accommodate payload data
+    char lineBuffer[NOTE_REPLAY_LINE_MAX];  // sized to the max publishable payload (see define)
     while (fgets(lineBuffer, sizeof(lineBuffer), src) != nullptr) {
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
       // Each note.add is a blocking I2C transaction; kick watchdog per iteration
@@ -7888,7 +7911,8 @@ static void pollForRelayCommands() {
   }
 
   JAddStringToObject(req, "file", RELAY_CONTROL_FILE);
-  JAddBoolToObject(req, "delete", true);
+  // Peek without deleting — delete only after the command is validated and executed so a
+  // transient parse/handler failure or a reboot mid-processing cannot silently drop it.
 
   J *rsp = notecard.requestAndResponse(req);
   if (!rsp) {
@@ -7902,6 +7926,7 @@ static void pollForRelayCommands() {
   gLastSuccessfulNotecardComm = millis();
   gNotecardFailureCount = 0;
 
+  bool consume = false;
   J *body = JGetObject(rsp, "body");
   if (body) {
     char *json = JConvertToJSONString(body);
@@ -7910,14 +7935,36 @@ static void pollForRelayCommands() {
       DeserializationError err = deserializeJson(doc, json);
       NoteFree(json);
       if (!err) {
-        processRelayCommand(doc);
+        int noteSchema = doc["_sv"] | 0;
+        if (noteSchema > NOTEFILE_SCHEMA_VERSION) {
+          // Future schema we cannot interpret — consume our inbox copy without acting.
+          Serial.println(F("Relay command from newer schema — ignoring"));
+          consume = true;
+        } else {
+          // processRelayCommand() validates the target UID and enforces the cooldown.
+          processRelayCommand(doc);
+          consume = true;
+        }
       } else {
-        Serial.println(F("Relay command invalid JSON"));
+        Serial.println(F("Relay command invalid JSON — discarding"));
+        consume = true;  // malformed note will never parse; discard to avoid blocking the queue
       }
     }
+  } else {
+    consume = true;  // no body to process — consume the empty/placeholder note
   }
 
   notecard.deleteResponse(rsp);
+
+  if (consume) {
+    J *delReq = notecard.newRequest("note.get");
+    if (delReq) {
+      JAddStringToObject(delReq, "file", RELAY_CONTROL_FILE);
+      JAddBoolToObject(delReq, "delete", true);
+      J *delRsp = notecard.requestAndResponse(delReq);
+      if (delRsp) notecard.deleteResponse(delRsp);
+    }
+  }
 }
 
 static void processRelayCommand(const JsonDocument &doc) {
@@ -8443,7 +8490,7 @@ static void pollForSerialRequests() {
     }
     
     JAddStringToObject(req, "file", SERIAL_REQUEST_FILE);
-    JAddBoolToObject(req, "delete", true);
+    // Peek without deleting — delete only after the request is handled (crash safety).
     
     J *rsp = notecard.requestAndResponse(req);
     if (!rsp) {
@@ -8466,6 +8513,14 @@ static void pollForSerialRequests() {
     }
 
     notecard.deleteResponse(rsp);
+    // Consume the note now that it has been handled (or was an unrecognized/empty request).
+    J *delReq = notecard.newRequest("note.get");
+    if (delReq) {
+      JAddStringToObject(delReq, "file", SERIAL_REQUEST_FILE);
+      JAddBoolToObject(delReq, "delete", true);
+      J *delRsp = notecard.requestAndResponse(delReq);
+      if (delRsp) notecard.deleteResponse(delRsp);
+    }
     processed++;
   }
 }
@@ -8578,7 +8633,7 @@ static void pollForLocationRequests() {
   }
   
   JAddStringToObject(req, "file", LOCATION_REQUEST_FILE);
-  JAddBoolToObject(req, "delete", true);
+  // Peek without deleting — delete only after the location response has been sent (crash safety).
   
   J *rsp = notecard.requestAndResponse(req);
   if (!rsp) {
@@ -8628,6 +8683,14 @@ static void pollForLocationRequests() {
   }
 
   notecard.deleteResponse(rsp);
+  // Consume the note now that the request has been handled (or was unrecognized/empty).
+  J *delReq = notecard.newRequest("note.get");
+  if (delReq) {
+    JAddStringToObject(delReq, "file", LOCATION_REQUEST_FILE);
+    JAddBoolToObject(delReq, "delete", true);
+    J *delRsp = notecard.requestAndResponse(delReq);
+    if (delRsp) notecard.deleteResponse(delRsp);
+  }
 }
 
 // ============================================================================
@@ -8644,7 +8707,7 @@ static void pollForSyncRequests() {
   if (!req) return;
 
   JAddStringToObject(req, "file", SYNC_REQUEST_FILE);
-  JAddBoolToObject(req, "delete", true);
+  // Peek without deleting — delete only after the sync has been initiated (crash safety).
 
   J *rsp = notecard.requestAndResponse(req);
   if (!rsp) return;
@@ -8656,11 +8719,12 @@ static void pollForSyncRequests() {
   }
 
   const char *request = JGetString(body, "request");
-  if (request && strcmp(request, "sync") == 0) {
+  bool handled = (request && strcmp(request, "sync") == 0);
+  notecard.deleteResponse(rsp);
+
+  if (handled) {
     Serial.println(F("Sync request received from server — forcing hub.sync"));
     addSerialLog("Server-requested hub.sync initiated");
-
-    notecard.deleteResponse(rsp);
 
     // Execute hub.sync to force immediate Notecard sync with Notehub
     J *syncReq = notecard.newRequest("hub.sync");
@@ -8671,10 +8735,16 @@ static void pollForSyncRequests() {
         Serial.println(F("hub.sync command failed"));
       }
     }
-    return;
   }
 
-  notecard.deleteResponse(rsp);
+  // Consume the note now that the sync has been initiated (or it was an unrecognized note).
+  J *delReq = notecard.newRequest("note.get");
+  if (delReq) {
+    JAddStringToObject(delReq, "file", SYNC_REQUEST_FILE);
+    JAddBoolToObject(delReq, "delete", true);
+    J *delRsp = notecard.requestAndResponse(delReq);
+    if (delRsp) notecard.deleteResponse(delRsp);
+  }
 }
 
 // ============================================================================

@@ -441,7 +441,6 @@ On first boot, default configuration is created:
   "deviceLabel": "Client-01",
   "serverFleet": "tankalarm-server",
   "sampleSeconds": 1800,
-  "levelChangeThreshold": 0,
   "tanks": [
     {
       "id": "A",
@@ -451,7 +450,8 @@ On first boot, default configuration is created:
       "primaryPin": 0,
       "heightInches": 120.0,
       "highAlarm": 100.0,
-      "lowAlarm": 20.0
+      "lowAlarm": 20.0,
+      "reportThreshold": 0
     }
   ]
 }
@@ -821,15 +821,17 @@ Two-level monitoring (high/low switches).
 
 ### Enabling Event-Based Reporting
 
-Set `levelChangeThreshold` to trigger reports on significant changes:
+Set a per-sensor `reportThreshold` to trigger reports on significant changes, in that sensor's own unit (inches, PSI, RPM, GPM):
 
 ```json
 {
-  "levelChangeThreshold": 6
+  "sensors": [
+    { "id": "A", "reportThreshold": 6 }
+  ]
 }
 ```
 
-Sends telemetry immediately if level changes by 6+ inches since last report.
+Sends telemetry immediately if that sensor's reading changes by 6+ units (e.g. 6 inches) since the last report. `0` disables change-based telemetry for the sensor.
 
 **Benefits:**
 - Faster alarm response

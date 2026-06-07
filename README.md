@@ -1,7 +1,7 @@
-# TankAlarm v1.6.14 - Industrial Tank Monitoring System
+# TankAlarm v1.8.0 - Industrial Tank Monitoring System
 
-**Release Date:** April 18, 2026  
-**Version:** 1.6.14  
+**Release Date:** June 7, 2026  
+**Version:** 1.8.0  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -428,6 +428,18 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.8.0 (June 7, 2026)
+- **Per-Monitor Report Threshold:** Change-based telemetry is now configured per sensor in the sensor's own unit (inches, PSI, RPM, GPM) via the new `reportThreshold` field, replacing the single global `levelChangeThreshold`. `0` disables change-based telemetry for that sensor. (`CONFIG_SCHEMA_VERSION` → 3)
+- **Universal Units in Alarm Logs:** Client alarm serial log now labels readings with the monitor's own unit instead of a hardcoded `in` suffix.
+- **Alarm Hysteresis Fix:** High and low alarm clear bands are now decoupled, so a latched alarm can no longer get stuck when thresholds are close relative to the hysteresis band.
+- **Sensor-Fault Hardening:** Total current-loop acquisition failure, invalid sensor ranges, and unknown interfaces now escalate a `sensor-fault` (return NAN) instead of reporting a plausible-but-fake `0`.
+- **Wireless Command Safety:** Relay/serial/location/sync command inboxes now peek-validate-execute-delete (and gate future schema versions) instead of deleting before processing.
+- **Server Identity/Schema Validation:** System-alarm, daily, and sensor paths validate the client UID and reject future-schema notes; sensor index is range-checked.
+- **Config Dispatch & Offline Replay:** Larger config snapshot capacity (4096B) and offline note replay buffer (2304B) so large multi-sensor configs and daily reports survive caching and outages.
+- **History Pruning:** Hot-tier prune now compacts survivors and skips pre-time-sync snapshots, preventing wrong-entry drops after a clock correction.
+- **Daily Reconciliation:** Daily reports always include the alarm array (schema 2+), so the server can clear orphaned alarms when a clear note was lost.
+- **Note:** `NOTEFILE_SCHEMA_VERSION` remains `2` — the telemetry/alarm/daily note wire format is unchanged.
 
 ### v1.1.8 (March 16, 2026)
 - **Data Integrity:** Save all dirty data (registry, metadata, hot tier, history settings) before DFU/reboot — previously only saved config
