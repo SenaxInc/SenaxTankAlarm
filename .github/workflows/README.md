@@ -2,22 +2,40 @@
 
 This directory contains automated CI/CD workflows for the SenaxTankAlarm project.
 
-## Arduino CI Workflow
+> The legacy **TankAlarm-092025** (Hologram / MKR NB 1500) project has been retired
+> to `RecycleBin/`. Its old `arduino-ci-092025.yml` workflow is archived alongside it
+> and no longer runs.
 
-**File:** `arduino-ci.yml`
+## Workflow Summary
+
+| Workflow | File | Trigger | What it does |
+|----------|------|---------|--------------|
+| Arduino CI & Firmware Build (112025) | `arduino-ci-112025.yml` | Push/PR on 112025 sketch paths; manual | Compile-checks the Opta sketches (opens an issue on failure); on push, builds `.bin` files and commits them to `firmware/112025/` |
+| Release Firmware (112025) | `release-firmware-112025.yml` | `v*` tag; manual | Builds Client + Server + Viewer `.bin` and publishes a GitHub Release |
+| Update Website Screenshots | `update-screenshots.yml` | Weekly schedule; push on Server/Viewer `.ino`; manual | Renders the embedded web UI and commits PNG screenshots |
+| Package Common Library | `package-tankalarm-common.yml` | Push on `TankAlarm-112025-Common/` | Zips the Common library and commits the archive |
+| Deploy GitHub Pages | `deploy-gh-pages.yml` | Push to `main`/`master`; manual | Builds the Jekyll site and deploys it to GitHub Pages |
+
+## Arduino CI & Firmware Build Workflow
+
+**File:** `arduino-ci-112025.yml`
+
+This workflow runs two jobs:
+- **`compile-check`** — compiles the TankAlarm-112025 (Arduino Opta) sketches on pushes and pull requests, and opens a GitHub issue if any sketch fails to build.
+- **`build-firmware`** — runs only on pushes, and only after `compile-check` succeeds. It builds the `.bin` files (with the `BLUES_PRODUCT_UID` secret baked in) and commits them to `firmware/112025/`. This job is documented under "Build Firmware Binaries" below.
 
 ### Purpose
-Automatically compiles the Arduino code for both TankAlarm-092025 and TankAlarm-112025 projects
+Automatically compiles the TankAlarm-112025 (Arduino Opta) sketches
 to ensure code quality and catch compilation errors early.
 
 ### Triggers
 The workflow runs on:
 - **Push events** to `main` or `master` branches when changes are made to:
-  - `TankAlarm-092025-Client-Hologram/` directory
-  - `TankAlarm-092025-Server-Hologram/` directory
   - `TankAlarm-112025-Client-BluesOpta/` directory
   - `TankAlarm-112025-Server-BluesOpta/` directory
   - `TankAlarm-112025-Viewer-BluesOpta/` directory
+  - `TankAlarm-112025-FTPS_Server_Test/` directory
+  - `TankAlarm-112025-Common/` directory
   - The workflow file itself
 - **Pull requests** targeting `main` or `master` branches
 - **Manual trigger** via workflow_dispatch
@@ -25,32 +43,22 @@ The workflow runs on:
 ### What It Does
 
 1. **Sets up the environment**
-   - Checks out the repository code
+   - Checks out the repository code and the `FTPSclientOPTA` library
    - Installs Arduino CLI
-   - Installs Arduino SAMD core for MKR boards
    - Installs Arduino Mbed OS Opta Boards core for Arduino Opta
 
 2. **Installs required libraries**
-   - MKRNB (cellular connectivity)
-   - SD (SD card operations)
-   - ArduinoLowPower (power management)
-   - RTCZero (real-time clock)
    - Ethernet (network connectivity for server)
    - ArduinoJson (JSON parsing for configuration)
    - Blues Wireless Notecard (cellular connectivity via Blues)
+   - ArduinoRS485 (Modbus transport)
+   - ArduinoModbus (Modbus sensor support)
 
-3. **Compiles the sketches**
-   
-   **TankAlarm-092025 (Arduino MKR NB 1500):**
-   - Compiles `TankAlarm-092025-Client-Hologram.ino`
-   - Compiles `TankAlarm-092025-Server-Hologram.ino`
-   - Target board: Arduino MKR NB 1500 (`arduino:samd:mkrnb1500`)
-   
-   **TankAlarm-112025 (Arduino Opta):**
+3. **Compiles the sketches** (target board: Arduino Opta, `arduino:mbed_opta:opta`)
    - Compiles `TankAlarm-112025-Client-BluesOpta.ino`
    - Compiles `TankAlarm-112025-Server-BluesOpta.ino`
    - Compiles `TankAlarm-112025-Viewer-BluesOpta.ino`
-   - Target board: Arduino Opta (`arduino:mbed_opta:opta`)
+   - Compiles `TankAlarm-112025-FTPS_Server_Test.ino`
 
 4. **Handles compilation failures**
    - If any compilation fails, automatically creates a GitHub issue
@@ -89,36 +97,25 @@ You can test Arduino compilation locally using Arduino CLI:
 # Install Arduino CLI
 curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
 
-# Install cores
+# Install the Opta core
 arduino-cli core update-index
-arduino-cli core install arduino:samd
 arduino-cli core install arduino:mbed_opta
 
 # Install required libraries
 arduino-cli lib update-index
-arduino-cli lib install "MKRNB"
-arduino-cli lib install "SD"
-arduino-cli lib install "ArduinoLowPower"
-arduino-cli lib install "RTCZero"
 arduino-cli lib install "Ethernet"
 arduino-cli lib install "ArduinoJson"
 arduino-cli lib install "Blues Wireless Notecard"
+arduino-cli lib install "ArduinoRS485"
+arduino-cli lib install "ArduinoModbus"
 
-# Compile TankAlarm-092025 sketches
-arduino-cli compile --fqbn arduino:samd:mkrnb1500 \
-  TankAlarm-092025-Client-Hologram/TankAlarm-092025-Client-Hologram.ino
-
-arduino-cli compile --fqbn arduino:samd:mkrnb1500 \
-  TankAlarm-092025-Server-Hologram/TankAlarm-092025-Server-Hologram.ino
-
-# Compile TankAlarm-112025 sketches
+# Compile TankAlarm-112025 sketches (Arduino Opta)
 arduino-cli compile --fqbn arduino:mbed_opta:opta \
+  --library TankAlarm-112025-Common \
   TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
 
 arduino-cli compile --fqbn arduino:mbed_opta:opta \
-  TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino
-
-arduino-cli compile --fqbn arduino:mbed_opta:opta \
+  --library TankAlarm-112025-Common \
   TankAlarm-112025-Viewer-BluesOpta/TankAlarm-112025-Viewer-BluesOpta.ino
 ```
 
@@ -141,24 +138,23 @@ arduino-cli compile --fqbn arduino:mbed_opta:opta \
 ### Maintenance
 
 To modify the workflow:
-1. Edit `.github/workflows/arduino-ci.yml`
+1. Edit `.github/workflows/arduino-ci-112025.yml`
 2. Test changes in a branch before merging
 3. Monitor the Actions tab after deployment
 
-## Build Firmware Binaries Workflow
+## Build Firmware Binaries (build-firmware job)
 
-**File:** `build-firmware-112025.yml`
+**Job:** `build-firmware` in `arduino-ci-112025.yml`
 
 ### Purpose
-Automatically builds firmware binary files (.bin) for the TankAlarm-112025 project and commits them to the repository for easy deployment.
+Automatically builds firmware binary files (.bin) for the TankAlarm-112025 project and commits them to the repository for easy deployment. It runs as the second job of the Arduino CI workflow, after the `compile-check` job passes (push events only).
 
 ### Triggers
-The workflow runs on:
-- **Push events** to `main` or `master` branches when changes are made to:
+The `build-firmware` job runs on **push events** to `main` or `master` (after the `compile-check` job passes) when changes are made to:
   - `TankAlarm-112025-Client-BluesOpta/` directory
   - `TankAlarm-112025-Server-BluesOpta/` directory
   - `TankAlarm-112025-Common/` directory
-  - The workflow file itself (`.github/workflows/build-firmware-112025.yml`)
+  - The workflow file itself (`.github/workflows/arduino-ci-112025.yml`)
 
 ### What It Does
 
@@ -239,7 +235,7 @@ The compiled binaries can be uploaded to Arduino Opta devices using:
 ### Maintenance
 
 To modify the workflow:
-1. Edit `.github/workflows/build-firmware-112025.yml`
+1. Edit `.github/workflows/arduino-ci-112025.yml`
 2. Test changes in a branch before merging to ensure the rebase strategy still works
 3. Monitor the Actions tab after deployment
 
@@ -347,3 +343,65 @@ To modify the workflow:
 2. Test changes in a branch before merging
 3. Monitor the Actions tab after deployment
 4. Use workflow_dispatch to trigger manual runs for testing
+
+## Release Firmware Workflow
+
+**File:** `release-firmware-112025.yml`
+
+### Purpose
+Builds the three production TankAlarm-112025 firmware binaries (Client, Server, and Viewer) and publishes them as downloadable assets on a GitHub Release. The FTPS test sketch is a developer diagnostic and is intentionally excluded from releases (it is still compile-checked by the CI workflow).
+
+### Triggers
+- **Tag push** matching `v*` (e.g. `v1.6.15`)
+- **Manual trigger** via workflow_dispatch
+
+### What It Does
+1. Checks out the repository and the `FTPSclientOPTA` library
+2. Reads `FIRMWARE_VERSION` from `TankAlarm-112025-Common/src/TankAlarm_Common.h`
+3. For tag builds, verifies the tag (`vX.Y.Z`) matches the firmware version and fails if they differ
+4. Installs the Opta core and required libraries
+5. Generates `ClientConfig.h`, `ServerConfig.h`, and `ViewerConfig.h` from the `BLUES_PRODUCT_UID` secret
+6. Builds `TankAlarm-Client-v<version>.bin`, `TankAlarm-Server-v<version>.bin`, and `TankAlarm-Viewer-v<version>.bin`
+7. Creates a GitHub Release with all three binaries and auto-generated release notes
+
+### Notes
+- Requires the `BLUES_PRODUCT_UID` repository secret
+- Keep the git tag in sync with `FIRMWARE_VERSION`, or the validation step will fail
+
+## Package Common Library Workflow
+
+**File:** `package-tankalarm-common.yml`
+
+### Purpose
+Keeps a ready-to-import `TankAlarm-112025-Common.zip` (Arduino library) in sync with the source whenever the Common library changes.
+
+### Triggers
+- **Push events** when changes are made to:
+  - `TankAlarm-112025-Common/` directory
+  - The workflow file itself
+
+### What It Does
+1. Checks out the repository
+2. Rebuilds `TankAlarm-112025-Common.zip` from the `TankAlarm-112025-Common/` folder (excluding `.DS_Store` / `Thumbs.db`)
+3. Commits and pushes the updated ZIP only when it actually changed (tag pushes are skipped)
+
+## Deploy GitHub Pages Workflow
+
+**File:** `deploy-gh-pages.yml`
+
+### Purpose
+Builds and publishes the project's GitHub Pages site.
+
+### Triggers
+- **Push events** to `main` or `master`
+- **Manual trigger** via workflow_dispatch
+
+### What It Does
+1. Checks out the repository
+2. On re-runs, deletes stale `github-pages` artifacts so the deploy step doesn't fail on duplicates
+3. Builds the site with Jekyll (`actions/jekyll-build-pages`)
+4. Uploads the build artifact and deploys it with `actions/deploy-pages`
+
+### Notes
+- Uses a `pages` concurrency group with `cancel-in-progress: false` so production deploys finish
+- The `build` and `deploy` jobs run with least-privilege permission scopes

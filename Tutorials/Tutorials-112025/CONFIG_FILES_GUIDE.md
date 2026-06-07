@@ -197,7 +197,7 @@ TankAlarm-112025-Viewer-BluesOpta/
 
 ## CI/CD: Build-Time Injection via GitHub Secret (Optional)
 
-If you use the **GitHub Actions firmware build workflow** (`.github/workflows/build-firmware-112025.yml`), you can inject the Product UID at build time using a GitHub repository secret. This is **optional** — you only need this if you want CI-built `.bin` files to have the Product UID baked in. If you build locally with your own Config.h files, or configure devices at runtime through the web dashboard, you can skip this section entirely.
+If you use the **GitHub Actions firmware build workflow** (`.github/workflows/arduino-ci-112025.yml`), you can inject the Product UID at build time using a GitHub repository secret. This is **optional** — you only need this if you want CI-built `.bin` files to have the Product UID baked in. If you build locally with your own Config.h files, or configure devices at runtime through the web dashboard, you can skip this section entirely.
 
 ### Step 1: Add the Secret
 

@@ -1,4 +1,4 @@
-name: Arduino CI - TankAlarm 112025 (Blues Opta)
+name: Arduino CI & Firmware Build - 112025 (Blues Opta)
 
 on:
   push:
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  compile-arduino-112025:
+  compile-check:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -208,3 +208,118 @@ jobs:
           steps.compile-112025-viewer.outcome == 'failure' ||
           steps.compile-112025-ftps.outcome == 'failure'
         run: exit 1
+
+  build-firmware:
+    needs: compile-check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: firmware-build-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout FTPSclientOPTA library
+        uses: actions/checkout@v4
+        with:
+          repository: dorkmo/FTPSclientOPTA
+          path: arduino-opta-ftps
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+
+      - name: Install Arduino Mbed OS Opta Boards core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:mbed_opta
+
+      - name: Install required libraries for 112025
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "Ethernet"
+          arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "Blues Wireless Notecard"
+          arduino-cli lib install "ArduinoRS485"
+          arduino-cli lib install "ArduinoModbus"
+
+      - name: Generate config headers from secret
+        run: |
+          cat > TankAlarm-112025-Client-BluesOpta/ClientConfig.h << EOF
+          #ifndef CLIENT_CONFIG_H
+          #define CLIENT_CONFIG_H
+          #define DEFAULT_PRODUCT_UID "${PRODUCT_UID}"
+          #endif // CLIENT_CONFIG_H
+          EOF
+
+          cat > TankAlarm-112025-Server-BluesOpta/ServerConfig.h << EOF
+          #ifndef SERVER_CONFIG_H
+          #define SERVER_CONFIG_H
+          #define DEFAULT_SERVER_PRODUCT_UID "${PRODUCT_UID}"
+          #endif // SERVER_CONFIG_H
+          EOF
+
+          cat > TankAlarm-112025-Viewer-BluesOpta/ViewerConfig.h << EOF
+          #ifndef VIEWER_CONFIG_H
+          #define VIEWER_CONFIG_H
+          #define DEFAULT_VIEWER_PRODUCT_UID "${PRODUCT_UID}"
+          #endif // VIEWER_CONFIG_H
+          EOF
+        env:
+          PRODUCT_UID: ${{ secrets.BLUES_PRODUCT_UID }}
+
+      - name: Build client firmware (.bin)
+        run: |
+          arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --library TankAlarm-112025-Common \
+            --output-dir firmware/112025/client \
+            TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
+
+      - name: Build server firmware (.bin)
+        run: |
+          LIB_ROOT="$RUNNER_TEMP/arduino-libraries"
+          mkdir -p "$LIB_ROOT/FTPSclientOPTA" "$LIB_ROOT/TankAlarm-112025-Common"
+          cp -r arduino-opta-ftps/src arduino-opta-ftps/library.properties "$LIB_ROOT/FTPSclientOPTA/"
+          cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
+
+          arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --libraries "$LIB_ROOT" \
+            --output-dir firmware/112025/server \
+            TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino
+
+      - name: Build FTPS test firmware (.bin)
+        run: |
+          LIB_ROOT="$RUNNER_TEMP/arduino-libraries"
+          mkdir -p "$LIB_ROOT/FTPSclientOPTA" "$LIB_ROOT/TankAlarm-112025-Common" firmware/112025/ftps-test
+          cp -r arduino-opta-ftps/src arduino-opta-ftps/library.properties "$LIB_ROOT/FTPSclientOPTA/"
+          cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
+
+          arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --libraries "$LIB_ROOT" \
+            --output-dir firmware/112025/ftps-test \
+            TankAlarm-112025-FTPS_Server_Test/TankAlarm-112025-FTPS_Server_Test.ino
+
+      - name: Commit firmware binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain firmware)" ]; then
+            git add firmware
+            git commit -m "Update Opta firmware binaries"
+            # Use the `-X theirs` strategy option to automatically resolve binary conflicts
+            # by keeping the version from the commit being rebased (the new build)
+            if git pull --rebase -X theirs origin "${GITHUB_REF_NAME}"; then
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+            else
+              echo "Rebase failed. Aborting..."
+              git rebase --abort || true
+              exit 1
+            fi
+          else
+            echo "No firmware changes to commit."
+          fi

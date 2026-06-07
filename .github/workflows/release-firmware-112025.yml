@@ -1,4 +1,4 @@
-name: Release TankAlarm Server and FTPS Firmware
+name: Release TankAlarm Firmware (112025)
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  release-server:
+  release-firmware:
     runs-on: ubuntu-latest
 
     steps:
@@ -59,26 +59,57 @@ jobs:
           arduino-cli lib install "ArduinoRS485"
           arduino-cli lib install "ArduinoModbus"
 
-      - name: Generate server config header from secret
+      - name: Generate config headers from secret
         run: |
+          cat > TankAlarm-112025-Client-BluesOpta/ClientConfig.h << EOF
+          #ifndef CLIENT_CONFIG_H
+          #define CLIENT_CONFIG_H
+          #define DEFAULT_PRODUCT_UID "${PRODUCT_UID}"
+          #endif // CLIENT_CONFIG_H
+          EOF
+
           cat > TankAlarm-112025-Server-BluesOpta/ServerConfig.h << EOF
           #ifndef SERVER_CONFIG_H
           #define SERVER_CONFIG_H
           #define DEFAULT_SERVER_PRODUCT_UID "${PRODUCT_UID}"
           #endif // SERVER_CONFIG_H
           EOF
+
+          cat > TankAlarm-112025-Viewer-BluesOpta/ViewerConfig.h << EOF
+          #ifndef VIEWER_CONFIG_H
+          #define VIEWER_CONFIG_H
+          #define DEFAULT_VIEWER_PRODUCT_UID "${PRODUCT_UID}"
+          #endif // VIEWER_CONFIG_H
+          EOF
         env:
           PRODUCT_UID: ${{ secrets.BLUES_PRODUCT_UID }}
+
+      - name: Prepare Arduino libraries
+        shell: bash
+        run: |
+          LIB_ROOT="$RUNNER_TEMP/arduino-libraries"
+          mkdir -p "$LIB_ROOT/FTPSclientOPTA" "$LIB_ROOT/TankAlarm-112025-Common"
+          cp -r arduino-opta-ftps/src arduino-opta-ftps/library.properties "$LIB_ROOT/FTPSclientOPTA/"
+          cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
+          echo "LIB_ROOT=$LIB_ROOT" >> "$GITHUB_ENV"
+
+      - name: Build client firmware
+        shell: bash
+        run: |
+          mkdir -p build/client
+          arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --libraries "$LIB_ROOT" \
+            --output-dir build/client \
+            TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
+
+          BIN_SOURCE=$(find build/client -maxdepth 1 -name '*.bin' ! -name '*.with_bootloader.bin' ! -name '*.bootloader.bin' | head -n1)
+          test -n "$BIN_SOURCE"
+          cp "$BIN_SOURCE" "TankAlarm-Client-v${{ steps.version.outputs.version }}.bin"
 
       - name: Build server firmware
         shell: bash
         run: |
-          LIB_ROOT="$RUNNER_TEMP/arduino-libraries"
-          mkdir -p "$LIB_ROOT/FTPSclientOPTA" "$LIB_ROOT/TankAlarm-112025-Common" build/server
-
-          cp -r arduino-opta-ftps/src arduino-opta-ftps/library.properties "$LIB_ROOT/FTPSclientOPTA/"
-          cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
-
+          mkdir -p build/server
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
             --libraries "$LIB_ROOT" \
             --output-dir build/server \
@@ -88,28 +119,25 @@ jobs:
           test -n "$BIN_SOURCE"
           cp "$BIN_SOURCE" "TankAlarm-Server-v${{ steps.version.outputs.version }}.bin"
 
-      - name: Build FTPS test firmware
+      - name: Build viewer firmware
         shell: bash
         run: |
-          LIB_ROOT="$RUNNER_TEMP/arduino-libraries"
-          mkdir -p "$LIB_ROOT/FTPSclientOPTA" "$LIB_ROOT/TankAlarm-112025-Common" build/ftps-test
-          cp -r arduino-opta-ftps/src arduino-opta-ftps/library.properties "$LIB_ROOT/FTPSclientOPTA/"
-          cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
-
+          mkdir -p build/viewer
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
             --libraries "$LIB_ROOT" \
-            --output-dir build/ftps-test \
-            TankAlarm-112025-FTPS_Server_Test/TankAlarm-112025-FTPS_Server_Test.ino
+            --output-dir build/viewer \
+            TankAlarm-112025-Viewer-BluesOpta/TankAlarm-112025-Viewer-BluesOpta.ino
 
-          BIN_SOURCE=$(find build/ftps-test -maxdepth 1 -name '*.bin' ! -name '*.with_bootloader.bin' ! -name '*.bootloader.bin' | head -n1)
+          BIN_SOURCE=$(find build/viewer -maxdepth 1 -name '*.bin' ! -name '*.with_bootloader.bin' ! -name '*.bootloader.bin' | head -n1)
           test -n "$BIN_SOURCE"
-          cp "$BIN_SOURCE" "TankAlarm-FTPS-Test-v${{ steps.version.outputs.version }}.bin"
+          cp "$BIN_SOURCE" "TankAlarm-Viewer-v${{ steps.version.outputs.version }}.bin"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: TankAlarm Beta v${{ steps.version.outputs.version }}
           files: |
+            TankAlarm-Client-v${{ steps.version.outputs.version }}.bin
             TankAlarm-Server-v${{ steps.version.outputs.version }}.bin
-            TankAlarm-FTPS-Test-v${{ steps.version.outputs.version }}.bin
+            TankAlarm-Viewer-v${{ steps.version.outputs.version }}.bin
           generate_release_notes: true
