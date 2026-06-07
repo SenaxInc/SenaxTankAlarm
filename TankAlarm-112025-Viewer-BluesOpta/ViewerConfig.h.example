@@ -53,25 +53,29 @@
 // Set to true to enable daily report printing
 #define PRINT_ENABLED false
 
-// Network printer IPv4 address (four octets, e.g. 192.168.1.50)
-#define PRINTER_IP_1 192
-#define PRINTER_IP_2 168
-#define PRINTER_IP_3 1
-#define PRINTER_IP_4 50
+// Network printer IPv4 address (four octets).
+// Replace all four values with your printer's actual LAN IP address.
+// Example: 192.168.1.50 → IP_1=192, IP_2=168, IP_3=1, IP_4=50
+#define PRINTER_IP_1 0
+#define PRINTER_IP_2 0
+#define PRINTER_IP_3 0
+#define PRINTER_IP_4 0
 
 // TCP port for Raw / JetDirect printing (9100 is the standard default)
 #define PRINTER_PORT 9100
 
 // UTC hour at which the daily report is printed (0–23).
-// Formula: UTC_hour = local_hour − UTC_offset
+// Formula: UTC_hour = (local_hour − UTC_offset) mod 24
 //   where UTC_offset is the signed value in your timezone name
 //   (negative west of UTC, positive east of UTC).
+//   If the result is negative, add 24.  If it is ≥ 24, subtract 24.
 //   US Eastern Standard Time (UTC-5): 8 AM − (−5) = 13 → set 13
 //   US Eastern Daylight Time (UTC-4): 8 AM − (−4) = 12 → set 12
 //   US Central Standard Time (UTC-6): 8 AM − (−6) = 14 → set 14
 //   US Mountain Standard Time (UTC-7): 8 AM − (−7) = 15 → set 15
 //   US Pacific Standard Time  (UTC-8): 8 AM − (−8) = 16 → set 16
 //   Central European Time     (UTC+1): 8 AM − (+1) =  7 → set  7
+//   Example near midnight: 11 PM NZST (UTC+12) → 23 − 12 = 11 → set 11
 #define PRINT_DAILY_HOUR 13
 
 #endif // VIEWER_CONFIG_H

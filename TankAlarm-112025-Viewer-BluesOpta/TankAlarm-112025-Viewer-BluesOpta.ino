@@ -133,7 +133,7 @@ struct ViewerConfig {
   // Network printer (JetDirect / Raw socket printing)
   bool printEnabled;             // true = send daily fleet-snapshot report to the printer
   uint8_t printerIp[4];         // Network printer IPv4 address
-  uint16_t printerPort;         // Printer port (9100 = JetDirect, also common: 515 LPR)
+  uint16_t printerPort;         // Printer TCP port (9100 = JetDirect/Raw — the only protocol implemented here)
   uint8_t printDailyHour;       // UTC hour (0–23) at which the daily report fires
 };
 
@@ -159,7 +159,7 @@ struct SensorRecord {
 
 // Global configuration instance with defaults
 static ViewerConfig gConfig = {
-  "Tank Alarm Viewer",           // viewerName
+  VIEWER_NAME,                   // viewerName
   DEFAULT_VIEWER_PRODUCT_UID,    // productUid - default, can be overridden
   false,                         // useStaticIp - DHCP by default
   { 0x02, 0x00, 0x01, 0x11, 0x20, 0x25 },  // macAddress
@@ -1510,6 +1510,15 @@ static bool sendDailyPrintJob() {
   printer.println('\f');  // Form-feed — ejects the page on most printers
 
   printer.flush();
+  // Check that the connection is still alive after all data has been flushed.
+  // A disconnected socket here means the printer closed the connection mid-job;
+  // returning false causes checkDailyPrint() to retry rather than marking today done.
+  if (!printer.connected()) {
+    safeSleep(100);
+    printer.stop();
+    Serial.println(F("Daily print: connection lost during transfer — will retry in 15 min"));
+    return false;
+  }
   safeSleep(500);
   printer.stop();
 
