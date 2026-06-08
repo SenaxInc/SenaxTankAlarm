@@ -29,16 +29,21 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout FTPSclientOPTA library
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: dorkmo/FTPSclientOPTA
           path: arduino-opta-ftps
 
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
+      - name: Install Arduino CLI
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          arduino-cli version
 
       - name: Install Arduino Mbed OS Opta Boards core
         run: |
@@ -102,7 +107,7 @@ jobs:
           steps.compile-112025-server.outcome == 'failure' ||
           steps.compile-112025-viewer.outcome == 'failure' ||
           steps.compile-112025-ftps.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -220,18 +225,23 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Checkout FTPSclientOPTA library
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: dorkmo/FTPSclientOPTA
           path: arduino-opta-ftps
 
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
+      - name: Install Arduino CLI
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          arduino-cli version
 
       - name: Install Arduino Mbed OS Opta Boards core
         run: |
