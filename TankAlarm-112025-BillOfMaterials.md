@@ -1,6 +1,6 @@
 # TankAlarm 112025 - Bill of Materials
 
-**Version:** 1.8.1  
+**Version:** 1.8.2  
 **Platform:** Arduino Opta + Blues Wireless  
 **Last Updated:** June 8, 2026
 

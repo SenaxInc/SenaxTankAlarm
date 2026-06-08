@@ -1,7 +1,7 @@
-# TankAlarm v1.8.1 - Industrial Tank Monitoring System
+# TankAlarm v1.8.2 - Industrial Tank Monitoring System
 
 **Release Date:** June 8, 2026  
-**Version:** 1.8.1  
+**Version:** 1.8.2  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -428,6 +428,11 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.8.2 (June 8, 2026)
+- **CI/Release Pipeline Modernization:** Migrated GitHub Actions workflow dependencies to Node 24-compatible versions to stay ahead of the Node 20 runner deprecation timeline.
+- **Arduino CLI Install Hardening:** Replaced action-based Arduino CLI setup in CI/release workflows with deterministic direct binary install (`arduino-cli 1.4.1`) to reduce external runtime coupling and improve reliability.
+- **Operational Note:** Firmware application behavior is unchanged; this release focuses on build/release infrastructure resilience.
 
 ### v1.8.1 (June 8, 2026)
 - **Viewer Daily Print Reports:** Added optional daily plain-text printing from Viewer Opta to LAN printers over JetDirect/Raw TCP (`9100`).
