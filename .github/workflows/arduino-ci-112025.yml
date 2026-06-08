@@ -40,7 +40,10 @@ jobs:
       - name: Install Arduino CLI
         shell: bash
         run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          ARDUINO_CLI_VERSION="1.4.1"
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz" | tar -xz -C /tmp
+          install -m 0755 /tmp/arduino-cli "$HOME/bin/arduino-cli"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/bin:$PATH"
           arduino-cli version
@@ -238,7 +241,10 @@ jobs:
       - name: Install Arduino CLI
         shell: bash
         run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          ARDUINO_CLI_VERSION="1.4.1"
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz" | tar -xz -C /tmp
+          install -m 0755 /tmp/arduino-cli "$HOME/bin/arduino-cli"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/bin:$PATH"
           arduino-cli version
