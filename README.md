@@ -1,7 +1,7 @@
-# TankAlarm v1.8.0 - Industrial Tank Monitoring System
+# TankAlarm v1.8.1 - Industrial Tank Monitoring System
 
-**Release Date:** June 7, 2026  
-**Version:** 1.8.0  
+**Release Date:** June 8, 2026  
+**Version:** 1.8.1  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -428,6 +428,12 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.8.1 (June 8, 2026)
+- **Viewer Daily Print Reports:** Added optional daily plain-text printing from Viewer Opta to LAN printers over JetDirect/Raw TCP (`9100`).
+- **Print Scheduling & Retry:** New daily UTC-hour scheduler with retry throttling, day-boundary reset, and config validation for safer unattended operation.
+- **Print Delivery Hardening:** Viewer now checks post-flush socket health and retries on transfer failure instead of marking the day as complete.
+- **Configuration Additions:** Added `PRINT_ENABLED`, `PRINTER_IP_1..4`, `PRINTER_PORT`, and `PRINT_DAILY_HOUR` options in `ViewerConfig.h` defaults/examples.
 
 ### v1.8.0 (June 7, 2026)
 - **Per-Monitor Report Threshold:** Change-based telemetry is now configured per sensor in the sensor's own unit (inches, PSI, RPM, GPM) via the new `reportThreshold` field, replacing the single global `levelChangeThreshold`. `0` disables change-based telemetry for that sensor. (`CONFIG_SCHEMA_VERSION` → 3)
