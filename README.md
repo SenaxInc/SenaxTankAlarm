@@ -1,7 +1,7 @@
-# TankAlarm v1.8.2 - Industrial Tank Monitoring System
+# TankAlarm v1.8.3 - Industrial Tank Monitoring System
 
 **Release Date:** June 8, 2026  
-**Version:** 1.8.2  
+**Version:** 1.8.3  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -428,6 +428,11 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.8.3 (June 8, 2026)
+- **Genuine Hardware MAC Retrieval:** Fixed a critical bug in standard Mbed OS parameterless `Ethernet.begin()` where raw ethernet interface registration defaulted to temporary/empty MAC values. The Server now retrieves the exact factory block register MAC address (`A8:61:0A` block) via `Ethernet.MACAddress(gMacAddress)` before boots, ensuring local router IP reservations (such as `192.168.7.117`) are correctly matched and active.
+- **Fail-Safe IP State Machine Fallback:** Added auto-healing IP negotiation. If DHCP fails or a static IP subnet is misconfigured (e.g., mismatching local gateway range), the initialization dynamically pivots to try the companion network mode rather than failing the network setup completely.
+- **Improved Serial Interface Recovery:** Hardened board interaction so host diagnostics and debug ports cleanly re-initialize COM configuration after DFU restarts.
 
 ### v1.8.2 (June 8, 2026)
 - **CI/Release Pipeline Modernization:** Migrated GitHub Actions workflow dependencies to Node 24-compatible versions to stay ahead of the Node 20 runner deprecation timeline.
