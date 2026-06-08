@@ -133,6 +133,7 @@ jobs:
           cp "$BIN_SOURCE" "TankAlarm-Viewer-v${{ steps.version.outputs.version }}.bin"
 
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: TankAlarm Beta v${{ steps.version.outputs.version }}
