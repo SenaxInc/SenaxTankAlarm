@@ -814,6 +814,7 @@ static char gPendingConfigAckMessage[48] = "Config applied and persisted";
 static unsigned long gPendingConfigAckRetryAt = 0;
 static unsigned long gPendingConfigAckRetryDelayMs = 5000UL;
 static bool gHardwareSummaryPrinted = false;
+static bool gChemistryChecked = false;
 
 // Network failure handling
 static unsigned long gLastSuccessfulNotecardComm = 0;
@@ -1895,9 +1896,8 @@ void loop() {
       // Chemistry verification: once setpoints are read, cross-check them
       // against the user-selected battery type / pack voltage. This is a
       // one-shot log so it doesn't spam the serial console.
-      static bool sChemistryChecked = false;
-      if (!sChemistryChecked && gSolarManager.getData().setpointsValid) {
-        sChemistryChecked = true;
+      if (!gChemistryChecked && gSolarManager.getData().setpointsValid) {
+        gChemistryChecked = true;
         char chemMsg[160];
         SolarManager::ChemistryCheck cc = gSolarManager.verifyChemistry(
           (uint8_t)gConfig.batteryMonitor.batteryType,
@@ -2776,6 +2776,31 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
   if (t["unloadAlarmEmail"].is<bool>()) mon.unloadAlarmEmail = t["unloadAlarmEmail"].as<bool>();
 }
 
+static void sanitizeSolarConfig(SolarConfig &sc) {
+  // modbusSlaveId: 1..247 (reject 0 broadcast and >247)
+  if (sc.modbusSlaveId == 0 || sc.modbusSlaveId > 247) {
+    sc.modbusSlaveId = SOLAR_DEFAULT_SLAVE_ID;
+  }
+  // modbusBaudRate: allowlist {9600, 19200, 38400, 57600, 115200}
+  if (sc.modbusBaudRate != 9600 && sc.modbusBaudRate != 19200 &&
+      sc.modbusBaudRate != 38400 && sc.modbusBaudRate != 57600 &&
+      sc.modbusBaudRate != 115200) {
+    sc.modbusBaudRate = SOLAR_DEFAULT_BAUD_RATE;
+  }
+  // pollIntervalSec: floor at 5s to avoid bus saturation, ceiling at 3600
+  if (sc.pollIntervalSec < 5) sc.pollIntervalSec = 5;
+  if (sc.pollIntervalSec > 3600) sc.pollIntervalSec = 3600;
+  // battery thresholds ordering: Critical < Low < High
+  if (sc.batteryCriticalVoltage >= sc.batteryLowVoltage || sc.batteryLowVoltage >= sc.batteryHighVoltage) {
+    Serial.println(F("WARNING: Solar battery thresholds out of order; using defaults"));
+    sc.batteryLowVoltage = BATTERY_VOLTAGE_LOW;
+    sc.batteryCriticalVoltage = BATTERY_VOLTAGE_CRITICAL;
+    sc.batteryHighVoltage = BATTERY_VOLTAGE_HIGH;
+  }
+  // modbusTimeoutMs floor of 500 ms (clamped in begin() but keep here for consistency)
+  if (sc.modbusTimeoutMs < 500) sc.modbusTimeoutMs = 500;
+}
+
 static bool loadConfigFromFlash(ClientConfig &cfg) {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -2912,6 +2937,9 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
     cfg.solarCharger.alertOnCommFailure = false;
     cfg.solarCharger.includeInDailyReport = true;
   }
+  
+  // Sanitize and clamp loaded solar configuration (Task 1.3)
+  sanitizeSolarConfig(cfg.solarCharger);
 
   // Load decoupled batteryConfig block (server v1.6.8+ generator).
   // Carries chemistry + nominal pack voltage; initBatteryConfig() computes
@@ -4198,11 +4226,8 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       // Re-arm the chemistry cross-check so the next solar poll re-verifies
       // against the new selection.
       if (gSolarManager.isEnabled()) {
-        // sChemistryChecked is a function-static in the poll path; we can't
-        // reset it from here directly, but the user-visible mismatch warning
-        // will reappear on the next reboot. Log a hint so the installer knows
-        // to re-check the SunSaver DIP after a chemistry change.
-        Serial.println(F("Solar: re-verify SunSaver DIP after chemistry change (reboot to refresh check)"));
+        gChemistryChecked = false;
+        Serial.println(F("Solar: retrace chemistry verification on next poll"));
       }
     }
   }
@@ -4237,6 +4262,9 @@ static void applyConfigUpdate(const JsonDocument &doc) {
                             (prevBaud  != gConfig.solarCharger.modbusBaudRate) ||
                             (prevTo    != gConfig.solarCharger.modbusTimeoutMs);
 
+    // Sanitize and clamp configuration parameters (Task 1.3)
+    sanitizeSolarConfig(gConfig.solarCharger);
+
     if (gConfig.solarCharger.enabled && (!prevEnabled || transportChanged)) {
       // (Re)initialize transport with the new config.
       gSolarManager.end();
@@ -4251,6 +4279,14 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       gSolarManager.end();
       Serial.println(F("Solar charger disabled via config update"));
       addSerialLog("Solar charger disabled via config update");
+    } else if (gConfig.solarCharger.enabled && prevEnabled && !transportChanged) {
+      // Non-transport change: refresh thresholds/flags directly (Task 1.1)
+      uint16_t prevPoll = gSolarManager.getConfig().pollIntervalSec;
+      gSolarManager.setConfig(gConfig.solarCharger);
+      if (prevPoll != gConfig.solarCharger.pollIntervalSec) {
+        gSolarManager.forcePollSoon();
+      }
+      Serial.println(F("Solar: runtime config refreshed (no transport restart)"));
     }
   }
 
@@ -6003,13 +6039,24 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
   solar["av"] = roundTo(data.arrayVoltage, 2);         // Array voltage
   solar["ic"] = roundTo(data.chargeCurrent, 2);        // Charge current
   
-  // Daily statistics
+  // Daily statistics (Task 1.2 & 2.1)
+#ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
   solar["bvMin"] = roundTo(data.batteryVoltageMinDaily, 2);
   solar["bvMax"] = roundTo(data.batteryVoltageMaxDaily, 2);
   if (data.ampHoursDaily > 0.0f) {
     solar["ah"] = roundTo(data.ampHoursDaily, 1);      // Amp-hours today (only if non-zero)
   }
-  
+  solar["ht"] = data.heatsinkTemp;  // Heatsink temp °C
+#else
+  // Software daily min/max (omitted if unseeded)
+  if (data.batteryVoltageMinDaily > 0.1f) {
+    solar["bvMin"] = roundTo(data.batteryVoltageMinDaily, 2);
+  }
+  if (data.batteryVoltageMaxDaily > 0.1f) {
+    solar["bvMax"] = roundTo(data.batteryVoltageMaxDaily, 2);
+  }
+#endif
+
   // Omitted: healthy, battOk (derivable from bv thresholds); cs (charge state string)
   // commOk is implicit (if this data exists, comm is OK)
   
@@ -6020,9 +6067,6 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
   if (data.hasAlarm) {
     solar["alarms"] = gSolarManager.getAlarmDescription();
   }
-  
-  // Temperature
-  solar["ht"] = data.heatsinkTemp;  // Heatsink temp °C
   
   return true;
 }

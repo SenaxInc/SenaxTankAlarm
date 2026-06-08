@@ -9,6 +9,7 @@
 
 #include "TankAlarm_Solar.h"
 #include "TankAlarm_Battery.h"
+#include "TankAlarm_Common.h"
 
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
 
@@ -24,8 +25,16 @@ static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t
     return false;
   }
 
+  if (ModbusRTUClient.available() < count) {
+    return false;
+  }
+
   for (uint8_t index = 0; index < count; ++index) {
-    buffer[index] = (uint16_t)ModbusRTUClient.read();
+    int val = ModbusRTUClient.read();
+    if (val < 0) {
+      return false;
+    }
+    buffer[index] = (uint16_t)val;
   }
 
   return true;
@@ -36,22 +45,60 @@ static bool readInputRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t c
     return false;
   }
 
+  if (ModbusRTUClient.available() < count) {
+    return false;
+  }
+
   for (uint8_t index = 0; index < count; ++index) {
-    buffer[index] = (uint16_t)ModbusRTUClient.read();
+    int val = ModbusRTUClient.read();
+    if (val < 0) {
+      return false;
+    }
+    buffer[index] = (uint16_t)val;
   }
 
   return true;
 }
 
-static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
+static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer, uint8_t &cachedFC) {
+  if (cachedFC == 3) {
+    if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
+      return true;
+    }
+    // Failed: cached FC is wrong. Clear cache, bypass holding, go straight to input fallback on this call (R-4)
+    cachedFC = 0;
+    if (readInputRegisters(slaveId, startAddress, count, buffer)) {
+      cachedFC = 4;
+      return true;
+    }
+    return false;
+  } else if (cachedFC == 4) {
+    if (readInputRegisters(slaveId, startAddress, count, buffer)) {
+      return true;
+    }
+    // Failed: cached FC is wrong. Clear cache, bypass input, go straight to holding fallback on this call (R-4)
+    cachedFC = 0;
+    if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
+      cachedFC = 3;
+      return true;
+    }
+    return false;
+  }
+
+  // Uncached: try holding first, then input
   if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
+    cachedFC = 3;
     return true;
   }
-  return readInputRegisters(slaveId, startAddress, count, buffer);
+  if (readInputRegisters(slaveId, startAddress, count, buffer)) {
+    cachedFC = 4;
+    return true;
+  }
+  return false;
 }
 
 SolarManager::SolarManager() 
-  : _initialized(false), _lastPollMillis(0) {
+  : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -127,14 +174,17 @@ bool SolarManager::begin(const SolarConfig& config) {
   bool startupHolding = readHoldingRegisters(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 1, &startupProbe);
   bool startupInput = false;
   if (!startupHolding) {
-    startupInput = readInputRegisters(_config.modbusSlaveId, 0x0008, 1, &startupProbe);
+    startupInput = readInputRegisters(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 1, &startupProbe);
   }
 
   if (startupHolding) {
+    _cachedHoldingFC = 3;
     Serial.println(F("Solar: Startup probe OK via FC03 (holding)"));
   } else if (startupInput) {
+    _cachedHoldingFC = 4;
     Serial.println(F("Solar: Startup probe OK via FC04 (input)"));
   } else {
+    _cachedHoldingFC = 0;
     Serial.println(F("Solar: Startup probe failed for both FC03 and FC04"));
   }
 
@@ -196,12 +246,39 @@ bool SolarManager::readRegisters() {
   // Real-time block: 5 contiguous filtered ADC registers starting at adc_vb_f
   //   0x0008 batt V, 0x0009 array V, 0x000A load V, 0x000B charge I, 0x000C load I.
   uint16_t realtimeRegs[5];
-  if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs)) {
-    nextData.batteryVoltage = scaleVoltage(realtimeRegs[0]);
-    nextData.arrayVoltage   = scaleVoltage(realtimeRegs[1]);
-    // realtimeRegs[2] is load voltage (adc_vl_f) -- not currently exposed in SolarData.
-    nextData.chargeCurrent  = scaleCurrent(realtimeRegs[3]);
-    nextData.loadCurrent    = scaleCurrent(realtimeRegs[4]);
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+#elif defined(ARDUINO_ARCH_STM32)
+  IWatchdog.reload();
+#endif
+
+  if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs, _cachedHoldingFC)) {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+#elif defined(ARDUINO_ARCH_STM32)
+    IWatchdog.reload();
+#endif
+    float battV = scaleVoltage(realtimeRegs[0]);
+    float arrV  = scaleVoltage(realtimeRegs[1]);
+    float chgI  = scaleCurrent(realtimeRegs[3]);
+    float lodI  = scaleCurrent(realtimeRegs[4]);
+
+    // Plausibility Clamps (R-3 / SR-1) - Reject glitches/unreasonable reads
+    if (battV >= 5.0f && battV <= 40.0f && arrV >= 0.0f && arrV <= 80.0f && chgI >= 0.0f && chgI <= 100.0f) {
+      nextData.batteryVoltage = battV;
+      nextData.arrayVoltage   = arrV;
+      nextData.chargeCurrent  = chgI;
+      nextData.loadCurrent    = lodI;
+    } else {
+      Serial.print(F("WARNING: Solar read registered implausible values, rejecting poll (bv="));
+      Serial.print(battV, 2);
+      Serial.print(F(" av="));
+      Serial.print(arrV, 2);
+      Serial.print(F(" ic="));
+      Serial.print(chgI, 2);
+      Serial.println(F(")"));
+      success = false;
+    }
   } else {
     success = false;
   }
@@ -214,7 +291,12 @@ bool SolarManager::readRegisters() {
   // overall poll as failed.
   if (success && !nextData.setpointsValid) {
     uint16_t setpointRegs[4];  // V_reg, (gap), V_float, V_eq
-    if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_REG, 4, setpointRegs)) {
+    if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_REG, 4, setpointRegs, _cachedHoldingFC)) {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+#elif defined(ARDUINO_ARCH_STM32)
+      IWatchdog.reload();
+#endif
       float vReg   = scaleVoltage(setpointRegs[0]);
       float vFloat = scaleVoltage(setpointRegs[2]);
       float vEq    = scaleVoltage(setpointRegs[3]);
@@ -243,13 +325,13 @@ bool SolarManager::readRegisters() {
   // In production these stay zeroed so derived health logic does not false-trip.
 #ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
   uint16_t temperatureRegs[2];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_HEATSINK_TEMP, 2, temperatureRegs)) {
+  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_HEATSINK_TEMP, 2, temperatureRegs, _cachedHoldingFC)) {
     nextData.heatsinkTemp = (int8_t)((int16_t)temperatureRegs[0]);
     nextData.batteryTemp = (int8_t)((int16_t)temperatureRegs[1]);
   }
 
   uint16_t statusRegs[5];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_CHARGE_STATE, 5, statusRegs)) {
+  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_CHARGE_STATE, 5, statusRegs, _cachedHoldingFC)) {
     nextData.chargeState = (SolarChargeState)(statusRegs[0] & 0xFF);
     nextData.faults = statusRegs[1];
     nextData.alarms = statusRegs[3];
@@ -257,12 +339,12 @@ bool SolarManager::readRegisters() {
   }
 
   uint16_t dailyChargeRegs[1];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_AH_DAILY, 1, dailyChargeRegs)) {
+  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_AH_DAILY, 1, dailyChargeRegs, _cachedHoldingFC)) {
     nextData.ampHoursDaily = dailyChargeRegs[0] * 0.1f;  // Scale: 0.1 Ah per count
   }
 
   uint16_t dailyVoltageRegs[2];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_V_MIN_DAILY, 2, dailyVoltageRegs)) {
+  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_V_MIN_DAILY, 2, dailyVoltageRegs, _cachedHoldingFC)) {
     nextData.batteryVoltageMinDaily = scaleVoltage(dailyVoltageRegs[0]);
     nextData.batteryVoltageMaxDaily = scaleVoltage(dailyVoltageRegs[1]);
   }
@@ -277,9 +359,54 @@ bool SolarManager::readRegisters() {
   nextData.loadOn = false;
   nextData.ampHoursDaily = 0.0f;
   nextData.wattHoursDaily = 0.0f;
-  nextData.batteryVoltageMinDaily = nextData.batteryVoltage;
-  nextData.batteryVoltageMaxDaily = nextData.batteryVoltage;
+
+  // Track daily min/max in software for production builds (Task 2.1 & SR-5)
+  if (success) {
+    if (!nextData.dailyStatsSeeded) {
+      nextData.batteryVoltageMinDaily = nextData.batteryVoltage;
+      nextData.batteryVoltageMaxDaily = nextData.batteryVoltage;
+      nextData.dailyStatsSeeded = true;
+    } else {
+      if (nextData.batteryVoltage < nextData.batteryVoltageMinDaily) {
+        nextData.batteryVoltageMinDaily = nextData.batteryVoltage;
+      }
+      if (nextData.batteryVoltage > nextData.batteryVoltageMaxDaily) {
+        nextData.batteryVoltageMaxDaily = nextData.batteryVoltage;
+      }
+    }
+  }
 #endif
+
+  // Track no-charge alert (Task 2.2, R-1 & SR-2)
+  if (success) {
+    // Dynamically calculate float charge target based on battery type multiplier
+    float scale = _config.batteryLowVoltage / BATTERY_VOLTAGE_LOW;
+    float floatThreshold = BATTERY_VOLTAGE_FLOAT * scale;
+    if (nextData.setpointsValid && nextData.vFloatSetpoint > 8.0f) {
+      floatThreshold = nextData.vFloatSetpoint;
+    }
+
+    bool batteryNeedsCharge = (nextData.batteryVoltage < (floatThreshold - 0.2f));
+    bool daylightDetected = (nextData.arrayVoltage > (nextData.batteryVoltage + 3.0f));
+    bool zeroChargingDetected = (nextData.chargeCurrent < 0.1f);
+
+    if (batteryNeedsCharge && daylightDetected && zeroChargingDetected) {
+      if (_noChargeConsecutivePolls < 3) {
+        _noChargeConsecutivePolls++;
+      }
+      if (_noChargeConsecutivePolls >= 3) {
+        nextData.noChargeAlertActive = true;
+      }
+    } else {
+      _noChargeConsecutivePolls = 0;
+      nextData.noChargeAlertActive = false;
+    }
+  } else {
+    // Clear alerts immediately on failed poll so old state does not leak (R-2)
+    _noChargeConsecutivePolls = 0;
+    _data.noChargeAlertActive = false;
+    nextData.noChargeAlertActive = false;
+  }
   
   // Update communication status
   if (success) {
@@ -318,11 +445,17 @@ void SolarManager::updateHealthStatus() {
   _data.hasFault = (_data.faults != 0);
   _data.hasAlarm = (_data.alarms != 0);
   
+#ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
   // Charge state indicators
   _data.isCharging = (_data.chargeState == CHARGE_STATE_BULK || 
                       _data.chargeState == CHARGE_STATE_ABSORPTION ||
                       _data.chargeState == CHARGE_STATE_EQUALIZE);
   _data.isFullyCharged = (_data.chargeState == CHARGE_STATE_FLOAT);
+#else
+  // Software-derived charge state indicators (Task 2.1)
+  _data.isCharging = (_data.chargeCurrent >= 0.1f);
+  _data.isFullyCharged = (!_data.isCharging && _data.batteryVoltage >= BATTERY_VOLTAGE_FLOAT);
+#endif
   
   // Battery health assessment
   _data.batteryHealthy = (_data.batteryVoltage >= _config.batteryLowVoltage) &&
@@ -333,7 +466,8 @@ void SolarManager::updateHealthStatus() {
   _data.solarHealthy = _data.batteryHealthy && 
                        _data.communicationOk && 
                        !_data.hasFault && 
-                       !_data.hasAlarm;
+                       !_data.hasAlarm &&
+                       !_data.noChargeAlertActive;
 }
 
 SolarAlertType SolarManager::checkAlerts() const {
@@ -365,6 +499,11 @@ SolarAlertType SolarManager::checkAlerts() const {
   // Hardware faults
   if (_data.hasFault && _config.alertOnFault) {
     return SOLAR_ALERT_FAULT;
+  }
+
+  // No charging during daylight (panel or fuse issue, Task 2.2)
+  if (_data.noChargeAlertActive) {
+    return SOLAR_ALERT_NO_CHARGE;
   }
   
   // Low battery voltage (warning level)
@@ -504,6 +643,7 @@ void SolarManager::resetDailyStats() {
   _data.batteryVoltageMaxDaily = _data.batteryVoltage;
   _data.ampHoursDaily = 0.0f;
   _data.wattHoursDaily = 0.0f;
+  _data.dailyStatsSeeded = false;
 }
 
 SolarManager::ChemistryCheck SolarManager::verifyChemistry(uint8_t expectedType,
@@ -656,7 +796,7 @@ SolarManager::ChemistryCheck SolarManager::verifyChemistry(uint8_t expectedType,
 #else // Platform not supported
 
 // Stub implementation for non-RS485 platforms
-SolarManager::SolarManager() : _initialized(false), _lastPollMillis(0) {
+SolarManager::SolarManager() : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }

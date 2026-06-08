@@ -177,6 +177,8 @@ struct SolarData {
   bool hasAlarm;              // Any alarm condition present
   bool isCharging;            // Currently charging (bulk, absorption, or equalize)
   bool isFullyCharged;        // Battery fully charged (float mode)
+  bool noChargeAlertActive;   // Solar panel daylight but zero charge alert active
+  bool dailyStatsSeeded;      // True when software daily tracking has been seeded
   
   // Communication status
   bool communicationOk;       // Last Modbus read successful
@@ -277,6 +279,9 @@ public:
   // Reset daily statistics (call at midnight or report time)
   void resetDailyStats();
 
+  // Force a poll execution on the next opportunity
+  void forcePollSoon() { _lastPollMillis = 0; }
+
   // Chemistry verification result vs. user-selected battery type.
   enum ChemistryCheck : uint8_t {
     CHEMISTRY_CHECK_OK             = 0,  // Setpoints match expected chemistry
@@ -307,6 +312,8 @@ private:
   SolarData _data;
   bool _initialized;
   unsigned long _lastPollMillis;
+  uint8_t _noChargeConsecutivePolls;
+  uint8_t _cachedHoldingFC; // Caches whether FC03 (holding) or FC04 (inputs) works: 3 = holding, 4 = inputs, 0 = unknown
   
   // Modbus communication
   bool readRegisters();

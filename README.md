@@ -1,7 +1,7 @@
-# TankAlarm v1.8.3 - Industrial Tank Monitoring System
+# TankAlarm v1.8.4 - Industrial Tank Monitoring System
 
 **Release Date:** June 8, 2026  
-**Version:** 1.8.3  
+**Version:** 1.8.4  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -319,6 +319,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
 - **Common Header Audit:** [CODE REVIEW/COMMON_HEADER_AUDIT_02192026.md](CODE%20REVIEW/COMMON_HEADER_AUDIT_02192026.md)
 
 ### Code Reviews & Release History
+- **v1.8.4 Release Notes:** [CODE REVIEW/V1.8.4_RELEASE_NOTES.md](CODE%20REVIEW/V1.8.4_RELEASE_NOTES.md)
 - **v1.1.8 Release Notes:** [CODE REVIEW/V1.1.8_RELEASE_NOTES.md](CODE%20REVIEW/V1.1.8_RELEASE_NOTES.md)
 - **v1.1.7 Release Notes:** [CODE REVIEW/V1.1.7_RELEASE_NOTES.md](CODE%20REVIEW/V1.1.7_RELEASE_NOTES.md)
 - **v1.1.6 Release Notes:** [CODE REVIEW/V1.1.6_RELEASE_NOTES.md](CODE%20REVIEW/V1.1.6_RELEASE_NOTES.md)
@@ -344,7 +345,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
   - [ ] Ethernet connectivity stable
   
 - [ ] **Software Validation**
-  - [ ] Firmware version 1.6.14 confirmed
+  - [ ] Firmware version 1.8.4 confirmed
   - [ ] All clients reporting to server
   - [ ] Alarms triggering correctly
   - [ ] SMS/email alerts delivering
@@ -428,6 +429,11 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.8.4 (June 8, 2026)
+- **Solar Charger Hardening:** Fully resolved all R-1 to R-5 and SR-1 to SR-5 implementation review findings to fix no-charge alert false-trips under float charging conditions, prevent stale alert leaks on link drops, enforce strict battery voltage range and charge current plausibility clamps, cache functional codes efficiently, and standardize software-tracked daily limits.
+- **Release Refresh:** Firmware versioning, package metadata, and release assets are synchronized to the current 1.8.4 source tree.
+- **Binary Assets:** Client, server, and viewer `.bin` files are rebuilt and published under the 1.8.4 release naming.
 
 ### v1.8.3 (June 8, 2026)
 - **Genuine Hardware MAC Retrieval:** Fixed a critical bug in standard Mbed OS parameterless `Ethernet.begin()` where raw ethernet interface registration defaulted to temporary/empty MAC values. The Server now retrieves the exact factory block register MAC address (`A8:61:0A` block) via `Ethernet.MACAddress(gMacAddress)` before boots, ensuring local router IP reservations (such as `192.168.7.117`) are correctly matched and active.
