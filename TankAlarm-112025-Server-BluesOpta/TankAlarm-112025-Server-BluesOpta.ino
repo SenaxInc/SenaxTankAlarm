@@ -385,8 +385,8 @@
 #define TEMPERATURE_UNAVAILABLE -999.0f
 
 static byte gMacAddress[6] = { 0 }; // Initialize to 0, will be read from hardware or set if needed
-static IPAddress gStaticIp(192, 168, 7, 200);
-static IPAddress gStaticGateway(192, 168, 7, 1);
+static IPAddress gStaticIp(192, 168, 1, 200);
+static IPAddress gStaticGateway(192, 168, 1, 1);
 static IPAddress gStaticSubnet(255, 255, 255, 0);
 static IPAddress gStaticDns(8, 8, 8, 8);
 static const char DEFAULT_ADMIN_PIN[] = "";  // Empty: force user to set PIN on first use
@@ -396,7 +396,6 @@ struct ServerConfig {
   char serverFleet[32];  // Fleet this server belongs to (clients target this fleet, e.g., "tankalarm-server")
   char clientFleet[32];  // Target fleet for client devices (e.g., "tankalarm-clients")
   char productUid[64];   // Notehub product UID (configurable for different fleets)
-  char githubRouteAlias[32]; // Notehub Route Alias for proxying GitHub API calls
   char smsPrimary[20];
   char smsSecondary[20];
   char dailyEmail[64];
@@ -482,11 +481,9 @@ struct ClientMetadata {
   char firmwareVersion[16];  // Firmware version string from client telemetry/daily
   // Stale alerting state
   bool staleAlertSent;       // Whether a stale alert has been sent for this client
-  bool staleDeletionPending; // Whether deletion of this stale client is pending approval
   // Last system-level alarm (solar/battery/power) — stored here, not on SensorRecord
   char lastSystemAlarmType[16];  // "solar", "battery", "power", or ""
   double lastSystemAlarmEpoch;   // When the last system alarm was received
-  double lastSystemSmsEpoch;     // When the last system-alarm SMS was sent (per-client rate limit)
   // Cellular signal strength (from client daily reports)
   int8_t signalBars;         // 0-4 bars, -1 = unknown
   int16_t signalRssi;        // RSSI in dBm
@@ -980,17 +977,10 @@ static SensorRecord *findSensorByHash(const char *clientUid, uint8_t sensorIndex
   return nullptr;  // Table full (should not happen)
 }
 
-// Per-client cached config snapshot. payload holds the compact JSON config pushed to the
-// client. Sized to fit multi-sensor configs that include learned-calibration coefficients
-// and custom labels — the previous 1536-byte limit could reject ~6-8 sensor configs and
-// block dispatch entirely (cacheClientConfigFromBuffer rejects payloads >= sizeof(payload)).
-// The cache line buffers in save/load are kept in sync via CLIENT_CONFIG_CACHE_LINE_MAX.
-#define CLIENT_CONFIG_SNAPSHOT_PAYLOAD_MAX 4096
-#define CLIENT_CONFIG_CACHE_LINE_MAX (CLIENT_CONFIG_SNAPSHOT_PAYLOAD_MAX + 256)
 struct ClientConfigSnapshot {
   char uid[48];
   char site[32];
-  char payload[CLIENT_CONFIG_SNAPSHOT_PAYLOAD_MAX];
+  char payload[1536];
   bool pendingDispatch;      // true when Notecard send failed and needs retry (persisted)
   char configVersion[16];    // Config version hash for ACK tracking
   double lastAckEpoch;       // When last config ACK was received from client
@@ -1650,8 +1640,8 @@ tbody tr:nth-child(even){background:#fafafa}
 }
 )HTML";
 
-static const char SERVER_SETTINGS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Settings - Tank Alarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Configuration</h2><form id="settingsForm"><h3>Blues Notehub</h3><div class="form-grid"><label class="field"><span>Product UID <span style="color:var(--danger);">*</span></span><input id="productUidInput" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>GitHub Route Alias</span><input id="githubRouteAliasInput" type="text" placeholder="github-api"></label></div><p style="color:var(--muted);font-size:0.85rem;margin:-8px 0 16px;">Required. The Product UID from your Blues Notehub project (e.g. com.company.product:project). The Route Alias is optional, but required on proxy-only cellular networks to enable server firmware update checks.</p><h3>Server SMS Alert Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive SMS alerts for server events (e.g., power restoration after outage).</p><div id="smsRecipientsList" class="recipient-list"><div class="empty-state">No SMS recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><button type="button" class="secondary" id="addSmsRecipientBtn">+ Add SMS Recipient</button></div><div class="toggle-group" style="margin-top:-12px;"><label class="toggle"><span>Server down (power loss &gt; 24h)<span class="tooltip-icon" tabindex="0" data-tooltip="Sends an SMS if the server was offline for at least 24 hours before reboot.">?</span></span><input type="checkbox" id="serverDownSmsToggle" checked></label></div><h3>Daily Email Report Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive the daily tank level summary email.</p><div class="form-grid"><label class="field"><span>Daily Email Time (HH:MM, UTC)</span><input id="dailyEmailTimeInput" type="time" value="05:00"></label></div><div id="dailyRecipientsList" class="recipient-list"><div class="empty-state">No daily report recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><div id="dailyRecipientControls" style="display:flex;gap:8px;align-items:center;"><select id="dailyRecipientDropdown" style="min-width:250px;"><option value="">Choose a contact...</option></select><button type="button" id="addSelectedDailyRecipient" class="secondary">Add</button></div><a class="pill secondary" href="/contacts" id="addNewContactLink" style="display:none;">+ Add New Contact</a><a class="pill secondary" href="/email-format" style="margin-left:8px;">Email Formatting</a></div><h3>Security</h3><div class="actions" style="margin-bottom: 24px;"><button type="button" class="secondary" id="changePinBtn">Change Admin PIN</button><span id="pinBadge" class="pin-chip hidden">PIN SET</span><span id="pinStatus" style="margin-left:12px;font-size:0.9rem;color:var(--muted)"></span></div><h3>FTP Backup & Restore</h3><div class="form-grid"><label class="field"><span>FTP Host</span><input id="ftpHost" type="text" placeholder="192.168.1.50"></label><label class="field"><span>FTP Port</span><input id="ftpPort" type="number" min="1" max="65535" value="21"></label><label class="field"><span>FTP User</span><input id="ftpUser" type="text" placeholder="user"></label><label class="field"><span>FTP Password <small style="color:var(--muted);font-weight:400;">(leave blank to keep)</small></span><input id="ftpPass" type="password" autocomplete="off"></label><label class="field"><span>FTP Path</span><input id="ftpPath" type="text" placeholder="/tankalarm/server"></label><label class="field"><span>TLS Server Name (SNI)</span><input id="ftpsTlsServerName" type="text" placeholder="ftp.example.com"></label><label class="field"><span>SHA-256 Fingerprint</span><input id="ftpsFingerprint" type="text" placeholder="64 hex chars" maxlength="64"></label><label class="field"><span>FTPS Trust Mode</span><select id="ftpsTrustMode"><option value="0">Fingerprint</option><option value="1">Imported Certificate</option></select></label></div><div class="toggle-group"><label class="toggle"><span>Enable FTP</span><input type="checkbox" id="ftpEnabled"></label><label class="toggle"><span>Passive Mode</span><input type="checkbox" id="ftpPassive" checked></label><label class="toggle"><span>Enable FTPS (Explicit TLS)</span><input type="checkbox" id="ftpsEnabled"></label><label class="toggle"><span>Auto-backup on save</span><input type="checkbox" id="ftpBackupOnChange"></label><label class="toggle"><span>Restore on boot</span><input type="checkbox" id="ftpRestoreOnBoot"></label></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px;">Fingerprint trust mode is currently supported. Imported certificate mode is reserved for a follow-up update.</p><div class="actions"><button type="button" id="ftpBackupNow">Backup Now</button><button type="button" class="secondary" id="ftpRestoreNow">Restore Now</button></div><h3>Viewer Device</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Enable periodic viewer summary publishing via Notecard. Only enable this if you have a Viewer Opta device set up and connected.</p><div class="toggle-group"><label class="toggle"><span>Enable Viewer Summary<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the server publishes sensor summary data to a Viewer Opta device every 6 hours via Notecard.">?</span></span><input type="checkbox" id="viewerEnabled"></label></div><h3>Update Policy</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Choose how the server handles firmware updates. Alert modes notify you on the dashboard when an update is available. Automatic modes apply updates without user intervention.</p><div class="form-grid"><label class="field" style="min-width:260px;"><span>Update Policy</span><select id="updatePolicy"><option value="0">Disabled</option><option value="1">Alert for DFU update available</option><option value="2">Alert for GitHub update available</option><option value="3">Update from GitHub automatically</option><option value="4">Update from DFU automatically</option></select></label></div><div class="toggle-group" style="margin-top:12px;"><label class="toggle"><span>Alert when connected clients report outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if any connected client is running a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkClientVersionAlerts" checked></label><label class="toggle"><span>Alert when viewer reports outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if the connected Viewer device reports a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkViewerVersionAlerts" checked></label></div><div class="actions"><button type="submit">Save Settings</button></div></form></div><div class="card"><h2>Tools & System Info</h2><h3>System Status</h3><div class="form-grid"><div class="field"><span>Firmware Version</span><div id="fwVersionDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Build Date</span><div id="fwBuildDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Firmware Last Updated</span><div id="fwLastUpdatedDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Notecard Supply (V+ rail)</span><div id="serverVoltageDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Server Time</span><div id="serverTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div></div><h3>Notecard Status</h3><div id="notecardStatusPanel" style="padding:16px;background:var(--chip);border:1px solid var(--card-border);border-radius:var(--radius);margin-bottom:16px;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><span id="notecardStatusDot" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#888;"></span><strong id="notecardStatusLabel">Checking...</strong></div><div class="form-grid" style="margin:0;"><div class="field"><span>Connection</span><div id="ncConnStatus" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Product UID</span><div id="ncProductUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Server UID</span><div id="ncServerUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Sync Mode</span><div id="ncSyncMode" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div></div><div class="actions" style="margin-top:12px;"><button type="button" class="secondary" id="ncRefreshBtn">Refresh Notecard Status</button></div></div><h3>Firmware Update (DFU)</h3><div id="dfuStatus" style="padding:12px;background:var(--chip);border:1px solid var(--card-border);margin-bottom:12px"><span id="dfuStatusText">Checking for updates...</span></div><div class="actions"><button type="button" id="dfuCheckBtn" class="secondary">Check for Update</button><button type="button" id="dfuEnableBtn" disabled>Install Update</button></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px">Manual install uses the policy source. GitHub Alert/Auto policies try GitHub Direct first and fall back to Notehub DFU. All other policies use Notehub DFU.</p><h3>Quick Access</h3><div class="actions"><button type="button" class="secondary" id="pauseBodyBtn">Pause Server</button><a class="pill" href="/serial-monitor">Open Serial Monitor</a><a class="pill" href="/transmission-log">Transmission Log</a><a class="pill secondary" href="https://github.com/SenaxInc/SenaxTankAlarm/blob/master/Tutorials/Tutorials-112025/SERVER_INSTALLATION_GUIDE.md" target="_blank" title="View Server Installation Guide">Help</a></div></div></main><div id="toast"></div><div id="contactSelectModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2 id="contactSelectTitle">Add Recipient</h2><button class="modal-close" onclick="closeContactSelectModal()">&times;</button></div><form id="contactSelectForm"><div class="form-grid"><div class="form-field"><label>Select Contact</label><select id="contactSelectDropdown" required><option value="">Choose a contact...</option></select></div></div><div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;"><button type="button" class="btn btn-secondary" onclick="closeContactSelectModal()">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div></form></div></div><div id="pinModal" class="modal hidden"><div class="modal-card"><div class="modal-badge" id="pinSessionBadge">Session</div><h2 id="pinModalTitle">Set Admin PIN</h2><p id="pinModalDescription">Enter a 4-digit PIN to unlock configuration changes.</p><form id="pinForm"><label class="field hidden" id="pinCurrentGroup"><span>Current PIN</span><input type="password" id="pinCurrentInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><label class="field" id="pinPrimaryGroup"><span id="pinPrimaryLabel">PIN</span><input type="password" id="pinInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off" required placeholder="4 digits" aria-describedby="pinHint" title="Enter exactly four digits (0-9)"><small class="pin-hint" id="pinHint">Use exactly 4 digits (0-9). The PIN is kept locally in this browser for 90 days.</small></label><label class="field hidden" id="pinConfirmGroup"><span>Confirm PIN</span><input type="password" id="pinConfirmInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><div class="actions"><button type="submit" id="pinSubmit">Save PIN</button><button type="button" class="secondary" id="pinCancel">Cancel</button></div></form></div></div><script>document.addEventListener('DOMContentLoaded', async () => {try{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const state={pin:null,pinConfigured:false,pendingAction:null,contacts:[],smsAlertRecipients:[],dailyReportRecipients:[],contactSelectMode:null};
-const getEl=(id)=>document.getElementById(id);const els={pauseBtn:getEl('pauseBtn'),pauseBodyBtn:getEl('pauseBodyBtn'),toast:getEl('toast'),form:getEl('settingsForm'),productUid:getEl('productUidInput'),githubRouteAlias:getEl('githubRouteAliasInput'),serverDownSmsToggle:getEl('serverDownSmsToggle'),dailyEmailTime:getEl('dailyEmailTimeInput'),ftpEnabled:getEl('ftpEnabled'),ftpPassive:getEl('ftpPassive'),ftpsEnabled:getEl('ftpsEnabled'),ftpsTrustMode:getEl('ftpsTrustMode'),ftpsFingerprint:getEl('ftpsFingerprint'),ftpsTlsServerName:getEl('ftpsTlsServerName'),ftpBackupOnChange:getEl('ftpBackupOnChange'),ftpRestoreOnBoot:getEl('ftpRestoreOnBoot'),ftpHost:getEl('ftpHost'),ftpPort:getEl('ftpPort'),ftpUser:getEl('ftpUser'),ftpPass:getEl('ftpPass'),ftpPath:getEl('ftpPath'),ftpBackupNow:getEl('ftpBackupNow'),ftpRestoreNow:getEl('ftpRestoreNow'),changePinBtn:getEl('changePinBtn'),pinStatus:getEl('pinStatus'),pinBadge:getEl('pinBadge'),smsRecipientsList:getEl('smsRecipientsList'),dailyRecipientsList:getEl('dailyRecipientsList'),addSmsRecipientBtn:getEl('addSmsRecipientBtn'),dailyRecipientDropdown:getEl('dailyRecipientDropdown'),addSelectedDailyRecipient:getEl('addSelectedDailyRecipient'),contactSelectModal:getEl('contactSelectModal'),contactSelectTitle:getEl('contactSelectTitle'),contactSelectDropdown:getEl('contactSelectDropdown'),contactSelectForm:getEl('contactSelectForm'),viewerEnabled:getEl('viewerEnabled'),updatePolicy:getEl('updatePolicy'),checkClientVersionAlerts:getEl('checkClientVersionAlerts'),checkViewerVersionAlerts:getEl('checkViewerVersionAlerts')};if(els.pauseBtn)els.pauseBtn.addEventListener('click',togglePause);if(els.pauseBodyBtn)els.pauseBodyBtn.addEventListener('click',togglePause);const pinEls={modal:getEl('pinModal'),title:getEl('pinModalTitle'),desc:getEl('pinModalDescription'),form:getEl('pinForm'),currentGroup:getEl('pinCurrentGroup'),currentInput:getEl('pinCurrentInput'),primaryGroup:getEl('pinPrimaryGroup'),primaryLabel:getEl('pinPrimaryLabel'),input:getEl('pinInput'),confirmGroup:getEl('pinConfirmGroup'),confirmInput:getEl('pinConfirmInput'),submit:getEl('pinSubmit'),cancel:getEl('pinCancel'),badge:getEl('pinSessionBadge')};)HTML"
+static const char SERVER_SETTINGS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Settings - Tank Alarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Configuration</h2><form id="settingsForm"><h3>Blues Notehub</h3><div class="form-grid"><label class="field"><span>Product UID <span style="color:var(--danger);">*</span></span><input id="productUidInput" type="text" placeholder="com.company.product:project" required></label></div><p style="color:var(--muted);font-size:0.85rem;margin:-8px 0 16px;">Required. The Product UID from your Blues Notehub project (e.g. com.company.product:project). Changing this requires a device restart to fully apply.</p><h3>Server SMS Alert Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive SMS alerts for server events (e.g., power restoration after outage).</p><div id="smsRecipientsList" class="recipient-list"><div class="empty-state">No SMS recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><button type="button" class="secondary" id="addSmsRecipientBtn">+ Add SMS Recipient</button></div><div class="toggle-group" style="margin-top:-12px;"><label class="toggle"><span>Server down (power loss &gt; 24h)<span class="tooltip-icon" tabindex="0" data-tooltip="Sends an SMS if the server was offline for at least 24 hours before reboot.">?</span></span><input type="checkbox" id="serverDownSmsToggle" checked></label></div><h3>Daily Email Report Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive the daily tank level summary email.</p><div class="form-grid"><label class="field"><span>Daily Email Time (HH:MM, UTC)</span><input id="dailyEmailTimeInput" type="time" value="05:00"></label></div><div id="dailyRecipientsList" class="recipient-list"><div class="empty-state">No daily report recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><div id="dailyRecipientControls" style="display:flex;gap:8px;align-items:center;"><select id="dailyRecipientDropdown" style="min-width:250px;"><option value="">Choose a contact...</option></select><button type="button" id="addSelectedDailyRecipient" class="secondary">Add</button></div><a class="pill secondary" href="/contacts" id="addNewContactLink" style="display:none;">+ Add New Contact</a><a class="pill secondary" href="/email-format" style="margin-left:8px;">Email Formatting</a></div><h3>Security</h3><div class="actions" style="margin-bottom: 24px;"><button type="button" class="secondary" id="changePinBtn">Change Admin PIN</button><span id="pinBadge" class="pin-chip hidden">PIN SET</span><span id="pinStatus" style="margin-left:12px;font-size:0.9rem;color:var(--muted)"></span></div><h3>FTP Backup & Restore</h3><div class="form-grid"><label class="field"><span>FTP Host</span><input id="ftpHost" type="text" placeholder="192.168.1.50"></label><label class="field"><span>FTP Port</span><input id="ftpPort" type="number" min="1" max="65535" value="21"></label><label class="field"><span>FTP User</span><input id="ftpUser" type="text" placeholder="user"></label><label class="field"><span>FTP Password <small style="color:var(--muted);font-weight:400;">(leave blank to keep)</small></span><input id="ftpPass" type="password" autocomplete="off"></label><label class="field"><span>FTP Path</span><input id="ftpPath" type="text" placeholder="/tankalarm/server"></label><label class="field"><span>TLS Server Name (SNI)</span><input id="ftpsTlsServerName" type="text" placeholder="ftp.example.com"></label><label class="field"><span>SHA-256 Fingerprint</span><input id="ftpsFingerprint" type="text" placeholder="64 hex chars" maxlength="64"></label><label class="field"><span>FTPS Trust Mode</span><select id="ftpsTrustMode"><option value="0">Fingerprint</option><option value="1">Imported Certificate</option></select></label></div><div class="toggle-group"><label class="toggle"><span>Enable FTP</span><input type="checkbox" id="ftpEnabled"></label><label class="toggle"><span>Passive Mode</span><input type="checkbox" id="ftpPassive" checked></label><label class="toggle"><span>Enable FTPS (Explicit TLS)</span><input type="checkbox" id="ftpsEnabled"></label><label class="toggle"><span>Auto-backup on save</span><input type="checkbox" id="ftpBackupOnChange"></label><label class="toggle"><span>Restore on boot</span><input type="checkbox" id="ftpRestoreOnBoot"></label></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px;">Fingerprint trust mode is currently supported. Imported certificate mode is reserved for a follow-up update.</p><div class="actions"><button type="button" id="ftpBackupNow">Backup Now</button><button type="button" class="secondary" id="ftpRestoreNow">Restore Now</button></div><h3>Viewer Device</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Enable periodic viewer summary publishing via Notecard. Only enable this if you have a Viewer Opta device set up and connected.</p><div class="toggle-group"><label class="toggle"><span>Enable Viewer Summary<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the server publishes sensor summary data to a Viewer Opta device every 6 hours via Notecard.">?</span></span><input type="checkbox" id="viewerEnabled"></label></div><h3>Update Policy</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Choose how the server handles firmware updates. Alert modes notify you on the dashboard when an update is available. Automatic modes apply updates without user intervention.</p><div class="form-grid"><label class="field" style="min-width:260px;"><span>Update Policy</span><select id="updatePolicy"><option value="0">Disabled</option><option value="1">Alert for DFU update available</option><option value="2">Alert for GitHub update available</option><option value="3">Update from GitHub automatically</option><option value="4">Update from DFU automatically</option></select></label></div><div class="toggle-group" style="margin-top:12px;"><label class="toggle"><span>Alert when connected clients report outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if any connected client is running a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkClientVersionAlerts" checked></label><label class="toggle"><span>Alert when viewer reports outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if the connected Viewer device reports a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkViewerVersionAlerts" checked></label></div><div class="actions"><button type="submit">Save Settings</button></div></form></div><div class="card"><h2>Tools & System Info</h2><h3>System Status</h3><div class="form-grid"><div class="field"><span>Firmware Version</span><div id="fwVersionDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Build Date</span><div id="fwBuildDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Firmware Last Updated</span><div id="fwLastUpdatedDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Notecard Supply (V+ rail)</span><div id="serverVoltageDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Server Time</span><div id="serverTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div></div><h3>Notecard Status</h3><div id="notecardStatusPanel" style="padding:16px;background:var(--chip);border:1px solid var(--card-border);border-radius:var(--radius);margin-bottom:16px;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><span id="notecardStatusDot" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#888;"></span><strong id="notecardStatusLabel">Checking...</strong></div><div class="form-grid" style="margin:0;"><div class="field"><span>Connection</span><div id="ncConnStatus" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Product UID</span><div id="ncProductUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Server UID</span><div id="ncServerUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Sync Mode</span><div id="ncSyncMode" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div></div><div class="actions" style="margin-top:12px;"><button type="button" class="secondary" id="ncRefreshBtn">Refresh Notecard Status</button></div></div><h3>Firmware Update (DFU)</h3><div id="dfuStatus" style="padding:12px;background:var(--chip);border:1px solid var(--card-border);margin-bottom:12px"><span id="dfuStatusText">Checking for updates...</span></div><div class="actions"><button type="button" id="dfuCheckBtn" class="secondary">Check for Update</button><button type="button" id="dfuEnableBtn" disabled>Install Update</button></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px">Manual install uses the policy source. GitHub Alert/Auto policies try GitHub Direct first and fall back to Notehub DFU. All other policies use Notehub DFU.</p><h3>Quick Access</h3><div class="actions"><button type="button" class="secondary" id="pauseBodyBtn">Pause Server</button><a class="pill" href="/serial-monitor">Open Serial Monitor</a><a class="pill" href="/transmission-log">Transmission Log</a><a class="pill secondary" href="https://github.com/SenaxInc/SenaxTankAlarm/blob/master/Tutorials/Tutorials-112025/SERVER_INSTALLATION_GUIDE.md" target="_blank" title="View Server Installation Guide">Help</a></div></div></main><div id="toast"></div><div id="contactSelectModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2 id="contactSelectTitle">Add Recipient</h2><button class="modal-close" onclick="closeContactSelectModal()">&times;</button></div><form id="contactSelectForm"><div class="form-grid"><div class="form-field"><label>Select Contact</label><select id="contactSelectDropdown" required><option value="">Choose a contact...</option></select></div></div><div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;"><button type="button" class="btn btn-secondary" onclick="closeContactSelectModal()">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div></form></div></div><div id="pinModal" class="modal hidden"><div class="modal-card"><div class="modal-badge" id="pinSessionBadge">Session</div><h2 id="pinModalTitle">Set Admin PIN</h2><p id="pinModalDescription">Enter a 4-digit PIN to unlock configuration changes.</p><form id="pinForm"><label class="field hidden" id="pinCurrentGroup"><span>Current PIN</span><input type="password" id="pinCurrentInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><label class="field" id="pinPrimaryGroup"><span id="pinPrimaryLabel">PIN</span><input type="password" id="pinInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off" required placeholder="4 digits" aria-describedby="pinHint" title="Enter exactly four digits (0-9)"><small class="pin-hint" id="pinHint">Use exactly 4 digits (0-9). The PIN is kept locally in this browser for 90 days.</small></label><label class="field hidden" id="pinConfirmGroup"><span>Confirm PIN</span><input type="password" id="pinConfirmInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><div class="actions"><button type="submit" id="pinSubmit">Save PIN</button><button type="button" class="secondary" id="pinCancel">Cancel</button></div></form></div></div><script>document.addEventListener('DOMContentLoaded', async () => {try{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const state={pin:null,pinConfigured:false,pendingAction:null,contacts:[],smsAlertRecipients:[],dailyReportRecipients:[],contactSelectMode:null};
+const getEl=(id)=>document.getElementById(id);const els={pauseBtn:getEl('pauseBtn'),pauseBodyBtn:getEl('pauseBodyBtn'),toast:getEl('toast'),form:getEl('settingsForm'),productUid:getEl('productUidInput'),serverDownSmsToggle:getEl('serverDownSmsToggle'),dailyEmailTime:getEl('dailyEmailTimeInput'),ftpEnabled:getEl('ftpEnabled'),ftpPassive:getEl('ftpPassive'),ftpsEnabled:getEl('ftpsEnabled'),ftpsTrustMode:getEl('ftpsTrustMode'),ftpsFingerprint:getEl('ftpsFingerprint'),ftpsTlsServerName:getEl('ftpsTlsServerName'),ftpBackupOnChange:getEl('ftpBackupOnChange'),ftpRestoreOnBoot:getEl('ftpRestoreOnBoot'),ftpHost:getEl('ftpHost'),ftpPort:getEl('ftpPort'),ftpUser:getEl('ftpUser'),ftpPass:getEl('ftpPass'),ftpPath:getEl('ftpPath'),ftpBackupNow:getEl('ftpBackupNow'),ftpRestoreNow:getEl('ftpRestoreNow'),changePinBtn:getEl('changePinBtn'),pinStatus:getEl('pinStatus'),pinBadge:getEl('pinBadge'),smsRecipientsList:getEl('smsRecipientsList'),dailyRecipientsList:getEl('dailyRecipientsList'),addSmsRecipientBtn:getEl('addSmsRecipientBtn'),dailyRecipientDropdown:getEl('dailyRecipientDropdown'),addSelectedDailyRecipient:getEl('addSelectedDailyRecipient'),contactSelectModal:getEl('contactSelectModal'),contactSelectTitle:getEl('contactSelectTitle'),contactSelectDropdown:getEl('contactSelectDropdown'),contactSelectForm:getEl('contactSelectForm'),viewerEnabled:getEl('viewerEnabled'),updatePolicy:getEl('updatePolicy'),checkClientVersionAlerts:getEl('checkClientVersionAlerts'),checkViewerVersionAlerts:getEl('checkViewerVersionAlerts')};if(els.pauseBtn)els.pauseBtn.addEventListener('click',togglePause);if(els.pauseBodyBtn)els.pauseBodyBtn.addEventListener('click',togglePause);const pinEls={modal:getEl('pinModal'),title:getEl('pinModalTitle'),desc:getEl('pinModalDescription'),form:getEl('pinForm'),currentGroup:getEl('pinCurrentGroup'),currentInput:getEl('pinCurrentInput'),primaryGroup:getEl('pinPrimaryGroup'),primaryLabel:getEl('pinPrimaryLabel'),input:getEl('pinInput'),confirmGroup:getEl('pinConfirmGroup'),confirmInput:getEl('pinConfirmInput'),submit:getEl('pinSubmit'),cancel:getEl('pinCancel'),badge:getEl('pinSessionBadge')};)HTML"
 R"HTML(let pinMode='unlock';state.paused=false;funct)HTML" R"HTML(ion showToast(message, isError){if(els.toast)els.toast.textContent=message;if(els.toast)els.toast.style.background=isError?'#dc2626':'#0284c7';if(els.toast)els.toast.classList.add('show');setTimeout(()=>{if(els.toast)els.toast.classList.remove('show')},2500);})HTML"
 R"HTML(funct)HTML" R"HTML(ion escapeHtml(text){const div=document.createElement('div');div.textContent=text;return div.innerHTML;})HTML"
 R"HTML(funct)HTML" R"HTML(ion renderPauseButtons(){if(els.pauseBtn){els.pauseBtn.style.display=state.paused?'':'none';els.pauseBtn.textContent='Unpause';els.pauseBtn.title='Resume data flow';}if(els.pauseBodyBtn){els.pauseBodyBtn.style.display=state.paused?'none':'';els.pauseBodyBtn.textContent='Pause Server';els.pauseBodyBtn.title='Pause data flow';}})HTML"
@@ -1669,8 +1659,8 @@ funct)HTML" R"HTML(ion openContactSelectModal(mode){state.contactSelectMode=mode
 window.closeContactSelectModal=funct)HTML" R"HTML(ion(){els.contactSelectModal.classList.add('hidden');state.contactSelectMode=null;};els.contactSelectForm.addEventListener('submit',(e)=>{e.preventDefault();const contactId=els.contactSelectDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(state.contactSelectMode==='sms'){if(!state.smsAlertRecipients.includes(contactId)){state.smsAlertRecipients.push(contactId);renderSmsRecipients();saveContactsData();}}closeContactSelectModal();});els.addSmsRecipientBtn.addEventListener('click',()=>openContactSelectModal('sms'));if(els.addSelectedDailyRecipient){els.addSelectedDailyRecipient.addEventListener('click',()=>{const contactId=els.dailyRecipientDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(!state.dailyReportRecipients.includes(contactId)){state.dailyReportRecipients.push(contactId);renderDailyRecipients();openContactSelectModal('daily');saveContactsData();}});}loadSettings().then(()=>openContactSelectModal('daily'));)HTML"
 R"HTML(async funct)HTML" R"HTML(ion loadContactsData(){try{const res=await fetch('/api/contacts');if(!res.ok)throw new Error('Failed to load contacts');const data=await res.json();state.contacts=data.contacts||[];state.smsAlertRecipients=data.smsAlertRecipients||[];state.dailyReportRecipients=data.dailyReportRecipients||[];renderSmsRecipients();renderDailyRecipients();}catch(err){console.error('Failed to load contacts:',err);}}
 async funct)HTML" R"HTML(ion saveContactsData(){try{const res=await fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:state.contacts,smsAlertRecipients:state.smsAlertRecipients,dailyReportRecipients:state.dailyReportRecipients})});if(!res.ok)throw new Error('Failed to save contacts');showToast('Recipients updated');}catch(err){showToast('Failed to save: '+err.message,true);}}
-async funct)HTML" R"HTML(ion loadSettings(){if(els.pinStatus){els.pinStatus.textContent='Loading...';els.pinStatus.style.color='var(--muted)';}try{const res=await fetch('/api/clients?summary=1');if(!res.ok)throw new Error('Server returned '+res.status);const data=await res.json();const s=(data&&data.srv)||{};const hour=typeof s.dh==='number'?s.dh:5;const minute=typeof s.dm==='number'?s.dm:0;const timeStr=String(hour).padStart(2,'0')+':'+String(minute).padStart(2,'0');state.pinConfigured=!!s.pc;state.paused=!!s.ps;updatePinButton();renderPauseButtons();if(els.productUid)els.productUid.value=s.pu||'';if(els.githubRouteAlias)els.githubRouteAlias.value=s.gra||'';if(els.serverDownSmsToggle)els.serverDownSmsToggle.checked=s.sds!==false;if(els.dailyEmailTime)els.dailyEmailTime.value=timeStr;const ftp=s.ftp||{};if(els.ftpEnabled)els.ftpEnabled.checked=!!ftp.enabled;if(els.ftpPassive)els.ftpPassive.checked=ftp.passive!==false;if(els.ftpsEnabled)els.ftpsEnabled.checked=!!ftp.ftpsEnabled;if(els.ftpsTrustMode)els.ftpsTrustMode.value=String(typeof ftp.ftpsTrustMode==='number'?ftp.ftpsTrustMode:0);if(els.ftpsFingerprint)els.ftpsFingerprint.value=ftp.ftpsFingerprint||'';if(els.ftpsTlsServerName)els.ftpsTlsServerName.value=ftp.ftpsTlsServerName||'';if(els.ftpBackupOnChange)els.ftpBackupOnChange.checked=!!ftp.backupOnChange;if(els.ftpRestoreOnBoot)els.ftpRestoreOnBoot.checked=!!ftp.restoreOnBoot;if(els.ftpHost)els.ftpHost.value=ftp.host||'';if(els.ftpPort)els.ftpPort.value=ftp.port||21;if(els.ftpUser)els.ftpUser.value=ftp.user||'';if(els.ftpPath)els.ftpPath.value=ftp.path||'/tankalarm/server';if(els.ftpPass)els.ftpPass.value='';if(els.viewerEnabled)els.viewerEnabled.checked=!!s.ve;if(els.updatePolicy)els.updatePolicy.value=String(typeof s.up==='number'?s.up:0);if(els.checkClientVersionAlerts)els.checkClientVersionAlerts.checked=s.ccva!==false;if(els.checkViewerVersionAlerts)els.checkViewerVersionAlerts.checked=s.cvva!==false;await loadContactsData();}catch(err){showToast(err.message||'Failed to load settings',true);if(els.pinStatus){els.pinStatus.textContent='Failed to load';els.pinStatus.style.color='#ef4444';}}})HTML"
-R"HTML(async funct)HTML" R"HTML(ion saveSettingsImpl(){if(!els.productUid.value.trim()){showToast('Product UID is required',true);els.productUid.focus();return;}const ftpSettings={enabled:!!els.ftpEnabled.checked,passive:!!els.ftpPassive.checked,ftpsEnabled:!!(els.ftpsEnabled&&els.ftpsEnabled.checked),ftpsTrustMode:parseInt((els.ftpsTrustMode&&els.ftpsTrustMode.value)||'0',10)||0,ftpsFingerprint:(els.ftpsFingerprint&&els.ftpsFingerprint.value?els.ftpsFingerprint.value.trim().toUpperCase():''),ftpsTlsServerName:els.ftpsTlsServerName&&els.ftpsTlsServerName.value?els.ftpsTlsServerName.value.trim():'',backupOnChange:!!els.ftpBackupOnChange.checked,restoreOnBoot:!!els.ftpRestoreOnBoot.checked,host:els.ftpHost.value.trim(),port:parseInt(els.ftpPort.value,10)||21,user:els.ftpUser.value.trim(),path:els.ftpPath.value.trim()||'/tankalarm/server'};const ftpPass=els.ftpPass.value.trim();if(ftpPass){ftpSettings.pass=ftpPass;}const timeValue=(els.dailyEmailTime&&els.dailyEmailTime.value)||'05:00';const timeParts=timeValue.split(':');const parsedHour=(timeParts.length===2&&!isNaN(parseInt(timeParts[0],10)))?Math.min(23,Math.max(0,parseInt(timeParts[0],10))):5;const parsedMinute=(timeParts.length===2&&!isNaN(parseInt(timeParts[1],10)))?Math.min(59,Math.max(0,parseInt(timeParts[1],10))):0;const payload={server:{productUid:els.productUid.value.trim(),githubRouteAlias:(els.githubRouteAlias&&els.githubRouteAlias.value?els.githubRouteAlias.value.trim():''),serverDownSmsEnabled:!!(els.serverDownSmsToggle&&els.serverDownSmsToggle.checked),viewerEnabled:!!(els.viewerEnabled&&els.viewerEnabled.checked),updatePolicy:parseInt((els.updatePolicy&&els.updatePolicy.value)||'0',10),checkClientVersionAlerts:!!(els.checkClientVersionAlerts&&els.checkClientVersionAlerts.checked),checkViewerVersionAlerts:!!(els.checkViewerVersionAlerts&&els.checkViewerVersionAlerts.checked),dailyHour:parsedHour,dailyMinute:parsedMinute,ftp:ftpSettings}};try{const res=await fetch('/api/server-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok){const text=await res.text();throw new Error(text||'Server rejected settings');}showToast('Settings saved successfully');await loadSettings();}catch(err){showToast(err.message||'Failed to save settings',true);}}if(els.form)els.form.addEventListener('submit',(e)=>{e.preventDefault();saveSettingsImpl();});async funct)HTML" R"HTML(ion performFtpAction(kind){const payload={};)HTML"
+async funct)HTML" R"HTML(ion loadSettings(){if(els.pinStatus){els.pinStatus.textContent='Loading...';els.pinStatus.style.color='var(--muted)';}try{const res=await fetch('/api/clients?summary=1');if(!res.ok)throw new Error('Server returned '+res.status);const data=await res.json();const s=(data&&data.srv)||{};const hour=typeof s.dh==='number'?s.dh:5;const minute=typeof s.dm==='number'?s.dm:0;const timeStr=String(hour).padStart(2,'0')+':'+String(minute).padStart(2,'0');state.pinConfigured=!!s.pc;state.paused=!!s.ps;updatePinButton();renderPauseButtons();if(els.productUid)els.productUid.value=s.pu||'';if(els.serverDownSmsToggle)els.serverDownSmsToggle.checked=s.sds!==false;if(els.dailyEmailTime)els.dailyEmailTime.value=timeStr;const ftp=s.ftp||{};if(els.ftpEnabled)els.ftpEnabled.checked=!!ftp.enabled;if(els.ftpPassive)els.ftpPassive.checked=ftp.passive!==false;if(els.ftpsEnabled)els.ftpsEnabled.checked=!!ftp.ftpsEnabled;if(els.ftpsTrustMode)els.ftpsTrustMode.value=String(typeof ftp.ftpsTrustMode==='number'?ftp.ftpsTrustMode:0);if(els.ftpsFingerprint)els.ftpsFingerprint.value=ftp.ftpsFingerprint||'';if(els.ftpsTlsServerName)els.ftpsTlsServerName.value=ftp.ftpsTlsServerName||'';if(els.ftpBackupOnChange)els.ftpBackupOnChange.checked=!!ftp.backupOnChange;if(els.ftpRestoreOnBoot)els.ftpRestoreOnBoot.checked=!!ftp.restoreOnBoot;if(els.ftpHost)els.ftpHost.value=ftp.host||'';if(els.ftpPort)els.ftpPort.value=ftp.port||21;if(els.ftpUser)els.ftpUser.value=ftp.user||'';if(els.ftpPath)els.ftpPath.value=ftp.path||'/tankalarm/server';if(els.ftpPass)els.ftpPass.value='';if(els.viewerEnabled)els.viewerEnabled.checked=!!s.ve;if(els.updatePolicy)els.updatePolicy.value=String(typeof s.up==='number'?s.up:0);if(els.checkClientVersionAlerts)els.checkClientVersionAlerts.checked=s.ccva!==false;if(els.checkViewerVersionAlerts)els.checkViewerVersionAlerts.checked=s.cvva!==false;await loadContactsData();}catch(err){showToast(err.message||'Failed to load settings',true);if(els.pinStatus){els.pinStatus.textContent='Failed to load';els.pinStatus.style.color='#ef4444';}}})HTML"
+R"HTML(async funct)HTML" R"HTML(ion saveSettingsImpl(){if(!els.productUid.value.trim()){showToast('Product UID is required',true);els.productUid.focus();return;}const ftpSettings={enabled:!!els.ftpEnabled.checked,passive:!!els.ftpPassive.checked,ftpsEnabled:!!(els.ftpsEnabled&&els.ftpsEnabled.checked),ftpsTrustMode:parseInt((els.ftpsTrustMode&&els.ftpsTrustMode.value)||'0',10)||0,ftpsFingerprint:(els.ftpsFingerprint&&els.ftpsFingerprint.value?els.ftpsFingerprint.value.trim().toUpperCase():''),ftpsTlsServerName:els.ftpsTlsServerName&&els.ftpsTlsServerName.value?els.ftpsTlsServerName.value.trim():'',backupOnChange:!!els.ftpBackupOnChange.checked,restoreOnBoot:!!els.ftpRestoreOnBoot.checked,host:els.ftpHost.value.trim(),port:parseInt(els.ftpPort.value,10)||21,user:els.ftpUser.value.trim(),path:els.ftpPath.value.trim()||'/tankalarm/server'};const ftpPass=els.ftpPass.value.trim();if(ftpPass){ftpSettings.pass=ftpPass;}const timeValue=(els.dailyEmailTime&&els.dailyEmailTime.value)||'05:00';const timeParts=timeValue.split(':');const parsedHour=(timeParts.length===2&&!isNaN(parseInt(timeParts[0],10)))?Math.min(23,Math.max(0,parseInt(timeParts[0],10))):5;const parsedMinute=(timeParts.length===2&&!isNaN(parseInt(timeParts[1],10)))?Math.min(59,Math.max(0,parseInt(timeParts[1],10))):0;const payload={server:{productUid:els.productUid.value.trim(),serverDownSmsEnabled:!!(els.serverDownSmsToggle&&els.serverDownSmsToggle.checked),viewerEnabled:!!(els.viewerEnabled&&els.viewerEnabled.checked),updatePolicy:parseInt((els.updatePolicy&&els.updatePolicy.value)||'0',10),checkClientVersionAlerts:!!(els.checkClientVersionAlerts&&els.checkClientVersionAlerts.checked),checkViewerVersionAlerts:!!(els.checkViewerVersionAlerts&&els.checkViewerVersionAlerts.checked),dailyHour:parsedHour,dailyMinute:parsedMinute,ftp:ftpSettings}};try{const res=await fetch('/api/server-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok){const text=await res.text();throw new Error(text||'Server rejected settings');}showToast('Settings saved successfully');await loadSettings();}catch(err){showToast(err.message||'Failed to save settings',true);}}if(els.form)els.form.addEventListener('submit',(e)=>{e.preventDefault();saveSettingsImpl();});async funct)HTML" R"HTML(ion performFtpAction(kind){const payload={};)HTML"
 R"HTML(const endpoint=kind==='restore'?'/api/ftp-restore':'/api/ftp-backup';try{const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok){const text=await res.text();throw new Error(text||`${kind} failed`);}const data=await res.json();if(data&&data.message){showToast(data.message,false);}else{showToast(kind==='restore'?'FTP restore completed':'FTP backup completed');}}catch(err){showToast(err.message||`FTP ${kind} failed`,true);}}if(els.ftpBackupNow)els.ftpBackupNow.addEventListener('click',()=>performFtpAction('backup'));if(els.ftpRestoreNow)els.ftpRestoreNow.addEventListener('click',()=>performFtpAction('restore'));const ncEls={dot:getEl('notecardStatusDot'),label:getEl('notecardStatusLabel'),conn:getEl('ncConnStatus'),product:getEl('ncProductUid'),uid:getEl('ncServerUid'),mode:getEl('ncSyncMode'),refreshBtn:getEl('ncRefreshBtn')};async function loadNotecardStatus(){if(ncEls.label)ncEls.label.textContent='Checking...';if(ncEls.dot)ncEls.dot.style.background='#888';try{const res=await fetch('/api/notecard/status');if(!res.ok)throw new Error('Failed');const d=await res.json();const ok=d.connected;if(ncEls.dot)ncEls.dot.style.background=ok?'#10b981':'#ef4444';if(ncEls.label)ncEls.label.textContent=ok?'Connected':'Disconnected';if(ncEls.conn)ncEls.conn.textContent=ok?'I2C OK — Notecard responding':'I2C FAILED — no response from Notecard';if(ncEls.conn)ncEls.conn.style.color=ok?'#10b981':'#ef4444';if(ncEls.product)ncEls.product.textContent=d.productUid||'Not configured';if(ncEls.uid)ncEls.uid.textContent=d.serverUid||'Unknown';if(ncEls.mode)ncEls.mode.textContent=d.syncMode||'Unknown';if(!ok&&ncEls.product){ncEls.product.style.color='var(--muted)';}}catch(err){if(ncEls.dot)ncEls.dot.style.background='#f59e0b';if(ncEls.label)ncEls.label.textContent='Error: '+err.message;if(ncEls.conn)ncEls.conn.textContent='Could not reach server';}}if(ncEls.refreshBtn)ncEls.refreshBtn.addEventListener('click',loadNotecardStatus);const dfuEls={checkBtn:getEl('dfuCheckBtn'),enableBtn:getEl('dfuEnableBtn'),statusText:getEl('dfuStatusText'),fwVersion:getEl('fwVersionDisplay'),fwBuild:getEl('fwBuildDisplay'),voltage:getEl('serverVoltageDisplay'),serverTime:getEl('serverTimeDisplay'),fwLastUpdated:getEl('fwLastUpdatedDisplay')};function updateDfuUI(data){if(dfuEls.fwVersion)dfuEls.fwVersion.textContent='v'+data.currentVersion;if(dfuEls.fwBuild)dfuEls.fwBuild.textContent=data.buildDate||'Unknown';if(dfuEls.fwLastUpdated){if(data.buildDate){var updatedStr=data.buildDate;if(data.buildTime)updatedStr+=' '+data.buildTime;dfuEls.fwLastUpdated.textContent=updatedStr;}else{dfuEls.fwLastUpdated.textContent='Unknown';}}if(dfuEls.voltage){var vParts=[];if(data.inputVoltage>0.5){vParts.push('Vin: '+data.inputVoltage.toFixed(2)+'V');}if(data.notecardVoltage>0){vParts.push('NC: '+data.notecardVoltage.toFixed(2)+'V');}dfuEls.voltage.textContent=vParts.length>0?vParts.join(' | '):'Not available';}if(dfuEls.serverTime){if(data.serverTime>0){const d=new Date(data.serverTime*1000);dfuEls.serverTime.textContent=d.toLocaleString();}else{dfuEls.serverTime.textContent='Not synced';}}var mode=data.dfuMode||'idle';if(data.dfuInProgress){if(dfuEls.statusText)dfuEls.statusText.textContent='Firmware update in progress... ('+mode+')';if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=true;if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=true;}else if(mode==='downloading'){if(dfuEls.statusText)dfuEls.statusText.textContent='Downloading firmware from Notehub...';if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=true;if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=false;}else if(mode==='ready'||data.updateAvailable){var verText=data.availableVersion||'';if(dfuEls.statusText)dfuEls.statusText.textContent=mode==='ready'?'Update ready to install: v'+verText:'Update available: v'+verText;if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=false;if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=false;}else if(mode==='error'){var errDetail=data.dfuError?' ('+data.dfuError+')':'';if(dfuEls.statusText)dfuEls.statusText.textContent='DFU error'+errDetail+' - try checking again';if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=true;if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=false;}else{if(dfuEls.statusText)dfuEls.statusText.textContent='Firmware is up to date (v'+data.currentVersion+')';if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=true;if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=false;}}async function loadDfuStatus(){try{const res=await fetch('/api/dfu/status');if(!res.ok)throw new Error('Failed to fetch DFU status');const data=await res.json();updateDfuUI(data);}catch(err){if(dfuEls.statusText)dfuEls.statusText.textContent='Error: '+err.message;if(dfuEls.fwVersion)dfuEls.fwVersion.textContent='Unknown';if(dfuEls.fwBuild)dfuEls.fwBuild.textContent='Unknown';if(dfuEls.fwLastUpdated)dfuEls.fwLastUpdated.textContent='Unknown';if(dfuEls.voltage)dfuEls.voltage.textContent='Not available';if(dfuEls.serverTime)dfuEls.serverTime.textContent='Not synced';if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=true;if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=false;}}if(dfuEls.checkBtn)dfuEls.checkBtn.addEventListener('click',async()=>{dfuEls.checkBtn.disabled=true;if(dfuEls.statusText)dfuEls.statusText.textContent='Querying Notecard for updates...';try{const res=await fetch('/api/dfu/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});if(!res.ok)throw new Error('Check failed');const data=await res.json();updateDfuUI(data);showToast(data.updateAvailable?'Update found: v'+data.availableVersion:'No updates available');}catch(err){if(dfuEls.statusText)dfuEls.statusText.textContent='Error checking: '+err.message;showToast('Failed to check for updates',true);}finally{if(dfuEls.checkBtn)dfuEls.checkBtn.disabled=false;}});if(dfuEls.enableBtn)dfuEls.enableBtn.addEventListener('click',async()=>{if(!confirm('Install firmware update using selected source? (May fall back to Notehub if configured)'))return;try{dfuEls.enableBtn.disabled=true;if(dfuEls.statusText)dfuEls.statusText.textContent='Starting firmware install...';const res=await fetch('/api/dfu/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});if(!res.ok){const text=await res.text();throw new Error(text||'Failed to enable DFU');}const data=await res.json();showToast(data.message||'Firmware install started');if(dfuEls.statusText)dfuEls.statusText.textContent=data.message||'Firmware install started';setTimeout(loadDfuStatus,5000);}catch(err){showToast(err.message,true);if(dfuEls.enableBtn)dfuEls.enableBtn.disabled=false;if(dfuEls.statusText)dfuEls.statusText.textContent='Error: '+err.message;}});await loadDfuStatus();await loadNotecardStatus();await loadSettings();}catch(e){console.error(e);const t=document.getElementById('toast');if(t){t.innerText='Script Error! '+e.message;t.style.background='red';t.classList.add('show');}}});</script></body></html>)HTML";
 
 static const char EMAIL_FORMAT_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Email Formatting - Tank Alarm</title><link rel="stylesheet" href="/style.css"><style>.format-section{border:1px solid var(--border);padding:var(--space-3);margin-bottom:var(--space-3);background:#fafafa}.format-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--space-2)}.format-title{font-weight:600;font-size:1rem}.preview-box{border:1px solid var(--border);background:#fff;padding:var(--space-3);font-family:ui-monospace,Consolas,monospace;font-size:0.85rem;white-space:pre-wrap;max-height:400px;overflow:auto}.field-list{display:flex;flex-direction:column;gap:var(--space-2)}.field-item{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2);border:1px solid var(--border);background:#fff}.field-item label{flex:1;display:flex;align-items:center;gap:8px}.field-item input[type="checkbox"]{width:auto}.drag-handle{cursor:grab;color:var(--muted);padding:0 8px}.drag-handle:active{cursor:grabbing}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Daily Email Format</h2><p style="color:var(--muted);margin-bottom:16px;">Customize the content and layout of daily sensor summary emails. Changes are saved automatically.</p><form id="formatForm"><div class="format-section"><div class="format-header"><span class="format-title">Email Header</span></div><div class="form-grid"><label class="field"><span>Email Subject</span><input type="text" id="emailSubject" value="Daily Tank Summary - {date}" placeholder="Daily Tank Summary - {date}"></label><label class="field"><span>Company/Organization Name</span><input type="text" id="companyName" value="" placeholder="Your Company Name (optional)"></label></div><div class="toggle-group" style="margin-top:12px"><label class="toggle"><span>Include Date in Header</span><input type="checkbox" id="includeDate" checked></label><label class="toggle"><span>Include Time Generated</span><input type="checkbox" id="includeTime"></label><label class="toggle"><span>Include Server Name</span><input type="checkbox" id="includeServerName" checked></label></div></div><div class="format-section"><div class="format-header"><span class="format-title">Site Information</span></div><div class="toggle-group"><label class="toggle"><span>Group Sensors by Site</span><input type="checkbox" id="groupBySite" checked></label><label class="toggle"><span>Show Site Summary (total change)</span><input type="checkbox" id="showSiteSummary" checked></label><label class="toggle"><span>Show Site Total Capacity</span><input type="checkbox" id="showSiteCapacity"></label></div></div><div class="format-section"><div class="format-header"><span class="format-title">Tank Details</span></div><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">Select which fields to include for each sensor:</p><div class="toggle-group"><label class="toggle"><span>Tank Number</span><input type="checkbox" id="fieldSensorIndex" checked></label><label class="toggle"><span>Tank Name</span><input type="checkbox" id="fieldSensorName" checked></label><label class="toggle"><span>Contents (Diesel, Water, etc.)</span><input type="checkbox" id="fieldContents" checked></label><label class="toggle"><span>Current Level (inches)</span><input type="checkbox" id="fieldLevelInches" checked></label><label class="toggle"><span>Current Level (percentage)</span><input type="checkbox" id="fieldLevelPercent"></label><label class="toggle"><span>Level Change (24h)</span><input type="checkbox" id="fieldLevelChange" checked></label><label class="toggle"><span>Delivery Indicator</span><input type="checkbox" id="fieldDeliveryIndicator" checked></label><label class="toggle"><span>Last Reading Time</span><input type="checkbox" id="fieldLastReading"></label><label class="toggle"><span>Sensor Raw Value (mA)</span><input type="checkbox" id="fieldSensorMa"></label><label class="toggle"><span>High/Low Alarm Status</span><input type="checkbox" id="fieldAlarmStatus" checked></label><label class="toggle"><span>Tank Capacity (max height)</span><input type="checkbox" id="fieldCapacity"></label></div></div><div class="format-section"><div class="format-header"><span class="format-title">Summary Section</span></div><div class="toggle-group"><label class="toggle"><span>Include Fleet Summary</span><input type="checkbox" id="includeFleetSummary" checked></label><label class="toggle"><span>Total Sensors Monitored</span><input type="checkbox" id="summaryTotalSensors" checked></label><label class="toggle"><span>Sensors with Active Alarms</span><input type="checkbox" id="summaryActiveAlarms" checked></label><label class="toggle"><span>Total Deliveries (24h)</span><input type="checkbox" id="summaryDeliveries" checked></label><label class="toggle"><span>Stale Readings Warning</span><input type="checkbox" id="summaryStaleWarning" checked></label></div></div><div class="format-section"><div class="format-header"><span class="format-title">Formatting Options</span></div><div class="form-grid"><label class="field"><span>Number Format</span><select id="numberFormat"><option value="decimal">Decimal (12.5)</option><option value="fraction">Fraction (12 1/2)</option></select></label><label class="field"><span>Date Format</span><select id="dateFormat"><option value="us">US (MM/DD/YYYY)</option><option value="iso">ISO (YYYY-MM-DD)</option><option value="eu">EU (DD/MM/YYYY)</option></select></label><label class="field"><span>Change Indicator Style</span><select id="changeStyle"><option value="arrow">Arrows (&#x2191; &#x2193;)</option><option value="plusminus">Plus/Minus (+5.2 / -3.1)</option><option value="text">Text (increased/decreased)</option></select></label></div><div class="toggle-group" style="margin-top:12px"><label class="toggle"><span>Use Color Coding (HTML emails)</span><input type="checkbox" id="useColors" checked></label><label class="toggle"><span>Include Horizontal Dividers</span><input type="checkbox" id="useDividers" checked></label></div></div><div class="actions"><button type="submit">Save Format</button><button type="button" class="secondary" id="previewBtn">Preview Email</button><button type="button" class="secondary" id="resetBtn">Reset to Defaults</button><a class="pill secondary" href="/server-settings">Back to Settings</a></div></form></div><div class="card" id="previewCard" style="display:none"><h2>Email Preview</h2><div id="previewContent" class="preview-box"></div></div></main><div id="toast"></div><script>document.addEventListener('DOMContentLoaded',()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const toast=document.getElementById('toast');const previewCard=document.getElementById('previewCard');const previewContent=document.getElementById('previewContent');function showToast(msg,isError){toast.textContent=msg;toast.style.background=isError?'#dc2626':'#0284c7';toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2500);}const fields=['emailSubject','companyName','includeDate','includeTime','includeServerName','groupBySite','showSiteSummary','showSiteCapacity','fieldSensorIndex','fieldSensorName','fieldContents','fieldLevelInches','fieldLevelPercent','fieldLevelChange','fieldDeliveryIndicator','fieldLastReading','fieldSensorMa','fieldAlarmStatus','fieldCapacity','includeFleetSummary','summaryTotalSensors','summaryActiveAlarms','summaryDeliveries','summaryStaleWarning','numberFormat','dateFormat','changeStyle','useColors','useDividers'];function getFormData(){const data={};fields.forEach(f=>{const el=document.getElementById(f);if(el.type==='checkbox')data[f]=el.checked;else data[f]=el.value;});return data;}function setFormData(data){fields.forEach(f=>{const el=document.getElementById(f);if(!el)return;if(el.type==='checkbox')el.checked=!!data[f];else if(data[f]!==undefined)el.value=data[f];});}async function loadFormat(){try{const res=await fetch('/api/email-format');if(!res.ok)throw new Error('Failed to load');const data=await res.json();setFormData(data);}catch(err){console.log('Using defaults');}}async function saveFormat(e){if(e)e.preventDefault();const data=getFormData();try{const res=await fetch('/api/email-format',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!res.ok)throw new Error('Failed to save');showToast('Format saved successfully');}catch(err){showToast(err.message,true);}}function generatePreview(){const d=getFormData();const dateStr=d.dateFormat==='iso'?new Date().toISOString().split('T')[0]:d.dateFormat==='eu'?new Date().toLocaleDateString('en-GB'):new Date().toLocaleDateString('en-US');let subject=d.emailSubject.replace('{date}',dateStr);let preview='Subject: '+subject+'\n\n';if(d.companyName)preview+=d.companyName+'\n';if(d.includeServerName)preview+='Server: TankAlarm-Server-01\n';if(d.includeDate)preview+='Date: '+dateStr+'\n';if(d.includeTime)preview+='Generated: '+new Date().toLocaleTimeString()+'\n';preview+='\n'+'-'.repeat(50)+'\n\n';const sites=[{name:'Site Alpha',sensors:[{num:1,name:'Main Tank',contents:'Diesel',level:85.5,change:12.3,alarm:false,capacity:120},{num:2,name:'Reserve',contents:'Diesel',level:45.2,change:-8.1,alarm:true,alarmType:'low',capacity:100}]},{name:'Site Beta',sensors:[{num:1,name:'Water Tank',contents:'Water',level:92.0,change:0,alarm:false,capacity:150}]}];if(d.groupBySite){sites.forEach(site=>{preview+='=== '+site.name+' ===\n';if(d.showSiteSummary){const totalChange=site.sensors.reduce((s,t)=>s+t.change,0);const arrow=d.changeStyle==='arrow'?(totalChange>0?'\u2191':'\u2193'):d.changeStyle==='plusminus'?(totalChange>0?'+':''):' ';preview+='Site Total Change: '+arrow+(d.numberFormat==='fraction'?Math.round(Math.abs(totalChange)):Math.abs(totalChange).toFixed(1))+' in\n';}if(d.showSiteCapacity){const totalCap=site.sensors.reduce((s,t)=>s+t.capacity,0);preview+='Total Capacity: '+totalCap+' in\n';}preview+='\n';site.sensors.forEach(t=>{let line='';if(d.fieldSensorIndex)line+='Tank #'+t.num+' ';if(d.fieldSensorName)line+=t.name+' ';if(d.fieldContents)line+='['+t.contents+'] ';preview+=line.trim()+'\n';let details='  ';if(d.fieldLevelInches)details+='Level: '+(d.numberFormat==='fraction'?Math.round(t.level):t.level.toFixed(1))+' in  ';if(d.fieldLevelPercent)details+=Math.round(t.level/t.capacity*100)+'%  ';if(d.fieldLevelChange&&t.change!==0){const arrow=d.changeStyle==='arrow'?(t.change>0?'\u2191':'\u2193'):d.changeStyle==='plusminus'?(t.change>0?'+':''): '';details+=arrow+Math.abs(t.change).toFixed(1)+' in  ';}if(d.fieldDeliveryIndicator&&t.change>5)details+='&#x1F4E6; DELIVERY  ';if(d.fieldAlarmStatus&&t.alarm)details+='&#x26A0;&#xFE0F; '+t.alarmType.toUpperCase()+' ALARM  ';if(d.fieldCapacity)details+='(Cap: '+t.capacity+' in)  ';preview+=details.trim()+'\n';if(d.fieldLastReading)preview+='  Last: '+new Date().toLocaleString()+'\n';if(d.fieldSensorMa)preview+='  Sensor: 12.45 mA\n';preview+='\n';});if(d.useDividers)preview+='-'.repeat(50)+'\n\n';});}if(d.includeFleetSummary){preview+='=== FLEET SUMMARY ===\n';if(d.summaryTotalSensors)preview+='Total Sensors: 3\n';if(d.summaryActiveAlarms)preview+='Active Alarms: 1\n';if(d.summaryDeliveries)preview+='Deliveries (24h): 1\n';if(d.summaryStaleWarning)preview+='Stale Readings: 0\n';}previewContent.textContent=preview;previewCard.style.display='block';previewCard.scrollIntoView({behavior:'smooth'});}document.getElementById('formatForm').addEventListener('submit',saveFormat);document.getElementById('previewBtn').addEventListener('click',generatePreview);document.getElementById('resetBtn').addEventListener('click',()=>{const defaults={emailSubject:'Daily Tank Summary - {date}',companyName:'',includeDate:true,includeTime:false,includeServerName:true,groupBySite:true,showSiteSummary:true,showSiteCapacity:false,fieldSensorIndex:true,fieldSensorName:true,fieldContents:true,fieldLevelInches:true,fieldLevelPercent:false,fieldLevelChange:true,fieldDeliveryIndicator:true,fieldLastReading:false,fieldSensorMa:false,fieldAlarmStatus:true,fieldCapacity:false,includeFleetSummary:true,summaryTotalSensors:true,summaryActiveAlarms:true,summaryDeliveries:true,summaryStaleWarning:true,numberFormat:'decimal',dateFormat:'us',changeStyle:'arrow',useColors:true,useDividers:true};setFormData(defaults);showToast('Reset to defaults');});loadFormat();});</script></body></html>)HTML";
@@ -1823,266 +1813,23 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 )HTML";
 
-static const char CONFIG_GENERATOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Client Configuration</title>
-<link rel="stylesheet" href="/style.css">
-</head>
-<body data-theme="light">
-<header>
-<div class="bar">
-<div class="brand">TankAlarm</div>
-<div class="header-actions">
-<button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button>
-<a class="pill secondary" href="/">Dashboard</a>
-<a class="pill secondary" href="/client-console">Client Console</a>
-<a class="pill" href="/config-generator">Client Config</a>
-<a class="pill secondary" href="/contacts">Contacts</a>
-<a class="pill secondary" href="/server-settings">Server Settings</a>
-<button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button>
-</div>
-</div>
-</header>
-<main>
-<div class="card">
-<h2>Client Configuration</h2>
+static const char CONFIG_GENERATOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Client Configuration</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill" href="/config-generator">Client Config</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Client Configuration</h2>
 <div class="actions" style="margin-bottom:20px;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-  <div style="display:flex;gap:8px;">
-<button type="button" id="loadFromCloudBtn" class="secondary">Load from Cloud</button>
-  <button type="button" id="importBtn" class="secondary">Import JSON</button>
+  <div style="display:flex;gap:8px;"><button type="button" id="loadFromCloudBtn" class="secondary">Load from Cloud</button>
+  <button type="button" id="importBtn" class="secondary">Import JSON</button></div>
+  <div style="display:flex;gap:8px;"><button type="submit" form="generatorForm">Save to Device</button>
+  <button type="button" id="downloadBtn" class="secondary">Download JSON</button></div>
 </div>
-  <div style="display:flex;gap:8px;">
-<button type="submit" form="generatorForm">Save to Device</button>
-  <button type="button" id="downloadBtn" class="secondary">Download JSON</button>
-</div>
-</div>
-<div id="configStatus" style="display:none;padding:12px;margin-bottom:16px;border-radius:var(--radius);background:#e6f2ff;border:1px solid #b3d9ff;color:#0066cc;">
-</div>
-<form id="generatorForm">
-<div class="form-grid">
-<label class="field">
-<span>Product UID <span class="tooltip-icon" tabindex="0" data-tooltip="Blues Notehub Product UID. Must match the server's Product UID for client-server communication.">?</span>
-</span>
-<input id="productUid" type="text" placeholder="com.company.product:project" required>
-</label>
-<label class="field">
-<span>Device UID</span>
-<input id="clientUid" type="text" placeholder="dev:xxxxxxxx">
-</label>
-<label class="field">
-<span>Site Name</span>
-<input id="siteName" type="text" placeholder="Site Name" required>
-</label>
-<label class="field">
-<span>Device Label</span>
-<input id="deviceLabel" type="text" placeholder="Device Label" required>
-</label>
-<label class="field">
-<span>Client Fleet</span>
-<input id="clientFleet" type="text" placeholder="Client Fleet">
-</label>
-<label class="field">
-<span>Server Fleet</span>
-<input id="serverFleet" type="text" value="tankalarm-server">
-</label>
-<label class="field">
-<span>Sample Minutes</span>
-<input id="sampleMinutes" type="number" value="30" min="1" max="1440">
-</label>
-<label class="field">
-<span>Report Time</span>
-<input id="reportTime" type="time" value="05:00">
-</label>
-<label class="field">
-<span>Daily Report Email Recipient</span>
-<input id="dailyEmail" type="email">
-</label>
-</div>
-<h3>Power Configuration</h3>
-<div class="form-grid">
-<label class="field">
-<span>Power Source<span class="tooltip-icon" tabindex="0" data-tooltip="Primary power supply feeding the device. Battery selection is configured separately below.">?</span>
-</span>
-<select id="powerSource" onchange="updatePowerConfigInfo()">
-<option value="grid">Grid AC</option>
-<option value="solar">Solar (Passive Charger)</option>
-<option value="solar_mppt">Solar + Non-Monitored MPPT</option>
-<option value="solar_modbus_mppt">Solar + Modbus MPPT (RS-485)</option>
-</select>
-</label>
-<label class="field">
-<span>Battery<span class="tooltip-icon" tabindex="0" data-tooltip="Battery chemistry. Lead-acid variants share thresholds; Flooded uses a higher equalization ceiling. Select None for grid-only or solar-direct installs.">?</span>
-</span>
-<select id="batteryType" onchange="updatePowerConfigInfo()">
-<option value="none">None (no battery)</option>
-<option value="agm" selected>AGM (Sealed)</option>
-<option value="sla">SLA (Sealed Lead-Acid)</option>
-<option value="flooded">Flooded (Wet Cell)</option>
-<option value="gel">Gel</option>
-<option value="lifepo4">LiFePO4</option>
-<option value="li_ion">Li-ion (NMC)</option>
-<option value="lipo">LiPo (single cell)</option>
-<option value="custom">Custom (manual thresholds)</option>
-</select>
-</label>
-<label class="field" id="batteryVoltageField">
-<span>Battery Pack Voltage<span class="tooltip-icon" tabindex="0" data-tooltip="Nominal pack voltage. 24V scales all thresholds 2x from the 12V baseline. 24V support is experimental — verify Vin divider headroom.">?</span>
-</span>
-<select id="batteryVoltage">
-<option value="12" selected>12V</option>
-<option value="24">24V (experimental)</option>
-</select>
-</label>
-<label class="field">
-<span>Vin Monitor<span class="tooltip-icon" tabindex="0" data-tooltip="Enable an external voltage divider on an Opta analog input to read actual battery voltage. Required for accurate solar-only sunset detection.">?</span>
-</span>
-<select id="vinMonitorEnabled" onchange="updatePowerConfigInfo()">
-<option value="0">Disabled</option>
-<option value="1">Enabled</option>
-</select>
-</label>
-</div>
-<div id="powerCombinationWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:10px 12px;margin-bottom:12px;border-radius:var(--radius);font-size:0.88rem;">
-</div>
-<div id="powerConfigInfo" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;font-size:0.9rem;color:var(--muted);">
-<strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.</div>
-<div id="vinConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);">
-<strong style="display:block;margin-bottom:8px;">Vin Monitor — Voltage Divider Configuration</strong>
-<p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">Wire a voltage divider from the battery to an Opta analog input: Battery+ → R1 → Pin → R2 → GND</p>
-<div class="form-grid">
-<label class="field">
-<span>Analog Pin</span>
-<select id="vinPin">
-<option value="0">A0</option>
-<option value="1">A1</option>
-<option value="2">A2</option>
-<option value="3">A3</option>
-<option value="4">A4</option>
-<option value="5">A5</option>
-<option value="6">A6</option>
-<option value="7">A7</option>
-</select>
-</label>
-<label class="field">
-<span>R1 High-side (kΩ)</span>
-<input id="vinR1" type="number" value="22" min="1" max="1000" step="0.1" onchange="updateVinCalc()">
-</label>
-<label class="field">
-<span>R2 Low-side (kΩ)</span>
-<input id="vinR2" type="number" value="47" min="1" max="1000" step="0.1" onchange="updateVinCalc()">
-</label>
-</div>
-<div id="vinCalcInfo" style="margin-top:8px;font-size:0.85rem;color:var(--muted);">
-</div>
-</div>
-<div id="solarOnlyConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);">
-<strong style="display:block;margin-bottom:8px;">Solar-Only (No Battery) Settings</strong>
-<p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">This device is powered directly by a solar panel without battery backup. It will only operate during daylight hours.</p>
-<div class="form-grid">
-<label class="field" id="solarOnlyDebounceVField">
-<span>Startup Debounce Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage before the system considers power stable enough to start. Only applies when Vin divider is connected.">?</span>
-</span>
-<input id="solarOnlyDebounceV" type="number" value="10" min="5" max="20" step="0.5">
-</label>
-<label class="field" id="solarOnlyDebounceSField">
-<span>Debounce Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of seconds the voltage must remain above the debounce threshold. Only applies when Vin divider is connected.">?</span>
-</span>
-<input id="solarOnlyDebounceSec" type="number" value="30" min="5" max="300">
-</label>
-<label class="field" id="solarOnlyWarmupField">
-<span>Startup Warmup (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Fixed warmup timer used when no Vin divider is installed. The device waits this long after boot before reading sensors.">?</span>
-</span>
-<input id="solarOnlyWarmupSec" type="number" value="60" min="10" max="600">
-</label>
-<label class="field" id="solarOnlySensorGateField">
-<span>Sensor Gate Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage required before sensor readings are taken. 4-20mA sensors typically need at least 11V excitation. Only applies when Vin divider is connected.">?</span>
-</span>
-<input id="solarOnlySensorGateV" type="number" value="11" min="5" max="20" step="0.5">
-</label>
-<label class="field" id="solarOnlySunsetVField">
-<span>Sunset Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="When Vin drops below this and continues declining, the device saves state and prepares for power loss. Only applies when Vin divider is connected.">?</span>
-</span>
-<input id="solarOnlySunsetV" type="number" value="10" min="5" max="20" step="0.5">
-</label>
-<label class="field">
-<span>Sunset Confirm Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="How long voltage must be declining below sunset threshold before triggering shutdown save.">?</span>
-</span>
-<input id="solarOnlySunsetSec" type="number" value="120" min="30" max="600">
-</label>
-<label class="field">
-<span>Opportunistic Report (hours)<span class="tooltip-icon" tabindex="0" data-tooltip="If more than this many hours have passed since the last daily report, send one immediately on startup. For solar-only, reports cannot be scheduled at a fixed time.">?</span>
-</span>
-<input id="solarOnlyReportHours" type="number" value="20" min="6" max="48">
-</label>
-</div>
-<div id="solarOnlyBatFailSection" style="display:none;margin-top:12px;border-top:1px solid var(--card-border);padding-top:12px;">
-<label style="display:flex;align-items:center;gap:8px;font-size:0.9rem;margin-bottom:8px;">
-<input type="checkbox" id="solarOnlyBatFail"> Enable battery failure fallback<span class="tooltip-icon" tabindex="0" data-tooltip="For solar+battery setups: if the battery voltage stays critically low for extended time, automatically switch to solar-only behaviors (opportunistic reporting, sunset protocol).">?</span>
-</label>
-<label class="field">
-<span>Failure Threshold (readings)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of consecutive critical-voltage readings before declaring battery failure.">?</span>
-</span>
-<input id="solarOnlyBatFailCount" type="number" value="10" min="3" max="50">
-</label>
-</div>
-</div>
-<h3>Sensors</h3>
-<div id="sensorsContainer">
-</div>
-<div class="actions" style="margin-bottom: 24px;">
-<button type="button" id="addSensorBtn" class="secondary">+ Add Sensor</button>
-</div>
-<h3>Inputs (Buttons &amp; Switches)</h3>
-<p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Configure physical inputs for actions like clearing relay alarms.</p>
-<div id="inputsContainer">
-</div>
-<div class="actions" style="margin-bottom: 24px;">
-<button type="button" id="addInputBtn" class="secondary">+ Add Input</button>
-</div>
-<div class="actions">
-<button type="submit" id="sendConfigBtn">Save Configuration to Device</button>
-<button type="button" id="retryConfigBtn" class="secondary" style="display:none">Retry Send to Notecard</button>
-<button type="button" id="syncRequestBtn" class="secondary" style="display:none" title="Force the client Notecard to sync inbound notes (useful for weak signal)">Request Client Sync</button>
-</div>
-</form>
-</div>
-</main>
-<div id="toast">
-</div>
-<div id="selectClientModal" class="modal hidden">
-<div class="modal-content">
-<div class="modal-header">
-<h2>Load Configuration</h2>
-<button class="modal-close" onclick="closeSelectClientModal()">&times;</button>
-</div>
-<div id="clientList" class="client-list">
-<div class="empty-state">Loading clients...</div>
-</div>
-</div>
-</div>
-<datalist id="relayTargetSuggestions">
-</datalist>
-<input type="file" id="importFileInput" accept=".json" style="display:none" />
+<div id="configStatus" style="display:none;padding:12px;margin-bottom:16px;border-radius:var(--radius);background:#e6f2ff;border:1px solid #b3d9ff;color:#0066cc;"></div><form id="generatorForm"><div class="form-grid"><label class="field"><span>Product UID <span class="tooltip-icon" tabindex="0" data-tooltip="Blues Notehub Product UID. Must match the server's Product UID for client-server communication.">?</span></span><input id="productUid" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>Device UID</span><input id="clientUid" type="text" placeholder="dev:xxxxxxxx"></label><label class="field"><span>Site Name</span><input id="siteName" type="text" placeholder="Site Name" required></label><label class="field"><span>Device Label</span><input id="deviceLabel" type="text" placeholder="Device Label" required></label><label class="field"><span>Client Fleet</span><input id="clientFleet" type="text" placeholder="Client Fleet"></label><label class="field"><span>Server Fleet</span><input id="serverFleet" type="text" value="tankalarm-server"></label><label class="field"><span>Sample Minutes</span><input id="sampleMinutes" type="number" value="30" min="1" max="1440"></label><label class="field"><span>Report Time</span><input id="reportTime" type="time" value="05:00"></label><label class="field"><span>Daily Report Email Recipient</span><input id="dailyEmail" type="email"></label></div><h3>Power Configuration</h3><div class="form-grid"><label class="field"><span>Power Source<span class="tooltip-icon" tabindex="0" data-tooltip="Primary power supply feeding the device. Battery selection is configured separately below.">?</span></span><select id="powerSource" onchange="updatePowerConfigInfo()"><option value="grid">Grid AC</option><option value="solar">Solar (Passive Charger)</option><option value="solar_mppt">Solar + Non-Monitored MPPT</option><option value="solar_modbus_mppt">Solar + Modbus MPPT (RS-485)</option></select></label><label class="field"><span>Battery<span class="tooltip-icon" tabindex="0" data-tooltip="Battery chemistry. Lead-acid variants share thresholds; Flooded uses a higher equalization ceiling. Select None for grid-only or solar-direct installs.">?</span></span><select id="batteryType" onchange="updatePowerConfigInfo()"><option value="none">None (no battery)</option><option value="agm" selected>AGM (Sealed)</option><option value="sla">SLA (Sealed Lead-Acid)</option><option value="flooded">Flooded (Wet Cell)</option><option value="gel">Gel</option><option value="lifepo4">LiFePO4</option><option value="li_ion">Li-ion (NMC)</option><option value="lipo">LiPo (single cell)</option><option value="custom">Custom (manual thresholds)</option></select></label><label class="field" id="batteryVoltageField"><span>Battery Pack Voltage<span class="tooltip-icon" tabindex="0" data-tooltip="Nominal pack voltage. 24V scales all thresholds 2x from the 12V baseline. 24V support is experimental — verify Vin divider headroom.">?</span></span><select id="batteryVoltage"><option value="12" selected>12V</option><option value="24">24V (experimental)</option></select></label><label class="field"><span>Vin Monitor<span class="tooltip-icon" tabindex="0" data-tooltip="Enable an external voltage divider on an Opta analog input to read actual battery voltage. Required for accurate solar-only sunset detection.">?</span></span><select id="vinMonitorEnabled" onchange="updatePowerConfigInfo()"><option value="0">Disabled</option><option value="1">Enabled</option></select></label></div><div id="powerCombinationWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:10px 12px;margin-bottom:12px;border-radius:var(--radius);font-size:0.88rem;"></div><div id="powerConfigInfo" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;font-size:0.9rem;color:var(--muted);"><strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.</div><div id="vinConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Vin Monitor — Voltage Divider Configuration</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">Wire a voltage divider from the battery to an Opta analog input: Battery+ → R1 → Pin → R2 → GND</p><div class="form-grid"><label class="field"><span>Analog Pin</span><select id="vinPin"><option value="0">A0</option><option value="1">A1</option><option value="2">A2</option><option value="3">A3</option><option value="4">A4</option><option value="5">A5</option><option value="6">A6</option><option value="7">A7</option></select></label><label class="field"><span>R1 High-side (kΩ)</span><input id="vinR1" type="number" value="22" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label><label class="field"><span>R2 Low-side (kΩ)</span><input id="vinR2" type="number" value="47" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label></div><div id="vinCalcInfo" style="margin-top:8px;font-size:0.85rem;color:var(--muted);"></div></div><div id="solarOnlyConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Solar-Only (No Battery) Settings</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">This device is powered directly by a solar panel without battery backup. It will only operate during daylight hours.</p><div class="form-grid"><label class="field" id="solarOnlyDebounceVField"><span>Startup Debounce Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage before the system considers power stable enough to start. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlyDebounceSField"><span>Debounce Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of seconds the voltage must remain above the debounce threshold. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceSec" type="number" value="30" min="5" max="300"></label><label class="field" id="solarOnlyWarmupField"><span>Startup Warmup (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Fixed warmup timer used when no Vin divider is installed. The device waits this long after boot before reading sensors.">?</span></span><input id="solarOnlyWarmupSec" type="number" value="60" min="10" max="600"></label><label class="field" id="solarOnlySensorGateField"><span>Sensor Gate Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage required before sensor readings are taken. 4-20mA sensors typically need at least 11V excitation. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySensorGateV" type="number" value="11" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlySunsetVField"><span>Sunset Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="When Vin drops below this and continues declining, the device saves state and prepares for power loss. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySunsetV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field"><span>Sunset Confirm Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="How long voltage must be declining below sunset threshold before triggering shutdown save.">?</span></span><input id="solarOnlySunsetSec" type="number" value="120" min="30" max="600"></label><label class="field"><span>Opportunistic Report (hours)<span class="tooltip-icon" tabindex="0" data-tooltip="If more than this many hours have passed since the last daily report, send one immediately on startup. For solar-only, reports cannot be scheduled at a fixed time.">?</span></span><input id="solarOnlyReportHours" type="number" value="20" min="6" max="48"></label></div><div id="solarOnlyBatFailSection" style="display:none;margin-top:12px;border-top:1px solid var(--card-border);padding-top:12px;"><label style="display:flex;align-items:center;gap:8px;font-size:0.9rem;margin-bottom:8px;"><input type="checkbox" id="solarOnlyBatFail"> Enable battery failure fallback<span class="tooltip-icon" tabindex="0" data-tooltip="For solar+battery setups: if the battery voltage stays critically low for extended time, automatically switch to solar-only behaviors (opportunistic reporting, sunset protocol).">?</span></label><label class="field"><span>Failure Threshold (readings)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of consecutive critical-voltage readings before declaring battery failure.">?</span></span><input id="solarOnlyBatFailCount" type="number" value="10" min="3" max="50"></label></div></div><h3>Sensors</h3><div id="sensorsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addSensorBtn" class="secondary">+ Add Sensor</button></div><h3>Inputs (Buttons &amp; Switches)</h3><p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Configure physical inputs for actions like clearing relay alarms.</p><div id="inputsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addInputBtn" class="secondary">+ Add Input</button></div><div class="actions"><button type="submit" id="sendConfigBtn">Save Configuration to Device</button><button type="button" id="retryConfigBtn" class="secondary" style="display:none">Retry Send to Notecard</button><button type="button" id="syncRequestBtn" class="secondary" style="display:none" title="Force the client Notecard to sync inbound notes (useful for weak signal)">Request Client Sync</button></div></form></div></main><div id="toast"></div><div id="selectClientModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2>Load Configuration</h2><button class="modal-close" onclick="closeSelectClientModal()">&times;</button></div><div id="clientList" class="client-list"><div class="empty-state">Loading clients...</div></div></div></div><datalist id="relayTargetSuggestions"></datalist><input type="file" id="importFileInput" accept=".json" style="display:none" />
 <script>
 (async () => {
-const token=localStorage.getItem('tankalarm_token');
-const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};
-if(!o.headers)o.headers={};
-if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};
-async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');
-const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
+const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
 const state={paused:false,clients:[]};
-
 const els={toast:document.getElementById('toast'),form:document.getElementById('generatorForm'),productUid:document.getElementById('productUid'),clientUid:document.getElementById('clientUid'),clientList:document.getElementById('clientList'),selectClientModal:document.getElementById('selectClientModal'),loadFromCloudBtn:document.getElementById('loadFromCloudBtn'),siteName:document.getElementById('siteName'),deviceLabel:document.getElementById('deviceLabel'),clientFleet:document.getElementById('clientFleet'),serverFleet:document.getElementById('serverFleet'),sampleMinutes:document.getElementById('sampleMinutes'),dailyEmail:document.getElementById('dailyEmail'),reportTime:document.getElementById('reportTime'),powerSource:document.getElementById('powerSource')};
-
 function showToast(m,e,dur){if(els.toast){els.toast.innerText=m;els.toast.style.background=e==='warn'?'#d97706':e?'#dc2626':'#0284c7';els.toast.classList.add('show');setTimeout(()=>els.toast.classList.remove('show'),dur||3000);}}
 
 const pauseBtn=document.getElementById('pauseBtn');function renderPauseBtn(){if(pauseBtn){pauseBtn.style.display=state.paused?'':'none';}}
-async function loadPauseState(){try{const r=await fetch('/api/clients?summary=1');
-const d=await r.json();if(d&&d.srv){state.paused=!!d.srv.ps;renderPauseBtn();}}catch(e){}}
+async function loadPauseState(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv){state.paused=!!d.srv.ps;renderPauseBtn();}}catch(e){}}
 if(pauseBtn)pauseBtn.addEventListener('click',async()=>{try{const r=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:false})});if(r.ok){state.paused=false;renderPauseBtn();showToast('Resumed');}else throw new Error('Failed');}catch(e){showToast('Error resuming',true);}});
 await loadPauseState();
 window.validatePowerCombination=function(){
@@ -2092,8 +1839,7 @@ window.validatePowerCombination=function(){
   const vin=document.getElementById('vinMonitorEnabled').value==='1';
   const w=document.getElementById('powerCombinationWarning');
   if(!w)return true;
-  let msg='';
-let block=false;
+  let msg='';let block=false;
   if(ps==='solar_modbus_mppt'&&bt==='none'){
     msg='SunSaver / Modbus MPPT chargers require a battery to operate. Select a battery chemistry or change power source.';
     block=true;
@@ -2119,7 +1865,6 @@ let block=false;
   if(msg){w.style.display='block';w.innerHTML=(block?'<strong>Blocked:</strong> ':'<strong>Warning:</strong> ')+msg;w.style.background=block?'#f8d7da':'#fff3cd';w.style.borderColor=block?'#dc3545':'#ffc107';w.style.color=block?'#721c24':'#856404';}else{w.style.display='none';}
   return !block;
 };
-
 window.updatePowerConfigInfo=function(){
   const ps=document.getElementById('powerSource').value||'grid';
   const bt=document.getElementById('batteryType').value||'agm';
@@ -2147,13 +1892,7 @@ window.updatePowerConfigInfo=function(){
   const batFailSec=document.getElementById('solarOnlyBatFailSection');
   if(batFailSec)batFailSec.style.display=(ps.startsWith('solar')&&bt!=='none')?'block':'none';
   validatePowerCombination();
-};
-window.updateVinCalc=function(){const r1=parseFloat(document.getElementById('vinR1').value)||22;
-const r2=parseFloat(document.getElementById('vinR2').value)||47;
-const ratio=r2/(r1+r2);
-const maxV=(10.0/ratio).toFixed(1);
-const bleed=(12/(r1+r2)*1000).toFixed(1);document.getElementById('vinCalcInfo').innerHTML='Divider ratio: '+ratio.toFixed(4)+' — Max readable: '+maxV+'V — Quiescent draw at 12V: ~'+bleed+'µA';};
-
+};window.updateVinCalc=function(){const r1=parseFloat(document.getElementById('vinR1').value)||22;const r2=parseFloat(document.getElementById('vinR2').value)||47;const ratio=r2/(r1+r2);const maxV=(10.0/ratio).toFixed(1);const bleed=(12/(r1+r2)*1000).toFixed(1);document.getElementById('vinCalcInfo').innerHTML='Divider ratio: '+ratio.toFixed(4)+' — Max readable: '+maxV+'V — Quiescent draw at 12V: ~'+bleed+'µA';};
 /* CONSTANTS */
 const sensorTypes=[{value:0,label:'Digital Input(Float Switch)'},{value:1,label:'Analog Input(0-10V)'},{value:2,label:'Current Loop(4-20mA)'},{value:3,label:'Hall Effect RPM'}];
 const currentLoopTypes=[{value:'pressure',label:'Pressure Sensor(Bottom-Mounted)'},{value:'ultrasonic',label:'Ultrasonic Sensor(Top-Mounted)'}];
@@ -2162,574 +1901,71 @@ const optaPins=[{value:0,label:'Opta I1'},{value:1,label:'Opta I2'},{value:2,lab
 const expansionChannels=[{value:0,label:'A0602 Ch1'},{value:1,label:'A0602 Ch2'},{value:2,label:'A0602 Ch3'},{value:3,label:'A0602 Ch4'},{value:4,label:'A0602 Ch5'},{value:5,label:'A0602 Ch6'}];
 const inputActions=[{value:'clear_relays',label:'Clear All Relay Alarms'},{value:'none',label:'Disabled(No Action)'}];
 const inputModes=[{value:'active_low',label:'Active LOW(Button to GND,internal pullup)'},{value:'active_high',label:'Active HIGH(Button to VCC,external pull-down)'}];
-let sensorCount=0;
-let inputIdCounter=0;
+let sensorCount=0;let inputIdCounter=0;
 /* SENSOR CARD HTML */
-function createSensorHtml(id){return `<div class="sensor-card" id="sensor-${id}">
-<div class="sensor-header">
-<span class="sensor-title">Sensor #${id+1}</span>
-<button type="button" class="remove-btn" onclick="removeSensor(${id})">Remove</button>
-</div>
-<div class="form-grid">
-<label class="field">
-<span>Monitor Type</span>
-<select class="monitor-type" onchange="updateMonitorFields(${id})">${monitorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select>
-</label>
-<label class="field tank-num-field">
-<span>Display Number (optional)</span>
-<input type="number" class="tank-num" placeholder="e.g. 1, 2, 3">
-</label>
-<label class="field">
-<span>
-<span class="name-label">Name</span>
-</span>
-<input type="text" class="tank-name" placeholder="Name">
-</label>
-<label class="field contents-field">
-<span>Contents</span>
-<input type="text" class="tank-contents" placeholder="e.g. Diesel, Water">
-</label>
-<label class="field">
-<span>Sensor Type</span>
-<select class="sensor-type" onchange="updatePinOptions(${id})">${sensorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select>
-</label>
-<label class="field">
-<span>Pin / Channel</span>
-<select class="sensor-pin">${optaPins.map(p=>`<option value="${p.value}">${p.label}</option>`).join('')}</select>
-</label>
-<label class="field switch-mode-field" style="display:none;">
-<span>Switch Mode<span class="tooltip-icon" tabindex="0" data-tooltip="NO(Normally-Open): Switch is open by default, closes when fluid is present. NC(Normally-Closed): Switch is closed by default, opens when fluid is present.">?</span>
-</span>
-<select class="switch-mode">
-<option value="NO">Normally-Open(NO)</option>
-<option value="NC">Normally-Closed(NC)</option>
-</select>
-</label>
-<label class="field pulses-per-rev-field" style="display:none;">
-<span>Pulses/Rev</span>
-<input type="number" class="pulses-per-rev" value="1" min="1" max="255">
-</label>
-<label class="field current-loop-type-field" style="display:none;">
-<span>4-20mA Sensor Type<span class="tooltip-icon" tabindex="0" data-tooltip="Select the type of 4-20mA sensor: Pressure sensors are mounted near the sensor bottom and measure liquid pressure. Ultrasonic sensors are mounted on top of the sensor and measure distance to the liquid surface.">?</span>
-</span>
-<select class="current-loop-type" onchange="updateCurrentLoopFields(${id})">
-<option value="pressure">Pressure Sensor(Bottom-Mounted)</option>
-<option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option>
-</select>
-</label>
-<label class="field sensor-range-field" style="display:none;">
-<span>
-<span class="sensor-range-label">Sensor Range</span>
-<span class="tooltip-icon sensor-range-tooltip" tabindex="0" data-tooltip="Native measurement range of the sensor (e.g., 0-5 PSI for pressure, 0-10m for ultrasonic). This is the range that corresponds to 4-20mA output.">?</span>
-</span>
-<div style="display:flex;gap:8px;align-items:center;">
-<input type="number" class="sensor-range-min" value="0" step="0.1" style="width:70px;" placeholder="Min">
-<span>to</span>
-<input type="number" class="sensor-range-max" value="5" step="0.1" style="width:70px;" placeholder="Max">
-<select class="sensor-range-unit" style="width:70px;">
-<option value="PSI">PSI</option>
-<option value="bar">bar</option>
-<option value="m">m</option>
-<option value="ft">ft</option>
-<option value="in">in</option>
-<option value="cm">cm</option>
-</select>
-</div>
-</label>
-<label class="field sensor-mount-height-field" style="display:none;">
-<span>
-<span class="mount-height-label">Sensor Mount Height(in)</span>
-<span class="tooltip-icon mount-height-tooltip" tabindex="0" data-tooltip="For pressure sensors: height of sensor above tank bottom (usually 0-2 inches). For ultrasonic sensors: distance from sensor to tank bottom when empty.">?</span>
-</span>
-<input type="number" class="sensor-mount-height" value="0" step="0.1" min="0">
-</label>
-<label class="field fluid-type-field" style="display:none;">
-<span>
-<span>Fluid Type</span>
-<span class="tooltip-icon" tabindex="0" data-tooltip="Specific gravity of the stored fluid. Pick the matching preset, or choose Custom and enter the SG manually. The server's calibration learning will refine this automatically once stick-gauge readings are submitted.">?</span>
-</span>
-<div style="display:flex;gap:8px;align-items:center;">
-<select class="fluid-type" onchange="updateFluidTypeFields(${id})" style="flex:1;">
-<option value="water">Water (1.00)</option>
-<option value="diesel">Diesel (0.85)</option>
-<option value="gasoline">Gasoline (0.74)</option>
-<option value="heatingOil">Heating Oil (0.85)</option>
-<option value="propane">Propane / LPG (0.50)</option>
-<option value="brine">Brine (1.20)</option>
-<option value="crudeOil">Crude Oil (0.83)</option>
-<option value="usedOil">Used Oil (0.92)</option>
-<option value="glycol50">Glycol 50% (1.07)</option>
-<option value="def">DEF / AdBlue (1.09)</option>
-<option value="ethanol">Ethanol (0.79)</option>
-<option value="custom">Custom...</option>
-</select>
-<input type="number" class="fluid-sg-custom" step="0.001" min="0.3" max="2.0" placeholder="SG" style="width:80px;display:none;">
-</div>
-</label>
-<label class="field analog-voltage-field" style="display:none;">
-<span>
-<span class="analog-voltage-label">Sensor Voltage Range</span>
-<span class="tooltip-icon analog-voltage-tooltip" tabindex="0" data-tooltip="The voltage output range of the analog sensor. Common ranges: 0-10V, 0-5V, 1-5V.">?</span>
-</span>
-<div style="display:flex;gap:8px;align-items:center;">
-<input type="number" class="analog-voltage-min" value="0" step="0.1" style="width:70px;" placeholder="Min">
-<span>to</span>
-<input type="number" class="analog-voltage-max" value="10" step="0.1" style="width:70px;" placeholder="Max">
-<span>V</span>
-</div>
-</label>
-<label class="field pwm-gating-enabled-field" style="display:none;">
-<span>
-<span>PWM Power Gating</span>
-<span class="tooltip-icon" tabindex="0" data-tooltip="Enable solid-state transmitter power gating using a high-side transistor driver (P1-P4) on the A0602 module. Controls low-power sensor switching.">?</span>
-</span>
-<select class="pwm-gating-enabled" onchange="updatePwmGatingVisibility(${id})">
-<option value="false">Disabled</option>
-<option value="true">Enabled (Transistor Switch)</option>
-</select>
-</label>
-<label class="field pwm-gating-channel-field" style="display:none;">
-<span>
-<span>Gating Output Pin</span>
-<span class="tooltip-icon" tabindex="0" data-tooltip="Select the transistor output terminal (P1-P4) used to gate power to this transmitter on the A0602 module. NOTE: Max switch current is 100mA.">?</span>
-</span>
-<select class="pwm-gating-channel">
-<option value="0">Terminal P1 (Ch 0)</option>
-<option value="1">Terminal P2 (Ch 1)</option>
-<option value="2">Terminal P3 (Ch 2)</option>
-<option value="3">Terminal P4 (Ch 3)</option>
-</select>
-</label>
-<label class="field pwm-gating-warmup-field" style="display:none;">
-<span>
-<span>Warmup Delay (ms)</span>
-<span class="tooltip-icon" tabindex="0" data-tooltip="Time in milliseconds to wait after enabling the power switch before reading the sensor. This avoids transients and allows the transmitter circuit to stabilize (e.g. 3000ms).">?</span>
-</span>
-<input type="number" class="pwm-gating-warmup" value="3000" min="0" step="50">
-</label>
-<label class="field pwm-gating-sample-delay-field" style="display:none;">
-<span>
-<span>Sample Settling Delay (ms)</span>
-<span class="tooltip-icon" tabindex="0" data-tooltip="Delay inside the averaging loop (in milliseconds) between individual samples (e.g. 5ms).">?</span>
-</span>
-<input type="number" class="pwm-gating-sample-delay" value="5" min="0" step="1">
-</label>
-</div>
-<label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
-<input type="checkbox" class="stuck-detection" checked> Stuck Sensor Detection<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the system flags a sensor as failed if it reports the same reading 10 consecutive times. Disable for sensors where readings naturally stay constant (e.g., gas pressure monitors).">?</span>
-</label>
-<label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
-<input type="checkbox" class="calibration-enabled" checked> Calibration Learning<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, you can submit manual verification readings on the Calibration page to teach the system the actual relationship between sensor output and measured values. Recommended for tank level sensors. For gas pressure or RPM sensors, disable unless you have reference gauges for comparison.">?</span>
-</label>
-<label class="field" style="margin-top:8px;">
-<span>
-<span>Report on Change</span>
-<span class="tooltip-icon" tabindex="0" data-tooltip="Send a telemetry update whenever the reading changes by at least this amount, in the sensor's own unit (inches for tanks, PSI for gas, RPM for engines, GPM for flow). 0 = only baseline, daily reports, and alarms (saves cellular data and battery).">?</span>
-</span>
-<input type="number" class="report-threshold" value="0" min="0" step="0.1">
-</label>
-<div class="digital-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);">
-<strong>Float Switch Mode:</strong> This sensor only detects whether fluid has reached the switch position.<br>
-<br>
-<strong>Wiring Note:</strong> Connect the switch between the input pin and GND. The software uses an internal pull-up resistor.</div>
-<div class="current-loop-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);">
-<div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.1);"><strong style="color:var(--secondary);">Power Gating Warning:</strong> A0602 outputs P1-P4 (high-side transistor controls) support a maximum of <strong>100mA</strong> peak current. Ensure your transmitter/sensor power draw does not exceed this limit.</div>
-<div class="pressure-sensor-info">
-<strong>Pressure Sensor(Bottom-Mounted):</strong> Measures the pressure of the liquid column above it.<br>- 4mA = Empty tank (0 pressure)<br>- 20mA = Full tank (max pressure)<br>- Sensor Range: The native pressure range (e.g., 0-5 PSI)<br>- Mount Height: Distance from sensor to tank bottom</div>
-<div class="ultrasonic-sensor-info" style="display:none;">
-<strong>Ultrasonic Sensor(Top-Mounted):</strong> Measures the distance from the sensor to the liquid surface.<br>- 4mA = Full tank (liquid close to sensor)<br>- 20mA = Empty tank (liquid far from sensor)<br>- Sensor Range: The native distance range (e.g., 0-10m)<br>- Sensor Mount Height: Distance from sensor to tank bottom when empty</div>
-</div>
-<button type="button" class="add-section-btn add-alarm-btn" onclick="toggleAlarmSection(${id})">+ Add Alarm</button>
-<div class="collapsible-section alarm-section">
-<h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">
-<span class="alarm-section-title">Alarm Thresholds</span>
-<button type="button" class="remove-btn" onclick="removeAlarmSection(${id})" style="float:right;">Remove Alarm</button>
-</h4>
-<div class="form-grid alarm-thresholds-grid">
-<div class="field">
-<span>
-<label style="display:flex;align-items:center;gap:6px;">
-<input type="checkbox" class="high-alarm-enabled" checked> High Alarm</label>
-</span>
-<input type="number" class="high-alarm" value="100">
-</div>
-<div class="field">
-<span>
-<label style="display:flex;align-items:center;gap:6px;">
-<input type="checkbox" class="low-alarm-enabled" checked> Low Alarm</label>
-</span>
-<input type="number" class="low-alarm" value="20">
-</div>
-</div>
-<div class="form-grid digital-alarm-grid" style="display:none;">
-<div class="field" style="grid-column:1 / -1;">
-<span>Trigger Condition<span class="tooltip-icon" tabindex="0" data-tooltip="Select when the alarm should trigger based on the float switch state.">?</span>
-</span>
-<select class="digital-trigger-state">
-<option value="activated">When Switch is Activated (fluid detected)</option>
-<option value="not_activated">When Switch is NOT Activated (no fluid)</option>
-</select>
-</div>
-</div>
-</div>
-<button type="button" class="add-section-btn add-relay-btn hidden" onclick="toggleRelaySection(${id})">+ Add Relay Control</button>
-<div class="collapsible-section relay-section">
-<h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">Relay Switch Control<button type="button" class="remove-btn" onclick="removeRelaySection(${id})" style="float:right;">Remove Relay</button>
-</h4>
-<div class="form-grid">
-<label class="field">
-<span>Target Client UID</span>
-<input type="text" class="relay-target" list="relayTargetSuggestions" placeholder="dev:IMEI (optional)">
-</label>
-<label class="field">
-<span>Trigger On</span>
-<select class="relay-trigger">
-<option value="any">Any Alarm (High or Low)</option>
-<option value="high">High Alarm Only</option>
-<option value="low">Low Alarm Only</option>
-</select>
-</label>
-<label class="field">
-<span>Relay Mode</span>
-<select class="relay-mode" onchange="toggleRelayDurations(${id})">
-<option value="momentary">Momentary (configurable duration)</option>
-<option value="until_clear">Stay On Until Alarm Clears</option>
-<option value="manual_reset">Stay On Until Manual Server Reset</option>
-</select>
-</label>
-<div class="field">
-<span>Relay Outputs</span>
-<div style="display:flex;gap:12px;padding:8px 0;">
-<label style="display:flex;align-items:center;gap:4px;">
-<input type="checkbox" class="relay-1" value="1"> R1</label>
-<label style="display:flex;align-items:center;gap:4px;">
-<input type="checkbox" class="relay-2" value="2"> R2</label>
-<label style="display:flex;align-items:center;gap:4px;">
-<input type="checkbox" class="relay-3" value="4"> R3</label>
-<label style="display:flex;align-items:center;gap:4px;">
-<input type="checkbox" class="relay-4" value="8"> R4</label>
-</div>
-</div>
-<div class="relay-durations-section" style="grid-column:1 / -1;display:block;">
-<span style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:8px;display:block;">Momentary Duration per Relay (seconds, 0 = default 30 min):</span>
-<div style="display:flex;gap:12px;flex-wrap:wrap;">
-<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R1:<input type="number" class="relay-duration-1" value="0" min="0" max="86400" style="width:70px;">
-</label>
-<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R2:<input type="number" class="relay-duration-2" value="0" min="0" max="86400" style="width:70px;">
-</label>
-<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R3:<input type="number" class="relay-duration-3" value="0" min="0" max="86400" style="width:70px;">
-</label>
-<label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R4:<input type="number" class="relay-duration-4" value="0" min="0" max="86400" style="width:70px;">
-</label>
-</div>
-</div>
-<label class="field relay-max-on-section" style="grid-column:1 / -1;display:none;">
-<span>Safety Max ON Duration (seconds, 0 = no limit)<span class="tooltip-icon" tabindex="0" data-tooltip="Maximum time a relay can stay ON in manual_reset mode. After this duration the relay is forced OFF and a relay_timeout alarm is sent. Set to 0 to disable. Max 604800 (7 days).">?</span>
-</span>
-<input type="number" class="relay-max-on" value="0" min="0" max="604800" style="width:120px;">
-</label>
-</div>
-</div>
-<button type="button" class="add-section-btn add-sms-btn hidden" onclick="toggleSmsSection(${id})">+ Add SMS Alert</button>
-<div class="collapsible-section sms-section">
-<h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">SMS Alert Notifications<button type="button" class="remove-btn" onclick="removeSmsSection(${id})" style="float:right;">Remove SMS Alert</button>
-</h4>
-<div class="form-grid">
-<label class="field" style="grid-column:1 / -1;">
-<span>Phone Numbers<span class="tooltip-icon" tabindex="0" data-tooltip="Enter phone numbers with country code (e.g., +15551234567). Separate multiple numbers with commas.">?</span>
-</span>
-<input type="text" class="sms-phones" placeholder="+15551234567,+15559876543">
-</label>
-<label class="field">
-<span>Trigger On</span>
-<select class="sms-trigger">
-<option value="any">Any Alarm (High or Low)</option>
-<option value="high">High Alarm Only</option>
-<option value="low">Low Alarm Only</option>
-</select>
-</label>
-<label class="field" style="grid-column:span 2;">
-<span>Custom Message (optional)</span>
-<input type="text" class="sms-message" placeholder="Tank alarm triggered">
-</label>
-</div>
-</div>
-</div>`;}
+function createSensorHtml(id){return `<div class="sensor-card" id="sensor-${id}"><div class="sensor-header"><span class="sensor-title">Sensor #${id+1}</span><button type="button" class="remove-btn" onclick="removeSensor(${id})">Remove</button></div><div class="form-grid"><label class="field"><span>Monitor Type</span><select class="monitor-type" onchange="updateMonitorFields(${id})">${monitorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select></label><label class="field tank-num-field"><span>Display Number (optional)</span><input type="number" class="tank-num" placeholder="e.g. 1, 2, 3"></label><label class="field"><span><span class="name-label">Name</span></span><input type="text" class="tank-name" placeholder="Name"></label><label class="field contents-field"><span>Contents</span><input type="text" class="tank-contents" placeholder="e.g. Diesel, Water"></label><label class="field"><span>Sensor Type</span><select class="sensor-type" onchange="updatePinOptions(${id})">${sensorTypes.map(t=>`<option value="${t.value}">${t.label}</option>`).join('')}</select></label><label class="field"><span>Pin / Channel</span><select class="sensor-pin">${optaPins.map(p=>`<option value="${p.value}">${p.label}</option>`).join('')}</select></label><label class="field switch-mode-field" style="display:none;"><span>Switch Mode<span class="tooltip-icon" tabindex="0" data-tooltip="NO(Normally-Open): Switch is open by default, closes when fluid is present. NC(Normally-Closed): Switch is closed by default, opens when fluid is present.">?</span></span><select class="switch-mode"><option value="NO">Normally-Open(NO)</option><option value="NC">Normally-Closed(NC)</option></select></label><label class="field pulses-per-rev-field" style="display:none;"><span>Pulses/Rev</span><input type="number" class="pulses-per-rev" value="1" min="1" max="255"></label><label class="field current-loop-type-field" style="display:none;"><span>4-20mA Sensor Type<span class="tooltip-icon" tabindex="0" data-tooltip="Select the type of 4-20mA sensor: Pressure sensors are mounted near the sensor bottom and measure liquid pressure. Ultrasonic sensors are mounted on top of the sensor and measure distance to the liquid surface.">?</span></span><select class="current-loop-type" onchange="updateCurrentLoopFields(${id})"><option value="pressure">Pressure Sensor(Bottom-Mounted)</option><option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option></select></label><label class="field sensor-range-field" style="display:none;"><span><span class="sensor-range-label">Sensor Range</span><span class="tooltip-icon sensor-range-tooltip" tabindex="0" data-tooltip="Native measurement range of the sensor (e.g., 0-5 PSI for pressure, 0-10m for ultrasonic). This is the range that corresponds to 4-20mA output.">?</span></span><div style="display:flex;gap:8px;align-items:center;"><input type="number" class="sensor-range-min" value="0" step="0.1" style="width:70px;" placeholder="Min"><span>to</span><input type="number" class="sensor-range-max" value="5" step="0.1" style="width:70px;" placeholder="Max"><select class="sensor-range-unit" style="width:70px;"><option value="PSI">PSI</option><option value="bar">bar</option><option value="m">m</option><option value="ft">ft</option><option value="in">in</option><option value="cm">cm</option></select></div></label><label class="field sensor-mount-height-field" style="display:none;"><span><span class="mount-height-label">Sensor Mount Height(in)</span><span class="tooltip-icon mount-height-tooltip" tabindex="0" data-tooltip="For pressure sensors: height of sensor above tank bottom (usually 0-2 inches). For ultrasonic sensors: distance from sensor to tank bottom when empty.">?</span></span><input type="number" class="sensor-mount-height" value="0" step="0.1" min="0"></label><label class="field fluid-type-field" style="display:none;"><span><span>Fluid Type</span><span class="tooltip-icon" tabindex="0" data-tooltip="Specific gravity of the stored fluid. Pick the matching preset, or choose Custom and enter the SG manually. The server's calibration learning will refine this automatically once stick-gauge readings are submitted.">?</span></span><div style="display:flex;gap:8px;align-items:center;"><select class="fluid-type" onchange="updateFluidTypeFields(${id})" style="flex:1;"><option value="water">Water (1.00)</option><option value="diesel">Diesel (0.85)</option><option value="gasoline">Gasoline (0.74)</option><option value="heatingOil">Heating Oil (0.85)</option><option value="propane">Propane / LPG (0.50)</option><option value="brine">Brine (1.20)</option><option value="crudeOil">Crude Oil (0.83)</option><option value="usedOil">Used Oil (0.92)</option><option value="glycol50">Glycol 50% (1.07)</option><option value="def">DEF / AdBlue (1.09)</option><option value="ethanol">Ethanol (0.79)</option><option value="custom">Custom...</option></select><input type="number" class="fluid-sg-custom" step="0.001" min="0.3" max="2.0" placeholder="SG" style="width:80px;display:none;"></div></label><label class="field analog-voltage-field" style="display:none;"><span><span class="analog-voltage-label">Sensor Voltage Range</span><span class="tooltip-icon analog-voltage-tooltip" tabindex="0" data-tooltip="The voltage output range of the analog sensor. Common ranges: 0-10V, 0-5V, 1-5V.">?</span></span><div style="display:flex;gap:8px;align-items:center;"><input type="number" class="analog-voltage-min" value="0" step="0.1" style="width:70px;" placeholder="Min"><span>to</span><input type="number" class="analog-voltage-max" value="10" step="0.1" style="width:70px;" placeholder="Max"><span>V</span></div></label></div><label style="display:flex;align-items:center;gap:6px;margin-top:8px;"><input type="checkbox" class="stuck-detection" checked> Stuck Sensor Detection<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the system flags a sensor as failed if it reports the same reading 10 consecutive times. Disable for sensors where readings naturally stay constant (e.g., gas pressure monitors).">?</span></label><label style="display:flex;align-items:center;gap:6px;margin-top:8px;"><input type="checkbox" class="calibration-enabled" checked> Calibration Learning<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, you can submit manual verification readings on the Calibration page to teach the system the actual relationship between sensor output and measured values. Recommended for tank level sensors. For gas pressure or RPM sensors, disable unless you have reference gauges for comparison.">?</span></label><div class="digital-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);"><strong>Float Switch Mode:</strong> This sensor only detects whether fluid has reached the switch position.<br><br><strong>Wiring Note:</strong> Connect the switch between the input pin and GND. The software uses an internal pull-up resistor.</div><div class="current-loop-sensor-info" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-top:8px;font-size:0.9rem;color:var(--muted);"><div class="pressure-sensor-info"><strong>Pressure Sensor(Bottom-Mounted):</strong> Measures the pressure of the liquid column above it.<br>- 4mA = Empty tank (0 pressure)<br>- 20mA = Full tank (max pressure)<br>- Sensor Range: The native pressure range (e.g., 0-5 PSI)<br>- Mount Height: Distance from sensor to tank bottom</div><div class="ultrasonic-sensor-info" style="display:none;"><strong>Ultrasonic Sensor(Top-Mounted):</strong> Measures the distance from the sensor to the liquid surface.<br>- 4mA = Full tank (liquid close to sensor)<br>- 20mA = Empty tank (liquid far from sensor)<br>- Sensor Range: The native distance range (e.g., 0-10m)<br>- Sensor Mount Height: Distance from sensor to tank bottom when empty</div></div><button type="button" class="add-section-btn add-alarm-btn" onclick="toggleAlarmSection(${id})">+ Add Alarm</button><div class="collapsible-section alarm-section"><h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;"><span class="alarm-section-title">Alarm Thresholds</span><button type="button" class="remove-btn" onclick="removeAlarmSection(${id})" style="float:right;">Remove Alarm</button></h4><div class="form-grid alarm-thresholds-grid"><div class="field"><span><label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" class="high-alarm-enabled" checked> High Alarm</label></span><input type="number" class="high-alarm" value="100"></div><div class="field"><span><label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" class="low-alarm-enabled" checked> Low Alarm</label></span><input type="number" class="low-alarm" value="20"></div></div><div class="form-grid digital-alarm-grid" style="display:none;"><div class="field" style="grid-column:1 / -1;"><span>Trigger Condition<span class="tooltip-icon" tabindex="0" data-tooltip="Select when the alarm should trigger based on the float switch state.">?</span></span><select class="digital-trigger-state"><option value="activated">When Switch is Activated (fluid detected)</option><option value="not_activated">When Switch is NOT Activated (no fluid)</option></select></div></div></div><button type="button" class="add-section-btn add-relay-btn hidden" onclick="toggleRelaySection(${id})">+ Add Relay Control</button><div class="collapsible-section relay-section"><h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">Relay Switch Control<button type="button" class="remove-btn" onclick="removeRelaySection(${id})" style="float:right;">Remove Relay</button></h4><div class="form-grid"><label class="field"><span>Target Client UID</span><input type="text" class="relay-target" list="relayTargetSuggestions" placeholder="dev:IMEI (optional)"></label><label class="field"><span>Trigger On</span><select class="relay-trigger"><option value="any">Any Alarm (High or Low)</option><option value="high">High Alarm Only</option><option value="low">Low Alarm Only</option></select></label><label class="field"><span>Relay Mode</span><select class="relay-mode" onchange="toggleRelayDurations(${id})"><option value="momentary">Momentary (configurable duration)</option><option value="until_clear">Stay On Until Alarm Clears</option><option value="manual_reset">Stay On Until Manual Server Reset</option></select></label><div class="field"><span>Relay Outputs</span><div style="display:flex;gap:12px;padding:8px 0;"><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-1" value="1"> R1</label><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-2" value="2"> R2</label><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-3" value="4"> R3</label><label style="display:flex;align-items:center;gap:4px;"><input type="checkbox" class="relay-4" value="8"> R4</label></div></div><div class="relay-durations-section" style="grid-column:1 / -1;display:block;"><span style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:8px;display:block;">Momentary Duration per Relay (seconds, 0 = default 30 min):</span><div style="display:flex;gap:12px;flex-wrap:wrap;"><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R1:<input type="number" class="relay-duration-1" value="0" min="0" max="86400" style="width:70px;"></label><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R2:<input type="number" class="relay-duration-2" value="0" min="0" max="86400" style="width:70px;"></label><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R3:<input type="number" class="relay-duration-3" value="0" min="0" max="86400" style="width:70px;"></label><label style="display:flex;align-items:center;gap:4px;font-size:0.85rem;">R4:<input type="number" class="relay-duration-4" value="0" min="0" max="86400" style="width:70px;"></label></div></div><label class="field relay-max-on-section" style="grid-column:1 / -1;display:none;"><span>Safety Max ON Duration (seconds, 0 = no limit)<span class="tooltip-icon" tabindex="0" data-tooltip="Maximum time a relay can stay ON in manual_reset mode. After this duration the relay is forced OFF and a relay_timeout alarm is sent. Set to 0 to disable. Max 604800 (7 days).">?</span></span><input type="number" class="relay-max-on" value="0" min="0" max="604800" style="width:120px;"></label></div></div><button type="button" class="add-section-btn add-sms-btn hidden" onclick="toggleSmsSection(${id})">+ Add SMS Alert</button><div class="collapsible-section sms-section"><h4 style="margin:16px 0 8px;font-size:0.95rem;border-top:1px solid var(--card-border);padding-top:12px;">SMS Alert Notifications<button type="button" class="remove-btn" onclick="removeSmsSection(${id})" style="float:right;">Remove SMS Alert</button></h4><div class="form-grid"><label class="field" style="grid-column:1 / -1;"><span>Phone Numbers<span class="tooltip-icon" tabindex="0" data-tooltip="Enter phone numbers with country code (e.g., +15551234567). Separate multiple numbers with commas.">?</span></span><input type="text" class="sms-phones" placeholder="+15551234567,+15559876543"></label><label class="field"><span>Trigger On</span><select class="sms-trigger"><option value="any">Any Alarm (High or Low)</option><option value="high">High Alarm Only</option><option value="low">Low Alarm Only</option></select></label><label class="field" style="grid-column:span 2;"><span>Custom Message (optional)</span><input type="text" class="sms-message" placeholder="Tank alarm triggered"></label></div></div></div>`;}
 /* SENSOR FUNCTIONS */
 function normalizeBulletText(root){if(!root)return;root.querySelectorAll('.current-loop-sensor-info').forEach(el=>{el.innerHTML=el.innerHTML.replace(/[^\x20-\x7E]+/g,'-');});}
-function ensureSensorGuidance(card){if(!card)return;
-const alarmGrid=card.querySelector('.alarm-thresholds-grid');if(alarmGrid&&!card.querySelector('.alarm-guidance-note')){const note=document.createElement('div');note.className='alarm-guidance-note';note.style.cssText='grid-column:1 / -1;background:var(--chip);border:1px solid var(--card-border);padding:10px 12px;font-size:0.85rem;color:var(--muted);display:none;';alarmGrid.appendChild(note);}const relaySection=card.querySelector('.relay-durations-section');if(relaySection&&!card.querySelector('.relay-timing-note')){const note=document.createElement('div');note.className='relay-timing-note';note.style.cssText='margin-top:8px;font-size:0.82rem;color:var(--muted);';note.textContent='Momentary relay timers turn off on the next main-loop pass after expiry. Add a small safety margin if you need a tighter pulse width.';relaySection.appendChild(note);}}
-function updateSensorGuidance(id){const card=document.getElementById(`sensor-${id}`);if(!card)return;ensureSensorGuidance(card);
-const note=card.querySelector('.alarm-guidance-note');if(!note)return;
-const type=parseInt(card.querySelector('.sensor-type').value,10);
-const isAnalog=(type!==0&&type!==2&&type!==3);if(isAnalog){note.textContent='Analog voltage thresholds are evaluated in converted inches. Keep hysteresis at 1.0 inch or higher unless you have field-tested noise margins; generated configs default to 2.0 inches.';note.style.display='block';}else{note.style.display='none';}}
-function addSensor(){const container=document.getElementById('sensorsContainer');
-const div=document.createElement('div');div.innerHTML=createSensorHtml(sensorCount);container.appendChild(div.firstElementChild);normalizeBulletText(div.firstElementChild);ensureSensorGuidance(div.firstElementChild);updateSensorTypeFields(sensorCount);sensorCount++;}
+function ensureSensorGuidance(card){if(!card)return;const alarmGrid=card.querySelector('.alarm-thresholds-grid');if(alarmGrid&&!card.querySelector('.alarm-guidance-note')){const note=document.createElement('div');note.className='alarm-guidance-note';note.style.cssText='grid-column:1 / -1;background:var(--chip);border:1px solid var(--card-border);padding:10px 12px;font-size:0.85rem;color:var(--muted);display:none;';alarmGrid.appendChild(note);}const relaySection=card.querySelector('.relay-durations-section');if(relaySection&&!card.querySelector('.relay-timing-note')){const note=document.createElement('div');note.className='relay-timing-note';note.style.cssText='margin-top:8px;font-size:0.82rem;color:var(--muted);';note.textContent='Momentary relay timers turn off on the next main-loop pass after expiry. Add a small safety margin if you need a tighter pulse width.';relaySection.appendChild(note);}}
+function updateSensorGuidance(id){const card=document.getElementById(`sensor-${id}`);if(!card)return;ensureSensorGuidance(card);const note=card.querySelector('.alarm-guidance-note');if(!note)return;const type=parseInt(card.querySelector('.sensor-type').value,10);const isAnalog=(type!==0&&type!==2&&type!==3);if(isAnalog){note.textContent='Analog voltage thresholds are evaluated in converted inches. Keep hysteresis at 1.0 inch or higher unless you have field-tested noise margins; generated configs default to 2.0 inches.';note.style.display='block';}else{note.style.display='none';}}
+function addSensor(){const container=document.getElementById('sensorsContainer');const div=document.createElement('div');div.innerHTML=createSensorHtml(sensorCount);container.appendChild(div.firstElementChild);normalizeBulletText(div.firstElementChild);ensureSensorGuidance(div.firstElementChild);updateSensorTypeFields(sensorCount);sensorCount++;}
 window.removeSensor=function(id){const el=document.getElementById(`sensor-${id}`);if(el)el.remove();};
-
-window.toggleAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);
-const alarmSection=card.querySelector('.alarm-section');
-const addAlarmBtn=card.querySelector('.add-alarm-btn');
-const addRelayBtn=card.querySelector('.add-relay-btn');
-const addSmsBtn=card.querySelector('.add-sms-btn');alarmSection.classList.add('visible');addAlarmBtn.classList.add('hidden');addRelayBtn.classList.remove('hidden');addSmsBtn.classList.remove('hidden');};
-
-window.removeAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);
-const alarmSection=card.querySelector('.alarm-section');
-const addAlarmBtn=card.querySelector('.add-alarm-btn');
-const addRelayBtn=card.querySelector('.add-relay-btn');
-const addSmsBtn=card.querySelector('.add-sms-btn');
-const relaySection=card.querySelector('.relay-section');
-const smsSection=card.querySelector('.sms-section');alarmSection.classList.remove('visible');addAlarmBtn.classList.remove('hidden');addRelayBtn.classList.add('hidden');addSmsBtn.classList.add('hidden');relaySection.classList.remove('visible');smsSection.classList.remove('visible');card.querySelector('.high-alarm').value='100';card.querySelector('.low-alarm').value='20';card.querySelector('.high-alarm-enabled').checked=true;card.querySelector('.low-alarm-enabled').checked=true;card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
-
-window.toggleRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);
-const relaySection=card.querySelector('.relay-section');
-const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.add('visible');addBtn.classList.add('hidden');};
-
-window.removeRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);
-const relaySection=card.querySelector('.relay-section');
-const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});['relay-duration-1','relay-duration-2','relay-duration-3','relay-duration-4'].forEach(cls=>{card.querySelector('.'+cls).value='0';});card.querySelector('.relay-max-on').value='0';card.querySelector('.relay-durations-section').style.display='block';card.querySelector('.relay-max-on-section').style.display='none';};
-
-window.toggleSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);
-const smsSection=card.querySelector('.sms-section');
-const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.add('visible');addBtn.classList.add('hidden');};
-
-window.removeSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);
-const smsSection=card.querySelector('.sms-section');
-const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
-
-window.toggleRelayDurations=function(id){const card=document.getElementById(`sensor-${id}`);
-const relayMode=card.querySelector('.relay-mode').value;
-const durationsSection=card.querySelector('.relay-durations-section');
-const maxOnSection=card.querySelector('.relay-max-on-section');if(relayMode==='momentary'){durationsSection.style.display='block';maxOnSection.style.display='none';}else if(relayMode==='manual_reset'){durationsSection.style.display='none';maxOnSection.style.display='flex';}else{durationsSection.style.display='none';maxOnSection.style.display='none';}};
-
-window.updateMonitorFields=function(id){const card=document.getElementById(`sensor-${id}`);
-const type=card.querySelector('.monitor-type').value;
-const numField=card.querySelector('.tank-num-field');
-const numFieldLabel=numField.querySelector('span');
-const nameLabel=card.querySelector('.name-label');
-const sensorTypeSelect=card.querySelector('.sensor-type');
-const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');
-const contentsField=card.querySelector('.contents-field');
-const calCheckbox=card.querySelector('.calibration-enabled');if(type==='gas'){numField.style.display='flex';numFieldLabel.textContent='Display Number (optional)';nameLabel.textContent='System Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';sensorTypeSelect.value='2';calCheckbox.checked=false;updatePinOptions(id);}else if(type==='rpm'){numField.style.display='flex';numFieldLabel.textContent='Engine Number (optional)';nameLabel.textContent='Engine Name';pulsesPerRevField.style.display='flex';contentsField.style.display='none';sensorTypeSelect.value='3';calCheckbox.checked=false;updatePinOptions(id);}else{numField.style.display='flex';numFieldLabel.textContent='Tank Number (optional)';nameLabel.textContent='Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';calCheckbox.checked=true;}updateSensorTypeFields(id);};
-
-window.updatePinOptions=function(id){const card=document.getElementById(`sensor-${id}`);
-const typeSelect=card.querySelector('.sensor-type');
-const pinSelect=card.querySelector('.sensor-pin');
-const type=parseInt(typeSelect.value);pinSelect.innerHTML='';
-let options=[];if(type===2){options=expansionChannels;}else{options=optaPins;}options.forEach(opt=>{const option=document.createElement('option');option.value=opt.value;option.textContent=opt.label;pinSelect.appendChild(option);});updateSensorTypeFields(id);};
-
-window.updatePwmGatingVisibility=function(id){const card=document.getElementById(`sensor-${id}`);if(!card)return;const isPwmSelect=card.querySelector('.pwm-gating-enabled');if(!isPwmSelect)return;const gatingEnabled=isPwmSelect.value==='true';const type=parseInt(card.querySelector('.sensor-type').value);const showGatingFields=type===2&&gatingEnabled;card.querySelector('.pwm-gating-channel-field').style.display=showGatingFields?'flex':'none';card.querySelector('.pwm-gating-warmup-field').style.display=showGatingFields?'flex':'none';card.querySelector('.pwm-gating-sample-delay-field').style.display=showGatingFields?'flex':'none';};
-
-window.updateSensorTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);
-const type=parseInt(card.querySelector('.sensor-type').value);
-const digitalInfoBox=card.querySelector('.digital-sensor-info');
-const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');
-const alarmThresholdsGrid=card.querySelector('.alarm-thresholds-grid');
-const digitalAlarmGrid=card.querySelector('.digital-alarm-grid');
-const alarmSectionTitle=card.querySelector('.alarm-section-title');
-const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');
-const switchModeField=card.querySelector('.switch-mode-field');
-const currentLoopTypeField=card.querySelector('.current-loop-type-field');
-const sensorMountHeightField=card.querySelector('.sensor-mount-height-field');
-const sensorRangeField=card.querySelector('.sensor-range-field');
-const analogVoltageField=card.querySelector('.analog-voltage-field');
-const pwmGatingEnabledField=card.querySelector('.pwm-gating-enabled-field');if(type===0){digitalInfoBox.style.display='block';currentLoopInfoBox.style.display='none';switchModeField.style.display='flex';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';pwmGatingEnabledField.style.display='none';card.querySelector('.pwm-gating-channel-field').style.display='none';card.querySelector('.pwm-gating-warmup-field').style.display='none';card.querySelector('.pwm-gating-sample-delay-field').style.display='none';alarmThresholdsGrid.style.display='none';digitalAlarmGrid.style.display='grid';alarmSectionTitle.textContent='Float Switch Alarm';pulsesPerRevField.style.display='none';}else if(type===2){const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='block';switchModeField.style.display='none';analogVoltageField.style.display='none';pwmGatingEnabledField.style.display='flex';updatePwmGatingVisibility(id);
-const loopTypeSelect=card.querySelector('.current-loop-type');if(monitorType==='tank'){currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor(Bottom-Mounted)</option>
-<option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option>';sensorMountHeightField.style.display='flex';sensorRangeField.style.display='flex';}else if(monitorType==='gas'){currentLoopTypeField.style.display='none';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}else{currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';updateCurrentLoopFields(id);}else if(type===3){digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';pwmGatingEnabledField.style.display='none';card.querySelector('.pwm-gating-channel-field').style.display='none';card.querySelector('.pwm-gating-warmup-field').style.display='none';card.querySelector('.pwm-gating-sample-delay-field').style.display='none';alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='flex';}else{const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';analogVoltageField.style.display='flex';sensorRangeField.style.display='flex';pwmGatingEnabledField.style.display='none';card.querySelector('.pwm-gating-channel-field').style.display='none';card.querySelector('.pwm-gating-warmup-field').style.display='none';card.querySelector('.pwm-gating-sample-delay-field').style.display='none';if(monitorType==='tank'){sensorMountHeightField.style.display='flex';}else{sensorMountHeightField.style.display='none';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';}updateSensorGuidance(id);updateFluidVisibility(id);};
-
-window.updateCurrentLoopFields=function(id){const card=document.getElementById(`sensor-${id}`);
-const currentLoopType=card.querySelector('.current-loop-type').value;
-const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');
-const pressureInfo=currentLoopInfoBox.querySelector('.pressure-sensor-info');
-const ultrasonicInfo=currentLoopInfoBox.querySelector('.ultrasonic-sensor-info');
-const mountHeightLabel=card.querySelector('.mount-height-label');
-const mountHeightTooltip=card.querySelector('.mount-height-tooltip');
-const sensorRangeLabel=card.querySelector('.sensor-range-label');
-const sensorRangeTooltip=card.querySelector('.sensor-range-tooltip');
-const sensorRangeUnit=card.querySelector('.sensor-range-unit');
-const sensorRangeMax=card.querySelector('.sensor-range-max');if(currentLoopType==='ultrasonic'){pressureInfo.style.display='none';ultrasonicInfo.style.display='block';mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Distance from the ultrasonic sensor to the sensor bottom when empty.');sensorRangeLabel.textContent='Sensor Range';sensorRangeTooltip.setAttribute('data-tooltip','Native distance range of the ultrasonic sensor (e.g., 0-10m).');sensorRangeUnit.value='m';sensorRangeMax.value='10';}else{const monitorType=card.querySelector('.monitor-type').value;pressureInfo.style.display='block';ultrasonicInfo.style.display='none';if(monitorType==='gas'){sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor that maps to 4-20mA output.');}else{mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Height of the pressure sensor above the sensor bottom (usually 0-2 inches).');sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor (e.g., 0-5 PSI).');}sensorRangeLabel.textContent='Sensor Range';sensorRangeUnit.value='PSI';sensorRangeMax.value='5';}updateFluidVisibility(id);};
-
-window.updateFluidTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);
-const sel=card.querySelector('.fluid-type');
-const customInput=card.querySelector('.fluid-sg-custom');if(!sel||!customInput)return;customInput.style.display=(sel.value==='custom')?'inline-block':'none';};
-
-window.updateFluidVisibility=function(id){const card=document.getElementById(`sensor-${id}`);
-const fluidField=card.querySelector('.fluid-type-field');if(!fluidField)return;
-const monitorType=card.querySelector('.monitor-type').value;
-const type=parseInt(card.querySelector('.sensor-type').value);
-let show=false;if(monitorType==='tank'){if(type===2){const lt=card.querySelector('.current-loop-type').value;if(lt==='pressure')show=true;}else if(type!==0&&type!==3){show=true;}}fluidField.style.display=show?'flex':'none';if(show)updateFluidTypeFields(id);};
-
+window.toggleAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);const alarmSection=card.querySelector('.alarm-section');const addAlarmBtn=card.querySelector('.add-alarm-btn');const addRelayBtn=card.querySelector('.add-relay-btn');const addSmsBtn=card.querySelector('.add-sms-btn');alarmSection.classList.add('visible');addAlarmBtn.classList.add('hidden');addRelayBtn.classList.remove('hidden');addSmsBtn.classList.remove('hidden');};
+window.removeAlarmSection=function(id){const card=document.getElementById(`sensor-${id}`);const alarmSection=card.querySelector('.alarm-section');const addAlarmBtn=card.querySelector('.add-alarm-btn');const addRelayBtn=card.querySelector('.add-relay-btn');const addSmsBtn=card.querySelector('.add-sms-btn');const relaySection=card.querySelector('.relay-section');const smsSection=card.querySelector('.sms-section');alarmSection.classList.remove('visible');addAlarmBtn.classList.remove('hidden');addRelayBtn.classList.add('hidden');addSmsBtn.classList.add('hidden');relaySection.classList.remove('visible');smsSection.classList.remove('visible');card.querySelector('.high-alarm').value='100';card.querySelector('.low-alarm').value='20';card.querySelector('.high-alarm-enabled').checked=true;card.querySelector('.low-alarm-enabled').checked=true;card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
+window.toggleRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);const relaySection=card.querySelector('.relay-section');const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.add('visible');addBtn.classList.add('hidden');};
+window.removeRelaySection=function(id){const card=document.getElementById(`sensor-${id}`);const relaySection=card.querySelector('.relay-section');const addBtn=card.querySelector('.add-relay-btn');relaySection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.relay-target').value='';card.querySelector('.relay-trigger').value='any';card.querySelector('.relay-mode').value='momentary';['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{card.querySelector('.'+cls).checked=false;});['relay-duration-1','relay-duration-2','relay-duration-3','relay-duration-4'].forEach(cls=>{card.querySelector('.'+cls).value='0';});card.querySelector('.relay-max-on').value='0';card.querySelector('.relay-durations-section').style.display='block';card.querySelector('.relay-max-on-section').style.display='none';};
+window.toggleSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);const smsSection=card.querySelector('.sms-section');const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.add('visible');addBtn.classList.add('hidden');};
+window.removeSmsSection=function(id){const card=document.getElementById(`sensor-${id}`);const smsSection=card.querySelector('.sms-section');const addBtn=card.querySelector('.add-sms-btn');smsSection.classList.remove('visible');addBtn.classList.remove('hidden');card.querySelector('.sms-phones').value='';card.querySelector('.sms-trigger').value='any';card.querySelector('.sms-message').value='';};
+window.toggleRelayDurations=function(id){const card=document.getElementById(`sensor-${id}`);const relayMode=card.querySelector('.relay-mode').value;const durationsSection=card.querySelector('.relay-durations-section');const maxOnSection=card.querySelector('.relay-max-on-section');if(relayMode==='momentary'){durationsSection.style.display='block';maxOnSection.style.display='none';}else if(relayMode==='manual_reset'){durationsSection.style.display='none';maxOnSection.style.display='flex';}else{durationsSection.style.display='none';maxOnSection.style.display='none';}};
+window.updateMonitorFields=function(id){const card=document.getElementById(`sensor-${id}`);const type=card.querySelector('.monitor-type').value;const numField=card.querySelector('.tank-num-field');const numFieldLabel=numField.querySelector('span');const nameLabel=card.querySelector('.name-label');const sensorTypeSelect=card.querySelector('.sensor-type');const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');const contentsField=card.querySelector('.contents-field');const calCheckbox=card.querySelector('.calibration-enabled');if(type==='gas'){numField.style.display='flex';numFieldLabel.textContent='Display Number (optional)';nameLabel.textContent='System Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';sensorTypeSelect.value='2';calCheckbox.checked=false;updatePinOptions(id);}else if(type==='rpm'){numField.style.display='flex';numFieldLabel.textContent='Engine Number (optional)';nameLabel.textContent='Engine Name';pulsesPerRevField.style.display='flex';contentsField.style.display='none';sensorTypeSelect.value='3';calCheckbox.checked=false;updatePinOptions(id);}else{numField.style.display='flex';numFieldLabel.textContent='Tank Number (optional)';nameLabel.textContent='Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';calCheckbox.checked=true;}updateSensorTypeFields(id);};
+window.updatePinOptions=function(id){const card=document.getElementById(`sensor-${id}`);const typeSelect=card.querySelector('.sensor-type');const pinSelect=card.querySelector('.sensor-pin');const type=parseInt(typeSelect.value);pinSelect.innerHTML='';let options=[];if(type===2){options=expansionChannels;}else{options=optaPins;}options.forEach(opt=>{const option=document.createElement('option');option.value=opt.value;option.textContent=opt.label;pinSelect.appendChild(option);});updateSensorTypeFields(id);};
+window.updateSensorTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);const type=parseInt(card.querySelector('.sensor-type').value);const digitalInfoBox=card.querySelector('.digital-sensor-info');const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');const alarmThresholdsGrid=card.querySelector('.alarm-thresholds-grid');const digitalAlarmGrid=card.querySelector('.digital-alarm-grid');const alarmSectionTitle=card.querySelector('.alarm-section-title');const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');const switchModeField=card.querySelector('.switch-mode-field');const currentLoopTypeField=card.querySelector('.current-loop-type-field');const sensorMountHeightField=card.querySelector('.sensor-mount-height-field');const sensorRangeField=card.querySelector('.sensor-range-field');const analogVoltageField=card.querySelector('.analog-voltage-field');if(type===0){digitalInfoBox.style.display='block';currentLoopInfoBox.style.display='none';switchModeField.style.display='flex';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';alarmThresholdsGrid.style.display='none';digitalAlarmGrid.style.display='grid';alarmSectionTitle.textContent='Float Switch Alarm';pulsesPerRevField.style.display='none';}else if(type===2){const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='block';switchModeField.style.display='none';analogVoltageField.style.display='none';const loopTypeSelect=card.querySelector('.current-loop-type');if(monitorType==='tank'){currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor(Bottom-Mounted)</option><option value="ultrasonic">Ultrasonic Sensor(Top-Mounted)</option>';sensorMountHeightField.style.display='flex';sensorRangeField.style.display='flex';}else if(monitorType==='gas'){currentLoopTypeField.style.display='none';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}else{currentLoopTypeField.style.display='flex';loopTypeSelect.innerHTML='<option value="pressure">Pressure Sensor</option>';loopTypeSelect.value='pressure';sensorMountHeightField.style.display='none';sensorRangeField.style.display='flex';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';updateCurrentLoopFields(id);}else if(type===3){digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';sensorMountHeightField.style.display='none';sensorRangeField.style.display='none';analogVoltageField.style.display='none';alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='flex';}else{const monitorType=card.querySelector('.monitor-type').value;digitalInfoBox.style.display='none';currentLoopInfoBox.style.display='none';switchModeField.style.display='none';currentLoopTypeField.style.display='none';analogVoltageField.style.display='flex';sensorRangeField.style.display='flex';if(monitorType==='tank'){sensorMountHeightField.style.display='flex';}else{sensorMountHeightField.style.display='none';}alarmThresholdsGrid.style.display='grid';digitalAlarmGrid.style.display='none';alarmSectionTitle.textContent='Alarm Thresholds';pulsesPerRevField.style.display='none';}updateSensorGuidance(id);updateFluidVisibility(id);};
+window.updateCurrentLoopFields=function(id){const card=document.getElementById(`sensor-${id}`);const currentLoopType=card.querySelector('.current-loop-type').value;const currentLoopInfoBox=card.querySelector('.current-loop-sensor-info');const pressureInfo=currentLoopInfoBox.querySelector('.pressure-sensor-info');const ultrasonicInfo=currentLoopInfoBox.querySelector('.ultrasonic-sensor-info');const mountHeightLabel=card.querySelector('.mount-height-label');const mountHeightTooltip=card.querySelector('.mount-height-tooltip');const sensorRangeLabel=card.querySelector('.sensor-range-label');const sensorRangeTooltip=card.querySelector('.sensor-range-tooltip');const sensorRangeUnit=card.querySelector('.sensor-range-unit');const sensorRangeMax=card.querySelector('.sensor-range-max');if(currentLoopType==='ultrasonic'){pressureInfo.style.display='none';ultrasonicInfo.style.display='block';mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Distance from the ultrasonic sensor to the sensor bottom when empty.');sensorRangeLabel.textContent='Sensor Range';sensorRangeTooltip.setAttribute('data-tooltip','Native distance range of the ultrasonic sensor (e.g., 0-10m).');sensorRangeUnit.value='m';sensorRangeMax.value='10';}else{const monitorType=card.querySelector('.monitor-type').value;pressureInfo.style.display='block';ultrasonicInfo.style.display='none';if(monitorType==='gas'){sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor that maps to 4-20mA output.');}else{mountHeightLabel.textContent='Sensor Mount Height(in)';mountHeightTooltip.setAttribute('data-tooltip','Height of the pressure sensor above the sensor bottom (usually 0-2 inches).');sensorRangeTooltip.setAttribute('data-tooltip','Native pressure range of the sensor (e.g., 0-5 PSI).');}sensorRangeLabel.textContent='Sensor Range';sensorRangeUnit.value='PSI';sensorRangeMax.value='5';}updateFluidVisibility(id);};
+window.updateFluidTypeFields=function(id){const card=document.getElementById(`sensor-${id}`);const sel=card.querySelector('.fluid-type');const customInput=card.querySelector('.fluid-sg-custom');if(!sel||!customInput)return;customInput.style.display=(sel.value==='custom')?'inline-block':'none';};
+window.updateFluidVisibility=function(id){const card=document.getElementById(`sensor-${id}`);const fluidField=card.querySelector('.fluid-type-field');if(!fluidField)return;const monitorType=card.querySelector('.monitor-type').value;const type=parseInt(card.querySelector('.sensor-type').value);let show=false;if(monitorType==='tank'){if(type===2){const lt=card.querySelector('.current-loop-type').value;if(lt==='pressure')show=true;}else if(type!==0&&type!==3){show=true;}}fluidField.style.display=show?'flex':'none';if(show)updateFluidTypeFields(id);};
 document.getElementById('addSensorBtn').addEventListener('click',addSensor);
 /* INPUTS */
-function addInput(){const id=inputIdCounter++;
-const container=document.getElementById('inputsContainer');
-const card=document.createElement('div');card.className='sensor-card';card.id=`input-${id}`;card.innerHTML=`<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-<h4 style="margin:0;font-size:1rem;">Input ${id+1}</h4>
-<button type="button" class="remove-btn" onclick="removeInput(${id})">Remove</button>
-</div>
-<div class="form-grid">
-<label class="field">
-<span>Input Name</span>
-<input type="text" class="input-name" placeholder="Clear Button" value="Clear Button">
-</label>
-<label class="field">
-<span>Pin Number<span class="tooltip-icon" tabindex="0" data-tooltip="Arduino Opta pin number for the input.">?</span>
-</span>
-<input type="number" class="input-pin" value="0" min="0" max="99">
-</label>
-<label class="field">
-<span>Input Mode<span class="tooltip-icon" tabindex="0" data-tooltip="Active LOW: Button connects pin to GND, uses internal pull-up. Active HIGH: Button connects pin to VCC, requires external pull-down.">?</span>
-</span>
-<select class="input-mode">${inputModes.map(m=>`<option value="${m.value}">${m.label}</option>`).join('')}</select>
-</label>
-<label class="field">
-<span>Action<span class="tooltip-icon" tabindex="0" data-tooltip="What happens when this input is activated.">?</span>
-</span>
-<select class="input-action">${inputActions.map(a=>`<option value="${a.value}">${a.label}</option>`).join('')}</select>
-</label>
-</div>`;container.appendChild(card);}
+function addInput(){const id=inputIdCounter++;const container=document.getElementById('inputsContainer');const card=document.createElement('div');card.className='sensor-card';card.id=`input-${id}`;card.innerHTML=`<div class="card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><h4 style="margin:0;font-size:1rem;">Input ${id+1}</h4><button type="button" class="remove-btn" onclick="removeInput(${id})">Remove</button></div><div class="form-grid"><label class="field"><span>Input Name</span><input type="text" class="input-name" placeholder="Clear Button" value="Clear Button"></label><label class="field"><span>Pin Number<span class="tooltip-icon" tabindex="0" data-tooltip="Arduino Opta pin number for the input.">?</span></span><input type="number" class="input-pin" value="0" min="0" max="99"></label><label class="field"><span>Input Mode<span class="tooltip-icon" tabindex="0" data-tooltip="Active LOW: Button connects pin to GND, uses internal pull-up. Active HIGH: Button connects pin to VCC, requires external pull-down.">?</span></span><select class="input-mode">${inputModes.map(m=>`<option value="${m.value}">${m.label}</option>`).join('')}</select></label><label class="field"><span>Action<span class="tooltip-icon" tabindex="0" data-tooltip="What happens when this input is activated.">?</span></span><select class="input-action">${inputActions.map(a=>`<option value="${a.value}">${a.label}</option>`).join('')}</select></label></div>`;container.appendChild(card);}
 window.removeInput=function(id){const card=document.getElementById(`input-${id}`);if(card)card.remove();};
-
 document.getElementById('addInputBtn').addEventListener('click',addInput);
 /* CONFIG COLLECTION */
 function sensorKeyFromValue(value){switch(value){case 0:return 'digital';case 2:return 'current';case 3:return 'rpm';default:return 'analog';}}
-function collectConfig(){if(!validatePowerCombination()){showToast('Invalid power/battery combination — see warning above',true);return null;}const sMinutes=Math.max(1,Math.min(1440,parseInt(document.getElementById('sampleMinutes').value,10)||30));
-const time=(document.getElementById('reportTime').value||'05:00').split(':');
-const reportHour=parseInt(time[0])||5;
-const reportMinute=parseInt(time[1])||0;
-const psRaw=document.getElementById('powerSource').value||'grid';
-const btStr=document.getElementById('batteryType').value||'agm';
-const bvNominal=parseInt(document.getElementById('batteryVoltage').value,10)||12;
-const hasVin=document.getElementById('vinMonitorEnabled').value==='1';
-const isSolarOnly=(btStr==='none'&&psRaw.startsWith('solar'));/* battery type enum value matching TankAlarm_Battery.h (chemistry only) */const btEnumMap={'none':0,'agm':1,'flooded':2,'gel':3,'sla':4,'lifepo4':5,'li_ion':6,'lipo':7,'custom':8};
-
-const btEnum=btEnumMap[btStr]!==undefined?btEnumMap[btStr]:1;
-const cfg={productUid:document.getElementById('productUid').value.trim(),deviceUid:(document.getElementById('clientUid').value||'').trim(),site:document.getElementById('siteName').value.trim(),deviceLabel:document.getElementById('deviceLabel').value.trim()||'Unconfigured Client',clientFleet:(document.getElementById('clientFleet').value||'').trim(),serverFleet:document.getElementById('serverFleet').value.trim()||'tankalarm-server',sampleSeconds:sMinutes*60,reportHour:reportHour,reportMinute:reportMinute,dailyEmail:document.getElementById('dailyEmail').value.trim(),powerSupply:psRaw,solarPowered:psRaw.startsWith('solar'),mpptEnabled:psRaw.includes('mppt'),solarCharger:{enabled:psRaw==='solar_modbus_mppt'},batteryConfig:{enabled:btStr!=='none',batteryType:btEnum,batteryTypeName:btStr,nominalVoltage:(btStr==='none'||btStr==='lipo')?0:bvNominal},vinMonitor:{enabled:hasVin,pin:hasVin?parseInt(document.getElementById('vinPin').value)||0:0,r1Kohm:hasVin?parseFloat(document.getElementById('vinR1').value)||22:22,r2Kohm:hasVin?parseFloat(document.getElementById('vinR2').value)||47:47},solarOnlyConfig:{enabled:isSolarOnly,startupDebounceVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlyDebounceV').value)||10:10,startupDebounceSec:(isSolarOnly&&hasVin)?parseInt(document.getElementById('solarOnlyDebounceSec').value)||30:30,startupWarmupSec:(isSolarOnly&&!hasVin)?parseInt(document.getElementById('solarOnlyWarmupSec').value)||60:60,sensorGateVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySensorGateV').value)||11:11,sunsetVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySunsetV').value)||10:10,sunsetConfirmSec:isSolarOnly?parseInt(document.getElementById('solarOnlySunsetSec').value)||120:120,opportunisticReportHours:isSolarOnly?parseInt(document.getElementById('solarOnlyReportHours').value)||20:20,batteryFailureFallback:(!isSolarOnly&&psRaw.startsWith('solar')&&btStr!=='none')?!!document.getElementById('solarOnlyBatFail').checked:false,batteryFailureThreshold:parseInt(document.getElementById('solarOnlyBatFailCount').value)||10},sensors:[],clearButtonPin:-1,clearButtonActiveHigh:false};
-
+function collectConfig(){if(!validatePowerCombination()){showToast('Invalid power/battery combination — see warning above',true);return null;}const sMinutes=Math.max(1,Math.min(1440,parseInt(document.getElementById('sampleMinutes').value,10)||30));const time=(document.getElementById('reportTime').value||'05:00').split(':');const reportHour=parseInt(time[0])||5;const reportMinute=parseInt(time[1])||0;const psRaw=document.getElementById('powerSource').value||'grid';const btStr=document.getElementById('batteryType').value||'agm';const bvNominal=parseInt(document.getElementById('batteryVoltage').value,10)||12;const hasVin=document.getElementById('vinMonitorEnabled').value==='1';const isSolarOnly=(btStr==='none'&&psRaw.startsWith('solar'));/* battery type enum value matching TankAlarm_Battery.h (chemistry only) */const btEnumMap={'none':0,'agm':1,'flooded':2,'gel':3,'sla':4,'lifepo4':5,'li_ion':6,'lipo':7,'custom':8};const btEnum=btEnumMap[btStr]!==undefined?btEnumMap[btStr]:1;const cfg={productUid:document.getElementById('productUid').value.trim(),deviceUid:(document.getElementById('clientUid').value||'').trim(),site:document.getElementById('siteName').value.trim(),deviceLabel:document.getElementById('deviceLabel').value.trim()||'Unconfigured Client',clientFleet:(document.getElementById('clientFleet').value||'').trim(),serverFleet:document.getElementById('serverFleet').value.trim()||'tankalarm-server',sampleSeconds:sMinutes*60,reportHour:reportHour,reportMinute:reportMinute,dailyEmail:document.getElementById('dailyEmail').value.trim(),powerSupply:psRaw,solarPowered:psRaw.startsWith('solar'),mpptEnabled:psRaw.includes('mppt'),solarCharger:{enabled:psRaw==='solar_modbus_mppt'},batteryConfig:{enabled:btStr!=='none',batteryType:btEnum,batteryTypeName:btStr,nominalVoltage:(btStr==='none'||btStr==='lipo')?0:bvNominal},vinMonitor:{enabled:hasVin,pin:hasVin?parseInt(document.getElementById('vinPin').value)||0:0,r1Kohm:hasVin?parseFloat(document.getElementById('vinR1').value)||22:22,r2Kohm:hasVin?parseFloat(document.getElementById('vinR2').value)||47:47},solarOnlyConfig:{enabled:isSolarOnly,startupDebounceVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlyDebounceV').value)||10:10,startupDebounceSec:(isSolarOnly&&hasVin)?parseInt(document.getElementById('solarOnlyDebounceSec').value)||30:30,startupWarmupSec:(isSolarOnly&&!hasVin)?parseInt(document.getElementById('solarOnlyWarmupSec').value)||60:60,sensorGateVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySensorGateV').value)||11:11,sunsetVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySunsetV').value)||10:10,sunsetConfirmSec:isSolarOnly?parseInt(document.getElementById('solarOnlySunsetSec').value)||120:120,opportunisticReportHours:isSolarOnly?parseInt(document.getElementById('solarOnlyReportHours').value)||20:20,batteryFailureFallback:(!isSolarOnly&&psRaw.startsWith('solar')&&btStr!=='none')?!!document.getElementById('solarOnlyBatFail').checked:false,batteryFailureThreshold:parseInt(document.getElementById('solarOnlyBatFailCount').value)||10},sensors:[],clearButtonPin:-1,clearButtonActiveHigh:false};
 const sensorCards=document.querySelectorAll('#sensorsContainer .sensor-card');if(!sensorCards.length){showToast('Add at least one sensor',true);return null;}
-sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monitor-type').value;
-const type=parseInt(card.querySelector('.sensor-type').value);
-const pin=parseInt(card.querySelector('.sensor-pin').value);
-let userNum=parseInt(card.querySelector('.tank-num').value)||0;
-let name=card.querySelector('.tank-name').value;
-const contents=card.querySelector('.tank-contents')?.value||'';if(monitorType==='gas'){if(!name)name=`Gas System ${userNum||index+1}`;}else if(monitorType==='rpm'){if(!name)name=`Engine ${userNum||index+1}`;}else{if(!name)name=`Tank ${userNum||index+1}`;}const sensor=sensorKeyFromValue(type);
-const pulsesPerRev=Math.max(1,Math.min(255,parseInt(card.querySelector('.pulses-per-rev').value)||1));
-const switchMode=card.querySelector('.switch-mode').value;
-const alarmSectionVisible=card.querySelector('.alarm-section').classList.contains('visible');
-const highAlarmEnabled=card.querySelector('.high-alarm-enabled').checked;
-const lowAlarmEnabled=card.querySelector('.low-alarm-enabled').checked;
-const highAlarmValue=card.querySelector('.high-alarm').value;
-const lowAlarmValue=card.querySelector('.low-alarm').value;
-const tank={
-id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,reportThreshold:parseFloat(card.querySelector('.report-threshold')?.value)||0,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};
-if(sensor==='digital'){tank.digitalSwitchMode=switchMode;}let sUnit='';if(sensor==='current'){const currentLoopType=card.querySelector('.current-loop-type').value;
-const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;
-const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;
-const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';
-tank.currentLoopType=currentLoopType;
-tank.sensorMountHeight=sensorMountHeight;
-tank.sensorRangeMin=sMin;
-tank.sensorRangeMax=sMax;
-tank.sensorRangeUnit=sUnit;
-const isPwmEnabled=card.querySelector('.pwm-gating-enabled').value==='true';
-tank.pwmGatingEnabled=isPwmEnabled;
-tank.pwmGatingChannel=isPwmEnabled?parseInt(card.querySelector('.pwm-gating-channel').value)||0:0;
-tank.pwmGatingWarmup=isPwmEnabled?parseInt(card.querySelector('.pwm-gating-warmup').value)||3000:0;
-tank.pwmGatingSampleDelay=isPwmEnabled?parseInt(card.querySelector('.pwm-gating-sample-delay').value)||300:0;}else if(sensor==='analog'){const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;
-const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;
-const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';
-tank.sensorMountHeight=sensorMountHeight;
-tank.sensorRangeMin=sMin;
-tank.sensorRangeMax=sMax;
-tank.sensorRangeUnit=sUnit;
-tank.analogVoltageMin=parseFloat(card.querySelector('.analog-voltage-min').value)||0;
-tank.analogVoltageMax=parseFloat(card.querySelector('.analog-voltage-max').value)||10;}if(monitorType==='tank'){const fluidSel=card.querySelector('.fluid-type');if(fluidSel){const fluidType=fluidSel.value;
-tank.fluidType=fluidType;if(fluidType==='custom'){const customSg=parseFloat(card.querySelector('.fluid-sg-custom').value);if(!isNaN(customSg)&&customSg>=0.3&&customSg<=2.0){tank.fluidSpecificGravity=customSg;}}}}if(monitorType==='gas'){tank.measurementUnit=sUnit?sUnit.toLowerCase():'psi';}else if(monitorType==='rpm'){tank.measurementUnit='rpm';}else if(monitorType==='flow'){tank.measurementUnit='gpm';}if(alarmSectionVisible){if(sensor==='digital'){const digitalTriggerState=card.querySelector('.digital-trigger-state').value;
-tank.digitalTrigger=digitalTriggerState;if(digitalTriggerState==='activated'){tank.highAlarm=1;}else{tank.lowAlarm=0;}tank.alarmsEnabled=true;
-tank.alarmSms=true;}else if(highAlarmEnabled||lowAlarmEnabled){if(highAlarmEnabled&&highAlarmValue!==''){const v=parseFloat(highAlarmValue);if(!isNaN(v))tank.highAlarm=v;}if(lowAlarmEnabled&&lowAlarmValue!==''){const v=parseFloat(lowAlarmValue);if(!isNaN(v))tank.lowAlarm=v;}tank.alarmsEnabled=true;
-tank.alarmSms=true;}else{tank.alarmsEnabled=false;
-tank.alarmSms=false;}}else{tank.alarmsEnabled=false;
-tank.alarmSms=false;}if(sensor==='rpm'){tank.pulsesPerRev=pulsesPerRev;}const relaySectionVisible=card.querySelector('.relay-section').classList.contains('visible');if(relaySectionVisible){let relayMask=0;['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{const cb=card.querySelector('.'+cls);if(cb.checked)relayMask|=parseInt(cb.value);});
-const relayTarget=card.querySelector('.relay-target').value.trim();
-const relayTrigger=card.querySelector('.relay-trigger').value;
-const relayMode=card.querySelector('.relay-mode').value;if(relayTarget){tank.relayTargetClient=relayTarget;
-tank.relayMask=relayMask;
-tank.relayTrigger=relayTrigger;
-tank.relayMode=relayMode;if(relayMode==='momentary'){tank.relayMomentaryDurations=[parseInt(card.querySelector('.relay-duration-1').value)||0,parseInt(card.querySelector('.relay-duration-2').value)||0,parseInt(card.querySelector('.relay-duration-3').value)||0,parseInt(card.querySelector('.relay-duration-4').value)||0];}if(relayMode==='manual_reset'){const maxOn=parseInt(card.querySelector('.relay-max-on').value)||0;if(maxOn>0)tank.relayMaxOnSeconds=Math.min(maxOn,604800);}}}const smsSectionVisible=card.querySelector('.sms-section').classList.contains('visible');if(smsSectionVisible){const smsPhones=card.querySelector('.sms-phones').value.trim();
-const smsTrigger=card.querySelector('.sms-trigger').value;
-const smsMessage=card.querySelector('.sms-message').value.trim();if(smsPhones){const phoneArray=smsPhones.split(',').map(p=>p.trim()).filter(p=>p.length>0);if(phoneArray.length>0){tank.smsAlert={phones:phoneArray,trigger:smsTrigger,message:smsMessage||'Tank alarm triggered'};
-}}}cfg.sensors.push(tank);});
-const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');
-let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
+sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monitor-type').value;const type=parseInt(card.querySelector('.sensor-type').value);const pin=parseInt(card.querySelector('.sensor-pin').value);let userNum=parseInt(card.querySelector('.tank-num').value)||0;let name=card.querySelector('.tank-name').value;const contents=card.querySelector('.tank-contents')?.value||'';if(monitorType==='gas'){if(!name)name=`Gas System ${userNum||index+1}`;}else if(monitorType==='rpm'){if(!name)name=`Engine ${userNum||index+1}`;}else{if(!name)name=`Tank ${userNum||index+1}`;}const sensor=sensorKeyFromValue(type);const pulsesPerRev=Math.max(1,Math.min(255,parseInt(card.querySelector('.pulses-per-rev').value)||1));const switchMode=card.querySelector('.switch-mode').value;const alarmSectionVisible=card.querySelector('.alarm-section').classList.contains('visible');const highAlarmEnabled=card.querySelector('.high-alarm-enabled').checked;const lowAlarmEnabled=card.querySelector('.low-alarm-enabled').checked;const highAlarmValue=card.querySelector('.high-alarm').value;const lowAlarmValue=card.querySelector('.low-alarm').value;const tank={id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};if(sensor==='digital'){tank.digitalSwitchMode=switchMode;}let sUnit='';if(sensor==='current'){const currentLoopType=card.querySelector('.current-loop-type').value;const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';tank.currentLoopType=currentLoopType;tank.sensorMountHeight=sensorMountHeight;tank.sensorRangeMin=sMin;tank.sensorRangeMax=sMax;tank.sensorRangeUnit=sUnit;}else if(sensor==='analog'){const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';tank.sensorMountHeight=sensorMountHeight;tank.sensorRangeMin=sMin;tank.sensorRangeMax=sMax;tank.sensorRangeUnit=sUnit;tank.analogVoltageMin=parseFloat(card.querySelector('.analog-voltage-min').value)||0;tank.analogVoltageMax=parseFloat(card.querySelector('.analog-voltage-max').value)||10;}if(monitorType==='tank'){const fluidSel=card.querySelector('.fluid-type');if(fluidSel){const fluidType=fluidSel.value;tank.fluidType=fluidType;if(fluidType==='custom'){const customSg=parseFloat(card.querySelector('.fluid-sg-custom').value);if(!isNaN(customSg)&&customSg>=0.3&&customSg<=2.0){tank.fluidSpecificGravity=customSg;}}}}if(monitorType==='gas'){tank.measurementUnit=sUnit?sUnit.toLowerCase():'psi';}else if(monitorType==='rpm'){tank.measurementUnit='rpm';}else if(monitorType==='flow'){tank.measurementUnit='gpm';}if(alarmSectionVisible){if(sensor==='digital'){const digitalTriggerState=card.querySelector('.digital-trigger-state').value;tank.digitalTrigger=digitalTriggerState;if(digitalTriggerState==='activated'){tank.highAlarm=1;}else{tank.lowAlarm=0;}tank.alarmsEnabled=true;tank.alarmSms=true;}else if(highAlarmEnabled||lowAlarmEnabled){if(highAlarmEnabled&&highAlarmValue!==''){const v=parseFloat(highAlarmValue);if(!isNaN(v))tank.highAlarm=v;}if(lowAlarmEnabled&&lowAlarmValue!==''){const v=parseFloat(lowAlarmValue);if(!isNaN(v))tank.lowAlarm=v;}tank.alarmsEnabled=true;tank.alarmSms=true;}else{tank.alarmsEnabled=false;tank.alarmSms=false;}}else{tank.alarmsEnabled=false;tank.alarmSms=false;}if(sensor==='rpm'){tank.pulsesPerRev=pulsesPerRev;}const relaySectionVisible=card.querySelector('.relay-section').classList.contains('visible');if(relaySectionVisible){let relayMask=0;['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{const cb=card.querySelector('.'+cls);if(cb.checked)relayMask|=parseInt(cb.value);});const relayTarget=card.querySelector('.relay-target').value.trim();const relayTrigger=card.querySelector('.relay-trigger').value;const relayMode=card.querySelector('.relay-mode').value;if(relayTarget){tank.relayTargetClient=relayTarget;tank.relayMask=relayMask;tank.relayTrigger=relayTrigger;tank.relayMode=relayMode;if(relayMode==='momentary'){tank.relayMomentaryDurations=[parseInt(card.querySelector('.relay-duration-1').value)||0,parseInt(card.querySelector('.relay-duration-2').value)||0,parseInt(card.querySelector('.relay-duration-3').value)||0,parseInt(card.querySelector('.relay-duration-4').value)||0];}if(relayMode==='manual_reset'){const maxOn=parseInt(card.querySelector('.relay-max-on').value)||0;if(maxOn>0)tank.relayMaxOnSeconds=Math.min(maxOn,604800);}}}const smsSectionVisible=card.querySelector('.sms-section').classList.contains('visible');if(smsSectionVisible){const smsPhones=card.querySelector('.sms-phones').value.trim();const smsTrigger=card.querySelector('.sms-trigger').value;const smsMessage=card.querySelector('.sms-message').value.trim();if(smsPhones){const phoneArray=smsPhones.split(',').map(p=>p.trim()).filter(p=>p.length>0);if(phoneArray.length>0){tank.smsAlert={phones:phoneArray,trigger:smsTrigger,message:smsMessage||'Tank alarm triggered'};}}}cfg.sensors.push(tank);});
+const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
 /* SUBMIT & DOWNLOAD */
 const retryBtn=document.getElementById('retryConfigBtn');
-async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;
-const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});
-const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}}catch(err){showToast('Error: '+err.message,true);}}
-async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});
-const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
 retryBtn.addEventListener('click',retryConfig);
 const syncBtn=document.getElementById('syncRequestBtn');
-async function requestSync(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID required',true);return;}try{const res=await fetch('/api/sync-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});
-const t=await res.text();if(res.ok){showToast(t||'Sync request sent');syncBtn.style.display='none';}else{showToast(t||'Sync request failed',true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function requestSync(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID required',true);return;}try{const res=await fetch('/api/sync-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});const t=await res.text();if(res.ok){showToast(t||'Sync request sent');syncBtn.style.display='none';}else{showToast(t||'Sync request failed',true);}}catch(err){showToast('Error: '+err.message,true);}}
 if(syncBtn)syncBtn.addEventListener('click',requestSync);
 if(els.form)els.form.addEventListener('submit',submitConfig);
-document.getElementById('downloadBtn').addEventListener('click',()=>{const cfg=collectConfig();if(!cfg)return;
-const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});
-const url=URL.createObjectURL(blob);
-const a=document.createElement('a');a.href=url;a.download='client_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);});
+document.getElementById('downloadBtn').addEventListener('click',()=>{const cfg=collectConfig();if(!cfg)return;const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='client_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);});
 /* LOAD CONFIG */
-window.loadConfig=function(c){if(els.siteName)els.siteName.value=c.site||'';if(els.clientUid)els.clientUid.value=c.deviceUid||'';if(els.deviceLabel)els.deviceLabel.value=c.deviceLabel||'';if(els.clientFleet)els.clientFleet.value=c.clientFleet||'';if(els.productUid)els.productUid.value=c.productUid||'';if(els.sampleMinutes)els.sampleMinutes.value=(c.sampleSeconds||1800)/60;if(els.dailyEmail)els.dailyEmail.value=c.dailyEmail||'';
-const h=String(c.reportHour||5).padStart(2,'0');
-const m=String(c.reportMinute||0).padStart(2,'0');if(els.reportTime)els.reportTime.value=`${h}:${m}`;
+window.loadConfig=function(c){if(els.siteName)els.siteName.value=c.site||'';if(els.clientUid)els.clientUid.value=c.deviceUid||'';if(els.deviceLabel)els.deviceLabel.value=c.deviceLabel||'';if(els.clientFleet)els.clientFleet.value=c.clientFleet||'';if(els.productUid)els.productUid.value=c.productUid||'';if(els.sampleMinutes)els.sampleMinutes.value=(c.sampleSeconds||1800)/60;if(els.dailyEmail)els.dailyEmail.value=c.dailyEmail||'';const h=String(c.reportHour||5).padStart(2,'0');const m=String(c.reportMinute||0).padStart(2,'0');if(els.reportTime)els.reportTime.value=`${h}:${m}`;
 /* Power model: powerSupply + batteryConfig.batteryType + batteryConfig.nominalVoltage + vinMonitor.enabled */
 let psSel=c.powerSupply||'grid';
-let btSel='agm';
-let bvSel=12;
-let vinSel=(c.vinMonitor&&c.vinMonitor.enabled)?'1':'0';
+let btSel='agm';let bvSel=12;let vinSel=(c.vinMonitor&&c.vinMonitor.enabled)?'1':'0';
 if(c.batteryConfig&&c.batteryConfig.batteryTypeName){btSel=c.batteryConfig.batteryTypeName;bvSel=c.batteryConfig.nominalVoltage||12;}
-else if(c.batteryConfig&&typeof c.batteryConfig.batteryType==='number'){const revMap={0:'none',1:'agm',2:'flooded',3:'gel',4:'sla',5:'lifepo4',6:'li_ion',7:'lipo',8:'custom'};
-btSel=revMap[c.batteryConfig.batteryType]||'agm';bvSel=c.batteryConfig.nominalVoltage||12;if(!c.batteryConfig.enabled)btSel='none';}
+else if(c.batteryConfig&&typeof c.batteryConfig.batteryType==='number'){const revMap={0:'none',1:'agm',2:'flooded',3:'gel',4:'sla',5:'lifepo4',6:'li_ion',7:'lipo',8:'custom'};btSel=revMap[c.batteryConfig.batteryType]||'agm';bvSel=c.batteryConfig.nominalVoltage||12;if(!c.batteryConfig.enabled)btSel='none';}
 const psEl=document.getElementById('powerSource');if(psEl)psEl.value=psSel;
 const btEl=document.getElementById('batteryType');if(btEl)btEl.value=btSel;
 const bvEl=document.getElementById('batteryVoltage');if(bvEl)bvEl.value=String(bvSel||12);
 const vinEl=document.getElementById('vinMonitorEnabled');if(vinEl)vinEl.value=vinSel;
 updatePowerConfigInfo();
-if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin').value=c.vinMonitor.pin;if(c.vinMonitor.r1Kohm!==undefined)document.getElementById('vinR1').value=c.vinMonitor.r1Kohm;if(c.vinMonitor.r2Kohm!==undefined)document.getElementById('vinR2').value=c.vinMonitor.r2Kohm;updateVinCalc();}if(c.solarOnlyConfig){const so=c.solarOnlyConfig;if(so.startupDebounceVoltage!==undefined)document.getElementById('solarOnlyDebounceV').value=so.startupDebounceVoltage;if(so.startupDebounceSec!==undefined)document.getElementById('solarOnlyDebounceSec').value=so.startupDebounceSec;if(so.startupWarmupSec!==undefined)document.getElementById('solarOnlyWarmupSec').value=so.startupWarmupSec;if(so.sensorGateVoltage!==undefined)document.getElementById('solarOnlySensorGateV').value=so.sensorGateVoltage;if(so.sunsetVoltage!==undefined)document.getElementById('solarOnlySunsetV').value=so.sunsetVoltage;if(so.sunsetConfirmSec!==undefined)document.getElementById('solarOnlySunsetSec').value=so.sunsetConfirmSec;if(so.opportunisticReportHours!==undefined)document.getElementById('solarOnlyReportHours').value=so.opportunisticReportHours;if(so.batteryFailureFallback!==undefined)document.getElementById('solarOnlyBatFail').checked=so.batteryFailureFallback;if(so.batteryFailureThreshold!==undefined)document.getElementById('solarOnlyBatFailCount').value=so.batteryFailureThreshold;}document.getElementById('sensorsContainer').innerHTML='';sensorCount=0;if(c.sensors)c.sensors.forEach(t=>{addSensor();
-const card=document.getElementById(`sensor-${sensorCount-1}`);if(card){const monitorSel=card.querySelector('.monitor-type');if(t.monitorType){monitorSel.value=t.monitorType;}else if(t.name&&t.name.match(/gas/i)){monitorSel.value='gas';}else if(t.sensor==='rpm'){monitorSel.value='rpm';}else{monitorSel.value='tank';}updateMonitorFields(sensorCount-1);card.querySelector('.tank-num').value=t.userNumber||'';card.querySelector('.tank-name').value=t.name||'';card.querySelector('.tank-contents').value=t.contents||'';
-const sensorVal=t.sensor==='digital'?0:(t.sensor==='current'?2:(t.sensor==='rpm'?3:1));card.querySelector('.sensor-type').value=sensorVal;updatePinOptions(sensorCount-1);if(t.sensor==='current'){card.querySelector('.sensor-pin').value=t.loopChannel||0;
-card.querySelector('.pwm-gating-enabled').value=t.pwmGatingEnabled?'true':'false';
-card.querySelector('.pwm-gating-channel').value=t.pwmGatingChannel!==undefined?t.pwmGatingChannel:0;
-card.querySelector('.pwm-gating-warmup').value=t.pwmGatingWarmup!==undefined?t.pwmGatingWarmup:3000;
-card.querySelector('.pwm-gating-sample-delay').value=t.pwmGatingSampleDelay!==undefined?t.pwmGatingSampleDelay:300;
-updatePwmGatingVisibility(sensorCount-1);}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.currentLoopType)card.querySelector('.current-loop-type').value=t.currentLoopType;if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.reportThreshold!==undefined)card.querySelector('.report-threshold').value=t.reportThreshold;if(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms){toggleAlarmSection(sensorCount-1);if(t.highAlarm!==undefined){card.querySelector('.high-alarm').value=t.highAlarm;card.querySelector('.high-alarm-enabled').checked=true;}if(t.lowAlarm!==undefined){card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.low-alarm-enabled').checked=true;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}if(t.smsAlert&&t.smsAlert.phones){toggleSmsSection(sensorCount-1);card.querySelector('.sms-phones').value=t.smsAlert.phones.join(',');if(t.smsAlert.trigger)card.querySelector('.sms-trigger').value=t.smsAlert.trigger;if(t.smsAlert.message)card.querySelector('.sms-message').value=t.smsAlert.message;}updateSensorTypeFields(sensorCount-1);if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');
-const fIn=card.querySelector('.fluid-sg-custom');if(fSel&&fIn){fSel.value='custom';fIn.value=t.fluidSpecificGravity;updateFluidTypeFields(sensorCount-1);}}updateFluidVisibility(sensorCount-1);}});showToast('Configuration loaded');};
-
+if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin').value=c.vinMonitor.pin;if(c.vinMonitor.r1Kohm!==undefined)document.getElementById('vinR1').value=c.vinMonitor.r1Kohm;if(c.vinMonitor.r2Kohm!==undefined)document.getElementById('vinR2').value=c.vinMonitor.r2Kohm;updateVinCalc();}if(c.solarOnlyConfig){const so=c.solarOnlyConfig;if(so.startupDebounceVoltage!==undefined)document.getElementById('solarOnlyDebounceV').value=so.startupDebounceVoltage;if(so.startupDebounceSec!==undefined)document.getElementById('solarOnlyDebounceSec').value=so.startupDebounceSec;if(so.startupWarmupSec!==undefined)document.getElementById('solarOnlyWarmupSec').value=so.startupWarmupSec;if(so.sensorGateVoltage!==undefined)document.getElementById('solarOnlySensorGateV').value=so.sensorGateVoltage;if(so.sunsetVoltage!==undefined)document.getElementById('solarOnlySunsetV').value=so.sunsetVoltage;if(so.sunsetConfirmSec!==undefined)document.getElementById('solarOnlySunsetSec').value=so.sunsetConfirmSec;if(so.opportunisticReportHours!==undefined)document.getElementById('solarOnlyReportHours').value=so.opportunisticReportHours;if(so.batteryFailureFallback!==undefined)document.getElementById('solarOnlyBatFail').checked=so.batteryFailureFallback;if(so.batteryFailureThreshold!==undefined)document.getElementById('solarOnlyBatFailCount').value=so.batteryFailureThreshold;}document.getElementById('sensorsContainer').innerHTML='';sensorCount=0;if(c.sensors)c.sensors.forEach(t=>{addSensor();const card=document.getElementById(`sensor-${sensorCount-1}`);if(card){const monitorSel=card.querySelector('.monitor-type');if(t.monitorType){monitorSel.value=t.monitorType;}else if(t.name&&t.name.match(/gas/i)){monitorSel.value='gas';}else if(t.sensor==='rpm'){monitorSel.value='rpm';}else{monitorSel.value='tank';}updateMonitorFields(sensorCount-1);card.querySelector('.tank-num').value=t.userNumber||'';card.querySelector('.tank-name').value=t.name||'';card.querySelector('.tank-contents').value=t.contents||'';const sensorVal=t.sensor==='digital'?0:(t.sensor==='current'?2:(t.sensor==='rpm'?3:1));card.querySelector('.sensor-type').value=sensorVal;updatePinOptions(sensorCount-1);if(t.sensor==='current'){card.querySelector('.sensor-pin').value=t.loopChannel||0;}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.currentLoopType)card.querySelector('.current-loop-type').value=t.currentLoopType;if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms){toggleAlarmSection(sensorCount-1);if(t.highAlarm!==undefined){card.querySelector('.high-alarm').value=t.highAlarm;card.querySelector('.high-alarm-enabled').checked=true;}if(t.lowAlarm!==undefined){card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.low-alarm-enabled').checked=true;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}if(t.smsAlert&&t.smsAlert.phones){toggleSmsSection(sensorCount-1);card.querySelector('.sms-phones').value=t.smsAlert.phones.join(',');if(t.smsAlert.trigger)card.querySelector('.sms-trigger').value=t.smsAlert.trigger;if(t.smsAlert.message)card.querySelector('.sms-message').value=t.smsAlert.message;}updateSensorTypeFields(sensorCount-1);if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');const fIn=card.querySelector('.fluid-sg-custom');if(fSel&&fIn){fSel.value='custom';fIn.value=t.fluidSpecificGravity;updateFluidTypeFields(sensorCount-1);}}updateFluidVisibility(sensorCount-1);}});showToast('Configuration loaded');};
 /* CLOUD & IMPORT */
 function closeSelectClientModal(){els.selectClientModal.classList.add('hidden');}window.closeSelectClientModal=closeSelectClientModal;
-els.loadFromCloudBtn.addEventListener('click',async()=>{els.selectClientModal.classList.remove('hidden');els.clientList.innerHTML='Loading...';try{const r=await fetch('/api/clients?summary=1');
-const d=await r.json();
-const clients=d.cs||[];els.clientList.innerHTML=clients.map(c=>{const uid=c.c||'';
-const label=c.n||uid;
-const site=c.s||'';return `<div class="client-item" onclick="fetchClientConfig('${escapeHtml(uid)}')">
-<strong>${escapeHtml(label)}</strong> (${escapeHtml(uid)})<br>${escapeHtml(site)}</div>`;}).join('');}catch(e){els.clientList.innerHTML='Error loading clients';}});
-window.fetchClientConfig=async(uid)=>{closeSelectClientModal();try{const r=await fetch('/api/client?uid='+encodeURIComponent(uid));if(!r.ok)throw new Error('Failed');
-const c=await r.json();if(els.clientUid)els.clientUid.value=uid;if(c.config)loadConfig(c.config);else showToast('No config found for client',true);}catch(e){showToast('Error loading config',true);}};
-
-const importInput=document.getElementById('importFileInput');document.getElementById('importBtn').addEventListener('click',()=>importInput.click());importInput.addEventListener('change',(e)=>{const f=e.target.files[0];if(!f)return;
-const r=new FileReader();r.onload=(evt)=>{try{loadConfig(JSON.parse(evt.target.result));}catch(err){showToast('Invalid JSON',true);}};
-r.readAsText(f);});
+els.loadFromCloudBtn.addEventListener('click',async()=>{els.selectClientModal.classList.remove('hidden');els.clientList.innerHTML='Loading...';try{const r=await fetch('/api/clients?summary=1');const d=await r.json();const clients=d.cs||[];els.clientList.innerHTML=clients.map(c=>{const uid=c.c||'';const label=c.n||uid;const site=c.s||'';return `<div class="client-item" onclick="fetchClientConfig('${escapeHtml(uid)}')"><strong>${escapeHtml(label)}</strong> (${escapeHtml(uid)})<br>${escapeHtml(site)}</div>`;}).join('');}catch(e){els.clientList.innerHTML='Error loading clients';}});
+window.fetchClientConfig=async(uid)=>{closeSelectClientModal();try{const r=await fetch('/api/client?uid='+encodeURIComponent(uid));if(!r.ok)throw new Error('Failed');const c=await r.json();if(els.clientUid)els.clientUid.value=uid;if(c.config)loadConfig(c.config);else showToast('No config found for client',true);}catch(e){showToast('Error loading config',true);}};
+const importInput=document.getElementById('importFileInput');document.getElementById('importBtn').addEventListener('click',()=>importInput.click());importInput.addEventListener('change',(e)=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=(evt)=>{try{loadConfig(JSON.parse(evt.target.result));}catch(err){showToast('Invalid JSON',true);}};r.readAsText(f);});
 function getQueryParam(name){const params=new URLSearchParams(window.location.search);return params.get(name)||'';}
-async function basicInit(){try{const r=await fetch('/api/clients?summary=1');
-const d=await r.json();if(d&&d.srv&&d.srv.pu)els.productUid.value=d.srv.pu;if(d&&d.srv&&d.srv.cf)els.clientFleet.value=d.srv.cf;window._siteClients=d;populateRelayTargets(d);}catch(e){}const urlUid=getQueryParam('uid');if(urlUid&&els.clientUid)els.clientUid.value=urlUid;
-const urlSite=getQueryParam('site');if(urlSite&&els.siteName)els.siteName.value=urlSite;if(urlUid){await fetchClientConfig(urlUid);}else{addSensor();}}function populateRelayTargets(d){const dl=document.getElementById('relayTargetSuggestions');if(!dl||!d||!d.cs)return;
-const seen=new Set();d.cs.forEach(c=>{const uid=c.c||'';if(uid&&!seen.has(uid)){seen.add(uid);
-const opt=document.createElement('option');
-const label=c.n||c.s||'';opt.value=uid;opt.label=label?label+' ('+uid+')':uid;dl.appendChild(opt);}});}basicInit();
+async function basicInit(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv&&d.srv.pu)els.productUid.value=d.srv.pu;if(d&&d.srv&&d.srv.cf)els.clientFleet.value=d.srv.cf;window._siteClients=d;populateRelayTargets(d);}catch(e){}const urlUid=getQueryParam('uid');if(urlUid&&els.clientUid)els.clientUid.value=urlUid;const urlSite=getQueryParam('site');if(urlSite&&els.siteName)els.siteName.value=urlSite;if(urlUid){await fetchClientConfig(urlUid);}else{addSensor();}}function populateRelayTargets(d){const dl=document.getElementById('relayTargetSuggestions');if(!dl||!d||!d.cs)return;const seen=new Set();d.cs.forEach(c=>{const uid=c.c||'';if(uid&&!seen.has(uid)){seen.add(uid);const opt=document.createElement('option');const label=c.n||c.s||'';opt.value=uid;opt.label=label?label+' ('+uid+')':uid;dl.appendChild(opt);}});}basicInit();
 })();
-</script>
-</body>
-</html>)HTML";
+</script></body></html>)HTML";
 
 static const char SERIAL_MONITOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Serial Monitor - Tank Alarm Server</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Serial Output</h2><div class="controls"><button id="refreshServerBtn">Refresh Server Logs</button><button class="secondary" id="clearServerBtn">Clear Display</button><span style="color: var(--muted); font-size: 0.9rem;">Auto-refreshes every 5 seconds</span></div><div class="log-container" id="serverLogs"><div class="empty-state">Loading server logs...</div></div></div><div class="card"><h2>Client Serial Output</h2><div class="controls-grid"><label class="control-group"><span>Site Filter</span><select id="siteSelect"><option value="all">All sites</option></select></label><label class="control-group"><span>Client</span><select id="clientSelect"><option value="">-- Select a client --</option></select></label><)HTML" R"HTML(div class="control-group compact" style="flex: 1 1 340px;"><button id="pinClientBtn" disabled>Add Client Panel</button><button id="pinSiteBtn" class="secondary" disabled>Add Site Clients</button><button id="clearClientBtn" class="secondary">Clear Panels</button></div></div><div class="panel-grid" id="clientPanels"><div class="empty-state">Pin one or more clients to view their serial output alongside the server.</div></div></div></main><div id="toast"></div><script>(async () => {const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);/* PAUSE LOGIC */const pause_els={btn:document.getElementById('pauseBtn'),toast:document.getElementById('toast')};
 const pause_state={paused:false};if(pause_els.btn)pause_els.btn.addEventListener('click',togglePauseFlow);if(pause_els.btn)pause_els.btn.addEventListener('mouseenter',()=>{if(pause_state.paused)pause_els.btn.textContent='Resume';});if(pause_els.btn)pause_els.btn.addEventListener('mouseleave',()=>{renderPauseBtn();});await fetch('/api/clients?summary=1').then(r=>r.json()).then(d=>{if(d&&d.srv){pause_state.paused=!!d.srv.ps;renderPauseBtn();}}).catch(e=>console.error('Failed to load pause state',e));
@@ -2943,16 +2179,16 @@ function formatEpoch(epoch){if(!epoch)return '--';const date = new Date(epoch * 
 function signalIcon(sig){if(!sig||sig.bars==null||sig.bars<0)return'';const b=sig.bars;const c=b<=1?'#dc2626':b<=2?'#f59e0b':'#10b981';const lbl=b<=1?'Weak':b<=2?'Fair':b<=3?'Good':'Strong';return' <span title="'+lbl+' signal: '+b+'/4 bars'+(sig.rsrp?', RSRP: '+sig.rsrp+'dBm':'')+'" style="color:'+c+';font-size:0.7rem;font-weight:600;">&#x25A0;'+b+'/4</span>';}
 function renderTelemetry(){if(!els.telemetryContainer)return;els.telemetryContainer.innerHTML = '';if(!state.data || !state.data.clients)return;const sites ={};state.data.clients.forEach(client =>{const siteName = client.site || 'Unknown Site';if(!sites[siteName])sites[siteName]=[];sites[siteName].push(client);});Object.keys(sites).sort().forEach(siteName =>{const sensors = sites[siteName];const siteCard = document.createElement('div');siteCard.className = 'site-card';const header = document.createElement('div');header.className = 'site-header';header.innerHTML = `<span>${escapeHtml(siteName)}</span><span style="display:flex;align-items:center;gap:8px;"><span style="font-size:0.8rem;font-weight:400;color:var(--muted)">${sensors.length} device${sensors.length===1?'':'s'}</span><a class="pill secondary" href="/site-config?site=${encodeURIComponent(siteName)}" style="font-size:0.75rem;padding:3px 10px;">Manage Site</a></span>`;siteCard.appendChild(header);const grid = document.createElement('div');grid.className = 'site-sensors';sensors.forEach(tank =>{const tankDiv = document.createElement('div');tankDiv.className = 'site-tank';if(tank.alarm)tankDiv.classList.add('alarm');if(!tank.lastUpdate){tankDiv.style.opacity='0.7';tankDiv.innerHTML = `<div class="tank-meta"><strong>Configured Client</strong><code>${escapeHtml(tank.client)}</code></div><div class="tank-value" style="font-size:0.85rem;color:var(--muted);">Awaiting first report</div><div class="tank-footer"><button type="button" class="secondary" style="padding:2px 10px;font-size:0.8rem;" onclick="window.location.href='/config-generator?uid=${encodeURIComponent(tank.client)}'">Edit Config</button></div>`;}else{const ot=tank.objectType||'tank';const tlbl=tank.label||(ot==='tank'?'Tank':'Sensor');const tmu=tank.measurementUnit||'';const tUnit=(function(mu,o){const abr={inches:'in',psi:'psi',rpm:'rpm',gpm:'gpm'};if(mu){const k=mu.toLowerCase();return abr[k]||mu;}if(o==='gas')return'psi';if(o==='rpm')return'rpm';if(o==='flow')return'gpm';return'in';})(tmu,ot);tankDiv.innerHTML = `<div class="tank-meta"><strong>${escapeHtml(tlbl)}${tank.userNumber?' #'+tank.userNumber:''}</strong><code>${escapeHtml(tank.client).substring(0,8)}...</code>${signalIcon(tank.signal)}</div><div class="tank-value">${formatNumber(tank.levelInches)} <small style="font-size:0.7em;color:var(--muted)">${tUnit}</small></div><div class="tank-footer">${tank.alarm ? `<span style="color:var(--danger);font-weight:600">ALARM: ${escapeHtml(tank.alarmType)}</span>`:'Normal'}<span style="float:right">${formatEpoch(tank.lastUpdate)}</span></div>`;}grid.appendChild(tankDiv);});siteCard.appendChild(grid);els.telemetryContainer.appendChild(siteCard);});}
 function renderNewSites(){if(!els.newSitesContainer)return;els.newSitesContainer.innerHTML='';if(!state.data||!state.data.clients){els.newSitesContainer.innerHTML='<div class="empty-state">No clients detected yet.</div>';return;}const unconfigured=state.data.clients.filter(client=>{if(!client.lastUpdate)return false;const hasNoSite=!client.site||client.site.trim()===''||client.site==='Unknown Site';const hasNoLabel=!client.label||client.label.trim()==='';const hasDefaultLabel=client.label&&(client.label==='Client-112025'||client.label==='Unconfigured Client'||client.label.includes('Tank A'));return hasNoSite||(hasNoLabel||hasDefaultLabel);});if(unconfigured.length===0){els.newSitesContainer.innerHTML='<div class="empty-state">No unconfigured clients detected.</div>';return;}unconfigured.forEach(client=>{const card=document.createElement('div');card.className='site-card';card.style.borderLeft='4px solid var(--warning)';const firmwareVersion=client.firmwareVersion||client.version||'unknown';const lastSeenEpoch=client.lastUpdate||0;const now=Date.now()/1000;const ageSeconds=now-lastSeenEpoch;let lastSeenDisplay='';if(ageSeconds<120){lastSeenDisplay='<span style="color:#10b981;">&#x2714; Active now</span>';}else if(ageSeconds<3600){const mins=Math.floor(ageSeconds/60);lastSeenDisplay=`Last seen ${mins} min${mins!==1?'s':''} ago`;}else if(ageSeconds<86400){const hours=Math.floor(ageSeconds/3600);lastSeenDisplay=`Last seen ${hours} hour${hours!==1?'s':''} ago`;}else{const days=Math.floor(ageSeconds/86400);lastSeenDisplay=`Last seen ${days} day${days!==1?'s':''} ago - ${formatEpoch(lastSeenEpoch)}`;}card.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center;"><div><strong style="color:var(--warning)">&#x26A0; Unconfigured Client</strong><div style="font-size:0.85rem;color:var(--muted);margin-top:4px;">UID: <code>${escapeHtml(client.client)}</code></div><div style="font-size:0.85rem;margin-top:4px;">${lastSeenDisplay}</div><div style="font-size:0.85rem;margin-top:4px;color:var(--muted);">Firmware: ${escapeHtml(firmwareVersion)}</div></div><button type="button" class="configure-btn" style="white-space:nowrap;">Configure &#x2192;</button></div>`;card.querySelector)HTML" R"HTML(('.configure-btn').addEventListener('click',()=>{window.location.href='/config-generator?uid='+encodeURIComponent(client.client);});els.newSitesContainer.appendChild(card);});}
-function populateClientList(){if(!els.clientList)return;els.clientList.innerHTML='';if(!state.data||!state.data.clients||!state.data.clients.length){els.clientList.innerHTML='<div style="padding:12px;color:var(--muted);text-align:center;">No clients available</div>';return;}const items=[];state.data.clients.forEach(c=>{items.push({uid:c.client,site:c.site||'Unknown Site',label:c.label||'',type:'telemetry',dp:c.dp});});if(state.data.configs){state.data.configs.forEach(entry=>{if(!items.find(i=>i.uid===entry.client)){items.push({uid:entry.client,site:entry.site||'Site',label:'Stored config',type:'config',dp:false});}});}if(!state.selected&&items.length){state.selected=items[0].uid;}items.forEach(item=>{const div=document.createElement('div');div.className='cl-item'+(state.selected===item.uid?' selected':'')+(item.dp?' stale-dp':'');div.dataset.uid=item.uid;const shortUid=item.uid.length>12?item.uid.substring(item.uid.length-8):item.uid;const warningBadge=item.dp?' <span style="color:#dc2626;font-weight:bold;font-size:0.75rem;">&#x26A0; STALE</span>':'';div.innerHTML='<div class="cl-site">'+escapeHtml(item.site)+warningBadge+'</div>'+(item.label&&item.type!=='config'?'<div class="cl-label">'+escapeHtml(item.label)+'</div>':'')+(item.type==='config'?'<div class="cl-label">Stored config</div>':'')+'<div class="cl-uid">'+escapeHtml(shortUid)+'</div>';div.addEventListener('click',()=>{state.selected=item.uid;els.clientList.querySelectorAll('.cl-item').forEach(el=>el.classList.remove('selected'));div.classList.add('selected');updateClientDetails(state.selected);fetchLocationInfo(state.selected);});els.clientList.appendChild(div);});updateClientDetails(state.selected);}
+function populateClientList(){if(!els.clientList)return;els.clientList.innerHTML='';if(!state.data||!state.data.clients||!state.data.clients.length){els.clientList.innerHTML='<div style="padding:12px;color:var(--muted);text-align:center;">No clients available</div>';return;}const items=[];state.data.clients.forEach(c=>{items.push({uid:c.client,site:c.site||'Unknown Site',label:c.label||'',type:'telemetry'});});if(state.data.configs){state.data.configs.forEach(entry=>{if(!items.find(i=>i.uid===entry.client)){items.push({uid:entry.client,site:entry.site||'Site',label:'Stored config',type:'config'});}});}if(!state.selected&&items.length){state.selected=items[0].uid;}items.forEach(item=>{const div=document.createElement('div');div.className='cl-item'+(state.selected===item.uid?' selected':'');div.dataset.uid=item.uid;const shortUid=item.uid.length>12?item.uid.substring(item.uid.length-8):item.uid;div.innerHTML='<div class="cl-site">'+escapeHtml(item.site)+'</div>'+(item.label&&item.type!=='config'?'<div class="cl-label">'+escapeHtml(item.label)+'</div>':'')+(item.type==='config'?'<div class="cl-label">Stored config</div>':'')+'<div class="cl-uid">'+escapeHtml(shortUid)+'</div>';div.addEventListener('click',()=>{state.selected=item.uid;els.clientList.querySelectorAll('.cl-item').forEach(el=>el.classList.remove('selected'));div.classList.add('selected');updateClientDetails(state.selected);fetchLocationInfo(state.selected);});els.clientList.appendChild(div);});updateClientDetails(state.selected);}
 function lookupClient(uid){if(!state.data || !state.data.clients)return null;return state.data.clients.find(c => c.client === uid)|| null;}
-function updateClientDetails(uid){if(!uid){els.clientDetails.textContent='Select a client';return;}const client = lookupClient(uid);const detailParts = [];if(client){detailParts.push(`<strong>Site:</strong> ${escapeHtml(client.site || 'Unknown')}`);const cOt=client.objectType||'';const dtLbl=client.label||(cOt==='tank'||!cOt?'Tank':'Sensor');const dtNum=client.userNumber?' #'+escapeHtml(String(client.userNumber)):'';detailParts.push(`<strong>Latest:</strong> ${escapeHtml(dtLbl)}${dtNum} at ${formatNumber(client.levelInches)}${client.measurementUnit||'in'}`);}else{detailParts.push('Client not in telemetry data');}detailParts.push(`<strong>UID:</strong><code>${uid}</code>`);let actionButtons=`<button type="button" class="secondary" style="padding:4px 12px;font-size:0.85rem;" onclick="window.location.href='/config-generator?uid=${encodeURIComponent(uid)}'">Edit Configuration</button>`;if(client&&client.dp){actionButtons+=` <button type="button" style="padding:4px 12px;font-size:0.85rem;background:#dc2626;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:600;" onclick="approveDeletion('${escapeHtml(uid)}')">&#x2714; Approve Deletion</button>`;}els.clientDetails.innerHTML = detailParts.join(' - ')+'<div style="margin-top:10px;display:flex;gap:8px;">'+actionButtons+'</div>';}
-function normalizeApiData(data){var srv=data.srv||{};var result={server:{name:srv.n||'',smsPrimary:srv.sp||'',smsSecondary:srv.ss||'',productUid:srv.pu||'',pinConfigured:!!srv.pc,dailyEmail:srv.de||''},serverUid:data.si||'',nextDailyEmailEpoch:data.nde||0,clients:(data.cs||[]).map(function(c){return{client:c.c||'',site:c.s||'',label:c.n||'',sensorIndex:c.k||'',userNumber:c.un||0,alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,levelInches:c.l,vinVoltage:c.v,firmwareVersion:c.fv||'',objectType:c.ot||'',measurementUnit:c.mu||'',signal:c.sig||null,dp:!!c.dp,sensors:(c.ts||[]).map(function(t){return{label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,heightInches:t.h,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,objectType:t.ot||'',measurementUnit:t.mu||''};})};})}};result.configs=(data.cfgs||[]).map(function(cfg){return{client:cfg.c||'',site:cfg.s||'',configJson:cfg.cj||''};});return result;}
+function updateClientDetails(uid){if(!uid){els.clientDetails.textContent='Select a client';return;}const client = lookupClient(uid);const detailParts = [];if(client){detailParts.push(`<strong>Site:</strong> ${escapeHtml(client.site || 'Unknown')}`);const cOt=client.objectType||'';const dtLbl=client.label||(cOt==='tank'||!cOt?'Tank':'Sensor');const dtNum=client.userNumber?' #'+escapeHtml(String(client.userNumber)):'';detailParts.push(`<strong>Latest:</strong> ${escapeHtml(dtLbl)}${dtNum} at ${formatNumber(client.levelInches)}${client.measurementUnit||'in'}`);}else{detailParts.push('Client not in telemetry data');}detailParts.push(`<strong>UID:</strong><code>${uid}</code>`);detailParts.push(`<button type="button" class="secondary" style="padding:4px 12px;font-size:0.85rem;" onclick="window.location.href='/config-generator?uid=${encodeURIComponent(uid)}'">Edit Configuration</button>`);els.clientDetails.innerHTML = detailParts.join(' - ');}
+function normalizeApiData(data){var srv=data.srv||{};var result={server:{name:srv.n||'',smsPrimary:srv.sp||'',smsSecondary:srv.ss||'',productUid:srv.pu||'',pinConfigured:!!srv.pc,dailyEmail:srv.de||''},serverUid:data.si||'',nextDailyEmailEpoch:data.nde||0,clients:(data.cs||[]).map(function(c){return{client:c.c||'',site:c.s||'',label:c.n||'',sensorIndex:c.k||'',userNumber:c.un||0,alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,levelInches:c.l,vinVoltage:c.v,firmwareVersion:c.fv||'',objectType:c.ot||'',measurementUnit:c.mu||'',signal:c.sig||null,sensors:(c.ts||[]).map(function(t){return{label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,heightInches:t.h,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,objectType:t.ot||'',measurementUnit:t.mu||''};})};})}};result.configs=(data.cfgs||[]).map(function(cfg){return{client:cfg.c||'',site:cfg.s||'',configJson:cfg.cj||''};});return result;}
 function applyServerData(data,preferredUid){try{state.data=normalizeApiData(data);if(preferredUid){state.selected=preferredUid;}renderTelemetry();renderNewSites();populateClientList();}catch(e){console.error('applyServerData error:',e);if(els.telemetryContainer)els.telemetryContainer.innerHTML='<div class="empty-state" style="color:var(--danger);">Render error: '+e.message+'</div>';}}
 async function refreshData(preferredUid){try{const query=preferredUid?'&client='+encodeURIComponent(preferredUid):'';const ac=new AbortController();const tid=setTimeout(()=>ac.abort(),10000);const res=await fetch('/api/clients?summary=1'+query,{signal:ac.signal,headers:{'Cache-Control':'no-cache'}});clearTimeout(tid);if(!res.ok){throw new Error('Failed to fetch server data');}const data=await res.json();console.log('API response: cs=',data.cs?data.cs.length:0,'clients, cfgs=',data.cfgs?data.cfgs.length:0);applyServerData(data,preferredUid||state.selected);}catch(err){const msg=err.name==='AbortError'?'Request timed out (server busy)':err.message||'Initialization failed';console.error('refreshData error:',err);showToast(msg,true);if(els.telemetryContainer)els.telemetryContainer.innerHTML='<div class="empty-state" style="color:var(--danger);">'+escapeHtml(msg)+'</div>';}}
 async function triggerManualRefresh(targetUid){const payload = targetUid ?{client:targetUid}:{};try{const res = await fetch('/api/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok){const text = await res.text();throw new Error(text || 'Refresh failed');}const data = await res.json();applyServerData(data,targetUid || state.selected);showToast(targetUid ? 'Selected site updated':'All sites updated');}catch(err){showToast(err.message || 'Refresh failed',true);}}
 async function requestLocation(clientUid){if(!clientUid){showToast('Select a client first.',true);return;}try{const res = await fetch('/api/location',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientUid:clientUid})});if(!res.ok){const text = await res.text();throw new Error(text || 'Location request failed');}showToast('Location request sent - check back in a few minutes');await fetchLocationInfo(clientUid);}catch(err){showToast(err.message || 'Location request failed',true);}}
 async function fetchLocationInfo(clientUid){if(!clientUid || !els.locationInfo)return;try{const res = await fetch(`/api/location?client=${encodeURIComponent(clientUid)}`);if(!res.ok)return;const data = await res.json();if(data.hasLocation){const date = data.locationEpoch ? new Date(data.locationEpoch * 1000).toLocaleString():'Unknown';els.locationInfo.innerHTML = `<strong>&#x1F4CD; Cached Location:</strong> ${data.latitude.toFixed(4)}, ${data.longitude.toFixed(4)} <span style="color:var(--muted)">(as of ${date})</span>`;els.locationInfo.style.display = 'block';}else{els.locationInfo.innerHTML = '<strong>&#x1F4CD; Location:</strong> <span style="color:var(--muted)">Not yet received. Click "Request GPS Location" to fetch.</span>';els.locationInfo.style.display = 'block';}}catch(err){els.locationInfo.style.display = 'none';}}
-if(els.refreshSelectedBtn)els.refreshSelectedBtn.addEventListener('click',()=>{if(!state.selected){showToast('Select a client first.',true);return;}triggerManualRefresh(state.selected);});if(els.requestLocationBtn)els.requestLocationBtn.addEventListener('click',()=>{requestLocation(state.selected);});refreshData().then(()=>{if(state.selected)fetchLocationInfo(state.selected);});async function approveDeletion(uid){const pin=prompt('Enter your admin command pin to approve and execute deletion for client: '+uid);if(pin===null)return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid,pin:pin})});if(!res.ok){throw new Error(await res.text()||'Deletion failed');}showToast('Client removed: '+uid);state.selected=null;await refreshData();}catch(err){showToast(err.message||'Failed to remove client',true);}}window.approveDeletion=approveDeletion;})();
+if(els.refreshSelectedBtn)els.refreshSelectedBtn.addEventListener('click',()=>{if(!state.selected){showToast('Select a client first.',true);return;}triggerManualRefresh(state.selected);});if(els.requestLocationBtn)els.requestLocationBtn.addEventListener('click',()=>{requestLocation(state.selected);});refreshData().then(()=>{if(state.selected)fetchLocationInfo(state.selected);});})();
 </script></body></html>)HTML";
 
 static const char SITE_CONFIG_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Site Configuration - Tank Alarm Server</title><link rel="stylesheet" href="/style.css"><style>.site-title{font-size:1.5rem;font-weight:700;margin:0;}.site-subtitle{color:var(--muted);font-size:0.9rem;margin-top:4px;}.client-grid{display:grid;gap:16px;margin-top:16px;}.client-card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;padding:16px;}.client-card.has-alarm{border-left:4px solid var(--danger);}.client-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;}.client-name{font-weight:600;font-size:1.05rem;}.client-uid{font-family:monospace;font-size:0.8rem;color:var(--muted);margin-top:2px;}.sensor-list{display:grid;gap:8px;}.sensor-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:0.9rem;}.sensor-row.alarm{background:rgba(220,38,38,0.08);}.sensor-level{font-weight:600;font-size:1.1rem;}.sensor-status{font-size:0.85rem;}.uid-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:0.9rem;}.uid-table th,.uid-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--card-border);}.uid-table th{font-weight:600;color:var(--muted);font-size:0.8rem;text-transform:uppercase;}.uid-table td code{font-size:0.85rem;cursor:pointer;}.uid-table td code:hover{color:var(--accent);}.copy-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;padding:8px 16px;border-radius:6px;font-size:0.85rem;opacity:0;transition:opacity 0.3s;pointer-events:none;}.copy-toast.show{opacity:1;}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;"><div><h1 class="site-title" id="siteTitle">Loading...</h1><p class="site-subtitle" id="siteSubtitle"></p></div><div style="display:flex;gap:8px;flex-wrap:wrap;"><button id="addClientBtn" class="pill">+ Add Client</button><button id="backBtn" class="pill secondary" onclick="window.location.href='/client-console'">Back to Console</button></div></div></div><div class="card"><h2 style="margin-top:0;">Client Devices</h2><div id="clientGrid" class="client-grid"><div class="empty-state">Loading site data...</div></div></div><div class="card"><h2 style="margin-top:0;">Client UID Quick Reference</h2><p style="color:var(--muted);font-size:0.9rem;margin-bottom:8px;">Click any UID to copy it. Use these UIDs for relay target configuration.</p><table class="uid-table"><thead><tr><th>Device Label</th><th>Client UID</th><th>Sensors</th><th>Status</th></tr></thead><tbody id="uidTableBody"></tbody></table></div></main><div id="toast"></div><div class="copy-toast" id="copyToast">UID copied to clipboard</div>)HTML" R"HTML(<script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);function escapeHtml(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}function formatNumber(v){return(typeof v==='number'&&isFinite(v))?v.toFixed(1):'--';}function formatEpoch(e){if(!e)return'--';const d=new Date(e*1000);if(isNaN(d.getTime()))return'--';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}function getQueryParam(n){return new URLSearchParams(window.location.search).get(n)||'';}const siteName=getQueryParam('site');if(!siteName){document.getElementById('siteTitle').textContent='No site specified';document.getElementById('clientGrid').innerHTML='<div class="empty-state">Use ?site=SiteName in the URL or navigate from the Client Console.</div>';return;}document.getElementById('siteTitle').textContent=siteName;document.title=siteName+' - Site Configuration';document.getElementById('addClientBtn').addEventListener('click',()=>{window.location.href='/config-generator?site='+encodeURIComponent(siteName);});function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}function copyUid(uid){navigator.clipboard.writeText(uid).then(()=>{const ct=document.getElementById('copyToast');ct.classList.add('show');setTimeout(()=>ct.classList.remove('show'),1500);}).catch(()=>{showToast('Copy failed',true);});}window.copyUid=copyUid;)HTML" R"HTML(async function loadSiteData(){try{const r=await fetch('/api/clients?summary=1');if(!r.ok)throw new Error('Failed to fetch');const raw=await r.json();const srv=raw.srv||{};const allClients=(raw.cs||[]).map(c=>({uid:c.c||'',site:c.s||'Unknown Site',label:c.n||'',sensorIndex:c.k||'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,levelInches:c.l,sensorMa:c.ma,vinVoltage:c.v,vinVoltageEpoch:c.ve,sensorCount:c.tc||1,sensors:(c.ts||[]).map(t=>({label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,sensorType:t.st||'',objectType:t.ot||'',measurementUnit:t.mu||'',contents:t.ct||'',change24h:t.d}))}));const siteClients=allClients.filter(c=>c.site===siteName);const uniqueMap=new Map();siteClients.forEach(c=>{if(!uniqueMap.has(c.uid)){uniqueMap.set(c.uid,{uid:c.uid,label:c.label,alarm:false,vinVoltage:c.vinVoltage,vinVoltageEpoch:c.vinVoltageEpoch,sensors:[]});}const entry=uniqueMap.get(c.uid);if(c.sensors&&c.sensors.length){c.sensors.forEach(t=>entry.sensors.push(t));}else{entry.sensors.push({label:c.label||'',sensorIndex:c.sensorIndex,levelInches:c.levelInches,alarm:c.alarm,alarmType:c.alarmType,lastUpdate:c.lastUpdate,objectType:'',measurementUnit:'',contents:''});}if(c.alarm)entry.alarm=true;entry.sensors.forEach(t=>{if(t.alarm)entry.alarm=true;});});const clients=Array.from(uniqueMap.values());document.getElementById('siteSubtitle').textContent=clients.length+' client device'+(clients.length===1?'':'s')+' at this site';renderClients(clients);renderUidTable(clients);}catch(e){console.error(e);document.getElementById('clientGrid').innerHTML='<div class="empty-state">Error loading site data.</div>';}}function objectTypeLabel(ot){const map={tank:'Tank',gas:'Gas Monitor',engine:'Engine',pump:'Pump',flow:'Flow Meter'};return map[ot]||'Sensor';}function sensorDisplayName(t){const ot=t.objectType||'';const lbl=t.label||objectTypeLabel(ot);return lbl+(t.userNumber?' #'+t.userNumber:'');}function unitLabel(mu,ot){const abr={inches:'in',psi:'psi',rpm:'rpm',gpm:'gpm'};if(mu){const k=mu.toLowerCase();return abr[k]||mu;}if(ot==='gas')return'psi';if(ot==='rpm')return'rpm';if(ot==='flow')return'gpm';return'in';}function renderClients(clients){const grid=document.getElementById('clientGrid');grid.innerHTML='';if(!clients.length){grid.innerHTML='<div class="empty-state">No client devices found at this site.</div>';return;})HTML" R"HTML(clients.forEach(client=>{const card=document.createElement('div');card.className='client-card'+(client.alarm?' has-alarm':'');let tanksHtml='';client.sensors.forEach(t=>{const alarmClass=t.alarm?' alarm':'';const statusHtml=t.alarm?`<span class="sensor-status" style="color:var(--danger);font-weight:600;">ALARM: ${escapeHtml(t.alarmType)}</span>`:'<span class="sensor-status" style="color:#10b981;">Normal</span>';const mu=unitLabel(t.measurementUnit,t.objectType);const changeHtml=(typeof t.change24h==='number')?`<span style="font-size:0.8rem;color:var(--muted);">${t.change24h>=0?'+':''}${t.change24h.toFixed(1)} ${mu}/24h</span>`:'';const contentsHtml=t.contents?`<span style="font-size:0.8rem;color:var(--muted);margin-left:6px;">(${escapeHtml(t.contents)})</span>`:'';tanksHtml+=`<div class="sensor-row${alarmClass}"><div><strong>${escapeHtml(sensorDisplayName(t))}</strong>${contentsHtml} ${changeHtml}</div><div style="text-align:right;"><span class="sensor-level">${formatNumber(t.levelInches)}</span> <small style="color:var(--muted)">${mu}</small><div style="font-size:0.8rem;color:var(--muted);">${formatEpoch(t.lastUpdate)}</div></div></div>`;});const voltageHtml=(typeof client.vinVoltage==='number'&&client.vinVoltage>0)?`<span style="font-size:0.85rem;color:var(--muted);">VIN: ${client.vinVoltage.toFixed(2)}V</span>`:'';card.innerHTML=`<div class="client-header"><div><div class="client-name">${escapeHtml(client.label||'Client Device')}</div><div class="client-uid">${escapeHtml(client.uid)}</div>${voltageHtml}</div><div style="display:flex;gap:6px;"><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;" onclick="window.location.href='/config-generator?uid=${encodeURIComponent(client.uid)}'">Edit Config</button><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;color:var(--danger);border-color:var(--danger);" onclick="deleteClient('${escapeHtml(client.uid)}')">Remove Client</button></div></div><div class="sensor-list">${tanksHtml}</div>`;grid.appendChild(card);});}async function deleteClient(uid){if(!confirm('Remove client '+uid+' and all its sensor data? This action cannot be undone.'))return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid})});if(!res.ok){throw new Error(await res.text()||'Delete failed');}showToast('Client removed successfully');loadSiteData();}catch(err){showToast(err.message||'Failed to remove client',true);}}function renderUidTable(clients){const tbody=document.getElementById('uidTableBody');tbody.innerHTML='';if(!clients.length){tbody.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--muted);">No clients at this site.</td></tr>';return;}clients.forEach(client=>{const tr=document.createElement('tr');const hasAlarm=client.sensors.some(t=>t.alarm);const statusHtml=hasAlarm?'<span style="color:var(--danger);font-weight:600;">ALARM</span>':'<span style="color:#10b981;">Normal</span>';tr.innerHTML=`<td>${escapeHtml(client.label||'Client Device')}</td><td><code onclick="copyUid('${escapeHtml(client.uid)}')" title="Click to copy">${escapeHtml(client.uid)}</code></td><td>${client.sensors.length}</td><td>${statusHtml}</td>`;tbody.appendChild(tr);});}loadSiteData();setInterval(loadSiteData,30000);})();</script></body></html>)HTML";
@@ -3079,7 +2315,7 @@ static void handleConfigRetryPost(EthernetClient &client, const String &body);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static float convertMaToLevelWithTemp(const char *clientUid, uint8_t sensorIndex, float mA, float currentTempF);
-static float resolveLevel(const char *clientUid, uint8_t sensorIndex, const char *sensorType, JsonObjectConst src);
+static float convertVoltageToLevel(const char *clientUid, uint8_t sensorIndex, float voltage);
 static ClientMetadata *findClientMetadata(const char *clientUid);
 static ClientMetadata *findOrCreateClientMetadata(const char *clientUid);
 static bool checkSmsRateLimit(SensorRecord *rec, bool bypassMinimumInterval = false);
@@ -4193,24 +3429,13 @@ static bool checkGitHubReleaseForTarget(uint8_t target,
     return false;
   }
 
-  if (gConfig.githubRouteAlias[0] != '\0') {
-    JAddStringToObject(req, "route", gConfig.githubRouteAlias);
-    char path[96];
-    snprintf(path,
-             sizeof(path),
-             "/repos/%s/%s/releases/latest",
-             GITHUB_REPO_OWNER,
-             GITHUB_REPO_NAME);
-    JAddStringToObject(req, "name", path);
-  } else {
-    char url[128];
-    snprintf(url,
-             sizeof(url),
-             "https://api.github.com/repos/%s/%s/releases/latest",
-             GITHUB_REPO_OWNER,
-             GITHUB_REPO_NAME);
-    JAddStringToObject(req, "url", url);
-  }
+  char url[128];
+  snprintf(url,
+           sizeof(url),
+           "https://api.github.com/repos/%s/%s/releases/latest",
+           GITHUB_REPO_OWNER,
+           GITHUB_REPO_NAME);
+  JAddStringToObject(req, "url", url);
 
   J *hdrs = JAddObjectToObject(req, "headers");
   if (hdrs) {
@@ -5441,7 +4666,6 @@ static void createDefaultConfig(ServerConfig &cfg) {
   strlcpy(cfg.serverFleet, "tankalarm-server", sizeof(cfg.serverFleet));
   strlcpy(cfg.clientFleet, "tankalarm-clients", sizeof(cfg.clientFleet));
   strlcpy(cfg.productUid, DEFAULT_SERVER_PRODUCT_UID, sizeof(cfg.productUid));  // From ServerConfig.h or Server Settings web page
-  strlcpy(cfg.githubRouteAlias, "", sizeof(cfg.githubRouteAlias));
   strlcpy(cfg.smsPrimary, "+15555555555", sizeof(cfg.smsPrimary));
   strlcpy(cfg.smsSecondary, "+15555555555", sizeof(cfg.smsSecondary));
   strlcpy(cfg.dailyEmail, "reports@example.com", sizeof(cfg.dailyEmail));
@@ -5647,7 +4871,6 @@ static bool loadConfig(ServerConfig &cfg) {
   strlcpy(cfg.serverFleet, doc["serverFleet"].as<const char *>() ? doc["serverFleet"].as<const char *>() : "tankalarm-server", sizeof(cfg.serverFleet));
   strlcpy(cfg.clientFleet, doc["clientFleet"].as<const char *>() ? doc["clientFleet"].as<const char *>() : "tankalarm-clients", sizeof(cfg.clientFleet));
   strlcpy(cfg.productUid, doc["productUid"].as<const char *>() ? doc["productUid"].as<const char *>() : "", sizeof(cfg.productUid));
-  strlcpy(cfg.githubRouteAlias, doc["githubRouteAlias"].as<const char *>() ? doc["githubRouteAlias"].as<const char *>() : "", sizeof(cfg.githubRouteAlias));
   strlcpy(cfg.smsPrimary, doc["smsPrimary"].as<const char *>() ? doc["smsPrimary"].as<const char *>() : "+15555555555", sizeof(cfg.smsPrimary));
   strlcpy(cfg.smsSecondary, doc["smsSecondary"].as<const char *>() ? doc["smsSecondary"].as<const char *>() : "+15555555555", sizeof(cfg.smsSecondary));
   strlcpy(cfg.dailyEmail, doc["dailyEmail"].as<const char *>() ? doc["dailyEmail"].as<const char *>() : "reports@example.com", sizeof(cfg.dailyEmail));
@@ -5821,7 +5044,6 @@ static bool saveConfig(const ServerConfig &cfg) {
   doc["serverFleet"] = cfg.serverFleet;
   doc["clientFleet"] = cfg.clientFleet;
   doc["productUid"] = cfg.productUid;
-  doc["githubRouteAlias"] = cfg.githubRouteAlias;
   doc["smsPrimary"] = cfg.smsPrimary;
   doc["smsSecondary"] = cfg.smsSecondary;
   doc["dailyEmail"] = cfg.dailyEmail;
@@ -7923,31 +7145,23 @@ static void pruneHotTierIfNeeded() {
   // Prune old telemetry snapshots from each sensor
   for (uint8_t i = 0; i < gSensorHistoryCount; i++) {
     SensorHourlyHistory &hist = gSensorHistory[i];
-    if (hist.snapshotCount == 0) continue;
-
-    // Compact survivors into a contiguous block starting at physical index 0. We do NOT
-    // assume timestamps are monotonic: a clock correction (or a pre-time-sync entry) could
-    // otherwise make the failing entries non-contiguous, and a count-only shrink would then
-    // drop the wrong (newest) snapshots. Copying survivors in logical order and rebasing
-    // writeIndex keeps the ring buffer correct regardless of timestamp ordering.
-    static TelemetrySnapshot survivors[MAX_HOURLY_HISTORY_PER_SENSOR];
     uint16_t newCount = 0;
+    
+    // Keep only snapshots newer than cutoff
     for (uint16_t j = 0; j < hist.snapshotCount; j++) {
       uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
       if (hist.snapshots[idx].timestamp >= cutoffEpoch) {
-        survivors[newCount++] = hist.snapshots[idx];
+        newCount++;
       } else {
         pruned++;
       }
     }
-    if (newCount == hist.snapshotCount) {
-      continue;  // nothing pruned for this sensor; leave the ring buffer untouched
-    }
-    for (uint16_t j = 0; j < newCount; j++) {
-      hist.snapshots[j] = survivors[j];
-    }
+    
+    // Update count — this is correct because timestamps are monotonically
+    // increasing, so all pruned entries are contiguous at the start of the
+    // logical sequence. Reducing snapshotCount shifts the logical start
+    // forward while writeIndex remains valid for the next write.
     hist.snapshotCount = newCount;
-    hist.writeIndex = newCount % MAX_HOURLY_HISTORY_PER_SENSOR;
   }
   
   // Prune old alarms (keep alarms for longer - 30 days)
@@ -9245,17 +8459,14 @@ static void initializeEthernet() {
     return;
   }
 
-  // Get raw hardware MAC address
-  if (gMacAddress[0] == 0 && gMacAddress[1] == 0 && gMacAddress[2] == 0 &&
-      gMacAddress[3] == 0 && gMacAddress[4] == 0 && gMacAddress[5] == 0) {
-    Ethernet.MACAddress(gMacAddress);
-  }
-
-  // Fallback to default MAC if hardware MAC is still all-zeroes
-  if (gMacAddress[0] == 0 && gMacAddress[1] == 0 && gMacAddress[2] == 0 &&
-      gMacAddress[3] == 0 && gMacAddress[4] == 0 && gMacAddress[5] == 0) {
-    gMacAddress[0] = 0x02; gMacAddress[1] = 0x00; gMacAddress[2] = 0x01;
-    gMacAddress[3] = 0x11; gMacAddress[4] = 0x20; gMacAddress[5] = 0x10;
+  // Retrieve hardware MAC address if not set. On PortentaEthernet the
+  // factory MAC is not readable until AFTER Ethernet.begin() has brought
+  // the PHY up, so before first begin() gMacAddress may still be zero.
+  bool usingFactoryMac = true;
+  if (!(gMacAddress[0] == 0 && gMacAddress[1] == 0 && gMacAddress[2] == 0 &&
+        gMacAddress[3] == 0 && gMacAddress[4] == 0 && gMacAddress[5] == 0)) {
+    // Application-provided MAC overrides the factory one.
+    usingFactoryMac = false;
   }
 
   // Retry DHCP a few times. The first attempt often fails because the
@@ -9263,16 +8474,13 @@ static void initializeEthernet() {
   // out by 1.5s lets the switch/router learn the port and respond.
   const int kMaxAttempts = 4;
   int status = 0;
-  bool triedStatic = false;
-  bool triedDhcp = false;
-  bool useStaticForAttempt = gConfig.useStaticIp;
-
   for (int attempt = 1; attempt <= kMaxAttempts && status == 0; ++attempt) {
-    if (useStaticForAttempt) {
-      triedStatic = true;
+    if (gConfig.useStaticIp) {
       status = Ethernet.begin(gMacAddress, gStaticIp, gStaticDns, gStaticGateway, gStaticSubnet);
+    } else if (usingFactoryMac) {
+      // No caller-supplied MAC: let PortentaEthernet use the factory MAC.
+      status = Ethernet.begin();
     } else {
-      triedDhcp = true;
       status = Ethernet.begin(gMacAddress);
     }
     if (status == 0) {
@@ -9289,26 +8497,20 @@ static void initializeEthernet() {
   }
 
   if (status == 0) {
-    if (gConfig.useStaticIp && !triedDhcp) {
-      Serial.println(F(" FAILED - Could not configure Ethernet via Static IP!"));
-      Serial.println(F("Static IP failed after retries. Falling back to DHCP as safety..."));
-      status = Ethernet.begin(gMacAddress);
-    } else if (!gConfig.useStaticIp && !triedStatic) {
-      Serial.println(F(" FAILED - Could not configure Ethernet via DHCP!"));
-      Serial.println(F("DHCP failed after retries. Falling back to default static IP: 192.168.7.200"));
-      status = Ethernet.begin(gMacAddress, gStaticIp, gStaticDns, gStaticGateway, gStaticSubnet);
-    }
-  }
-
-  if (status == 0) {
-    Serial.println(F(" FAILED - Could not configure Ethernet (even with fallback)!"));
+    Serial.println(F(" FAILED - Could not configure Ethernet!"));
     if (!gConfig.useStaticIp) {
-      Serial.println(F("ERROR: DHCP and static IP fallback both failed. Check network cable and DHCP server."));
+      Serial.println(F("ERROR: DHCP failed after retries. Check network cable and DHCP server."));
     } else {
       Serial.println(F("ERROR: Static IP configuration failed."));
     }
     // Don't halt, just return and let the main loop handle the lack of network
     return;
+  }
+
+  // If the caller didn't supply a MAC, pull the factory MAC now (post-begin)
+  // so we can log it and reuse it elsewhere.
+  if (usingFactoryMac) {
+    Ethernet.MACAddress(gMacAddress);
   }
   
   // Check link status
@@ -9323,7 +8525,7 @@ static void initializeEthernet() {
         if (gMacAddress[i] < 16) Serial.print("0");
         Serial.print(gMacAddress[i], HEX);
     }
-    Serial.println();
+    Serial.println(usingFactoryMac ? " (Hardware)" : " (Static)");
     Serial.print(F("IP Address: "));
     Serial.println(Ethernet.localIP());
     Serial.print(F("Gateway: "));
@@ -10409,7 +9611,6 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
   serverObj["n"] = gConfig.serverName;
   serverObj["cf"] = gConfig.clientFleet;
   serverObj["pu"] = gConfig.productUid;
-  serverObj["gra"] = gConfig.githubRouteAlias;
   serverObj["sp"] = gConfig.smsPrimary;
   serverObj["ss"] = gConfig.smsSecondary;
   serverObj["de"] = gConfig.dailyEmail;
@@ -10529,10 +9730,6 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       // Add firmware version from client metadata
       if (meta && meta->firmwareVersion[0] != '\0') {
         clientObj["fv"] = meta->firmwareVersion;
-      }
-      // Add stale deletion pending flag from client metadata
-      if (meta && meta->staleDeletionPending) {
-        clientObj["dp"] = true;
       }
       // Add cellular signal strength from client metadata
       if (meta && meta->signalBars >= 0) {
@@ -11586,45 +10783,10 @@ static bool sendConfigViaNotecard(const char *clientUid, const char *jsonPayload
   return true;
 }
 
-// Inject the server's learned per-sensor calibration into a config document before it is
-// dispatched to the client (v1.6.15 calibration sync, P1-5). The client applies these
-// coefficients locally so its self-describing "lvl" matches what the server would compute,
-// and echoes the calibration version ("cv") back so the server can detect a stale client.
-// Pushing the fitted slope/offset (and temperature coefficient, when a current temperature is
-// known) keeps both sides in agreement by construction.
-static void injectCalibrationIntoConfig(const char *clientUid, JsonDocument &doc) {
-  JsonArray sensors = doc["sensors"].as<JsonArray>();
-  if (sensors.isNull()) return;
-  float tempF = getCachedTemperature(clientUid);
-  bool tempValid = (tempF > TEMPERATURE_UNAVAILABLE + 1.0f);
-  for (JsonObject t : sensors) {
-    uint8_t sensorIdx = t["number"] | (uint8_t)0;
-    if (sensorIdx == 0) continue;
-    SensorCalibration *cal = findSensorCalibration(clientUid, sensorIdx);
-    if (cal && cal->hasLearnedCalibration) {
-      t["calHasCal"] = true;
-      t["calSlope"] = cal->learnedSlope;
-      t["calOffset"] = cal->learnedOffset;
-      // Only send a non-zero temperature coefficient when we have a current temperature to
-      // anchor it; otherwise the client cannot evaluate the term consistently with the server.
-      t["calTempCoef"] = (cal->hasTempCompensation && tempValid) ? cal->learnedTempCoef : 0.0f;
-      t["calTempF"] = tempValid ? tempF : TEMP_REFERENCE_F;
-      t["calVersion"] = (uint32_t)cal->lastCalibrationEpoch;
-    }
-  }
-}
-
 static ConfigDispatchStatus dispatchClientConfig(const char *clientUid, JsonVariantConst cfgObj) {
   // Use static buffer to avoid 8KB stack allocation (Mbed OS stack is only 4-8KB)
   static char buffer[8192];
-  // Copy the (immutable) inbound config into a mutable document so the server's learned
-  // calibration can be injected before serialization/caching (P1-5). This temporarily
-  // doubles the config in heap; the Opta's STM32H7 has ample RAM for an ~8KB payload.
-  static JsonDocument augmented;
-  augmented.clear();
-  augmented.set(cfgObj);
-  injectCalibrationIntoConfig(clientUid, augmented);
-  size_t len = serializeJson(augmented, buffer, sizeof(buffer));
+  size_t len = serializeJson(cfgObj, buffer, sizeof(buffer));
   if (len == 0 || len >= sizeof(buffer)) {
     Serial.println(F("Client config payload too large"));
     return ConfigDispatchStatus::PayloadTooLarge;
@@ -11844,26 +11006,8 @@ static void processNotefile(const char *fileName, void (*handler)(JsonDocument &
       DeserializationError err = deserializeJson(doc, json);
       NoteFree(json);
       if (!err) {
-        // Central schema gate: reject notes stamped with a newer schema than this
-        // firmware understands. Such notes parse fine as JSON but their field
-        // semantics are unknown, so handing them to a handler could misinterpret
-        // data. They are deleted (treated as processed) with a prominent log so the
-        // queue is not blocked; deploy a newer server to consume them.
-        int noteSchema = doc["_sv"] | 0;
-        if (noteSchema > NOTEFILE_SCHEMA_VERSION) {
-          Serial.print(F("Rejecting future-schema note in "));
-          Serial.print(fileName);
-          Serial.print(F(" (_sv="));
-          Serial.print(noteSchema);
-          Serial.print(F(" > "));
-          Serial.print(NOTEFILE_SCHEMA_VERSION);
-          Serial.println(F(") — server upgrade required"));
-          addServerSerialLog("Rejected future-schema note", "warn", "schema");
-          processedOk = true;  // delete; cannot safely interpret
-        } else {
-          handler(doc, epoch);
-          processedOk = true;
-        }
+        handler(doc, epoch);
+        processedOk = true;
       } else {
         Serial.print(F("Skipping malformed note in "));
         Serial.print(fileName);
@@ -12033,9 +11177,28 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
     rec->sensorVoltage = (voltage > 0.0f) ? voltage : 0.0f;
   }
   
-  // Resolve the display level. The client sends a self-describing "lvl"; the server only
-  // re-derives from raw mA when its learned calibration is newer than the client's cv.
-  float newLevel = resolveLevel(clientUid, sensorIndex, rec->sensorType, doc.as<JsonObjectConst>());
+  // Get level/value reading based on sensor type
+  float newLevel = 0.0f;
+  bool isCurrentLoop = (strcmp(rec->sensorType, "currentLoop") == 0);
+  bool isAnalog = (strcmp(rec->sensorType, "analog") == 0);
+  bool isDigital = (strcmp(rec->sensorType, "digital") == 0);
+  bool isPulse = (strcmp(rec->sensorType, "pulse") == 0);
+  
+  if (isCurrentLoop && mA >= 4.0f) {
+    // Current-loop sensor: convert raw mA to level using config
+    // Use temperature compensation if available
+    float currentTemp = getCachedTemperature(clientUid);
+    newLevel = convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
+  } else if (isAnalog && voltage > 0.0f) {
+    // Analog voltage sensor: convert raw voltage to level using config
+    newLevel = convertVoltageToLevel(clientUid, sensorIndex, voltage);
+  } else if (isDigital && doc["fl"]) {
+    // Digital float switch: use fl field
+    newLevel = doc["fl"].as<float>();
+  } else if (isPulse && doc["rm"]) {
+    // Pulse/RPM sensor: use rm field
+    newLevel = doc["rm"].as<float>();
+  }
   
   double now = (epoch > 0.0) ? epoch : currentEpoch();
   
@@ -12057,8 +11220,8 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // Record telemetry snapshot for historical charting
   // Get site name and tank height for history record
   const char *siteName = doc["s"] | "";
-  float recordHeight = doc["cap"] | (doc["h"] | 0.0f);
-  if (recordHeight <= 0) recordHeight = 48.0f; // Default only if neither cap nor h present
+  float recordHeight = doc["h"].as<float>();
+  if (recordHeight <= 0) recordHeight = 48.0f; // Default tank height
   
   // Get voltage from client metadata if available
   float vinVoltage = 0.0f;
@@ -12073,14 +11236,6 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
 static void handleAlarm(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   const char *type = doc["y"] | "";
-
-  // Validate the source UID before creating any state (sensor record OR metadata).
-  // The sensor path is guarded by upsertSensorRecord, but the system-alarm path below
-  // creates ClientMetadata directly — without this gate a malformed/spoofed UID could
-  // consume a metadata slot and evict a legitimate client.
-  if (!isValidClientUid(clientUid)) {
-    return;
-  }
 
   // System alarms (solar/battery/power) don't reference a specific sensor.
   // Store on ClientMetadata instead of creating a phantom sensorIndex=0 SensorRecord.
@@ -12102,39 +11257,29 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     // SMS for system alarms if client flagged as critical (se=true)
     // BugFix v1.6.2 (I-14): Rate-limit system alarm SMS — they previously bypassed
     // the per-sensor rate limiter, allowing SMS floods from rapid power transitions.
-    // v1.6.15 (P1-4): rate-limit per-client (stored on ClientMetadata) instead of a single
-    // fleet-wide static, so one chatty client can no longer suppress alarms from others.
+    static double sLastSystemSmsSentEpoch = 0.0;
     bool smsRequested = doc["se"] | false;
     if (smsRequested) {
       double smsNow = currentEpoch();
-      double lastSms = meta ? meta->lastSystemSmsEpoch : 0.0;
-      if (smsNow - lastSms >= MIN_SMS_ALERT_INTERVAL_SECONDS) {
+      if (smsNow - sLastSystemSmsSentEpoch >= MIN_SMS_ALERT_INTERVAL_SECONDS) {
         const char *siteName = doc["s"] | "";
         char message[160];
-        int written = 0;
         if (strcmp(type, "solar") == 0) {
           const char *alert = doc["alert"] | "unknown";
           float bv = doc["bv"] | 0.0f;
-          written = snprintf(message, sizeof(message), "%s Solar: %s (%.1fV)", siteName, alert, bv);
+          snprintf(message, sizeof(message), "%s Solar: %s (%.1fV)", siteName, alert, bv);
         } else if (strcmp(type, "battery") == 0) {
           const char *alert = doc["alert"] | "unknown";
           float v = doc["v"] | 0.0f;
-          written = snprintf(message, sizeof(message), "%s Battery: %s (%.1fV)", siteName, alert, v);
+          snprintf(message, sizeof(message), "%s Battery: %s (%.1fV)", siteName, alert, v);
         } else if (strcmp(type, "power") == 0) {
           const char *from = doc["from"] | "?";
           const char *to = doc["to"] | "?";
           float v = doc["v"] | 0.0f;
-          written = snprintf(message, sizeof(message), "%s Power: %s->%s (%.1fV)", siteName, from, to, v);
-        }
-        // W-4: if the formatted message was truncated, fall back to a compact, safe message.
-        if (written < 0 || written >= (int)sizeof(message)) {
-          snprintf(message, sizeof(message), "System alert: %s", type);
+          snprintf(message, sizeof(message), "%s Power: %s->%s (%.1fV)", siteName, from, to, v);
         }
         sendSmsAlert(message);
-        if (meta) {
-          meta->lastSystemSmsEpoch = smsNow;
-          gClientMetadataDirty = true;
-        }
+        sLastSystemSmsSentEpoch = smsNow;
       } else {
         Serial.println(F("System alarm SMS suppressed by rate limit"));
       }
@@ -12188,18 +11333,23 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     rec->sensorVoltage = (voltage > 0.0f) ? voltage : 0.0f;
   }
   
-  // Self-describing alarm decode: if the registry was evicted/rebooted, recover the sensor
-  // interface type from the note's "st" so resolveLevel can reconcile correctly even with no
-  // prior registry state (P1-3).
-  const char *stField = doc["st"] | "";
-  if (stField && stField[0] != '\0' && rec->sensorType[0] == '\0') {
-    if (strcmp(stField, "rpm") == 0) strlcpy(rec->sensorType, "pulse", sizeof(rec->sensorType));
-    else strlcpy(rec->sensorType, stField, sizeof(rec->sensorType));
+  // Get level - convert from raw sensor data if no level provided
+  float level = 0.0f;
+  bool isCurrentLoop = (strcmp(rec->sensorType, "currentLoop") == 0);
+  bool isAnalog = (strcmp(rec->sensorType, "analog") == 0);
+  bool isDigital = (strcmp(rec->sensorType, "digital") == 0);
+  bool isPulse = (strcmp(rec->sensorType, "pulse") == 0);
+  
+  if (isCurrentLoop && mA >= 4.0f) {
+    float currentTemp = getCachedTemperature(clientUid);
+    level = convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
+  } else if (isAnalog && voltage > 0.0f) {
+    level = convertVoltageToLevel(clientUid, sensorIndex, voltage);
+  } else if (isDigital && doc["fl"]) {
+    level = doc["fl"].as<float>();
+  } else if (isPulse && doc["rm"]) {
+    level = doc["rm"].as<float>();
   }
-
-  // Resolve the display level (trusts the client's self-describing "lvl" unless its
-  // calibration version is stale, in which case the server re-applies its coefficients).
-  float level = resolveLevel(clientUid, sensorIndex, rec->sensorType, doc.as<JsonObjectConst>());
   
   bool isDiagnostic = (strcmp(type, "sensor-fault") == 0) ||
                       (strcmp(type, "sensor-stuck") == 0) ||
@@ -12242,12 +11392,8 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     float alarmVin = 0.0f;
     ClientMetadata *alarmMeta = findOrCreateClientMetadata(clientUid);
     if (alarmMeta) alarmVin = alarmMeta->vinVoltage;
-    // Use the client-reported capacity (cap) as the immutable tank height, never the
-    // current level. Falls back to 48 in only if the note predates self-describing payloads.
-    float alarmCap = doc["cap"] | 0.0f;
-    if (alarmCap <= 0.0f) alarmCap = 48.0f;
     recordTelemetrySnapshot(clientUid, alarmSiteName, sensorIndex,
-                            alarmCap, level, alarmVin);
+                            rec->levelInches, level, alarmVin);
   }
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   gSensorRegistryDirty = true;
@@ -12362,10 +11508,7 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
 
 static void handleDaily(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
-  // Daily reports aggregate 24h of sensor data and create ClientMetadata directly, so
-  // apply the same UID format validation used by the sensor-record path rather than only
-  // checking for an empty string.
-  if (!isValidClientUid(clientUid)) {
+  if (!clientUid || strlen(clientUid) == 0) {
     return;
   }
   
@@ -12438,14 +11581,7 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   // If the original alarm note was lost due to weak signal, detect active
   // alarms here and cross-reference with server-side SensorRecord state.
   JsonArray dailyAlarms = doc["alarms"];
-  int dailySchema = doc["_sv"] | 0;
-  // Run reconciliation when the report carries an alarms array OR when a schema-2+ client
-  // omitted it. Schema-2 clients always include the array when any alarm is active, so an
-  // absent/empty array on a first part means "no active alarms" — any server-side alarm for
-  // this client is therefore orphaned (its clear note was lost) and must be reconciled.
-  // The schema gate avoids misreading legacy (pre-schema) daily reports that never sent it.
-  bool runAlarmReconcile = isFirstPart && (dailyAlarms || dailySchema >= 2);
-  if (runAlarmReconcile) {
+  if (isFirstPart && dailyAlarms) {
     for (JsonObject a : dailyAlarms) {
       uint8_t sensorIdx = a["k"] | 0;
       bool hiAlarm = a["hi"] | false;
@@ -12583,9 +11719,23 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       rec->sensorVoltage = (voltage > 0.0f) ? voltage : 0.0f;
     }
     
-    // Resolve the display level (trusts the client's self-describing "lvl" unless its
-    // calibration version is stale). handleDaily already set rec->sensorType from t["st"].
-    float newLevel = resolveLevel(clientUid, sensorIndex, rec->sensorType, t);
+    // Get level - convert from raw sensor data if no level provided
+    float newLevel = 0.0f;
+    bool isCurrentLoop = (strcmp(rec->sensorType, "currentLoop") == 0);
+    bool isAnalog = (strcmp(rec->sensorType, "analog") == 0);
+    bool isDigital = (strcmp(rec->sensorType, "digital") == 0);
+    bool isPulse = (strcmp(rec->sensorType, "pulse") == 0);
+    
+    if (isCurrentLoop && mA >= 4.0f) {
+      float currentTemp = getCachedTemperature(clientUid);
+      newLevel = convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
+    } else if (isAnalog && voltage > 0.0f) {
+      newLevel = convertVoltageToLevel(clientUid, sensorIndex, voltage);
+    } else if (isDigital && t["fl"]) {
+      newLevel = t["fl"].as<float>();
+    } else if (isPulse && t["rm"]) {
+      newLevel = t["rm"].as<float>();
+    }
     
     double now = (epoch > 0.0) ? epoch : currentEpoch();
     
@@ -12606,13 +11756,10 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
-    // even when change-based telemetry is disabled (per-monitor reportThreshold = 0)
+    // even when change-based telemetry is disabled (levelChangeThreshold = 0)
     if (newLevel > 0.0f) {
-      // Use client-reported capacity (cap) as the immutable tank height, never the level.
-      float dailyCap = t["cap"] | 0.0f;
-      if (dailyCap <= 0.0f) dailyCap = 48.0f;
       recordTelemetrySnapshot(clientUid, siteName, sensorIndex,
-                              dailyCap, newLevel, vinVoltage);
+                              rec->levelInches, newLevel, vinVoltage);
     }
   }
 
@@ -12787,15 +11934,6 @@ static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorInd
   // Validate UID length to prevent silent truncation issues
   if (!isValidClientUid(clientUid)) {
     Serial.println(F("ERROR: Invalid client UID, skipping sensor record"));
-    return nullptr;
-  }
-
-  // Bound the sensor index. A note that omits "k" deserializes to 0, and a garbled note
-  // could carry any 0-255 value; reject implausible indices so they cannot pollute the
-  // registry or consume slots toward MAX_SENSOR_RECORDS.
-  if (sensorIndex >= MAX_SENSOR_RECORDS) {
-    Serial.print(F("ERROR: Sensor index out of range: "));
-    Serial.println(sensorIndex);
     return nullptr;
   }
   
@@ -13394,59 +12532,160 @@ static float convertMaToLevelWithTemp(const char *clientUid, uint8_t sensorIndex
     return level;
   }
   
-  // No learned calibration available. Under the v1.6.15 conversion architecture the client
-  // sends a self-describing level ("lvl"), so the server no longer re-derives the level
-  // theoretically here. This is only reached defensively (e.g. resolveLevel called for a
-  // sensor without calibration); return 0 so the caller falls back to the client's level.
-  return 0.0f;
-}
-
-// Resolve the display level for an inbound note (telemetry/alarm/daily).
-//
-// The client now ships a self-describing level ("lvl") it computed locally, the raw reading
-// (ma/vt/fl/rm), and the calibration version ("cv") it applied. The server reconciles:
-//   - Current-loop sensor WITH a server learned calibration AND the client's cv is stale
-//     (it has not yet received the latest coefficients) → the server re-applies its own
-//     coefficients to the raw mA so the dashboard stays correct until the client catches up.
-//   - Otherwise → trust the client's "lvl" directly (it is already calibrated, or there is
-//     no calibration to apply). No theoretical reconversion.
-//   - No "lvl" present (legacy/registration notes) → fall back to fl/rm.
-static float resolveLevel(const char *clientUid, uint8_t sensorIndex,
-                          const char *sensorType, JsonObjectConst src) {
-  bool isCurrentLoop = (sensorType && strcmp(sensorType, "currentLoop") == 0);
-  float mA = src["ma"] | (src["sensorMa"] | 0.0f);
-  uint32_t clientCv = src["cv"] | (uint32_t)0;
-
-  if (isCurrentLoop && mA >= 4.0f) {
-    SensorCalibration *cal = findSensorCalibration(clientUid, sensorIndex);
-    if (cal && cal->hasLearnedCalibration) {
-      uint32_t serverCv = (uint32_t)cal->lastCalibrationEpoch;
-      // Re-derive the level from raw mA (with live temperature) when EITHER:
-      //  (a) the client has not applied the latest coefficients yet (cv stale), OR
-      //  (b) this sensor uses temperature compensation. The client only carries a static
-      //      calTempF snapshot from config-push time, so applying live server temperature
-      //      here keeps the level accurate across the day and avoids a display jump when
-      //      the client's cv catches up and the server would otherwise trust its static lvl.
-      bool clientStale = (clientCv != serverCv);
-      bool liveTempComp = (cal->hasTempCompensation && cal->learnedTempCoef != 0.0f);
-      if (clientStale || liveTempComp) {
-        float currentTemp = getCachedTemperature(clientUid);
-        return convertMaToLevelWithTemp(clientUid, sensorIndex, mA, currentTemp);
+  // No calibration available - use theoretical calculation from config
+  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (!snap || strlen(snap->payload) == 0) {
+    // No config snapshot available - use simple linear 4-20mA mapping
+    // Assume 0-100 range as fallback
+    float level = ((mA - 4.0f) / 16.0f) * 100.0f;
+    if (level < 0.0f) level = 0.0f;
+    return level;
+  }
+  
+  // Parse the config snapshot to find the sensor settings
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, snap->payload);
+  if (err) {
+    float level = ((mA - 4.0f) / 16.0f) * 100.0f;
+    if (level < 0.0f) level = 0.0f;
+    return level;  // Fallback
+  }
+  
+  // Find the sensor in the config
+  JsonArray sensors = doc["sensors"];
+  if (!sensors) {
+    float level = ((mA - 4.0f) / 16.0f) * 100.0f;
+    if (level < 0.0f) level = 0.0f;
+    return level;  // Fallback
+  }
+  
+  for (JsonVariant t : sensors) {
+    uint8_t tn = t["number"] | 0;
+    if (tn == sensorIndex) {
+      // Found the sensor - get sensor range settings
+      float rangeMin = t["sensorRangeMin"] | 0.0f;
+      float rangeMax = t["sensorRangeMax"] | 5.0f;  // Default 0-5 PSI
+      float mountHeight = t["sensorMountHeight"] | 0.0f;
+      const char *currentLoopType = t["currentLoopType"] | "pressure";
+      const char *monitorType = t["monitorType"] | "tank";
+      const char *rangeUnit = t["sensorRangeUnit"] | "PSI";
+      // Fluid characterization (added 2026-04 for non-water tanks).
+      // SG defaults to 1.0 (water). When > 0, divides the PSI->inches conversion so
+      // diesel/propane/brine/etc. report correct head height before learned calibration
+      // takes over. Falls back to water if missing/implausible.
+      float fluidSg = t["fluidSpecificGravity"] | 0.0f;
+      if (fluidSg < 0.3f || fluidSg > 2.0f) {
+        // Try to derive from preset name. If missing, default water.
+        const char *fluidTypeName = t["fluidType"] | "water";
+        if      (strcmp(fluidTypeName, "diesel") == 0)       fluidSg = 0.85f;
+        else if (strcmp(fluidTypeName, "gasoline") == 0)     fluidSg = 0.74f;
+        else if (strcmp(fluidTypeName, "heatingOil") == 0)   fluidSg = 0.85f;
+        else if (strcmp(fluidTypeName, "propane") == 0 || strcmp(fluidTypeName, "lpg") == 0) fluidSg = 0.50f;
+        else if (strcmp(fluidTypeName, "brine") == 0)        fluidSg = 1.20f;
+        else if (strcmp(fluidTypeName, "crudeOil") == 0)     fluidSg = 0.83f;
+        else if (strcmp(fluidTypeName, "usedOil") == 0)      fluidSg = 0.92f;
+        else if (strcmp(fluidTypeName, "glycol50") == 0)     fluidSg = 1.07f;
+        else if (strcmp(fluidTypeName, "def") == 0 || strcmp(fluidTypeName, "adblue") == 0) fluidSg = 1.09f;
+        else if (strcmp(fluidTypeName, "ethanol") == 0)      fluidSg = 0.79f;
+        else                                                  fluidSg = 1.00f;
       }
+
+      // Calculate the fraction within 4-20mA range
+      float fraction = (mA - 4.0f) / 16.0f;
+
+      float sensorValue;
+      if (strcmp(currentLoopType, "ultrasonic") == 0) {
+        // Ultrasonic: 4mA = full (rangeMin distance), 20mA = empty (rangeMax distance)
+        // Level = mountHeight - distance
+        float distance = rangeMin + fraction * (rangeMax - rangeMin);
+        sensorValue = mountHeight - distance;
+        if (sensorValue < 0.0f) sensorValue = 0.0f;
+      } else if (strcmp(monitorType, "gas") == 0) {
+        // Gas pressure monitor: report raw pressure in its native unit (PSI/bar/...).
+        // No PSI->inches conversion, no mount-height add. Mirrors the client's gas path.
+        sensorValue = rangeMin + fraction * (rangeMax - rangeMin);
+        if (sensorValue < 0.0f) sensorValue = 0.0f;
+      } else {
+        // Pressure sensor on a liquid tank: convert PSI (or other pressure unit) to
+        // inches of fluid, dividing by SG so non-water fluids size correctly.
+        float pressure = rangeMin + fraction * (rangeMax - rangeMin);
+        float pressureFactor = 27.68f; // PSI -> inches of water
+        if      (strcmp(rangeUnit, "bar") == 0)   pressureFactor = 401.46f;
+        else if (strcmp(rangeUnit, "kPa") == 0)   pressureFactor = 4.0146f;
+        else if (strcmp(rangeUnit, "mbar") == 0)  pressureFactor = 0.40146f;
+        else if (strcmp(rangeUnit, "inH2O") == 0) pressureFactor = 1.0f;
+        sensorValue = (pressure * pressureFactor) / fluidSg + mountHeight;
+        if (sensorValue < 0.0f) sensorValue = 0.0f;
+      }
+      return sensorValue;
     }
   }
+  
+  // Sensor not found in config - use fallback
+  float level = ((mA - 4.0f) / 16.0f) * 100.0f;
+  if (level < 0.0f) level = 0.0f;
+  return level;
+}
 
-  // Trust the client-computed level when present.
-  if (!src["lvl"].isNull()) {
-    float lvl = src["lvl"].as<float>();
-    if (lvl < 0.0f) lvl = 0.0f;
-    return lvl;
+// Convert raw voltage reading to level/value using sensor config from client config snapshot
+// Returns the computed level, or 0.0 if config not found or invalid voltage
+static float convertVoltageToLevel(const char *clientUid, uint8_t sensorIndex, float voltage) {
+  if (voltage < 0.0f || voltage > 12.0f) {
+    return 0.0f;  // Invalid voltage reading (allow up to 12V for headroom)
   }
-
-  // Legacy / no-lvl fallback (digital float, pulse, or registration notes).
-  if (!src["fl"].isNull()) return src["fl"].as<float>();
-  if (!src["rm"].isNull()) return src["rm"].as<float>();
-  return 0.0f;
+  
+  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (!snap || strlen(snap->payload) == 0) {
+    // No config snapshot available - use simple linear 0-10V mapping
+    // Assume 0-100 range as fallback
+    return (voltage / 10.0f) * 100.0f;
+  }
+  
+  // Parse the config snapshot to find the sensor settings
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, snap->payload);
+  if (err) {
+    return (voltage / 10.0f) * 100.0f;  // Fallback
+  }
+  
+  // Find the sensor in the config
+  JsonArray sensors = doc["sensors"];
+  if (!sensors) {
+    return (voltage / 10.0f) * 100.0f;  // Fallback
+  }
+  
+  for (JsonVariant t : sensors) {
+    uint8_t tn = t["number"] | 0;
+    if (tn == sensorIndex) {
+      // Found the sensor - get sensor range settings
+      float voltageMin = t["analogVoltageMin"] | 0.0f;   // e.g., 0V or 1V
+      float voltageMax = t["analogVoltageMax"] | 10.0f;  // e.g., 10V or 5V
+      float rangeMin = t["sensorRangeMin"] | 0.0f;       // e.g., 0 PSI
+      float rangeMax = t["sensorRangeMax"] | 100.0f;     // e.g., 100 inches or 5 PSI
+      float mountHeight = t["sensorMountHeight"] | 0.0f;
+      
+      // Validate voltage range
+      float voltageRange = voltageMax - voltageMin;
+      if (voltageRange <= 0.0f) {
+        return (voltage / 10.0f) * 100.0f;  // Invalid config fallback
+      }
+      
+      // Calculate the fraction within the voltage range
+      float fraction = (voltage - voltageMin) / voltageRange;
+      if (fraction < 0.0f) fraction = 0.0f;
+      if (fraction > 1.0f) fraction = 1.0f;
+      
+      // Map voltage to sensor's native range
+      float sensorValue = rangeMin + fraction * (rangeMax - rangeMin);
+      
+      // Add mount height offset (for pressure sensors measuring liquid column)
+      // Note: for pure pressure monitoring applications, mountHeight is typically 0
+      return sensorValue + mountHeight;
+    }
+  }
+  
+  // Sensor not found in config - use fallback
+  return (voltage / 10.0f) * 100.0f;
 }
 
 // ============================================================================
@@ -13685,9 +12924,6 @@ static void saveClientMetadataCache() {
         obj["sa"] = meta.lastSystemAlarmType;
         obj["sae"] = meta.lastSystemAlarmEpoch;
       }
-      if (meta.staleDeletionPending) {
-        obj["sdp"] = true;
-      }
       // Note: cachedTemperatureF and staleAlertSent are runtime-only, not persisted
     }
     
@@ -13779,7 +13015,6 @@ static void loadClientMetadataCache() {
       meta.lastSystemAlarmEpoch = obj["sae"] | 0.0;
       meta.cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
       meta.staleAlertSent = false;
-      meta.staleDeletionPending = obj["sdp"] | false;
     }
     
     Serial.print(F("Client metadata loaded: "));
@@ -13920,23 +13155,15 @@ static void checkStaleClients() {
         meta.staleAlertSent = true;
       }
 
-      // --- Phase 4: Flag fully stale clients for deletion instead of auto-removing ---
+      // --- Phase 4: Auto-remove fully stale clients after extended period ---
       if (STALE_CLIENT_PRUNE_SECONDS > 0 &&
-          offlineSeconds >= STALE_CLIENT_PRUNE_SECONDS) {
-        if (!meta.staleDeletionPending) {
-          meta.staleDeletionPending = true;
-          gClientMetadataDirty = true;
-          char logMsg[128];
-          snprintf(logMsg, sizeof(logMsg),
-                   "Client %s (%s) flagged for deletion approval (no data for >%lu days)",
-                   siteName, meta.clientUid,
-                   (unsigned long)(STALE_CLIENT_PRUNE_SECONDS / 86400UL));
-          Serial.println(logMsg);
-          addServerSerialLog(logMsg, "warn", "stale");
-        }
+          offlineSeconds >= STALE_CLIENT_PRUNE_SECONDS &&
+          removeCount < MAX_CLIENT_METADATA) {
+        strlcpy(clientsToRemove[removeCount], meta.clientUid, 48);
+        removeCount++;
       }
     } else {
-      // Client is reporting again — reset stale alert flag and deletion pending state
+      // Client is reporting again — reset stale alert flag
       if (meta.staleAlertSent) {
         meta.staleAlertSent = false;
         // BugFix v1.6.2 (M-5): Notify operator that a previously-stale client has recovered.
@@ -13947,17 +13174,6 @@ static void checkStaleClients() {
         sendSmsAlert(recoveryMsg);
         addServerSerialLog(recoveryMsg, "info", "stale");
         Serial.print(F("Stale alert cleared for client: "));
-        Serial.println(meta.clientUid);
-      }
-      if (meta.staleDeletionPending) {
-        meta.staleDeletionPending = false;
-        gClientMetadataDirty = true;
-        char recoveryMsg[160];
-        snprintf(recoveryMsg, sizeof(recoveryMsg),
-                 "Client recovered: %s (%s) - stale deletion pending cleared.",
-                 siteName, meta.clientUid);
-        addServerSerialLog(recoveryMsg, "info", "stale");
-        Serial.print(F("Stale deletion pending cleared for client: "));
         Serial.println(meta.clientUid);
       }
     }
@@ -13978,13 +13194,11 @@ static void checkStaleClients() {
     removeClientData(clientsToRemove[r]);
   }
 
-  // If any clients were removed, or metadata flagged, force persistence save
+  // If any clients were removed, force persistence save
   if (removeCount > 0) {
     saveSensorRegistry();
-    gSensorRegistryDirty = false;
-  }
-  if (gClientMetadataDirty) {
     saveClientMetadataCache();
+    gSensorRegistryDirty = false;
     gClientMetadataDirty = false;
   }
 }
@@ -14664,11 +13878,11 @@ static void saveClientConfigSnapshots() {
     }
     
     // Accumulate output into a buffer first, then write atomically.
-    // Each line: uid + tab + payload + tab + flag + tab + version + tab + epoch + tab
-    //            + status + tab + dispatchAttempts + tab + dispatchEpoch + newline.
-    // CLIENT_CONFIG_CACHE_LINE_MAX tracks the payload size so large configs are not
-    // silently truncated on save. Reserve generously.
-    const size_t bufSize = (size_t)gClientConfigCount * CLIENT_CONFIG_CACHE_LINE_MAX + 64;
+    // Each line: uid(48) + tab + payload(1536) + tab + flag(1) + tab
+    //            + version(16) + tab + epoch(14) + tab + status(16)
+    //            + tab + dispatchAttempts(3) + tab + dispatchEpoch(14) + newline
+    // ≈ 1660 bytes per entry. Reserve generously.
+    const size_t bufSize = (size_t)gClientConfigCount * 1700 + 64;
     char *buf = (char *)malloc(bufSize);
     if (!buf) {
       Serial.println(F("ERROR: Cannot allocate config cache buffer"));
@@ -14704,7 +13918,7 @@ static void saveClientConfigSnapshots() {
     output.reserve(gClientConfigCount * 1700);
     for (uint8_t i = 0; i < gClientConfigCount; ++i) {
       // Format: uid\tpayload\tpendingDispatch\tconfigVersion\tlastAckEpoch\tlastAckStatus\tdispatchAttempts\tlastDispatchEpoch
-      char line[CLIENT_CONFIG_CACHE_LINE_MAX];
+      char line[1700];
       snprintf(line, sizeof(line), "%s\t%s\t%d\t%s\t%lu\t%s\t%u\t%.0f\n",
                gClientConfigs[i].uid,
                gClientConfigs[i].payload,
@@ -15982,11 +15196,6 @@ static void handleServerSettingsPost(EthernetClient &client, const String &body)
     productUidChanged = true;
   }
 
-  // Update GitHub Route Alias
-  if (settings.containsKey("githubRouteAlias")) {
-    strlcpy(gConfig.githubRouteAlias, settings["githubRouteAlias"] | "", sizeof(gConfig.githubRouteAlias));
-  }
-
   // Update server fleet (requires reinitialization if changed)
   if (settings.containsKey("serverFleet")) {
     const char *newFleet = settings["serverFleet"] | "tankalarm-server";
@@ -16588,23 +15797,6 @@ static void recalculateCalibration(SensorCalibration *cal) {
 #endif
 }
 
-// Re-push the client's cached configuration so freshly learned calibration coefficients reach
-// the device (v1.6.15 calibration sync, P1-5). dispatchClientConfig re-injects the current
-// calibration and bumps the calibration version, so once the client ACKs it will echo the new
-// "cv" and the server stops overriding its level.
-static void redispatchConfigWithCalibration(const char *clientUid) {
-  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
-  if (!snap || snap->payload[0] == '\0') return;
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, snap->payload);
-  if (err) {
-    Serial.print(F("Calibration re-dispatch: failed to parse cached config: "));
-    Serial.println(err.c_str());
-    return;
-  }
-  dispatchClientConfig(clientUid, doc.as<JsonVariantConst>());
-}
-
 static void saveCalibrationEntry(const char *clientUid, uint8_t sensorIndex, double timestamp, 
                                   float sensorReading, float verifiedLevelInches, float temperatureF, const char *notes) {
 #ifdef FILESYSTEM_AVAILABLE
@@ -16634,11 +15826,6 @@ static void saveCalibrationEntry(const char *clientUid, uint8_t sensorIndex, dou
     // recalculateCalibration will read the file and update entryCount
     recalculateCalibration(cal);
     saveCalibrationData();
-    // Push the freshly fitted coefficients to the client so its locally-computed level matches
-    // the server (P1-5). Only worth a config round-trip once we actually have a calibration.
-    if (cal->hasLearnedCalibration) {
-      redispatchConfigWithCalibration(clientUid);
-    }
   }
 #endif
 }

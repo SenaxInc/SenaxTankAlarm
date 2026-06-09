@@ -485,3 +485,103 @@ During **Phase 4 (Authenticity Hardening)**, when migrating from CRC-32 to SHA-2
 The STM32H747XI internal flash is high-end, but typical sector erasure life on internal flash is rated for roughly **10,000 to 100,000 program/erase cycles**.
 * **The Risk:** A deterministic update loop (detailed in Finding 6.6) can wear out the flash sector gate oxides in a matter of weeks if left unchecked.
 * **Advisory Suggestion:** Enforce an unbypassable **minimum 24-hour cool-down period** between DFU retries, regardless of whether a new version is requested, unless manual intervention is triggered locally via the physical front-panel USER button. Record persistent failure counts in the Opta's Backup SRAM or OTP (One-Time Programmable) area so they survive power losses.
+
+---
+
+## 9. Second Reviewer Notes on the Implementation Plan
+
+The Phase 0-4 plan is directionally correct and captures the right order of operations: first prevent watchdog/safe-state failures, then remove the destructive flash window, then harden authenticity. I would keep that sequencing, but tighten several implementation details before coding so the fix does not create a new class of field failures.
+
+### 9.1 Promote A/B boot confirmation into Phase 3, not a follow-up
+
+Section 8's boot-confirmation warning is important enough to become a **Phase 3 acceptance requirement**. A bank swap without a boot-confirmed latch protects against interrupted writes, but it does **not** protect against a validly written image that crashes immediately after reset. The dual-bank work should therefore include these states from the first implementation:
+- `current_bank_confirmed`
+- `pending_bank`
+- `pending_version`
+- `boot_attempt_count`
+- `last_reset_reason`
+
+The new bank should only be marked confirmed after the application reaches a real health threshold, not merely after `setup()` starts. A practical threshold for this product is: relays initialized to the site-safe state, Notecard reachable, time/config loaded enough to evaluate alarms, and at least one successful outbound health/update-status note queued or synced. If that threshold is not reached within N watchdog resets or one boot deadline, early boot should swap back before normal application logic proceeds.
+
+### 9.2 Validate the Opta flash map before assuming dual-bank drop-in support
+
+The current updater writes to `flashStart + 0x40000`, matching the Arduino application start assumption. Phase 3 should start with a small proof-of-concept that proves the actual Opta/Mbed/Arduino boot chain can boot both banks safely. Specifically verify:
+- the linker script and vector table location for the application image,
+- whether the Arduino bootloader expects the sketch at a fixed offset,
+- whether option-byte bank swap preserves the bootloader/application relationship,
+- whether `SCB->VTOR` and interrupt vectors are correct after swap,
+- the true maximum image size per inactive bank.
+
+The current `1536 KB` application limit is not automatically compatible with a simple `2 x 1 MB` A/B layout. If the bootloader occupies part of bank 1 and the inactive bank is only one physical bank, the usable A/B image size may be closer to the smaller bank budget. If the current firmware can grow beyond that, the safer architecture may be a tiny immutable boot stub plus external/QSPI staging rather than direct bank swap from the application.
+
+### 9.3 Split safe-state hooks into enter, restore, and pre-reset hooks
+
+The proposed `enterSafeState()` hook is the right decoupling idea, but it should not be the only lifecycle hook. Calling the same hook on the failure path could leave the RS-485/Modbus stack stopped and relays held in a service state after the application resumes. Prefer a lifecycle bundle such as:
+```cpp
+struct TankAlarmDfuHooks {
+  void (*kickWatchdog)();
+  bool (*okToUpdateNow)();
+  bool (*prepareForUpdate)();       // final alarm flush, stop Modbus, safe relays
+  void (*restoreAfterAbort)();      // restart Modbus, force immediate sensor/alarm pass
+  void (*prepareForReset)();        // final relay/bus state just before NVIC_SystemReset()
+  void (*onProgress)(uint32_t done, uint32_t total);
+};
+```
+For the client, `prepareForUpdate()` should call the existing `SolarManager::end()` path instead of reaching directly into low-level RS-485 pins where possible. `restoreAfterAbort()` should re-run the solar/Modbus initialization with the saved config and schedule an immediate sensor/alarm evaluation so the device does not wait for the normal polling interval after a failed update.
+
+### 9.4 Watchdog kicks do not fix a permanently blocking I2C call
+
+Kicking immediately before and after `requestAndResponse()` is necessary, but it is not sufficient if the Notecard or I2C driver can block longer than the watchdog window. Phase 1 should also define bounded transport behavior:
+- configure/request a Notecard transaction timeout if the library exposes one,
+- set an I2C/Wire timeout when supported by the platform,
+- add an I2C bus recovery path for stuck SDA/SCL before retrying,
+- count total DFU wall-clock time, not only DFU-mode-entry time,
+- treat failure to send `dfu.status stop` or restore `hub.set` as a reportable degraded state.
+
+Every blocking call in the success and failure cleanup paths should use the same watchdog discipline. That includes `dfu.status stop`, `hub.set`, final `hub.sync`, TLS reads in the GitHub-direct path, and any alarm-flush operation added before entering DFU mode.
+
+### 9.5 Preserve the server path's existing SHA-256 strengths
+
+The FTPS/GitHub-direct path already computes SHA-256 over the advertised asset size during download and again over the same byte count from flash. That is the right padding behavior: page-alignment bytes are written as erase-value padding, but they are not part of the expected digest. When this is factored into common helpers, preserve the explicit `(expectedDigest, expectedLength)` pairing so future callers cannot accidentally hash the rounded program size.
+
+One related security note: the direct TLS download currently disables certificate verification and relies on the digest fetched from GitHub release metadata. That is acceptable only if the digest source is trusted independently of the asset transport. Phase 4 should make this explicit by requiring the expected digest from a pinned/signed manifest, Notehub environment/config channel, or release metadata fetched over a trusted path. Do not fetch the binary and its trust anchor from the same unauthenticated channel.
+
+### 9.6 Use durable, wear-aware state for retry and boot metadata
+
+The 24-hour DFU retry cooldown is a good addition, but the suggested storage targets need refinement. Backup SRAM may survive watchdog resets but is not reliable across full power loss unless the VBAT domain is maintained. OTP is not appropriate for counters because it is one-time programmable and cannot support repeated retry bookkeeping.
+
+Use a small wear-aware record instead: LittleFS with a two-slot journal, a dedicated flash settings page with sequence numbers, or a Notehub/Notecard state note mirrored locally. The stored record should include version, target firmware type, attempt count, first-failure time, next-allowed-at time, last failure reason, and whether the failure happened before or after flash erase/swap.
+
+### 9.7 Make `okToUpdateNow()` stricter than `!anyAlarmActive()`
+
+The update gate should check more than active alarm thresholds. For this product, a safe auto-update gate should include:
+- no active high/low/leak alarm,
+- no manual relay command currently holding a relay on,
+- no unacknowledged critical alarm note queued locally,
+- battery voltage above threshold with non-negative trend,
+- charger/solar telemetry recent enough to trust,
+- no config update currently pending or partially applied,
+- a local service override only when deliberately requested.
+
+The peak-solar-hours suggestion is useful, but it should be implemented as a policy input rather than hard-coded local time. If time sync is stale, the device should either defer or fall back to a conservative power-only rule.
+
+### 9.8 Re-audit cleanup scope before implementing the shared failure label
+
+If the cleanup label is expanded to free buffers and deinitialize flash, be careful with C++ object scope and `goto`. The current `progBuf` allocation is inside the flash block, and the label is outside that block. A central cleanup label cannot safely reference block-scoped locals unless the variables are hoisted or wrapped in a small RAII helper. Prefer simple RAII-style wrappers or a single `DfuContext` struct over many `goto` exits.
+
+Also re-check the current code before treating the original CRC-path leak as still present: in the current `TankAlarm_DFU.h`, `progBuf` is freed before read-back CRC verification. The cleanup improvement is still worthwhile, but it should be implemented as defensive simplification rather than assuming that exact leak path still exists.
+
+### 9.9 Add field telemetry for every DFU terminal state
+
+The plan should require a compact DFU telemetry note for success, defer, abort, blocked, rollback, and failed-restore states. Minimum fields: current version, target version, target type, firmware length, phase, elapsed seconds, reset reason, failure reason, attempt count, free heap minimum, battery voltage/trend, and active alarm summary. This will make field failures diagnosable without USB access and will confirm whether the new gates are too conservative.
+
+### 9.10 Recommended adjustment to the release cut
+
+I would still ship Phase 1 + Phase 2 first, but include these additions in that same safety patch:
+- total DFU wall-clock timeout,
+- transport timeout/bus recovery notes,
+- durable failure backoff record,
+- explicit restore-after-abort hook,
+- DFU terminal-state telemetry.
+
+Then gate Phase 3 behind `DFU_DUAL_BANK_EXPERIMENTAL` until the flash-map proof, bank-swap proof, and boot-confirmation rollback all pass on hardware. The dual-bank feature should not be considered field-ready until a deliberately crashing image automatically rolls back to the previous working firmware.

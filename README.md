@@ -1,7 +1,7 @@
-# TankAlarm v1.8.4 - Industrial Tank Monitoring System
+# TankAlarm v1.8.5 - Industrial Tank Monitoring System
 
-**Release Date:** June 8, 2026  
-**Version:** 1.8.4  
+**Release Date:** April 18, 2026  
+**Version:** 1.8.5  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -319,7 +319,6 @@ CLIENT                      BLUES NOTEHUB              SERVER
 - **Common Header Audit:** [CODE REVIEW/COMMON_HEADER_AUDIT_02192026.md](CODE%20REVIEW/COMMON_HEADER_AUDIT_02192026.md)
 
 ### Code Reviews & Release History
-- **v1.8.4 Release Notes:** [CODE REVIEW/V1.8.4_RELEASE_NOTES.md](CODE%20REVIEW/V1.8.4_RELEASE_NOTES.md)
 - **v1.1.8 Release Notes:** [CODE REVIEW/V1.1.8_RELEASE_NOTES.md](CODE%20REVIEW/V1.1.8_RELEASE_NOTES.md)
 - **v1.1.7 Release Notes:** [CODE REVIEW/V1.1.7_RELEASE_NOTES.md](CODE%20REVIEW/V1.1.7_RELEASE_NOTES.md)
 - **v1.1.6 Release Notes:** [CODE REVIEW/V1.1.6_RELEASE_NOTES.md](CODE%20REVIEW/V1.1.6_RELEASE_NOTES.md)
@@ -345,7 +344,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
   - [ ] Ethernet connectivity stable
   
 - [ ] **Software Validation**
-  - [ ] Firmware version 1.8.4 confirmed
+  - [ ] Firmware version 1.8.5 confirmed
   - [ ] All clients reporting to server
   - [ ] Alarms triggering correctly
   - [ ] SMS/email alerts delivering
@@ -365,7 +364,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
 
 ### Deployment Checklist
 
-1. Flash all devices with v1.6.14 firmware
+1. Flash all devices with v1.8.5 firmware
 2. Configure Blues Notehub fleet assignments
 3. Set server IP address and network configuration
 4. Configure SMS/email recipients
@@ -429,39 +428,6 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
-
-### v1.8.4 (June 8, 2026)
-- **Solar Charger Hardening:** Fully resolved all R-1 to R-5 and SR-1 to SR-5 implementation review findings to fix no-charge alert false-trips under float charging conditions, prevent stale alert leaks on link drops, enforce strict battery voltage range and charge current plausibility clamps, cache functional codes efficiently, and standardize software-tracked daily limits.
-- **Release Refresh:** Firmware versioning, package metadata, and release assets are synchronized to the current 1.8.4 source tree.
-- **Binary Assets:** Client, server, and viewer `.bin` files are rebuilt and published under the 1.8.4 release naming.
-
-### v1.8.3 (June 8, 2026)
-- **Genuine Hardware MAC Retrieval:** Fixed a critical bug in standard Mbed OS parameterless `Ethernet.begin()` where raw ethernet interface registration defaulted to temporary/empty MAC values. The Server now retrieves the exact factory block register MAC address (`A8:61:0A` block) via `Ethernet.MACAddress(gMacAddress)` before boots, ensuring local router IP reservations (such as `192.168.7.117`) are correctly matched and active.
-- **Fail-Safe IP State Machine Fallback:** Added auto-healing IP negotiation. If DHCP fails or a static IP subnet is misconfigured (e.g., mismatching local gateway range), the initialization dynamically pivots to try the companion network mode rather than failing the network setup completely.
-- **Improved Serial Interface Recovery:** Hardened board interaction so host diagnostics and debug ports cleanly re-initialize COM configuration after DFU restarts.
-
-### v1.8.2 (June 8, 2026)
-- **CI/Release Pipeline Modernization:** Migrated GitHub Actions workflow dependencies to Node 24-compatible versions to stay ahead of the Node 20 runner deprecation timeline.
-- **Arduino CLI Install Hardening:** Replaced action-based Arduino CLI setup in CI/release workflows with deterministic direct binary install (`arduino-cli 1.4.1`) to reduce external runtime coupling and improve reliability.
-- **Operational Note:** Firmware application behavior is unchanged; this release focuses on build/release infrastructure resilience.
-
-### v1.8.1 (June 8, 2026)
-- **Viewer Daily Print Reports:** Added optional daily plain-text printing from Viewer Opta to LAN printers over JetDirect/Raw TCP (`9100`).
-- **Print Scheduling & Retry:** New daily UTC-hour scheduler with retry throttling, day-boundary reset, and config validation for safer unattended operation.
-- **Print Delivery Hardening:** Viewer now checks post-flush socket health and retries on transfer failure instead of marking the day as complete.
-- **Configuration Additions:** Added `PRINT_ENABLED`, `PRINTER_IP_1..4`, `PRINTER_PORT`, and `PRINT_DAILY_HOUR` options in `ViewerConfig.h` defaults/examples.
-
-### v1.8.0 (June 7, 2026)
-- **Per-Monitor Report Threshold:** Change-based telemetry is now configured per sensor in the sensor's own unit (inches, PSI, RPM, GPM) via the new `reportThreshold` field, replacing the single global `levelChangeThreshold`. `0` disables change-based telemetry for that sensor. (`CONFIG_SCHEMA_VERSION` → 3)
-- **Universal Units in Alarm Logs:** Client alarm serial log now labels readings with the monitor's own unit instead of a hardcoded `in` suffix.
-- **Alarm Hysteresis Fix:** High and low alarm clear bands are now decoupled, so a latched alarm can no longer get stuck when thresholds are close relative to the hysteresis band.
-- **Sensor-Fault Hardening:** Total current-loop acquisition failure, invalid sensor ranges, and unknown interfaces now escalate a `sensor-fault` (return NAN) instead of reporting a plausible-but-fake `0`.
-- **Wireless Command Safety:** Relay/serial/location/sync command inboxes now peek-validate-execute-delete (and gate future schema versions) instead of deleting before processing.
-- **Server Identity/Schema Validation:** System-alarm, daily, and sensor paths validate the client UID and reject future-schema notes; sensor index is range-checked.
-- **Config Dispatch & Offline Replay:** Larger config snapshot capacity (4096B) and offline note replay buffer (2304B) so large multi-sensor configs and daily reports survive caching and outages.
-- **History Pruning:** Hot-tier prune now compacts survivors and skips pre-time-sync snapshots, preventing wrong-entry drops after a clock correction.
-- **Daily Reconciliation:** Daily reports always include the alarm array (schema 2+), so the server can clear orphaned alarms when a clear note was lost.
-- **Note:** `NOTEFILE_SCHEMA_VERSION` remains `2` — the telemetry/alarm/daily note wire format is unchanged.
 
 ### v1.1.8 (March 16, 2026)
 - **Data Integrity:** Save all dirty data (registry, metadata, hot tier, history settings) before DFU/reboot — previously only saved config

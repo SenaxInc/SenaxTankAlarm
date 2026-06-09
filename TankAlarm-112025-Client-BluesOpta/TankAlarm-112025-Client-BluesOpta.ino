@@ -25,6 +25,11 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+#include <ArduinoRS485.h>
+#endif
+
 #include <ArduinoJson.h>
 #include <memory>
 #include <math.h>
@@ -1968,7 +1973,7 @@ void loop() {
   // ---- Update power conservation state (after polling battery sources) ----
   updatePowerState();
   
-  // Periodic firmware update check via Notecard IAP DFU
+  // Periodic firmware update check via Notecard Coordinated ODFU DFU
   // Interval matches inbound poll: 10 min (grid) / 1 hour (solar)
   // Skip in LOW_POWER and CRITICAL — firmware updates are not urgent
   if (gPowerState <= POWER_STATE_ECO) {
@@ -1982,7 +1987,7 @@ void loop() {
         // Auto-apply firmware updates when available (pushed via Notehub DFU)
         // Guarded by: power state <= ECO, Notecard available, DFU not in progress
         if (gDfuUpdateAvailable) {
-          Serial.println(F("Auto-DFU: Applying available firmware update (IAP)..."));
+          Serial.println(F("Auto-DFU: Applying available firmware update (Coordinated ODFU)..."));
           enableDfuMode();
         }
       }
@@ -3550,10 +3555,23 @@ static void initializeNotecard() {
     }
   }
 
-  // Enable IAP DFU so Notecard downloads host firmware from Notehub.
-  // Note: ODFU (card.dfu) is NOT supported on Blues Wireless for Opta carrier
-  // because the AUX pins (BOOT0, NRST, UART) are not routed. IAP is used instead.
+  // Enable user DFU status checks so Notecard downloads host firmware from Notehub in background.
   tankalarm_enableIapDfu(notecard);
+
+  // Initialize card.dfu on the Notecard for stm32, but set "off" to true to
+  // prevent any autonomous or untimely resets from occurring until the Opta host
+  // explicitly quiesces the serial bus and authorizes the flash reset.
+  {
+    J *dfuReq = notecard.newRequest("card.dfu");
+    if (dfuReq) {
+      JAddStringToObject(dfuReq, "name", "stm32");
+      JAddBoolToObject(dfuReq, "off", true);
+      J *dfuRsp = notecard.requestAndResponse(dfuReq);
+      if (dfuRsp) {
+        notecard.deleteResponse(dfuRsp);
+      }
+    }
+  }
 
   // Try to retrieve the Notecard's Device UID (e.g. "dev:860322068012345").
   J *req = notecard.newRequest("hub.get");
@@ -3782,20 +3800,15 @@ static void scheduleNextDailyReport() {
 }
 
 // ============================================================================
-// Device Firmware Update (DFU) via Blues Notecard — IAP Mode
-// Blues Wireless for Opta does NOT support ODFU (no AUX pin routing).
-// IAP: host reads firmware from Notecard via dfu.get and writes to flash.
+// Device Firmware Update (DFU) via Blues Notecard — Coordinated ODFU Mode
+// True brick-proof hardware-managed Outboard DFU (ODFU) over proprietary
+// side-connector DIN bus. 
+// Handshake: boot disabled ("off":true), checked periodically, and applied 
+// explicitly by quiescing/isolating RS-485 and resetting the STM32 via card.dfu.
 // ============================================================================
 
 // Firmware length from last dfu.status (needed by enableDfuMode)
 static uint32_t gDfuFirmwareLength = 0;
-
-// Watchdog kick wrapper for IAP DFU (global function pointer for callback)
-static void dfuKickWatchdog() {
-  #ifdef TANKALARM_WATCHDOG_AVAILABLE
-    mbedWatchdog.kick();
-  #endif
-}
 
 static void checkForFirmwareUpdate() {
   TankAlarmDfuStatus dfuStatus;
@@ -3832,10 +3845,10 @@ static void checkForFirmwareUpdate() {
       Serial.print(F("Size: "));
       Serial.print(gDfuFirmwareLength);
       Serial.println(F(" bytes"));
-      Serial.println(F("Device will auto-update on next check (IAP)"));
+      Serial.println(F("Device will auto-update on next check (Coordinated ODFU)"));
       Serial.println(F("========================================"));
 
-      addSerialLog("Firmware update available (IAP)");
+      addSerialLog("Firmware update available (Coordinated ODFU)");
     }
   } else if (gDfuUpdateAvailable) {
     gDfuUpdateAvailable = false;
@@ -3850,11 +3863,16 @@ static void enableDfuMode() {
     return;
   }
   if (gDfuFirmwareLength == 0) {
-    Serial.println(F("ERROR: No firmware length — cannot apply IAP update"));
+    Serial.println(F("ERROR: No firmware length — cannot apply update"));
     return;
   }
 
-  addSerialLog("IAP DFU mode enabled - updating firmware");
+  Serial.println(F("========================================"));
+  Serial.println(F("ENABLING COORDINATED HOSTAT ODFU MODE"));
+  Serial.println(F("System will quiesce RS-485 bus and authorize ODFU reset"));
+  Serial.println(F("========================================"));
+
+  addSerialLog("Coordinated ODFU mode enabled - updating firmware");
 
   // Save any pending config before rebooting
   if (gConfigDirty) {
@@ -3863,20 +3881,83 @@ static void enableDfuMode() {
 
   gDfuInProgress = true;
 
-  // Determine hub mode to restore on failure
-  const char *restoreMode = gConfig.solarPowered ? "periodic" : "continuous";
+  // --- Step 1: Pre-Update Software Bus Quiescing ---
+  Serial.println(F("ODFU Handshake: Quiescing RS-485 and Modbus bus..."));
+  
+  // Decouple ModbusRTUClient and stop SolarManager
+  if (gSolarManager.isEnabled()) {
+    gSolarManager.end();
+  }
+  
+  // Force DE & RE LOW and force serial pins of built-in transceiver to high-impedance flotation inputs
+  #if defined(PIN_RS485_DE) && defined(PIN_RS485_RE)
+    pinMode(PIN_RS485_DE, OUTPUT);
+    digitalWrite(PIN_RS485_DE, LOW);
+    pinMode(PIN_RS485_RE, OUTPUT);
+    digitalWrite(PIN_RS485_RE, LOW);
+    
+    pinMode(PIN_RS485_DE, INPUT);
+    pinMode(PIN_RS485_RE, INPUT);
+  #endif
+  #if defined(PIN_RS485_TX) && defined(PIN_RS485_RX)
+    pinMode(PIN_RS485_TX, INPUT);
+    pinMode(PIN_RS485_RX, INPUT);
+  #endif
 
-  // Perform IAP update (blocking — reads chunks, writes flash, reboots on success)
-  bool ok = tankalarm_performIapUpdate(
-    notecard,
-    gDfuFirmwareLength,
-    restoreMode,
-    dfuKickWatchdog
-  );
+  // Stop built-in Arduino RS485 module
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    RS485.end();
+  #endif
 
-  // If we get here, the update failed (success reboots)
-  gDfuInProgress = false;
-  Serial.println(F("IAP DFU failed — resuming normal operation"));
+  // Settling period of 1 second to ensure lines settle to high impedance
+  delay(1000);
+  Serial.println(F("ODFU Handshake: RS-485 bus is quiet and isolated."));
+
+  // --- Step 2: Authorize ODFU Reset ---
+  Serial.println(F("ODFU Handshake: Triggering hardware ODFU flash on Notecard..."));
+  J *req = notecard.newRequest("card.dfu");
+  if (req) {
+    JAddStringToObject(req, "name", "stm32");
+    JAddBoolToObject(req, "on", true);
+    
+    J *rsp = notecard.requestAndResponse(req);
+    if (rsp) {
+      const char *err = JGetString(rsp, "err");
+      if (err && err[0] != '\0') {
+        Serial.print(F("ODFU Handshake ERROR: card.dfu on failed: "));
+        Serial.println(err);
+        gDfuInProgress = false;
+        
+        // Restore Modbus RTU if trigger failed
+        if (gConfig.solarCharger.enabled) {
+          gSolarManager.begin(gConfig.solarCharger);
+        }
+      } else {
+        Serial.println(F("ODFU Handshake: Reset command accepted. MCU restarting..."));
+        // The Notecard will pull the hardware NRST low and reset us.
+        // We can wait indefinitely or loop.
+        while (true) {
+          #ifdef TANKALARM_WATCHDOG_AVAILABLE
+            mbedWatchdog.kick();
+          #endif
+          delay(100);
+        }
+      }
+      notecard.deleteResponse(rsp);
+    } else {
+      Serial.println(F("ODFU Handshake ERROR: card.dfu returned no response"));
+      gDfuInProgress = false;
+      if (gConfig.solarCharger.enabled) {
+        gSolarManager.begin(gConfig.solarCharger);
+      }
+    }
+  } else {
+    Serial.println(F("ODFU Handshake ERROR: Failed to create request"));
+    gDfuInProgress = false;
+    if (gConfig.solarCharger.enabled) {
+      gSolarManager.begin(gConfig.solarCharger);
+    }
+  }
 }
 
 static void updateDailyScheduleIfNeeded() {

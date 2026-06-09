@@ -16,13 +16,13 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "1.8.4"
+#define FIRMWARE_VERSION "1.8.5"
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.
 // Receivers can check _sv to decide whether they understand the payload format.
 #ifndef NOTEFILE_SCHEMA_VERSION
-#define NOTEFILE_SCHEMA_VERSION 2
+#define NOTEFILE_SCHEMA_VERSION 1
 #endif
 
 #ifndef FIRMWARE_BUILD_DATE
