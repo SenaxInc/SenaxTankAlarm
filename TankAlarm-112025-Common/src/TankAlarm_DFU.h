@@ -276,7 +276,9 @@ static bool tankalarm_performIapUpdate(
       return false;
     }
     JAddStringToObject(req, "mode", "dfu");
+    if (kickWatchdog) kickWatchdog();
     J *rsp = notecard.requestAndResponse(req);
+    if (kickWatchdog) kickWatchdog();
     if (rsp) {
       const char *err = JGetString(rsp, "err");
       if (err && err[0] != '\0') {
@@ -304,7 +306,9 @@ static bool tankalarm_performIapUpdate(
       J *req = notecard.newRequest("dfu.get");
       if (!req) continue;
       JAddNumberToObject(req, "length", 0);
+      if (kickWatchdog) kickWatchdog();
       J *rsp = notecard.requestAndResponse(req);
+      if (kickWatchdog) kickWatchdog();
       if (rsp) {
         const char *err = JGetString(rsp, "err");
         if (!err || err[0] == '\0') {
@@ -377,11 +381,31 @@ static bool tankalarm_performIapUpdate(
     Serial.print(F("KB at 0x"));
     Serial.println(eraseAddr, HEX);
 
-    if (kickWatchdog) kickWatchdog();
-    flashResult = flash.erase(eraseAddr, eraseSize);
+    // Erase sector-by-sector, kicking the watchdog between each sector.
+    // A single flash.erase() of the whole application region is one long
+    // blocking call; on a brown-out-prone supply it can approach or exceed
+    // the ~30s watchdog window and reset the MCU with the app region already
+    // wiped (an unrecoverable brick for IAP). Per-sector erase keeps each
+    // blocking interval short and lets the watchdog be serviced in between.
+    flashResult = 0;
+    {
+      uint32_t eraseCursor = eraseAddr;
+      uint32_t eraseEnd = eraseAddr + eraseSize;
+      while (eraseCursor < eraseEnd) {
+        if (kickWatchdog) kickWatchdog();
+        uint32_t ss = flash.get_sector_size(eraseCursor);
+        flashResult = flash.erase(eraseCursor, ss);
+        if (flashResult != 0) {
+          Serial.print(F("IAP DFU: Flash erase failed at 0x"));
+          Serial.print(eraseCursor, HEX);
+          Serial.print(F(": "));
+          Serial.println(flashResult);
+          break;
+        }
+        eraseCursor += ss;
+      }
+    }
     if (flashResult != 0) {
-      Serial.print(F("IAP DFU: Flash erase failed: "));
-      Serial.println(flashResult);
       flash.deinit();
       goto iap_restore_hub;
     }
@@ -419,6 +443,7 @@ static bool tankalarm_performIapUpdate(
         J *req = notecard.newRequest("dfu.get");
         if (!req) {
           delay(500);
+          if (kickWatchdog) kickWatchdog();
           continue;
         }
         JAddNumberToObject(req, "length", (int)thisChunk);
@@ -426,11 +451,14 @@ static bool tankalarm_performIapUpdate(
           JAddNumberToObject(req, "offset", (int)offset);
         }
 
+        if (kickWatchdog) kickWatchdog();
         J *rsp = notecard.requestAndResponse(req);
+        if (kickWatchdog) kickWatchdog();
         if (!rsp) {
           Serial.print(F("IAP DFU: dfu.get no response at offset "));
           Serial.println(offset);
           delay(500);
+          if (kickWatchdog) kickWatchdog();
           continue;
         }
 
@@ -440,6 +468,7 @@ static bool tankalarm_performIapUpdate(
           Serial.println(err);
           notecard.deleteResponse(rsp);
           delay(500);
+          if (kickWatchdog) kickWatchdog();
           continue;
         }
 
@@ -448,6 +477,7 @@ static bool tankalarm_performIapUpdate(
           Serial.println(F("IAP DFU: Empty payload"));
           notecard.deleteResponse(rsp);
           delay(500);
+          if (kickWatchdog) kickWatchdog();
           continue;
         }
 
@@ -459,6 +489,7 @@ static bool tankalarm_performIapUpdate(
         if (decoded <= 0) {
           Serial.println(F("IAP DFU: Base64 decode failed"));
           delay(500);
+          if (kickWatchdog) kickWatchdog();
           continue;
         }
 
