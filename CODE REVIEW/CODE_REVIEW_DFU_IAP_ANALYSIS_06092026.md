@@ -162,3 +162,326 @@ This simple fix prevents memory leaks on CRC mismatches, check-bounds failures, 
 | **Office / Lab Testing (USB connected)** | Use **IAP** or **ODFU** interchangeably | Keep serial monitors closed when trigger/reset occurs. |
 | **Clean Field LAN / Grid Power** | Use **ODFU (Out-of-Band)** | Safe, automatic, robust, and completely protects against sketch locks. |
 | **Remote Solar Setup (Weak Signal/Modbus)** | Use **IAP (Host-initiated)** | Highly reliable because the MCU has absolute control over power state gating and can pause Modbus transactions before flashing. |
+
+---
+
+# 6. Addendum — Full Review of the Update Logic Under Blocking Events
+**Date appended:** June 9, 2026  
+**Reviewer focus:** Blocking-event behavior of the IAP update path — watchdog interaction, RS-485 / Modbus bus state, relay/pump safe-states, and the erase-before-download bricking window.  
+**Code reviewed (as built):**
+- `TankAlarm-112025-Common/src/TankAlarm_DFU.h` — `tankalarm_performIapUpdate()`, `tankalarm_checkDfuStatus()`
+- `TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino` — `loop()` DFU gate (lines ~1971–1990), `enableDfuMode()`/`checkForFirmwareUpdate()` (lines ~3799–3939), `dfuKickWatchdog()`
+- `TankAlarm-112025-Common/src/TankAlarm_Solar.cpp` — synchronous Modbus RTU reads over RS-485
+- `TankAlarm-112025-Common/src/TankAlarm_Common.h` — `WATCHDOG_TIMEOUT_SECONDS 30`
+
+> **Threat model for this section:** The IAP update is a *long, single-threaded, blocking* routine executed from `loop()`. For its multi-minute duration the device performs **no** sensor sampling, alarm evaluation, relay logic, or Modbus polling. Every concern below stems from that fact.
+
+---
+
+## 6.1 Watchdog Interaction (HIGH — can reset the MCU mid-flash)
+
+The watchdog is configured at **30 s** (`WATCHDOG_TIMEOUT_SECONDS`), which is near the STM32H7 IWDG ceiling (~32.7 s). The IAP routine relies *entirely* on the optional `kickWatchdog` callback to survive. There are several windows where no kick occurs:
+
+### Finding 6.1-A: Single un-kicked `flash.erase()` of the entire application region (HIGH)
+In `tankalarm_performIapUpdate()` the erase is one atomic, blocking call:
+```cpp
+    if (kickWatchdog) kickWatchdog();
+    flashResult = flash.erase(eraseAddr, eraseSize);   // <-- whole app region, no kick inside
+    ...
+    if (kickWatchdog) kickWatchdog();
+```
+`eraseSize` is rounded up to cover the *entire* firmware (up to the 1536 KB cap = ~12× 128 KB sectors). On an H7 a 128 KB sector erase is typically ~150–600 ms but is heavily dependent on `Vcore`/voltage scaling and bus contention. In a brown-out-prone solar setup the erase of the full region can approach or exceed the 30 s window. Because the kick happens **before** the call and only resumes **after** it returns, a slow erase = watchdog reset **with the application region already wiped** → guaranteed brick (IAP cannot self-recover; see §6.4).
+- **Fix:** Erase sector-by-sector in a loop and kick between each sector:
+  ```cpp
+  uint32_t a = eraseAddr, end = eraseAddr + eraseSize;
+  while (a < end) {
+    if (kickWatchdog) kickWatchdog();
+    uint32_t ss = flash.get_sector_size(a);
+    if (flash.erase(a, ss) != 0) { /* abort */ }
+    a += ss;
+  }
+  if (kickWatchdog) kickWatchdog();
+  ```
+
+### Finding 6.1-B: Un-kicked Notecard I2C transactions inside the DFU-mode wait loop (MEDIUM)
+```cpp
+    while ((millis() - start) < DFU_IAP_MODE_TIMEOUT_MS) {
+      if (kickWatchdog) kickWatchdog();
+      delay(2000);
+      J *req = notecard.newRequest("dfu.get");
+      ...
+      J *rsp = notecard.requestAndResponse(req);   // <-- blocking I2C, NO kick around it
+```
+The kick fires, then `delay(2000)` + a blocking `requestAndResponse()` run with no further kick. If the Notecard is mid-sync, busy, or the I2C transaction stalls near its library timeout, the combined gap can approach the 30 s window. The same pattern exists for the per-chunk `dfu.get` in step 4 (kick is at the top of the outer `while`, but each retry performs a blocking `requestAndResponse()` plus `delay(500)` with no kick — three retries × ~(I2C timeout + 500 ms) can be large).
+- **Fix:** Kick *immediately before and after* every blocking `requestAndResponse()` and after every `delay()` inside retry loops, not just once per outer iteration.
+
+### Finding 6.1-C: Step 1 `hub.set mode=dfu` has no kick (LOW)
+The very first `hub.set` (entering DFU mode) executes a blocking `requestAndResponse()` before the wait loop's first kick. Add a kick before it.
+
+### Finding 6.1-D: Default callback is `nullptr` (MEDIUM, latent)
+`tankalarm_performIapUpdate(..., void (*kickWatchdog)() = nullptr)` defaults to no kicking. The client correctly passes `dfuKickWatchdog`, but any future caller (or a refactor) that omits it will brick on the first erase if the watchdog is running. Recommend making the callback **non-optional**, or asserting it is non-null when `TANKALARM_WATCHDOG_AVAILABLE` is defined.
+
+---
+
+## 6.2 RS-485 / Modbus Bus State During the Update (MEDIUM)
+
+The solar/charger telemetry path (`TankAlarm_Solar.cpp`) drives the shared **RS-485** transceiver via synchronous `ModbusRTUClient.requestFrom(...)` calls. Because the whole system is single-threaded and the IAP routine runs to completion inside `loop()`, there is **no concurrent Modbus access** during DFU — that part is safe and is the key reason IAP is preferred over ODFU on noisy buses (IAP moves bytes over **I2C to the Notecard**, not over the RS-485/UART bootloader handshake).
+
+However, two real issues remain:
+
+### Finding 6.2-A: RS-485 driver/DE-RE pin left in its last state (MEDIUM)
+Nothing quiesces the RS-485 PHY before the update. Whatever DE/RE (driver-enable) state the **last** Modbus transaction left is held for the entire multi-minute update and across the `NVIC_SystemReset()` glitch. If the last transaction left the driver **enabled**, the node keeps asserting the bus, which can:
+- corrupt other masters/slaves sharing the segment, and
+- bias the differential pair during the reset window.
+- **Fix:** Before erase, explicitly release the bus: end any Modbus session and force the transceiver into receive/high-impedance (`RS485.end()` / drive DE low). Re-init on the post-reboot path.
+
+### Finding 6.2-B: "Pause Modbus before flashing" is claimed but **not implemented** (MEDIUM — doc/code mismatch)
+§5 of this document and the IAP "Pros" state the host "can pause Modbus transactions before flashing" and waits for "active alarms to clear, local relays to de-energize, and solar batteries to exceed a safe 12.8 V threshold." The shipped `enableDfuMode()` does **none** of this. The only gate is in `loop()`:
+```cpp
+  if (gPowerState <= POWER_STATE_ECO) { ... if (gDfuUpdateAvailable) { enableDfuMode(); } }
+```
+i.e. a coarse power-state check. There is no alarm-active check, no relay-de-energize step, and no explicit Modbus pause. This is a gap between documented intent and behavior and should either be implemented or the claims softened.
+
+---
+
+## 6.3 Relay / Pump Safe-State Across Reboot (MEDIUM–HIGH for a safety device)
+
+On success the routine does:
+```cpp
+  Serial.flush();
+  delay(500);
+  NVIC_SystemReset();
+```
+Outputs (alarm relays, pump-control relays) are **not driven to a defined safe state** before the reset. During `NVIC_SystemReset()` + bootloader re-init + sketch `setup()`, Opta relay GPIOs pass through a floating/default phase and may **glitch** — momentarily energizing or de-energizing a pump or sounder. For a tank-alarm controller this is a process-safety concern, not just cosmetics.
+- **Fix:** Immediately before `NVIC_SystemReset()`, command all relays to their fail-safe state (per site policy — typically alarm-asserted/pump-off), then reset. Mirror this de-energize at the very top of `setup()` so the safe state is held continuously through the reboot.
+- The same applies to the **failure path** (`iap_restore_hub:`) which resumes `loop()` after potentially minutes of frozen outputs — confirm the first post-DFU loop re-evaluates alarms and relay logic promptly.
+
+---
+
+## 6.4 The Erase-Before-Download Bricking Window (HIGH — the dominant field risk)
+
+The current sequence is **destructive-first**:
+1. `flash.erase(appStart, eraseSize)` wipes the entire running application, **then**
+2. chunks are pulled one-at-a-time over cellular/I2C (the slowest, least reliable link), **then**
+3. CRC-32 is verified.
+
+Between (1) and the end of (2) the device has **no valid application**. Any power loss, cellular stall that outlasts the retries, or watchdog reset (see §6.1-A) in that window leaves a partially-written or empty app. Because IAP recovery **requires the application to boot and reach the Notecard**, a corrupt app cannot pull a rollback — this is the textbook IAP bricking case requiring a physical USB site visit.
+
+Mitigations, in order of preference:
+- **Best:** Exploit the Opta/STM32H747 **dual-bank flash** — write/verify the new image into the *inactive* bank, then flip the boot bank (`FLASH_OB` bank-swap) atomically. A failed/partial write never touches the running bank; a bad image can be reverted by swapping back.
+- **Good:** Stage the full image to an external/QSPI region first, CRC-verify it **before** erasing the app bank, then do a fast block copy. Shrinks the destructive window from "minutes of cellular download" to "seconds of local copy."
+- **Minimum:** Do not erase until the *entire* image has been successfully pulled and buffered/verified. (Not feasible to fully buffer 1.5 MB in RAM, but per-bank staging makes it possible.)
+
+> Note: the **server** GitHub-direct path (`TankAlarm-112025-FTPS_Server_Test.ino`) already does SHA-256 verification of both the download and the flash read-back — stronger than the IAP path's CRC-32. It still shares the same erase-first window, so the dual-bank recommendation applies there too.
+
+---
+
+## 6.5 Authenticity vs. Integrity (MEDIUM, security)
+
+The IAP path validates only a **CRC-32** (integrity against random corruption). It does **not** verify authenticity — there is no signature/hash check on the binary content itself; trust is delegated entirely to the Notehub/Blues transport. The server GitHub path is stronger (SHA-256 against a pinned expected digest). For a remotely-updatable field controller, an unauthenticated image accepted purely on transport trust is an OWASP-class "Software and Data Integrity Failure" (A08). Recommend verifying a signed digest (or at minimum a pinned SHA-256 supplied out-of-band) before booting the new image on the IAP path as well.
+
+---
+
+## 6.6 Retry / Re-arm Behavior After a Failed Update (MEDIUM)
+
+On failure, `enableDfuMode()` clears `gDfuInProgress` but **leaves `gDfuUpdateAvailable == true`**:
+```cpp
+  gDfuInProgress = false;
+  Serial.println(F("IAP DFU failed — resuming normal operation"));
+```
+On the next DFU interval the `loop()` gate sees `gDfuUpdateAvailable` still true and **immediately re-attempts** — re-entering DFU mode and re-erasing the app bank. A *deterministic* failure (e.g. a genuine CRC mismatch from a bad build, or a chronically weak link) therefore loops forever: repeated full-region erases (flash wear) and repeated multi-minute offline windows during which **no alarms are delivered**.
+- **Fix:** Add a per-version failure counter with exponential backoff; after N consecutive failures for the same `gDfuVersion`, latch "do not auto-apply this version" and surface it via health telemetry for operator action.
+- Also note the client auto-apply path does **not** compare versions for "is newer" before applying (it only checks `version != last-seen`), so a mistaken Notehub assignment could trigger a **downgrade** loop. Add a `compareFirmwareVersions()` "strictly newer" guard before auto-applying.
+
+---
+
+## 6.7 Availability Gap: No Alarm Delivery While in DFU Mode (MEDIUM)
+
+`hub.set mode=dfu` stops sync, and the routine then blocks for the full download. For a tank-alarm safety system this is a multi-minute window where a real high-level/leak alarm **cannot be transmitted**. Combined with §6.6's retry loop this can become a significant cumulative outage.
+- **Fix:** Bound the total DFU wall-clock time (`DFU_IAP_MODE_TIMEOUT_MS` only covers mode entry, not the whole download). Before entering DFU mode, force a final alarm/state flush, and prefer scheduling auto-DFU only when no alarm is active (ties into §6.2-B).
+
+---
+
+## 6.8 Summary of Addendum Findings
+
+| # | Finding | Severity | Core Risk |
+|---|---|---|---|
+| 6.1-A | Whole-region `flash.erase()` with no kick inside | **HIGH** | Watchdog reset mid-erase → brick |
+| 6.1-B | Notecard I2C calls in wait/retry loops un-kicked | MEDIUM | Watchdog reset during download |
+| 6.1-C | First `hub.set mode=dfu` un-kicked | LOW | Edge-case reset on entry |
+| 6.1-D | `kickWatchdog` defaults to `nullptr` | MEDIUM | Future caller bricks silently |
+| 6.2-A | RS-485 DE/RE left in last state across update+reset | MEDIUM | Bus contention / corruption |
+| 6.2-B | "Pause Modbus / wait for safe conditions" not implemented | MEDIUM | Doc/code mismatch |
+| 6.3 | Relays/pumps not driven to safe state before reset | MEDIUM–HIGH | Output glitch on reboot |
+| 6.4 | Erase-before-download destructive window | **HIGH** | Brick on power loss / stall |
+| 6.5 | CRC-32 only (no authenticity) on IAP path | MEDIUM | Unauthenticated firmware (A08) |
+| 6.6 | `gDfuUpdateAvailable` not cleared on failure → retry loop | MEDIUM | Flash wear + repeated outage |
+| 6.7 | No alarm delivery during DFU; total time unbounded | MEDIUM | Safety availability gap |
+
+### Top three priorities
+1. **Make erase watchdog-safe and non-destructive** — sector-by-sector erase with kicks (6.1-A) and move to dual-bank staged write (6.4). Together these eliminate the dominant brick scenarios.
+2. **Define output/bus safe-states** — de-energize relays and release the RS-485 driver before `NVIC_SystemReset()`, and re-assert at the top of `setup()` (6.2-A, 6.3).
+3. **Add failure backoff + "strictly newer" guard** so a bad image or weak link cannot loop forever erasing flash and starving alarm delivery (6.6, 6.7).
+
+---
+
+# 7. Implementation Plan
+
+This plan sequences the §6 findings into four phases ordered by risk-reduction-per-effort. Phases 1–2 are *defensive* (low blast radius, no flash-layout changes) and should ship first. Phase 3 is the *structural* dual-bank rework. Phase 4 is *hardening*. Each task lists the target file, the exact insertion point, and an acceptance check.
+
+> **Guiding principle:** Land the cheap, high-value safety guards (watchdog-safe erase, safe-states, failure backoff) *before* the larger dual-bank refactor, so field units are protected even if Phase 3 slips.
+
+---
+
+## Phase 0 — Pre-work: Pre-Update Hooks (enables everything else)
+
+Introduce a small, sketch-supplied callback bundle so `tankalarm_performIapUpdate()` can quiesce the system without the common library depending on sketch internals (relays, Modbus). This keeps the library decoupled while fixing 6.2 and 6.3.
+
+**File:** `TankAlarm-112025-Common/src/TankAlarm_DFU.h`
+- Extend the signature with optional callbacks (keep `kickWatchdog` mandatory in practice — see Phase 1):
+  ```cpp
+  struct TankAlarmDfuHooks {
+    void (*kickWatchdog)();        // REQUIRED when watchdog is enabled
+    void (*enterSafeState)();      // de-energize relays/pumps, release RS-485
+    bool (*okToUpdateNow)();       // returns false if an alarm is active
+  };
+  static bool tankalarm_performIapUpdate(Notecard &notecard, uint32_t firmwareLength,
+                                         const char *hubMode, const TankAlarmDfuHooks &hooks);
+  ```
+- Keep a thin backward-compatible overload that wraps the old `void(*)()` kick-only signature so the server test sketch still compiles during migration.
+
+**Files (callers):** client `enableDfuMode()` and `TankAlarm-112025-FTPS_Server_Test.ino` — populate the hook struct.
+
+**Acceptance:** both sketches compile; `okToUpdateNow()` defaults to `true` if not supplied.
+
+---
+
+## Phase 1 — Watchdog-Safe Blocking (fixes 6.1-A/B/C/D)
+
+**Task 1.1 — Sector-by-sector erase with kicks (6.1-A).**  
+`TankAlarm_DFU.h`, Step 3 erase block. Replace the single `flash.erase(eraseAddr, eraseSize)` with the per-sector loop from §6.1-A, kicking before each sector. Apply the *same* change to the server GitHub-direct path in `TankAlarm-112025-FTPS_Server_Test.ino`.
+- **Acceptance:** with the watchdog at 30 s, a full ~1.5 MB erase completes without reset on the bench (instrument with a per-sector `Serial` tick).
+
+**Task 1.2 — Kick around every blocking Notecard call (6.1-B, 6.1-C).**  
+`TankAlarm_DFU.h`, Step 1 (`hub.set mode=dfu`), Step 2 (DFU-mode wait loop), and Step 4 (per-chunk retry loop). Add `hooks.kickWatchdog()` immediately **before and after** each `requestAndResponse()` and after each `delay()`.
+- **Acceptance:** induce a stalled Notecard (pull SDA briefly / unplug) and confirm no watchdog reset within one retry cycle.
+
+**Task 1.3 — Make the kick non-optional when the watchdog is armed (6.1-D).**  
+With the `TankAlarmDfuHooks` struct, treat `kickWatchdog == nullptr` as a hard error when `TANKALARM_WATCHDOG_AVAILABLE` is defined: log and **abort to `iap_restore_hub`** before erasing, rather than proceeding into a guaranteed brick.
+- **Acceptance:** a unit/compile-time guard or an early runtime check that refuses to erase without a kick callback.
+
+---
+
+## Phase 2 — Output & Bus Safe-States + Failure Backoff (fixes 6.2, 6.3, 6.6, 6.7)
+
+**Task 2.1 — `enterSafeState()` before erase (6.2-A, 6.3).**  
+Implement in the client sketch: drive alarm/pump relays to the site-defined fail-safe, then `RS485.end()` / force DE low. Call `hooks.enterSafeState()` in `tankalarm_performIapUpdate()` *immediately before* the erase, and again on the `iap_restore_hub:` path's exit so the failure path also resumes from a known state.
+- Mirror the relay safe-state at the **very top of `setup()`** so it is held continuously through `NVIC_SystemReset()`.
+- **Acceptance:** scope/log relay GPIO and DE pin: no spurious energize during update or across reboot.
+
+**Task 2.2 — `okToUpdateNow()` alarm gate (6.2-B, 6.7).**  
+In the client `loop()` DFU gate, AND the existing `gPowerState <= POWER_STATE_ECO` check with `!anyAlarmActive()`. Pass the same predicate as `hooks.okToUpdateNow` so the library re-checks right before committing.
+- Force a final alarm/state flush (`hub.sync` of the outbox) before `hub.set mode=dfu`.
+- **Acceptance:** with a simulated active alarm, auto-DFU is deferred; the alarm note is delivered before DFU entry.
+
+**Task 2.3 — Failure backoff + clear stale availability (6.6).**  
+In client `enableDfuMode()` failure tail: do **not** leave `gDfuUpdateAvailable` latched. Add `gDfuFailCountForVersion` keyed on `gDfuVersion`; after `DFU_MAX_ATTEMPTS` (e.g. 3) consecutive failures for the same version, set `gDfuVersionBlocked` and stop auto-applying until a *different* version appears or an operator clears it. Surface the blocked state in health telemetry.
+- **Acceptance:** a deterministically-failing image stops retrying after N attempts; a subsequent new version still updates.
+
+**Task 2.4 — "Strictly newer" guard (6.6).**  
+Before auto-applying, require `compareFirmwareVersions(gDfuVersion, FIRMWARE_VERSION) > 0`. Reuse the existing `compareFirmwareVersions()` already present in the server test sketch (promote it to `TankAlarm_Utils.h` for shared use).
+- **Acceptance:** an equal or older advertised version does not trigger an auto-downgrade.
+
+---
+
+## Phase 3 — Non-Destructive Dual-Bank Update (fixes 6.4; the structural change)
+
+The STM32H747 on Opta is dual-bank (2× 1 MB). Stage into the inactive bank and swap, so a failed/partial write never touches the running image.
+
+**Task 3.1 — Bank topology helper.**  
+Add `TankAlarm_FlashBank.h` in common: detect current boot bank, expose `inactiveBankStart()`, and wrap the `FLASH->OPTCR` `BFB2`/`SWAP_BANK` option-byte flip behind a single `commitBankSwap()` that performs the option-byte program + reset.
+- **Acceptance:** read-back confirms boot bank toggles after `commitBankSwap()` on the bench.
+
+**Task 3.2 — Retarget IAP write to the inactive bank.**  
+In `tankalarm_performIapUpdate()`: erase + program into `inactiveBankStart()` instead of `flashStart + 0x40000`. Keep the running app untouched throughout download and CRC verify.
+- **Acceptance:** during download the device still runs valid code (pull power mid-download → reboots into the *old* working app, not a brick).
+
+**Task 3.3 — Verify-then-swap commit.**  
+Only after the read-back CRC (Phase 4 upgrades this to SHA-256) passes against the *inactive* bank, call `commitBankSwap()` → reset. On any failure, simply restore hub mode and keep running the current bank — no rollback binary needed because the old bank was never erased.
+- **Acceptance:** corrupt the staged image deliberately → device declines swap and continues on current firmware.
+
+**Task 3.4 — Apply the same dual-bank flow to the server GitHub-direct path** in `TankAlarm-112025-FTPS_Server_Test.ino` (it already has SHA-256; only the target address + commit step change).
+
+---
+
+## Phase 4 — Authenticity Hardening (fixes 6.5)
+
+**Task 4.1 — Upgrade IAP integrity check to SHA-256.**  
+Replace the CRC-32 in `TankAlarm_DFU.h` with the same `mbedtls_sha256` streaming verification already used on the server path (factor it into a shared helper).
+
+**Task 4.2 — Pinned/-signed digest.**  
+Require an expected digest delivered out-of-band (Notehub env var / config note for IAP; release manifest for GitHub) and refuse `commitBankSwap()` unless the staged image matches. Optionally verify an Ed25519 signature over the digest for full authenticity.
+- **Acceptance:** an image whose digest does not match the pinned value is rejected before swap (negative test).
+
+---
+
+## 7.1 Sequencing, Effort & Dependencies
+
+| Phase | Fixes | Relative Effort | Risk if Deferred | Depends On |
+|---|---|---|---|---|
+| 0 | Hook plumbing | S | — (enabler) | — |
+| 1 | 6.1-A/B/C/D | S–M | **HIGH** (active brick risk) | 0 |
+| 2 | 6.2, 6.3, 6.6, 6.7 | M | MEDIUM–HIGH (safety/outage) | 0 |
+| 3 | 6.4 | **L** | **HIGH** (brick window) | 1 |
+| 4 | 6.5 | M | MEDIUM (security/A08) | 3 |
+
+**Recommended release cut:** ship **Phase 1 + Phase 2** as a single safety patch (`vX.Y` minor — no flash-layout change, fully backward compatible), then land **Phase 3** behind a build flag (`DFU_DUAL_BANK`) for staged field validation, and finally enable **Phase 4** once Notehub/release tooling supplies the pinned digest.
+
+## 7.2 Test Matrix (per phase, on hardware)
+
+| Scenario | Expected (post-fix) |
+|---|---|
+| Power loss during erase | Phase 1: reset is survivable only post-Phase 3; Phase 3: reboots into old bank |
+| Watchdog stall (Notecard unplugged mid-download) | No MCU reset; clean abort to `iap_restore_hub` |
+| Active alarm at update time | Update deferred; alarm delivered first |
+| Deterministically corrupt image | Declined after N attempts; current firmware retained; telemetry flags it |
+| Older version advertised | No downgrade |
+| Tampered image (wrong digest) | Phase 4: rejected before swap |
+| Relay/DE pins during update+reboot | No spurious energize; bus released |
+
+## 7.3 Out-of-Scope / Follow-ups
+- ODFU (hardware AUX) remains unavailable on Wireless-for-Opta and is not part of this plan.
+- A/B persistent "boot-confirmed" flag (mark new bank *confirmed* only after it boots and reaches Notehub once; auto-revert on next boot if unconfirmed) is a strong future addition layered on Phase 3.
+
+---
+
+## 8. Reviewer Thoughts and Advisory Suggestions
+The proposed multi-phase implementation plan starting from **Phase 0** and working progressively through **Phase 4** is exceptionally thorough, highly structured, and targets the direct risks associated with field-level IAP updates. Specifically:
+* Splitting the work into a lightweight, backward-compatible, change-free **Phase 1 & 2** (Watchdog and Safe-state fixes) and reserving the deep-cutting dual-bank flash logic for **Phase 3** represents the gold standard of defensive field engineering. It minimizes the development blast radius while immediately preventing the leading causes of actual field-unit brick resets.
+
+Below are strategic advisory suggestions to enhance and extend this plan:
+
+### 1. ⚠️ The "Zombie Rollback" Pitfall (Highly Critical for Phase 3)
+When implementing **Phase 3 (Non-Destructive Dual-Bank Update)**, we boot atomically into the alternate bank using `commitBankSwap()`. 
+* **The Risk:** If the newly flashed image has a subtle bug that compiles cleanly but causes a HardFault or an immediate stack crash 3 seconds *after* boot or if it enters a crash-reboot loop, it will never be able to execute any new DFU commands or restore its previous state. The unit enters a "Zombie Loop" where the watchdog continuously resets, boots the bad bank, crashes, and resets.
+* **Advisory Suggestion:** You should companion **Phase 3** with a **Hardware Boot Confirmation State Machine (A/B Boot Latching)**:
+  1. Upon bank swap, the bootloader (or early `setup()`) marks the new bank as "unconfirmed" in a dedicated, retained register or flash offset.
+  2. If the application boots, successfully registers with the Notecard, and obtains its first valid `hub.sync` back to the cloud, the application marks the bank as "confirmed" (stable).
+  3. If the MCU resets (by watchdog or panic) *before* reaching this confirmation threshold, the board's early boot sequence detects that an unconfirmed bank failed. It immediately executes an automatic bank rollback (`commitBankSwap()` back to the old, known-working bank) before initializing the bad application. This creates a true, bullet-proof self-healing industrial system.
+
+### 2. ⚡ Brownout Management Gating (Phase 2 Enhancement)
+During **Phase 2 (Output & Bus Safe-States)**:
+* **The Risk:** Flashing is a high-power operation due to flash sector charge-pump activity. If voltage fluctuates on a solar client, even if the primary starting voltage was >12.8V, the continuous current draw of maintaining a cellular download *plus* continuous flash erasure can sag a batteries-under-load capacity below the brown-out threshold (BOR).
+* **Advisory Suggestion:** 
+  1. Add an active **Voltage Trend Check** in `okToUpdateNow()`. Refuse DFU if the battery voltage slope is negative or falling rapidly, indicating that the unit is currently in high-draw or discharging conditions with low solar supply.
+  2. Perform the update sequentially only during peak charging hours (e.g., gating updates so they only fire between 10:00 AM and 2:00 PM local timezone when solar generation is historically most active).
+
+### 3. 🛡️ SHA-256 Signature Padding Gaps (Phase 4 Enhancement)
+During **Phase 4 (Authenticity Hardening)**, when migrating from CRC-32 to SHA-256 streaming verification:
+* **The Risk:** Flash memory sectors are padded to page alignments (completed with default `0x00` or `0xFF` erase values). If you perform a read-back SHA-256 verification of the final compiled length, any page-boundary padding bytes written to the tail of the flash memory block must be symmetrically padded or trimmed from your reference binary’s SHA-256 digest, or the hashes will mismatch.
+* **Advisory Suggestion:** Embed the exact **Expected Application Cargo Size** (not rounded block size) inside a fixed struct header at a predefined offset of the binary image (or pass it out-of-band via Notehub envelopes). Ensure your SHA-256 read-back routine bounds itself strictly to the *exact* original binary length (leaving out the page-erased tail padding) to ensure absolute hash equivalence.
+
+### 4. 📈 Flash wear-leveling considerations (Ongoing advisory)
+The STM32H747XI internal flash is high-end, but typical sector erasure life on internal flash is rated for roughly **10,000 to 100,000 program/erase cycles**.
+* **The Risk:** A deterministic update loop (detailed in Finding 6.6) can wear out the flash sector gate oxides in a matter of weeks if left unchecked.
+* **Advisory Suggestion:** Enforce an unbypassable **minimum 24-hour cool-down period** between DFU retries, regardless of whether a new version is requested, unless manual intervention is triggered locally via the physical front-panel USER button. Record persistent failure counts in the Opta's Backup SRAM or OTP (One-Time Programmable) area so they survive power losses.
