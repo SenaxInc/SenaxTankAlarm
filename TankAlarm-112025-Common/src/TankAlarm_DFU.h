@@ -654,3 +654,264 @@ iap_restore_hub:
 #endif // ARDUINO_OPTA || ARDUINO_ARCH_MBED
 
 #endif // TANKALARM_DFU_H
+
+#if defined(TANKALARM_DFU_MCUBOOT)
+#include <MCUboot.h>
+#include "QSPIFBlockDevice.h"
+#include "MBRBlockDevice.h"
+#include "FATFileSystem.h"
+
+// Initialize QSPI block device
+static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+
+static bool tankalarm_performMcubootUpdate(
+    Notecard &notecard,
+    uint32_t firmwareLength,
+    const char *hubMode,
+    void (*kickWatchdog)() = nullptr
+) {
+  if (firmwareLength == 0 || firmwareLength > 0x1E0000) {
+    Serial.print(F("MCUboot DFU: Invalid firmware length: "));
+    Serial.println(firmwareLength);
+    return false;
+  }
+
+  Serial.println(F("========================================"));
+  Serial.println(F("MCUboot DFU: Starting firmware update"));
+  Serial.print(F("Firmware size: "));
+  Serial.print(firmwareLength);
+  Serial.println(F(" bytes"));
+  Serial.println(F("========================================"));
+
+  // --- Step 1: Put Notecard into DFU mode ---
+  Serial.println(F("MCUboot DFU: Entering Notecard DFU mode..."));
+  {
+    J *req = notecard.newRequest("hub.set");
+    if (!req) return false;
+    JAddStringToObject(req, "mode", "dfu");
+    if (kickWatchdog) kickWatchdog();
+    J *rsp = notecard.requestAndResponse(req);
+    if (kickWatchdog) kickWatchdog();
+    if (rsp) {
+      notecard.deleteResponse(rsp);
+    } else {
+      return false;
+    }
+  }
+
+  // --- Step 2: Wait for Notecard DFU mode ---
+  Serial.println(F("MCUboot DFU: Waiting for DFU mode to activate..."));
+  {
+    unsigned long start = millis();
+    bool dfuReady = false;
+    while ((millis() - start) < DFU_IAP_MODE_TIMEOUT_MS) {
+      if (kickWatchdog) kickWatchdog();
+      delay(2000);
+
+      J *req = notecard.newRequest("dfu.get");
+      if (!req) continue;
+      JAddNumberToObject(req, "length", 0);
+      if (kickWatchdog) kickWatchdog();
+      J *rsp = notecard.requestAndResponse(req);
+      if (kickWatchdog) kickWatchdog();
+      if (rsp) {
+        const char *err = JGetString(rsp, "err");
+        if (!err || err[0] == '\0') {
+          dfuReady = true;
+          notecard.deleteResponse(rsp);
+          break;
+        }
+        notecard.deleteResponse(rsp);
+      }
+    }
+    if (!dfuReady) {
+      goto mcuboot_restore_hub;
+    }
+  }
+  Serial.println(F("MCUboot DFU: DFU mode active"));
+
+  // --- Step 3: Mount FAT filesystem and open update file ---
+  FILE* fp = nullptr;
+  {
+    static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
+    static mbed::FATFileSystem ota_data_fs("fs_ota");
+    
+    int err = ota_data_fs.mount(&ota_data);
+    if (err) {
+      Serial.println(F("MCUboot DFU: Failed to mount MBR2 FAT filesystem. Run Provisioning Sketch."));
+      goto mcuboot_restore_hub;
+    }
+    
+    // Open in O_RDWR mode to overwrite without truncation (assuming pre-allocated)
+    fp = fopen("/fs_ota/update.bin", "r+b");
+    if (!fp) {
+      Serial.println(F("MCUboot DFU: Failed to open /fs_ota/update.bin in r+b mode. Opening in wb..."));
+      fp = fopen("/fs_ota/update.bin", "wb");
+      if (!fp) {
+        Serial.println(F("MCUboot DFU: Failed to create update.bin."));
+        goto mcuboot_restore_hub;
+      }
+    }
+  }
+
+  Serial.println(F("MCUboot DFU: File opened, reading firmware chunks..."));
+
+  // --- Step 4: Stream Notecard data to file (Unpadded) ---
+  {
+    const uint32_t chunkSize = DFU_IAP_CHUNK_SIZE;
+    uint8_t *progBuf = (uint8_t *)malloc(chunkSize + 16);
+    if (!progBuf) {
+      if (fp) fclose(fp);
+      goto mcuboot_restore_hub;
+    }
+
+    uint32_t offset = 0;
+    uint32_t downloadCrc = 0xFFFFFFFF;
+
+    while (offset < firmwareLength) {
+      if (kickWatchdog) kickWatchdog();
+
+      uint32_t remaining = firmwareLength - offset;
+      uint32_t thisChunk = (remaining < chunkSize) ? remaining : chunkSize;
+      bool chunkOk = false;
+
+      for (uint8_t retry = 0; retry < DFU_IAP_CHUNK_RETRIES; retry++) {
+        J *req = notecard.newRequest("dfu.get");
+        if (!req) { delay(500); if (kickWatchdog) kickWatchdog(); continue; }
+        
+        JAddNumberToObject(req, "length", (int)thisChunk);
+        if (offset > 0) {
+          JAddNumberToObject(req, "offset", (int)offset);
+        }
+
+        if (kickWatchdog) kickWatchdog();
+        J *rsp = notecard.requestAndResponse(req);
+        if (kickWatchdog) kickWatchdog();
+        
+        if (!rsp) { delay(500); if (kickWatchdog) kickWatchdog(); continue; }
+
+        const char *err = JGetString(rsp, "err");
+        if (err && err[0] != '\0') {
+          notecard.deleteResponse(rsp);
+          delay(500); if (kickWatchdog) kickWatchdog(); continue;
+        }
+
+        const char *payload = JGetString(rsp, "payload");
+        if (!payload || payload[0] == '\0') {
+          notecard.deleteResponse(rsp);
+          delay(500); if (kickWatchdog) kickWatchdog(); continue;
+        }
+
+        memset(progBuf, 0, chunkSize + 16);
+        int decoded = tankalarm_b64decode(progBuf, payload, chunkSize + 16);
+        notecard.deleteResponse(rsp);
+
+        if (decoded <= 0) {
+          delay(500); if (kickWatchdog) kickWatchdog(); continue;
+        }
+
+        // Bounds check
+        if ((uint32_t)decoded > thisChunk || (uint32_t)decoded > remaining) {
+          free(progBuf);
+          fclose(fp);
+          goto mcuboot_restore_hub;
+        }
+
+        // Write to QSPI fat file
+        fseek(fp, offset, SEEK_SET);
+        if (fwrite(progBuf, 1, decoded, fp) != (size_t)decoded) {
+          free(progBuf);
+          fclose(fp);
+          goto mcuboot_restore_hub;
+        }
+
+        downloadCrc = tankalarm_crc32(progBuf, (size_t)decoded, downloadCrc);
+        offset += (uint32_t)decoded;
+        chunkOk = true;
+        break;
+      }
+
+      if (!chunkOk) {
+        free(progBuf);
+        fclose(fp);
+        goto mcuboot_restore_hub;
+      }
+    }
+    
+    // --- Step 4b: Programmatically format the remainder of the 0x1E0000 slot ---
+    // If the previous firmware was larger, remaining bytes might not be 0xFF.
+    // Fill the remainder of the slot to ensure MCUboot sees a clean end.
+    if (offset < 0x1E0000) {
+      Serial.println(F("MCUboot DFU: Padding remaining slot with 0xFF..."));
+      memset(progBuf, 0xFF, chunkSize);
+      while(offset < 0x1E0000) {
+        if (kickWatchdog) kickWatchdog();
+        uint32_t padAmt = (0x1E0000 - offset > chunkSize) ? chunkSize : (0x1E0000 - offset);
+        if(fwrite(progBuf, 1, padAmt, fp) != padAmt) break;
+        offset += padAmt;
+      }
+    }
+
+    free(progBuf);
+    fflush(fp);
+    fclose(fp);
+    downloadCrc ^= 0xFFFFFFFF;
+    Serial.println(F("MCUboot DFU: Firmware written and padded."));
+  }
+
+  // --- Step 5: Inform Notehub ---
+  {
+    J *req = notecard.newRequest("dfu.status");
+    if (req) {
+      JAddBoolToObject(req, "stop", true);
+      JAddStringToObject(req, "status", "staged for MCUboot");
+      JAddStringToObject(req, "name", "user");
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) notecard.deleteResponse(rsp);
+    }
+  }
+
+  {
+    J *req = notecard.newRequest("hub.set");
+    if (req) {
+      JAddStringToObject(req, "mode", hubMode);
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) notecard.deleteResponse(rsp);
+    }
+  }
+
+  Serial.println(F("========================================"));
+  Serial.println(F("MCUboot DFU: STAGED — TRIGGERING SWAP"));
+  Serial.println(F("========================================"));
+  Serial.flush();
+  delay(500);
+
+  // Set the MCUboot trailer so the bootloader tests the firmware on next boot
+  MCUboot::applyUpdate(false);
+  delay(500);
+  NVIC_SystemReset();
+  return true;
+
+mcuboot_restore_hub:
+  Serial.println(F("MCUboot DFU: FAILED — restoring normal operation"));
+  {
+    J *req = notecard.newRequest("dfu.status");
+    if (req) {
+      JAddBoolToObject(req, "stop", true);
+      JAddStringToObject(req, "status", "firmware update failed");
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) notecard.deleteResponse(rsp);
+    }
+  }
+  {
+    J *req = notecard.newRequest("hub.set");
+    if (req) {
+      JAddStringToObject(req, "mode", hubMode);
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) notecard.deleteResponse(rsp);
+    }
+  }
+  return false;
+}
+#endif // TANKALARM_DFU_MCUBOOT
+
