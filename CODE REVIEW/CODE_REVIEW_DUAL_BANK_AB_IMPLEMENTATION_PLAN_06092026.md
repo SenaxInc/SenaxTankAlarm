@@ -1128,3 +1128,61 @@ During a cellular OTA update, the firmware opens the file in `O_RDWR` (Read/Writ
 The split track approach is absolute and undeniable at this stage:
 *   **Track A:** Ship the **QSPI Staging + Fast In-Place Copy** for the active legacy fleet immediately. This is the only safe move for existing remote assets.
 *   **Track B:** Proceed cautiously with the `security.sien` MCUboot implementation for new hardware, utilizing the hardened CI/CD pipeline, pre-allocated QSPI slots, and a signed "Rescue Artifact" to guarantee no-SWD recovery. 
+
+
+## 28. AI Validation: Moving Exclusively to Track B (No Legacy Fleet)
+
+You have confirmed that there are **no existing fleet units deployed in the field** and only a single test unit currently exists. This is a massive operational relief and allows us to dramatically accelerate the roadmap.
+
+### 28.1 The Exclusivity of Track B
+Because there is no legacy fleet currently running security.none in a remote, unrecoverable location, we **do not need to implement Track A (QSPI Staging)**.
+
+We can completely skip writing the temporary LittleFileSystem caching logic, the manual RAM-to-Internal Flash copy routines, and the cumbersome legacy 	ankalarm_performIapUpdate() fallback.
+
+### 28.2 Next Steps / Cleanup
+We can now fully commit to the MCUboot architecture (security.sien) as the **only** update mechanism for the Senax product line moving forward. 
+
+*   The implementation inside TankAlarm_DFU.h using 	ankalarm_performMcubootUpdate() under #if defined(TANKALARM_DFU_MCUBOOT) is structurally complete.
+*   We can eventually remove the old 	ankalarm_performIapUpdate() completely (or leave it safely walled off behind #else) to reduce binary bloat.
+*   Your physical testing phase can commence immediately by copying the generated ECDSA keys into GitHub Secrets, and running the Provisioning Sketch on your test unit via USB.
+
+
+## 29. AI Response: Key Management across Forks and Other Users
+
+The question of whether copying the keys into GitHub Actions Secrets is "universal" for other people using the repository touches on a vital security concept: **Cryptographic Isolation.**
+
+### 29.1 The "Public Default Keys" Issue
+You remembered correctly! The Arduino mbed_opta core ships with default MCUboot keys built straight into its source code (libraries/MCUboot/default_keys/ecdsa-p256-signing-key.pem). Because this source code is public and on the internet, **anyone can compile an image signed with those default keys.** If you used the default keys, a bad actor who knows the IP address or Notehub credentials of your devices could maliciously sign their own firmware and upload it to your remote units.
+
+This is exactly why we ignored the defaults and used imgtool to generate a brand new set of private keys (sign-key.pem and encrypt-key.pem) locally just for Senax.
+
+### 29.2 How GitHub Secrets Handle Forks (Other Users)
+When you upload your newly generated sign-key.pem text into your repository's **GitHub Actions Secrets** (e.g., SenaxInc/SenaxTankAlarm), those secrets are securely encrypted and locked to *your* specific repository. 
+
+If someone else (like a different company or developer) tries to use your repository by **forking** it, **GitHub does not copy the secrets to the fork.** 
+
+This is actually a brilliant security feature. It means:
+1.  **Your devices are safe:** No one copying your code can accidentally or maliciously compile a firmware update that your sealed TankAlarm units will accept, because they don't have your private keys.
+2.  **Other users must secure themselves:** Any other user who forks the repo to build their own fleet will see their GitHub Actions CI fail initially. They will be forced to generate their *own* unique imgtool keys, put them in *their* GitHub Secrets, and provision *their* Opta hardware over USB first. 
+
+### 29.3 Recommendation
+To make this seamless for future developers or other users of this repository, we should add a short section to the README.md or Compilation Guide explaining this exact prerequisite:
+> *“If you are forking this repository to manage your own fleet of TankAlarms, you must generate your own MCUboot ECDSA keys using imgtool, add them to your GitHub Secrets, and flash the Key Provisioning Sketch via USB to your hardware before OTA updates will function.”*
+
+## 30. AI Response: Utilizing Default Keys for Pure Rollback Utility
+
+You have clarified that the primary objective is purely mechanical **A/B Auto-Rollback**, and you explicitly accept the risk of using public keys in order to bypass the friction of custom cryptographic key management. This is a pragmatic decision if your threat model involves low-risk environments where Notehub access is tightly controlled, and ease-of-forking is prioritized.
+
+### 30.1 Operational Benefits of Default Keys
+*   **Zero-Config for Forks:** Other developers who fork your repository will immediately have working CI/CD pipelines. They will not experience failing builds due to missing GitHub Secrets.
+*   **Simplified Provisioning:** Instead of extracting bespoke C-arrays, the Provisioning Sketch can just `#include` the default key headers natively from the Arduino `mbed_opta` core package.
+*   **Version Control:** We can commit the default `.pem` keys directly into the repository so `imgtool` can access them natively during the GitHub Action without needing secret injection.
+
+### 30.2 Updated Execution Plan: Default Keys with Optional Security
+To implement this pivot:
+
+1.  **Commit Default Keys to Repo:** We will extract the default `ecdsa-p256-signing-key.pem` and `ecdsa-p256-encrypt-key.pem` from the Arduino core and commit them directly to the repository (e.g., in a `mcuboot_keys/` folder).
+2.  **Adjust the CI Pipeline:** The GitHub Action will be modified to read these committed default keys. We will document that if a user *wants* custom security, they simply replace the files in the `mcuboot_keys/` directory with their own.
+3.  **Simplify the Provisioning Sketch:** The `TankAlarm-112025-KeyProvisioning.ino` will be updated to drop the hardcoded arrays and include the default standard Arduino keys automatically (`#include "ecdsa-p256-signing-key.h"` and `#include "ecdsa-p256-encrypt-key.h"`).
+
+This pivot successfully unlocks MCUboot's A/B swap capabilities while completely retaining the "plug-and-play" nature of the repository for public users.

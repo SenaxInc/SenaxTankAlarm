@@ -146,14 +146,10 @@ jobs:
       - name: Sign & Format MCUboot Images
         shell: bash
         run: |
-          # The key.pem is stored as a multiline GitHub Secret
-          echo "${{ secrets.MCUBOOT_SIGNING_KEY }}" > sign-key.pem 
-          echo "${{ secrets.MCUBOOT_ENCRYPT_PUB_KEY }}" > encrypt-pub-key.pem 
-          
           # Client
           imgtool sign \
-            --key sign-key.pem \
-            --encrypt encrypt-pub-key.pem \
+            --key mcuboot_keys/ecdsa-p256-signing-priv-key.pem \
+            --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
             --align 32 \
             --max-align 32 \
             --version "${{ steps.version.outputs.version }}.0" \
@@ -165,8 +161,8 @@ jobs:
 
           # Server
           imgtool sign \
-            --key sign-key.pem \
-            --encrypt encrypt-pub-key.pem \
+            --key mcuboot_keys/ecdsa-p256-signing-priv-key.pem \
+            --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
             --align 32 \
             --max-align 32 \
             --version "${{ steps.version.outputs.version }}.0" \
@@ -178,8 +174,8 @@ jobs:
             
           # Viewer
           imgtool sign \
-            --key sign-key.pem \
-            --encrypt encrypt-pub-key.pem \
+            --key mcuboot_keys/ecdsa-p256-signing-priv-key.pem \
+            --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
             --align 32 \
             --max-align 32 \
             --version "${{ steps.version.outputs.version }}.0" \
