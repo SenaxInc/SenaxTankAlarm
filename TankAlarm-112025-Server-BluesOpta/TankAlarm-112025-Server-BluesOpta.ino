@@ -4257,6 +4257,21 @@ void setup() {
   addServerSerialLog("Server started", "info", "lifecycle");
 }
 
+// Storage availability helper (used by the MCUboot offline-safe health gate in
+// loop()). Defined here, after all struct definitions, so the Arduino
+// auto-prototype insertion point is not moved ahead of types like SensorRecord.
+static inline bool isStorageAvailable() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    return (mbedFS != nullptr);
+  #else
+    return true;
+  #endif
+#else
+  return false;
+#endif
+}
+
 void loop() {
 #if defined(TANKALARM_DFU_MCUBOOT)
   // 15.6 Server Offline-Safe Local Health Gate

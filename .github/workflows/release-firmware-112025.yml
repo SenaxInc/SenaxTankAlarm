@@ -106,6 +106,7 @@ jobs:
         run: |
           mkdir -p build/client
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --libraries "$LIB_ROOT" \
             --output-dir build/client \
             TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
@@ -119,6 +120,7 @@ jobs:
         run: |
           mkdir -p build/server
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --libraries "$LIB_ROOT" \
             --output-dir build/server \
             TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino
@@ -132,6 +134,7 @@ jobs:
         run: |
           mkdir -p build/viewer
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --libraries "$LIB_ROOT" \
             --output-dir build/viewer \
             TankAlarm-112025-Viewer-BluesOpta/TankAlarm-112025-Viewer-BluesOpta.ino
@@ -152,7 +155,7 @@ jobs:
             --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
             --align 32 \
             --max-align 32 \
-            --version "${{ steps.version.outputs.version }}.0" \
+            --version "${{ steps.version.outputs.version }}+0" \
             --header-size 0x20000 \
             --pad-header \
             --slot-size 0x1E0000 \
@@ -165,7 +168,7 @@ jobs:
             --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
             --align 32 \
             --max-align 32 \
-            --version "${{ steps.version.outputs.version }}.0" \
+            --version "${{ steps.version.outputs.version }}+0" \
             --header-size 0x20000 \
             --pad-header \
             --slot-size 0x1E0000 \
@@ -178,7 +181,7 @@ jobs:
             --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
             --align 32 \
             --max-align 32 \
-            --version "${{ steps.version.outputs.version }}.0" \
+            --version "${{ steps.version.outputs.version }}+0" \
             --header-size 0x20000 \
             --pad-header \
             --slot-size 0x1E0000 \
@@ -197,5 +200,4 @@ jobs:
             TankAlarm-Client-secure-v${{ steps.version.outputs.version }}.slot.bin
             TankAlarm-Server-secure-v${{ steps.version.outputs.version }}.slot.bin
             TankAlarm-Viewer-secure-v${{ steps.version.outputs.version }}.slot.bin
-            TankAlarm-Viewer-v${{ steps.version.outputs.version }}.bin
           generate_release_notes: true
