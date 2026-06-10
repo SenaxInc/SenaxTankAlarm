@@ -1249,12 +1249,14 @@ static void checkForFirmwareUpdate() {
 
   if (status.updateAvailable && status.version[0] != '\0') {
     // Check blacklist first
+#if defined(TANKALARM_DFU_MCUBOOT)
     if (tankalarm_isVersionBlacklisted(status.version)) {
       Serial.print(F("DFU: Version "));
       Serial.print(status.version);
       Serial.println(F(" is locally blacklisted. Skipping download."));
       return;
     }
+#endif
 
     gDfuStatus = status;
 
@@ -1292,6 +1294,7 @@ static void enableDfuMode() {
   gDfuInProgress = true;
 
   // Viewer always uses "continuous" mode (Ethernet / High Power)
+#if defined(TANKALARM_DFU_MCUBOOT)
   bool success = tankalarm_performMcubootUpdate(
       notecard, gDfuStatus, "continuous", DEVICE_ROLE, dfuKickWatchdog);
 
@@ -1300,6 +1303,9 @@ static void enableDfuMode() {
     Serial.println(F("IAP DFU update failed (MCUboot) — resuming normal operation"));
     gDfuInProgress = false;
   }
+#else
+  gDfuInProgress = false;
+#endif
 }
 
 // ============================================================================

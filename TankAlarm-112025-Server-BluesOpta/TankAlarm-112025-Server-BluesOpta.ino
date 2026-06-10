@@ -8331,12 +8331,14 @@ static void checkForFirmwareUpdate() {
 
   // Check blacklist first
   if (status.updateAvailable && status.version[0] != '\0') {
+#if defined(TANKALARM_DFU_MCUBOOT)
     if (tankalarm_isVersionBlacklisted(status.version)) {
       Serial.print(F("DFU: Version "));
       Serial.print(status.version);
       Serial.println(F(" is locally blacklisted. Skipping check."));
       return;
     }
+#endif
   }
 
   gDfuStatus = status;
@@ -8430,12 +8432,16 @@ static void enableDfuMode() {
   saveClientConfigSnapshots();
   saveHistorySettings();
 
+#if defined(TANKALARM_DFU_MCUBOOT)
   bool success = tankalarm_performMcubootUpdate(
       notecard,
       gDfuStatus,
       "continuous",
       DEVICE_ROLE,
       dfuKickWatchdog);
+#else
+  bool success = false;
+#endif
 
   gDfuInProgress = false;
   if (!success) {

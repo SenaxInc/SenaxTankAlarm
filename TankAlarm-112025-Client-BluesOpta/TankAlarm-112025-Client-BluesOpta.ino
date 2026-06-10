@@ -3857,12 +3857,14 @@ static void checkForFirmwareUpdate() {
   // Detect update available
   if (dfuStatus.updateAvailable && dfuStatus.version[0] != '\0') {
     // Check local blacklist before anything else
+#if defined(TANKALARM_DFU_MCUBOOT)
     if (tankalarm_isVersionBlacklisted(dfuStatus.version)) {
       Serial.print(F("DFU: Version "));
       Serial.print(dfuStatus.version);
       Serial.println(F(" is locally blacklisted. Skipping check."));
       return;
     }
+#endif
 
     gDfuStatus = dfuStatus;
 
@@ -3929,8 +3931,12 @@ static void enableDfuMode() {
     gSolarManager.end();
   }
 
+#if defined(TANKALARM_DFU_MCUBOOT)
   bool ok = tankalarm_performMcubootUpdate(
       notecard, gDfuStatus, restoreMode, DEVICE_ROLE, dfuKickWatchdog);
+#else
+  bool ok = false;
+#endif
 
   gDfuInProgress = false; // Only reached on failure
 
