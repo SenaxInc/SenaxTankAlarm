@@ -217,9 +217,48 @@ jobs:
           steps.compile-112025-ftps.outcome == 'failure'
         run: exit 1
 
-  build-firmware:
-    needs: compile-check
+  check-version:
     if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect FIRMWARE_VERSION change
+        id: diff
+        shell: bash
+        run: |
+          VERSION_FILE="TankAlarm-112025-Common/src/TankAlarm_Common.h"
+          extract() { grep -E '^#define FIRMWARE_VERSION ' "$1" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/'; }
+
+          NEW=$(extract "$VERSION_FILE")
+          echo "New FIRMWARE_VERSION: '${NEW}'"
+
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No previous commit on this ref (new branch / first push) — treating as a version change."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OLD=$(git show "${BEFORE}:${VERSION_FILE}" 2>/dev/null | grep -E '^#define FIRMWARE_VERSION ' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          echo "Previous FIRMWARE_VERSION: '${OLD}'"
+
+          if [ "$OLD" != "$NEW" ]; then
+            echo "FIRMWARE_VERSION changed ('${OLD}' -> '${NEW}') — firmware binaries will be rebuilt and committed."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "FIRMWARE_VERSION unchanged ('${NEW}') — skipping firmware binary rebuild/commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-firmware:
+    needs: [compile-check, check-version]
+    if: github.event_name == 'push' && needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
