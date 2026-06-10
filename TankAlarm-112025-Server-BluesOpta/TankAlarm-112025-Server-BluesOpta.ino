@@ -8331,12 +8331,14 @@ static void checkForFirmwareUpdate() {
 
   // Check blacklist first
   if (status.updateAvailable && status.version[0] != '\0') {
+#if defined(TANKALARM_DFU_MCUBOOT)
     if (tankalarm_isVersionBlacklisted(status.version)) {
       Serial.print(F("DFU: Version "));
       Serial.print(status.version);
       Serial.println(F(" is locally blacklisted. Skipping check."));
       return;
     }
+#endif
   }
 
   gDfuStatus = status;
@@ -8430,12 +8432,28 @@ static void enableDfuMode() {
   saveClientConfigSnapshots();
   saveHistorySettings();
 
+#if defined(TANKALARM_DFU_MCUBOOT)
   bool success = tankalarm_performMcubootUpdate(
       notecard,
       gDfuStatus,
       "continuous",
       DEVICE_ROLE,
       dfuKickWatchdog);
+#else
+  bool success = false;
+  // MCUboot DFU support is not compiled in — stop the pending update so the
+  // Server does not repeatedly attempt to apply it on every DFU check cycle.
+  {
+    J *req = notecard.newRequest("dfu.status");
+    if (req) {
+      JAddBoolToObject(req, "stop", true);
+      JAddStringToObject(req, "status", "MCUboot DFU not supported in this build");
+      JAddStringToObject(req, "name", "user");
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) notecard.deleteResponse(rsp);
+    }
+  }
+#endif
 
   gDfuInProgress = false;
   if (!success) {

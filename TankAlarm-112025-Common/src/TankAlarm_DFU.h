@@ -820,8 +820,6 @@ static inline bool tankalarm_isVersionBlacklisted(const char *version) {
   }
   return false;
 }
-  return major * 100 + minor * 10 + patch;
-}
 
 static bool tankalarm_performMcubootUpdate(
     Notecard &notecard,
