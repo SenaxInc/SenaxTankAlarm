@@ -8441,6 +8441,18 @@ static void enableDfuMode() {
       dfuKickWatchdog);
 #else
   bool success = false;
+  // MCUboot DFU support is not compiled in — stop the pending update so the
+  // Server does not repeatedly attempt to apply it on every DFU check cycle.
+  {
+    J *req = notecard.newRequest("dfu.status");
+    if (req) {
+      JAddBoolToObject(req, "stop", true);
+      JAddStringToObject(req, "status", "MCUboot DFU not supported in this build");
+      JAddStringToObject(req, "name", "user");
+      J *rsp = notecard.requestAndResponse(req);
+      if (rsp) notecard.deleteResponse(rsp);
+    }
+  }
 #endif
 
   gDfuInProgress = false;
