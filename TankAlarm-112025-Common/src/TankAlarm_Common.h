@@ -16,7 +16,11 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "1.9.0"
+#define FIRMWARE_VERSION "1.9.1"
+#endif
+
+#ifndef FIRMWARE_BUILD_SEQ
+#define FIRMWARE_BUILD_SEQ 191   // monotonic; bump every release (v1.9.1 = 191)
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.
@@ -32,6 +36,29 @@
 #ifndef FIRMWARE_BUILD_TIME
 #define FIRMWARE_BUILD_TIME __TIME__
 #endif
+
+// ============================================================================
+// Device Role Definitions
+// ============================================================================
+#define TANKALARM_ROLE_CLIENT 1
+#define TANKALARM_ROLE_SERVER 2
+#define TANKALARM_ROLE_VIEWER 3
+
+// ============================================================================
+// Client Update Policy Definitions
+// ============================================================================
+#define CLIENT_UPDATE_POLICY_DISABLED       0
+#define CLIENT_UPDATE_POLICY_ALERT_ONLY     1
+#define CLIENT_UPDATE_POLICY_AUTO_MCUBOOT   2
+
+static inline const char* tankalarm_roleToken(uint8_t role) {
+  switch (role) {
+    case TANKALARM_ROLE_CLIENT: return "Client";
+    case TANKALARM_ROLE_SERVER: return "Server";
+    case TANKALARM_ROLE_VIEWER: return "Viewer";
+    default: return "Unknown";
+  }
+}
 
 // ============================================================================
 // Notecard Configuration

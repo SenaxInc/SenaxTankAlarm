@@ -94,6 +94,10 @@ struct TankAlarmDfuStatus {
   bool downloading;           // Notecard is still downloading from Notehub
   bool error;                 // DFU error occurred
   uint32_t firmwareLength;    // Size of firmware binary (when ready)
+  uint32_t firmwareCrc32;      // CRC32 of firmware from Notecard body (when ready)
+  char firmwareMd5[33];       // MD5 hash of firmware from Notecard body
+  char firmwareName[96];      // Name of firmware from Notecard body
+  char firmwareSource[96];    // Source filename from Notecard body
   char version[32];           // Available firmware version string
   char mode[16];              // Raw Notecard DFU mode string
   char errorMsg[64];          // Error message (if any)
@@ -140,10 +144,23 @@ static inline bool tankalarm_checkDfuStatus(Notecard &notecard, TankAlarmDfuStat
     status.error = true;
   }
 
-  // Parse firmware length from body (available when mode is "ready")
+  // Parse firmware length, crc32, md5, name, source from body (available when mode is "ready")
   J *body = JGetObject(rsp, "body");
   if (body) {
     status.firmwareLength = (uint32_t)JGetNumber(body, "length");
+    status.firmwareCrc32 = (uint32_t)JGetNumber(body, "crc32");
+    const char *md5 = JGetString(body, "md5");
+    if (md5) {
+      strlcpy(status.firmwareMd5, md5, sizeof(status.firmwareMd5));
+    }
+    const char *name = JGetString(body, "name");
+    if (name) {
+      strlcpy(status.firmwareName, name, sizeof(status.firmwareName));
+    }
+    const char *source = JGetString(body, "source");
+    if (source) {
+      strlcpy(status.firmwareSource, source, sizeof(status.firmwareSource));
+    }
   }
 
   // Determine state
@@ -651,33 +668,191 @@ iap_restore_hub:
   return false;
 }
 
-#endif // ARDUINO_OPTA || ARDUINO_ARCH_MBED
-
-#endif // TANKALARM_DFU_H
-
 #if defined(TANKALARM_DFU_MCUBOOT)
 #include <MCUboot.h>
 #include "QSPIFBlockDevice.h"
 #include "MBRBlockDevice.h"
 #include "FATFileSystem.h"
+#include "TankAlarm_MCUbootConfig.h"
 
-// Initialize QSPI block device
-static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+static inline uint32_t tankalarm_versionToSeq(const char *verStr) {
+  if (!verStr || verStr[0] == '\0') return 0;
+  int major = 0, minor = 0, patch = 0;
+  sscanf(verStr, "%d.%d.%d", &major, &minor, &patch);
+  return major * 100 + minor * 10 + patch;
+}
+
+static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
+  // Local static initialization of the QSPI block device
+  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
+  static mbed::FATFileSystem ota_data_fs("fs_ota");
+  
+  int err = ota_data_fs.mount(&ota_data);
+  if (err) {
+    Serial.println(F("MCUboot: No QSPI fs_ota available for OTA checking."));
+    return;
+  }
+
+  FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
+  if (!fp) {
+    ota_data_fs.unmount();
+    return;
+  }
+
+  // Read JSON content
+  char buf[256];
+  memset(buf, 0, sizeof(buf));
+  size_t read_bytes = fread(buf, 1, sizeof(buf) - 1, fp);
+  fclose(fp);
+
+  if (read_bytes == 0) {
+    remove("/fs_ota/pending_ota.json");
+    ota_data_fs.unmount();
+    return;
+  }
+
+  // Parse pending ota json: {"target_seq":191,"target_v":"1.9.1","status":"trial"}
+  unsigned int target_seq = 0;
+  char target_v[32];
+  memset(target_v, 0, sizeof(target_v));
+  char status[32];
+  memset(status, 0, sizeof(status));
+
+  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}", 
+                      &target_seq, target_v, status);
+
+  if (parsed < 2) {
+    parsed = sscanf(buf, "{\x22target_seq\x22:%u,\x22target_v\x22:\x22%[^\x22]\x22,\x22status\x22:\x22%[^\x22]\x22}",
+                    &target_seq, target_v, status);
+  }
+
+  if (parsed >= 2) {
+    if (strcmp(status, "trial") == 0) {
+      if (FIRMWARE_BUILD_SEQ == target_seq) {
+        Serial.print(F("MCUboot: Trial boot of version "));
+        Serial.print(target_v);
+        Serial.println(F(" succeeded! Health gate verification pending."));
+        
+        FILE *f_write = fopen("/fs_ota/pending_ota.json", "w");
+        if (f_write) {
+          fprintf(f_write, "{\"target_seq\":%u,\"target_v\":\"%s\",\"status\":\"confirmed\"}\n", 
+                  (unsigned int)target_seq, target_v);
+          fclose(f_write);
+        }
+      } else {
+        // Rollback Detected!
+        Serial.print(F("MCUboot: ROLLBACK DETECTED! Expected target build seq: "));
+        Serial.print(target_seq);
+        Serial.print(F(" ("));
+        Serial.print(target_v);
+        Serial.print(F("), but currently running: "));
+        Serial.println(FIRMWARE_BUILD_SEQ);
+
+        // Send rollback & stop failure status to Notehub, evicting the bad image from Notecard cache
+        J *req = notecard.newRequest("dfu.status");
+        if (req) {
+          JAddBoolToObject(req, "stop", true);
+          char err_buf[128];
+          snprintf(err_buf, sizeof(err_buf), "rollback detected - trial crashed - reverted to %s", FIRMWARE_VERSION);
+          JAddStringToObject(req, "status", err_buf);
+          J *rsp = notecard.requestAndResponse(req);
+          if (rsp) notecard.deleteResponse(rsp);
+        }
+
+        // Store version blacklist locally
+        FILE *f_write = fopen("/fs_ota/pending_ota.json", "w");
+        if (f_write) {
+          fprintf(f_write, "{\"target_seq\":%u,\"target_v\":\"%s\",\"status\":\"failed_rollback\"}\n", 
+                  (unsigned int)target_seq, target_v);
+          fclose(f_write);
+        }
+      }
+    } else if (strcmp(status, "failed_rollback") == 0) {
+      Serial.print(F("MCUboot: Version "));
+      Serial.print(target_v);
+      Serial.println(F(" is locally blacklisted due to a previous rollback."));
+    }
+  }
+
+  ota_data_fs.unmount();
+}
+
+static inline bool tankalarm_isVersionBlacklisted(const char *version) {
+  if (!version || version[0] == '\0') return false;
+  
+  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
+  static mbed::FATFileSystem ota_data_fs("fs_ota");
+  
+  int err = ota_data_fs.mount(&ota_data);
+  if (err) return false;
+
+  FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
+  if (!fp) {
+    ota_data_fs.unmount();
+    return false;
+  }
+
+  char buf[256];
+  memset(buf, 0, sizeof(buf));
+  size_t read_bytes = fread(buf, 1, sizeof(buf) - 1, fp);
+  fclose(fp);
+  ota_data_fs.unmount();
+
+  if (read_bytes == 0) return false;
+
+  unsigned int target_seq = 0;
+  char target_v[32];
+  memset(target_v, 0, sizeof(target_v));
+  char status[32];
+  memset(status, 0, sizeof(status));
+
+  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}", 
+                      &target_seq, target_v, status);
+  if (parsed < 2) {
+    parsed = sscanf(buf, "{\x22target_seq\x22:%u,\x22target_v\x22:\x22%[^\x22]\x22,\x22status\x22:\x22%[^\x22]\x22}",
+                    &target_seq, target_v, status);
+  }
+
+  if (parsed >= 3 && strcmp(status, "failed_rollback") == 0 && strcmp(target_v, version) == 0) {
+    return true;
+  }
+  return false;
+}
+  return major * 100 + minor * 10 + patch;
+}
 
 static bool tankalarm_performMcubootUpdate(
     Notecard &notecard,
-    uint32_t firmwareLength,
+    const TankAlarmDfuStatus &dfu,   // length + crc32 + name/source for H2
     const char *hubMode,
+    uint8_t deviceRole,              // DEVICE_ROLE â€” for the role/source check
     void (*kickWatchdog)() = nullptr
 ) {
-  if (firmwareLength == 0 || firmwareLength > 0x1E0000) {
+  FILE* fp = nullptr;
+  uint32_t firmwareLength = dfu.firmwareLength;
+
+  if (firmwareLength == 0 || firmwareLength > TANKALARM_MCUBOOT_SLOT_SIZE) {
     Serial.print(F("MCUboot DFU: Invalid firmware length: "));
     Serial.println(firmwareLength);
     return false;
   }
 
+  // --- H2: Role/source check ---
+  // Ensure that if a firmware source is available, it matches our role token.
+  if (dfu.firmwareSource[0] != '\0' && !strstr(dfu.firmwareSource, tankalarm_roleToken(deviceRole))) {
+    Serial.print(F("MCUboot DFU: ERROR - firmware source \""));
+    Serial.print(dfu.firmwareSource);
+    Serial.print(F("\" does not match device role: "));
+    Serial.println(tankalarm_roleToken(deviceRole));
+    return false;
+  }
+
   Serial.println(F("========================================"));
   Serial.println(F("MCUboot DFU: Starting firmware update"));
+  Serial.print(F("Device Role: "));
+  Serial.println(tankalarm_roleToken(deviceRole));
   Serial.print(F("Firmware size: "));
   Serial.print(firmwareLength);
   Serial.println(F(" bytes"));
@@ -731,8 +906,8 @@ static bool tankalarm_performMcubootUpdate(
   Serial.println(F("MCUboot DFU: DFU mode active"));
 
   // --- Step 3: Mount FAT filesystem and open update file ---
-  FILE* fp = nullptr;
   {
+    static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
     static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
     static mbed::FATFileSystem ota_data_fs("fs_ota");
     
@@ -742,16 +917,21 @@ static bool tankalarm_performMcubootUpdate(
       goto mcuboot_restore_hub;
     }
     
-    // Open in O_RDWR mode to overwrite without truncation (assuming pre-allocated)
+    // --- 11.6: Fail-closed opening behaviour ---
     fp = fopen("/fs_ota/update.bin", "r+b");
     if (!fp) {
-      Serial.println(F("MCUboot DFU: Failed to open /fs_ota/update.bin in r+b mode. Opening in wb..."));
+#if defined(TANKALARM_MCUBOOT_ALLOW_RECREATE_UPDATE_FILE)
+      Serial.println(F("[WARNING] QSPI file allocation missing! Re-creating space, fragment risks alert. Run KeyProvisioning to restore contiguous sectors."));
       fp = fopen("/fs_ota/update.bin", "wb");
-      if (!fp) {
-        Serial.println(F("MCUboot DFU: Failed to create update.bin."));
-        goto mcuboot_restore_hub;
-      }
+#else
+      Serial.println(F("MCUboot DFU: ERROR - /fs_ota/update.bin missing or failed to open in r+b mode (QSPI partition not provisioned; run KeyProvisioning). Aborting."));
+      goto mcuboot_restore_hub;
+#endif
     }
+  }
+
+  if (!fp) {
+    goto mcuboot_restore_hub;
   }
 
   Serial.println(F("MCUboot DFU: File opened, reading firmware chunks..."));
@@ -761,7 +941,8 @@ static bool tankalarm_performMcubootUpdate(
     const uint32_t chunkSize = DFU_IAP_CHUNK_SIZE;
     uint8_t *progBuf = (uint8_t *)malloc(chunkSize + 16);
     if (!progBuf) {
-      if (fp) fclose(fp);
+      fclose(fp);
+      fp = nullptr;
       goto mcuboot_restore_hub;
     }
 
@@ -814,7 +995,24 @@ static bool tankalarm_performMcubootUpdate(
         if ((uint32_t)decoded > thisChunk || (uint32_t)decoded > remaining) {
           free(progBuf);
           fclose(fp);
+          fp = nullptr;
           goto mcuboot_restore_hub;
+        }
+
+        // --- H1 / First-chunk verification ---
+        // Verify MCUboot magic 0x96f3b83d
+        if (offset == 0 && decoded >= 4) {
+          uint32_t magic = 0;
+          memcpy(&magic, progBuf, 4);
+          if (magic != 0x96f3b83d) {
+            Serial.print(F("MCUboot DFU: ERROR - Invalid MCUboot magic: 0x"));
+            Serial.println(magic, HEX);
+            free(progBuf);
+            fclose(fp);
+            fp = nullptr;
+            goto mcuboot_restore_hub;
+          }
+          Serial.println(F("MCUboot DFU: MCUboot magic verified."));
         }
 
         // Write to QSPI fat file
@@ -822,6 +1020,7 @@ static bool tankalarm_performMcubootUpdate(
         if (fwrite(progBuf, 1, decoded, fp) != (size_t)decoded) {
           free(progBuf);
           fclose(fp);
+          fp = nullptr;
           goto mcuboot_restore_hub;
         }
 
@@ -834,20 +1033,27 @@ static bool tankalarm_performMcubootUpdate(
       if (!chunkOk) {
         free(progBuf);
         fclose(fp);
+        fp = nullptr;
         goto mcuboot_restore_hub;
       }
     }
     
-    // --- Step 4b: Programmatically format the remainder of the 0x1E0000 slot ---
+    // --- Step 4b: Programmatically format the remainder of the slot ---
     // If the previous firmware was larger, remaining bytes might not be 0xFF.
     // Fill the remainder of the slot to ensure MCUboot sees a clean end.
-    if (offset < 0x1E0000) {
+    if (offset < TANKALARM_MCUBOOT_SLOT_SIZE) {
       Serial.println(F("MCUboot DFU: Padding remaining slot with 0xFF..."));
       memset(progBuf, 0xFF, chunkSize);
-      while(offset < 0x1E0000) {
+      while(offset < TANKALARM_MCUBOOT_SLOT_SIZE) {
         if (kickWatchdog) kickWatchdog();
-        uint32_t padAmt = (0x1E0000 - offset > chunkSize) ? chunkSize : (0x1E0000 - offset);
-        if(fwrite(progBuf, 1, padAmt, fp) != padAmt) break;
+        uint32_t padAmt = (TANKALARM_MCUBOOT_SLOT_SIZE - offset > chunkSize) ? chunkSize : (TANKALARM_MCUBOOT_SLOT_SIZE - offset);
+        if(fwrite(progBuf, 1, padAmt, fp) != padAmt) {
+          Serial.println(F("MCUboot DFU: ERROR - padding write failed. Fail-closed."));
+          free(progBuf);
+          fclose(fp);
+          fp = nullptr;
+          goto mcuboot_restore_hub;
+        }
         offset += padAmt;
       }
     }
@@ -855,8 +1061,34 @@ static bool tankalarm_performMcubootUpdate(
     free(progBuf);
     fflush(fp);
     fclose(fp);
+    fp = nullptr;
     downloadCrc ^= 0xFFFFFFFF;
-    Serial.println(F("MCUboot DFU: Firmware written and padded."));
+    
+    // --- Step 4c: Verify integrity with CRC32 ---
+    if (dfu.firmwareCrc32 != 0 && downloadCrc != dfu.firmwareCrc32) {
+      Serial.print(F("MCUboot DFU: ERROR - CRC32 link integrity mismatch! Staged: 0x"));
+      Serial.print(downloadCrc, HEX);
+      Serial.print(F(", Expected/CRC in body: 0x"));
+      Serial.println(dfu.firmwareCrc32, HEX);
+      goto mcuboot_restore_hub;
+    }
+    
+    Serial.println(F("MCUboot DFU: Firmware written, padded and verified."));
+  }
+
+  // --- Step 4d: Persistent Trial state file pending_ota.json ---
+  {
+    FILE *f_pending = fopen("/fs_ota/pending_ota.json", "w");
+    if (f_pending) {
+      uint32_t target_seq = tankalarm_versionToSeq(dfu.version);
+      fprintf(f_pending, "{\"target_seq\":%u,\"target_v\":\"%s\",\"status\":\"trial\"}\n", 
+              (unsigned int)target_seq, dfu.version);
+      fclose(f_pending);
+      Serial.println(F("MCUboot DFU: Written pending_ota.json for trial boot."));
+    } else {
+      Serial.println(F("MCUboot DFU: ERROR - failed to write pending_ota.json. Aborting update."));
+      goto mcuboot_restore_hub;
+    }
   }
 
   // --- Step 5: Inform Notehub ---
@@ -881,7 +1113,7 @@ static bool tankalarm_performMcubootUpdate(
   }
 
   Serial.println(F("========================================"));
-  Serial.println(F("MCUboot DFU: STAGED — TRIGGERING SWAP"));
+  Serial.println(F("MCUboot DFU: STAGED * TRIGGERING SWAP"));
   Serial.println(F("========================================"));
   Serial.flush();
   delay(500);
@@ -889,11 +1121,19 @@ static bool tankalarm_performMcubootUpdate(
   // Set the MCUboot trailer so the bootloader tests the firmware on next boot
   MCUboot::applyUpdate(false);
   delay(500);
+
+  // Kick watchdog one last time before rebooting to maximize our ~30s window (13.6 option 1)
+  if (kickWatchdog) kickWatchdog();
+
   NVIC_SystemReset();
   return true;
 
 mcuboot_restore_hub:
-  Serial.println(F("MCUboot DFU: FAILED — restoring normal operation"));
+  Serial.println(F("MCUboot DFU: FAILED * restoring normal operation"));
+  if (fp) {
+    fclose(fp);
+    fp = nullptr;
+  }
   {
     J *req = notecard.newRequest("dfu.status");
     if (req) {
@@ -913,5 +1153,17 @@ mcuboot_restore_hub:
   }
   return false;
 }
+
+static inline void tankalarm_markFirmwareHealthy() {
+  static bool confirmed = false;
+  if (!confirmed) {
+    MCUboot::confirmSketch();
+    confirmed = true;
+    Serial.println(F("MCUboot: firmware confirmed healthy."));
+  }
+}
 #endif // TANKALARM_DFU_MCUBOOT
 
+#endif // ARDUINO_OPTA || ARDUINO_ARCH_MBED
+
+#endif // TANKALARM_DFU_H

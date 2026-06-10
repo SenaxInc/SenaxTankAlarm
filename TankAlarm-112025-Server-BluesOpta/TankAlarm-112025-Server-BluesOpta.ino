@@ -17,6 +17,8 @@
 // Created: November 2025
 // Using GitHub Copilot for code generation
 
+#define DEVICE_ROLE TANKALARM_ROLE_SERVER
+
 // Shared library - common constants and utilities
 #include <TankAlarm_Common.h>
 
@@ -1076,6 +1078,7 @@ static uint32_t gDfuFirmwareLength = 0;
 static char gDfuMode[16] = "idle";  // Notecard DFU mode: idle, downloading, ready, error, etc.
 static bool gDfuInProgress = false;
 static char gDfuError[128] = {0};   // Last error message from Notecard dfu.status
+static TankAlarmDfuStatus gDfuStatus;
 
 // GitHub release check state
 static bool gGitHubUpdateAvailable = false;
@@ -3695,33 +3698,13 @@ static bool failGitHubDirectInstall(String &statusMessage, const String &message
 }
 
 static bool attemptGitHubDirectInstall(String &statusMessage) {
-  if (!gGitHubAssetAvailable || gGitHubAssetUrl[0] == '\0') {
-    return failGitHubDirectInstall(statusMessage,
-                                   "GitHub release found but matching Server .bin asset is missing");
-  }
-  if (gGitHubAssetSize == 0 || gGitHubAssetSha256[0] == '\0') {
-    return failGitHubDirectInstall(statusMessage,
-                                   "GitHub asset metadata is incomplete for direct install");
-  }
+  return failGitHubDirectInstall(statusMessage,
+                                 "GitHub Direct installation is disabled for safety. Please use Notehub OTA firmware update.");
+}
 
-  NetworkInterface *network = Ethernet.getNetwork();
-  if (network == nullptr) {
-    return failGitHubDirectInstall(statusMessage,
-                                   "Ethernet NetworkInterface is unavailable for GitHub Direct install");
-  }
-
-  gDfuInProgress = true;
-  strlcpy(gDfuMode, "github", sizeof(gDfuMode));
-  gDfuError[0] = '\0';
-
-  Serial.println(F("GitHub Direct: starting direct HTTPS firmware install"));
-  Serial.print(F("GitHub Direct: asset URL: "));
-  Serial.println(gGitHubAssetUrl);
-  Serial.print(F("GitHub Direct: expected size: "));
-  Serial.println(gGitHubAssetSize);
-  Serial.print(F("GitHub Direct: expected SHA-256: "));
-  Serial.println(gGitHubAssetSha256);
-  addServerSerialLog("GitHub Direct install started", "info", "dfu");
+/* Lines 3704-4109 omitted from compilation */
+#if 0
+static bool attemptGitHubDirectInstall_disabled(String &statusMessage) {
 
   String currentUrl = gGitHubAssetUrl;
   TLSSocketWrapper *activeTls = nullptr;
@@ -4103,12 +4086,8 @@ static bool attemptGitHubDirectInstall(String &statusMessage) {
   return failGitHubDirectInstall(statusMessage,
                                  "GitHub asset redirect chain exceeded the supported limit");
 }
-#else
-static bool attemptGitHubDirectInstall(String &statusMessage) {
-  statusMessage = "GitHub Direct install requires an Opta/Mbed build";
-  return false;
-}
-#endif
+#endif // Close our #if 0 block
+#endif // Close the platform block
 
 static void attemptAutoGitHubInstall() {
   if (!gGitHubUpdateAvailable) {
@@ -4195,6 +4174,9 @@ void setup() {
   }
 
   initializeNotecard();
+#if defined(TANKALARM_DFU_MCUBOOT)
+  tankalarm_resolvePendingOta(notecard);
+#endif
   ensureTimeSync();
   scheduleNextDailyEmail();
   if (gConfig.viewerEnabled) {
@@ -4276,6 +4258,13 @@ void setup() {
 }
 
 void loop() {
+#if defined(TANKALARM_DFU_MCUBOOT)
+  // 15.6 Server Offline-Safe Local Health Gate
+  if (isStorageAvailable() && (gNotecardAvailable || Ethernet.linkStatus() == LinkON)) {
+    tankalarm_markFirmwareHealthy();
+  }
+#endif
+
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
   // Reset watchdog timer to prevent system reset
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -8340,6 +8329,18 @@ static void checkForFirmwareUpdate() {
     return;
   }
 
+  // Check blacklist first
+  if (status.updateAvailable && status.version[0] != '\0') {
+    if (tankalarm_isVersionBlacklisted(status.version)) {
+      Serial.print(F("DFU: Version "));
+      Serial.print(status.version);
+      Serial.println(F(" is locally blacklisted. Skipping check."));
+      return;
+    }
+  }
+
+  gDfuStatus = status;
+
   strlcpy(gDfuMode, status.mode[0] != '\0' ? status.mode : "idle", sizeof(gDfuMode));
 
   if (status.error) {
@@ -8429,10 +8430,11 @@ static void enableDfuMode() {
   saveClientConfigSnapshots();
   saveHistorySettings();
 
-  bool success = tankalarm_performIapUpdate(
+  bool success = tankalarm_performMcubootUpdate(
       notecard,
-      gDfuFirmwareLength,
+      gDfuStatus,
       "continuous",
+      DEVICE_ROLE,
       dfuKickWatchdog);
 
   gDfuInProgress = false;

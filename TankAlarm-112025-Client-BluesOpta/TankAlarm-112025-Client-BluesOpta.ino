@@ -20,6 +20,8 @@
   Using GitHub Copilot for code generation
 */
 
+#define DEVICE_ROLE TANKALARM_ROLE_CLIENT
+
 // Shared library - common constants and utilities
 #include <TankAlarm_Common.h>
 
@@ -695,6 +697,7 @@ struct ClientConfig {
   float powerCriticalExitV;   // Exit CRITICAL above this voltage
   // Remote-tunable health check interval (0 = use compile-time default)
   uint32_t healthCheckBaseIntervalMs;  // Base Notecard health check interval in ms
+  uint8_t updatePolicy;                // Choice: 0=Disabled, 1=AlertOnly, 2=AutoMCUboot
 };
 
 struct MonitorRuntime {
@@ -1452,6 +1455,9 @@ void setup() {
   }
 
   initializeNotecard();
+#if defined(TANKALARM_DFU_MCUBOOT)
+  tankalarm_resolvePendingOta(notecard);
+#endif
   ensureTimeSync();
   scheduleNextDailyReport();
 
@@ -1657,17 +1663,16 @@ void setup() {
   Serial.println(F("Client setup complete"));
   tankalarm_printHeapStats();
   addSerialLog("Client started successfully");
-
-#if defined(TANKALARM_DFU_MCUBOOT)
-  // Health Milestone (Track B): Relays are initialized safe, QSPI loaded, 
-  // Notecard telemetry sent. The boot is verified successful.
-  // Lock in the new firmware to prevent auto-rollback on the next reboot.
-  MCUboot::confirmSketch();
-  Serial.println(F("MCUboot DFU: Sketch confirmed healthy."));
-#endif
 }
 
 void loop() {
+#if defined(TANKALARM_DFU_MCUBOOT)
+  // 15.6 Client Offline-Safe Local Health Gate
+  if (isStorageAvailable() && gNotecardAvailable) {
+    tankalarm_markFirmwareHealthy();
+  }
+#endif
+
   unsigned long now = millis();
 
   logSolarHardwareTestHeartbeat(now);
@@ -1996,10 +2001,9 @@ void loop() {
       gLastDfuCheckMillis = now;
       if (!gDfuInProgress && gNotecardAvailable) {
         checkForFirmwareUpdate();
-        // Auto-apply firmware updates when available (pushed via Notehub DFU)
-        // Guarded by: power state <= ECO, Notecard available, DFU not in progress
-        if (gDfuUpdateAvailable) {
-          Serial.println(F("Auto-DFU: Applying available firmware update (Coordinated ODFU)..."));
+        // Auto-apply firmware updates when available & policy permits
+        if (gDfuUpdateAvailable && gConfig.updatePolicy == CLIENT_UPDATE_POLICY_AUTO_MCUBOOT) {
+          Serial.println(F("Auto-DFU: Applying available firmware update (MCUboot)..."));
           enableDfuMode();
         }
       }
@@ -2400,6 +2404,7 @@ static void createDefaultConfig(ClientConfig &cfg) {
   
   // Solar-Only (No Battery) mode defaults (disabled)
   initSolarOnlyConfig(&cfg.solarOnlyConfig);                 // Disabled by default
+  cfg.updatePolicy = CLIENT_UPDATE_POLICY_DISABLED;         // Disabled by default
 }
 
 // ============================================================================
@@ -3032,6 +3037,9 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
     ? (uint32_t)doc["healthCheckBaseIntervalMs"].as<int>() 
     : 0;
 
+  // Load update policy
+  cfg.updatePolicy = doc["updatePolicy"].is<int>() ? (uint8_t)doc["updatePolicy"].as<int>() : CLIENT_UPDATE_POLICY_DISABLED;
+
   // Support both "sensors" (from server) and "monitors" (local config) array names
   JsonArray monitorsArray = doc["sensors"].as<JsonArray>();
   if (!monitorsArray) {
@@ -3293,6 +3301,9 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
 
   // Save remote-tunable health check interval (only if non-default)
   if (cfg.healthCheckBaseIntervalMs > 0) doc["healthCheckBaseIntervalMs"] = cfg.healthCheckBaseIntervalMs;
+
+  // Save update policy
+  doc["updatePolicy"] = cfg.updatePolicy;
 
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     // Mbed OS — atomic write-to-temp-then-rename
@@ -3821,6 +3832,7 @@ static void scheduleNextDailyReport() {
 
 // Firmware length from last dfu.status (needed by enableDfuMode)
 static uint32_t gDfuFirmwareLength = 0;
+static TankAlarmDfuStatus gDfuStatus;
 
 static void checkForFirmwareUpdate() {
   TankAlarmDfuStatus dfuStatus;
@@ -3844,6 +3856,16 @@ static void checkForFirmwareUpdate() {
 
   // Detect update available
   if (dfuStatus.updateAvailable && dfuStatus.version[0] != '\0') {
+    // Check local blacklist before anything else
+    if (tankalarm_isVersionBlacklisted(dfuStatus.version)) {
+      Serial.print(F("DFU: Version "));
+      Serial.print(dfuStatus.version);
+      Serial.println(F(" is locally blacklisted. Skipping check."));
+      return;
+    }
+
+    gDfuStatus = dfuStatus;
+
     if (!gDfuUpdateAvailable || strcmp(gDfuVersion, dfuStatus.version) != 0) {
       gDfuUpdateAvailable = true;
       gDfuFirmwareLength = dfuStatus.firmwareLength;
@@ -3857,16 +3879,27 @@ static void checkForFirmwareUpdate() {
       Serial.print(F("Size: "));
       Serial.print(gDfuFirmwareLength);
       Serial.println(F(" bytes"));
-      Serial.println(F("Device will auto-update on next check (Coordinated ODFU)"));
+      Serial.println(F("Device will auto-update on next check (MCUboot)"));
       Serial.println(F("========================================"));
 
-      addSerialLog("Firmware update available (Coordinated ODFU)");
+      addSerialLog("Firmware update available (MCUboot)");
     }
   } else if (gDfuUpdateAvailable) {
     gDfuUpdateAvailable = false;
     gDfuVersion[0] = '\0';
     gDfuFirmwareLength = 0;
+    memset(&gDfuStatus, 0, sizeof(gDfuStatus));
   }
+}
+
+static void dfuKickWatchdog() {
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    mbedWatchdog.kick();
+  #else
+    IWatchdog.reload();
+  #endif
+#endif
 }
 
 static void enableDfuMode() {
@@ -3879,93 +3912,31 @@ static void enableDfuMode() {
     return;
   }
 
-  Serial.println(F("========================================"));
-  Serial.println(F("ENABLING COORDINATED HOSTAT ODFU MODE"));
-  Serial.println(F("System will quiesce RS-485 bus and authorize ODFU reset"));
-  Serial.println(F("========================================"));
-
-  addSerialLog("Coordinated ODFU mode enabled - updating firmware");
-
-  // Save any pending config before rebooting
+  gDfuInProgress = true;
   if (gConfigDirty) {
-    persistConfigIfDirty();
+    persistConfigIfDirty(); // Save state first
   }
 
-  gDfuInProgress = true;
+  const char *restoreMode = gConfig.solarPowered ? "periodic" : "continuous";
 
-  // --- Step 1: Pre-Update Software Bus Quiescing ---
-  Serial.println(F("ODFU Handshake: Quiescing RS-485 and Modbus bus..."));
-  
-  // Decouple ModbusRTUClient and stop SolarManager
+  Serial.println(F("========================================"));
+  Serial.println(F("MCUboot DFU: Staging update to QSPI..."));
+  Serial.println(F("========================================"));
+  addSerialLog("MCUboot staging started");
+
+  // Disable solar manager polling to avoid serial/modbus/I2C contention
   if (gSolarManager.isEnabled()) {
     gSolarManager.end();
   }
-  
-  // Force DE & RE LOW and force serial pins of built-in transceiver to high-impedance flotation inputs
-  #if defined(PIN_RS485_DE) && defined(PIN_RS485_RE)
-    pinMode(PIN_RS485_DE, OUTPUT);
-    digitalWrite(PIN_RS485_DE, LOW);
-    pinMode(PIN_RS485_RE, OUTPUT);
-    digitalWrite(PIN_RS485_RE, LOW);
-    
-    pinMode(PIN_RS485_DE, INPUT);
-    pinMode(PIN_RS485_RE, INPUT);
-  #endif
-  #if defined(PIN_RS485_TX) && defined(PIN_RS485_RX)
-    pinMode(PIN_RS485_TX, INPUT);
-    pinMode(PIN_RS485_RX, INPUT);
-  #endif
 
-  // Stop built-in Arduino RS485 module
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    RS485.end();
-  #endif
+  bool ok = tankalarm_performMcubootUpdate(
+      notecard, gDfuStatus, restoreMode, DEVICE_ROLE, dfuKickWatchdog);
 
-  // Settling period of 1 second to ensure lines settle to high impedance
-  delay(1000);
-  Serial.println(F("ODFU Handshake: RS-485 bus is quiet and isolated."));
+  gDfuInProgress = false; // Only reached on failure
 
-  // --- Step 2: Authorize ODFU Reset ---
-  Serial.println(F("ODFU Handshake: Triggering hardware ODFU flash on Notecard..."));
-  J *req = notecard.newRequest("card.dfu");
-  if (req) {
-    JAddStringToObject(req, "name", "stm32");
-    JAddBoolToObject(req, "on", true);
-    
-    J *rsp = notecard.requestAndResponse(req);
-    if (rsp) {
-      const char *err = JGetString(rsp, "err");
-      if (err && err[0] != '\0') {
-        Serial.print(F("ODFU Handshake ERROR: card.dfu on failed: "));
-        Serial.println(err);
-        gDfuInProgress = false;
-        
-        // Restore Modbus RTU if trigger failed
-        if (gConfig.solarCharger.enabled) {
-          gSolarManager.begin(gConfig.solarCharger);
-        }
-      } else {
-        Serial.println(F("ODFU Handshake: Reset command accepted. MCU restarting..."));
-        // The Notecard will pull the hardware NRST low and reset us.
-        // We can wait indefinitely or loop.
-        while (true) {
-          #ifdef TANKALARM_WATCHDOG_AVAILABLE
-            mbedWatchdog.kick();
-          #endif
-          delay(100);
-        }
-      }
-      notecard.deleteResponse(rsp);
-    } else {
-      Serial.println(F("ODFU Handshake ERROR: card.dfu returned no response"));
-      gDfuInProgress = false;
-      if (gConfig.solarCharger.enabled) {
-        gSolarManager.begin(gConfig.solarCharger);
-      }
-    }
-  } else {
-    Serial.println(F("ODFU Handshake ERROR: Failed to create request"));
-    gDfuInProgress = false;
+  if (!ok) {
+    Serial.println(F("MCUboot DFU failed — resuming normal operation"));
+    addSerialLog("MCUboot staging failed");
     if (gConfig.solarCharger.enabled) {
       gSolarManager.begin(gConfig.solarCharger);
     }
@@ -4473,6 +4444,11 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   // Handle remote-tunable health check interval
   if (!doc["healthCheckBaseIntervalMs"].isNull()) {
     gConfig.healthCheckBaseIntervalMs = (uint32_t)doc["healthCheckBaseIntervalMs"].as<int>();
+  }
+
+  // Handle update policy
+  if (!doc["updatePolicy"].isNull()) {
+    gConfig.updatePolicy = (uint8_t)doc["updatePolicy"].as<int>();
   }
 
   if (!doc["sensors"].isNull()) {

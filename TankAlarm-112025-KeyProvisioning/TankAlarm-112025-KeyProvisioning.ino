@@ -1,4 +1,16 @@
 
+/**
+ * TankAlarm-112025-KeyProvisioning.ino
+ * 
+ * MCUboot keys in this repository are the public Arduino default keys. 
+ * They exist solely so the Arduino MCUboot bootloader will accept our images 
+ * and so we get mechanical benefits: image integrity (hash/magic) checks 
+ * and A/B rollback on a bad boot. They provide no firmware authenticity: 
+ * anyone can sign an image the bootloader accepts. This is an accepted 
+ * trade-off — device firmware confidentiality/authenticity is explicitly out 
+ * of scope for this product. Do not describe these signatures as a security control.
+ */
+
 #include "FlashIAP.h"
 #include "QSPIFBlockDevice.h"
 #include "MBRBlockDevice.h"
@@ -44,17 +56,38 @@ void printProgress(uint32_t offset, uint32_t size, uint32_t threshold, bool rese
 
 void setupMCUBootOTAData() {
   mbed::MBRBlockDevice ota_data(&root, 2);
-  mbed::FATFileSystem ota_data_fs("fs");
+  mbed::FATFileSystem ota_data_fs("fs_ota");
   
+  // Try to mount the partition first to reduce commissions wear
+  int mount_err = ota_data_fs.mount(&ota_data);
+  if (mount_err == 0) {
+    FILE* f_up = fopen("/fs_ota/update.bin", "rb");
+    FILE* f_sc = fopen("/fs_ota/scratch.bin", "rb");
+    if (f_up && f_sc) {
+      Serial.println("QSPI partition already provisioned and healthy. Skipping format.");
+      fclose(f_up);
+      fclose(f_sc);
+      return;
+    }
+    if (f_up) fclose(f_up);
+    if (f_sc) fclose(f_sc);
+    ota_data_fs.unmount();
+  }
+
   int err = ota_data_fs.reformat(&ota_data);
   if (err) {
     Serial.println("Error creating MCUboot FAT partition! Please partition QSPI manually first.");
+    return;
   } else {
     Serial.println("FAT Partition MBR2 reformatted successfully.");
   }
 
   // Pre-allocate scratch and update bin files with 0xFF bytes to save flash wear on OTA downloads
-  FILE* fp = fopen("/fs/scratch.bin", "wb");
+  FILE* fp = fopen("/fs_ota/scratch.bin", "wb");
+  if (!fp) {
+    Serial.println("Error: Failed to open /fs_ota/scratch.bin for writing!");
+    return;
+  }
   const int scratch_file_size = 128 * 1024;
   uint8_t buffer[128];
   memset(buffer, 0xFF, sizeof(buffer));
@@ -73,7 +106,11 @@ void setupMCUBootOTAData() {
   }
   fclose(fp);
 
-  fp = fopen("/fs/update.bin", "wb");
+  fp = fopen("/fs_ota/update.bin", "wb");
+  if (!fp) {
+    Serial.println("Error: Failed to open /fs_ota/update.bin for writing!");
+    return;
+  }
   const int update_file_size = 15 * 128 * 1024; // 1.92 MB
   size = 0;
 

@@ -14,6 +14,8 @@
   Created: November 2025
 */
 
+#define DEVICE_ROLE TANKALARM_ROLE_VIEWER
+
 // Shared library - common constants and utilities
 #include <TankAlarm_Common.h>
 
@@ -208,6 +210,7 @@ static bool gDfuUpdateAvailable = false;
 static char gDfuVersion[32] = {0};
 static bool gDfuInProgress = false;
 static uint32_t gDfuFirmwareLength = 0;  // Firmware size in bytes (from dfu.status body)
+static TankAlarmDfuStatus gDfuStatus;
 
 // GitHub release check state
 static bool gGitHubUpdateAvailable = false;
@@ -321,6 +324,9 @@ void setup() {
   }
 
   initializeNotecard();
+#if defined(TANKALARM_DFU_MCUBOOT)
+  tankalarm_resolvePendingOta(notecard);
+#endif
   ensureTimeSync();
   fetchViewerSummary();  // Drain any queued summaries before serving UI
   scheduleNextSummaryFetch();
@@ -353,6 +359,13 @@ void setup() {
 }
 
 void loop() {
+#if defined(TANKALARM_DFU_MCUBOOT)
+  // 15.6 Viewer Offline-Safe Local Health Gate
+  if (gNotecardAvailable) {
+    tankalarm_markFirmwareHealthy();
+  }
+#endif
+
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     mbedWatchdog.kick();
@@ -1235,29 +1248,33 @@ static void checkForFirmwareUpdate() {
   }
 
   if (status.updateAvailable && status.version[0] != '\0') {
+    // Check blacklist first
+    if (tankalarm_isVersionBlacklisted(status.version)) {
+      Serial.print(F("DFU: Version "));
+      Serial.print(status.version);
+      Serial.println(F(" is locally blacklisted. Skipping download."));
+      return;
+    }
+
+    gDfuStatus = status;
+
     Serial.print(F("Firmware update available: v"));
     Serial.println(status.version);
     gDfuUpdateAvailable = true;
     strlcpy(gDfuVersion, status.version, sizeof(gDfuVersion));
 
     // Auto-apply: headless device with no UI — apply updates automatically
-    Serial.println(F("Auto-enabling IAP DFU..."));
+    Serial.println(F("Auto-enabling IAP DFU (MCUboot)..."));
     enableDfuMode();
   } else {
     Serial.println(F("No firmware update available"));
     gDfuUpdateAvailable = false;
     gDfuVersion[0] = '\0';
     gDfuFirmwareLength = 0;
+    memset(&gDfuStatus, 0, sizeof(gDfuStatus));
   }
 }
 
-/**
- * @brief Apply firmware update via IAP (In-Application Programming)
- *
- * Reads firmware chunks from Notecard via dfu.get, writes to internal flash
- * via FlashIAP, then reboots. Replaces ODFU card.dfu which doesn't work on
- * Wireless for Opta (no AUX pin routing).
- */
 static void enableDfuMode() {
   if (!gDfuUpdateAvailable) {
     Serial.println(F("No DFU update available to enable"));
@@ -1269,17 +1286,18 @@ static void enableDfuMode() {
     return;
   }
 
-  Serial.print(F("Enabling IAP DFU for version: "));
+  Serial.print(F("Enabling IAP DFU (MCUboot) for version: "));
   Serial.println(gDfuVersion);
 
   gDfuInProgress = true;
 
-  // Viewer always uses "continuous" mode (Ethernet)
-  bool success = tankalarm_performIapUpdate(notecard, gDfuFirmwareLength, "continuous", dfuKickWatchdog);
+  // Viewer always uses "continuous" mode (Ethernet / High Power)
+  bool success = tankalarm_performMcubootUpdate(
+      notecard, gDfuStatus, "continuous", DEVICE_ROLE, dfuKickWatchdog);
 
   // If we get here, update failed (success path reboots via NVIC_SystemReset)
   if (!success) {
-    Serial.println(F("IAP DFU update failed — resuming normal operation"));
+    Serial.println(F("IAP DFU update failed (MCUboot) — resuming normal operation"));
     gDfuInProgress = false;
   }
 }
