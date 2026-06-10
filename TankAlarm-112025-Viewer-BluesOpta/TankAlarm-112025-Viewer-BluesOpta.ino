@@ -1297,15 +1297,15 @@ static void enableDfuMode() {
 #if defined(TANKALARM_DFU_MCUBOOT)
   bool success = tankalarm_performMcubootUpdate(
       notecard, gDfuStatus, "continuous", DEVICE_ROLE, dfuKickWatchdog);
+#else
+  bool success = false;
+#endif
 
   // If we get here, update failed (success path reboots via NVIC_SystemReset)
   if (!success) {
     Serial.println(F("IAP DFU update failed (MCUboot) — resuming normal operation"));
     gDfuInProgress = false;
   }
-#else
-  gDfuInProgress = false;
-#endif
 }
 
 // ============================================================================
