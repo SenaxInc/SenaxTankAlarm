@@ -6,13 +6,21 @@
 
 ## Introduction
 
-The TankAlarm 112025 system uses the Blues Notecard's Device Firmware Update (DFU) feature to provide secure, reliable over-the-air (OTA) firmware updates for all three system components:
+> ℹ️ **v1.9.1+ update model (important):** As of v1.9.1, the **Client** receives over-the-air
+> updates through the Arduino **MCUboot** bootloader, which adds atomic A/B image swap and automatic
+> rollback. Each Client must be **provisioned once over USB** before it can accept OTA updates — see
+> the [Client MCUboot Provisioning Guide](CLIENT_MCUBOOT_PROVISIONING_GUIDE.md). The **Server** and
+> **Viewer** are updated **locally over USB** with their raw `.bin` (they are not OTA targets), since
+> both are physically accessible. The general DFU concepts below still apply to how firmware reaches
+> the Client through Notehub.
 
-- **Client** - Field monitoring devices (tanks, pumps, sensors)
-- **Server** - Central aggregation and web dashboard
-- **Viewer** - Remote read-only kiosk displays
+The TankAlarm 112025 system uses the Blues Notecard's Device Firmware Update (DFU) feature to deliver firmware over the cellular link. Update support by component:
 
-With DFU, you can deploy firmware updates to your entire fleet without physical access to the devices. Updates are delivered via cellular connection through Blues Notehub, and devices automatically check for updates every hour.
+- **Client** - Field monitoring devices → **OTA via MCUboot** (provisioned, signed `.slot.bin`)
+- **Server** - Central aggregation and web dashboard → **USB `.bin`** (local)
+- **Viewer** - Read-only kiosk displays → **USB `.bin`** (local)
+
+With OTA, you can deploy Client firmware updates in the field without physical access. Updates are delivered via cellular connection through Blues Notehub, and devices automatically check for updates every hour.
 
 ### Why Use OTA Updates?
 

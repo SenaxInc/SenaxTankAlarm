@@ -636,7 +636,7 @@ Tutorials/
 └── Power User Guides/
     └── ADVANCED_CONFIGURATION_GUIDE.md (~10,000 words)
 
-Total: 13 comprehensive guides (~111,500 words)
+Total: 14 comprehensive guides (~114,000 words)
 ```
 
 ### Firmware Locations
@@ -751,6 +751,7 @@ These tutorials are maintained alongside firmware releases:
 | Server Installation | 1.1 | Feb 2026 | v1.1.2+ |
 | Fleet Setup | 1.1 | Feb 2026 | v1.1.2+ |
 | Firmware Update | 1.1 | Feb 2026 | v1.1.2+ |
+| Client MCUboot Provisioning | 1.0 | Jun 2026 | v1.9.1+ |
 | Sensor Calibration | 1.1 | Feb 2026 | v1.1.2+ |
 | Relay Control | 1.1 | Feb 2026 | v1.1.2+ |
 | Unload Tracking | 1.1 | Feb 2026 | v1.1.2+ |
@@ -858,5 +859,5 @@ Head to the **[Quick Start Guide](QUICK_START_GUIDE.md)** and have your first sy
 
 ---
 
-*Tutorial Library v1.1 | Last Updated: February 20, 2026*  
+*Tutorial Library v1.2 | Last Updated: June 11, 2026*  
 *Compatible with TankAlarm Firmware 1.1.2+*

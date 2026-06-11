@@ -7,6 +7,25 @@
 
 ---
 
+## 0. DECISION (LOCKED 2026-06-11) — Client-only MCUboot; Server + Viewer stay simple
+
+> **Adopted:** Server **Option A** + Viewer **Option V2**. Only the **Client** is built with
+> `-DTANKALARM_DFU_MCUBOOT` and published as a `.slot.bin` for OTA. The **Server** (at HQ) and the
+> **Viewer** (at a separate but USB-reachable office) are updated locally over USB with their raw
+> `.bin`, and are **not** built with MCUboot. Rationale: neither is "super remote," and keeping them
+> identical (no MCUboot, whole-device LittleFS, no QSPI provisioning) maximizes long-term commonality
+> and removes the latent QSPI-wipe hazard entirely.
+>
+> **Implemented in build configuration (2026-06-11):**
+> - `.github/workflows/release-firmware-112025.yml` — macro removed from Server/Viewer builds; imgtool signing reduced to Client only; Server/Viewer `.slot.bin` removed from the release `files:` set (raw `.bin` retained).
+> - `.github/workflows/arduino-ci-112025.yml` — macro removed from Server/Viewer compile-check and the Server build-firmware step (Client retains it).
+> - `build/release-build.ps1` — `Build-Sketch` now takes a `-Mcuboot` switch; only the Client passes it.
+>
+> The §3/§4 options below are retained for historical context and in case remote Server/Viewer
+> updates are ever required.
+
+---
+
 ## 1. Background & Decision Recap
 
 The Client was fixed to mount its LittleFS config store on **QSPI MBR partition 4** and to never reformat the whole device, reserving **partition 2** for MCUboot OTA staging. The product decision was:
@@ -107,7 +126,8 @@ If the realistic maximum exceeds the **7 MB** partition 4, adjust the partition 
 | Role | Remote? | Local QSPI FS? | Storage conflict today | Suggested update path | MCUboot macro |
 |------|---------|----------------|------------------------|-----------------------|---------------|
 | **Client** | Yes | Yes (now **partition 4**) | ✅ Fixed | MCUboot OTA + rollback | **On** |
-| **Server** | No | Yes (**whole device**) | ⚠️ Yes (latent) | USB `.bin` (Option A) | **Off** (recommended) |
-| **Viewer** | Maybe | No | ✅ None | USB `.bin`, or MCUboot if remote | On (V1) / Off (V2) |
+| **Server** | No (HQ) | Yes (**whole device**) | ✅ Resolved (macro off) | USB `.bin` (Option A) | **Off** ✓ |
+| **Viewer** | No (separate office, USB-reachable) | No | ✅ None | USB `.bin` (Option V2) | **Off** ✓ |
 
-**Bottom line:** The Client is correct and field-ready. The highest-value follow-up is resolving the Server's latent QSPI-wipe hazard — most cheaply by turning the MCUboot build flag **off** for the Server (Option A), since the Server does not need remote OTA. The Viewer is safe either way and is the best candidate for validating the OTA mechanism on the bench if desired.
+**Bottom line:** Decision locked 2026-06-11 (see §0) — **Client-only MCUboot**. Server and Viewer are
+built without the macro and updated over USB, keeping them identical and removing the QSPI-wipe hazard.

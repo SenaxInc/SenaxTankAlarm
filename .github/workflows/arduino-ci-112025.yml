@@ -81,7 +81,6 @@ jobs:
           cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
 
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
-            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --libraries "$LIB_ROOT" \
             TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino
 
@@ -90,7 +89,6 @@ jobs:
         continue-on-error: true
         run: |
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
-            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --library TankAlarm-112025-Common \
             TankAlarm-112025-Viewer-BluesOpta/TankAlarm-112025-Viewer-BluesOpta.ino
 
@@ -346,7 +344,6 @@ jobs:
           cp -r TankAlarm-112025-Common/src TankAlarm-112025-Common/library.properties "$LIB_ROOT/TankAlarm-112025-Common/"
 
           arduino-cli compile --fqbn arduino:mbed_opta:opta \
-            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --libraries "$LIB_ROOT" \
             --output-dir firmware/112025/server \
             TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino

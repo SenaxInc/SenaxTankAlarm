@@ -1,7 +1,7 @@
-# TankAlarm v1.8.6 - Industrial Tank Monitoring System
+# TankAlarm v1.9.1 - Industrial Tank Monitoring System
 
-**Release Date:** June 9, 2026  
-**Version:** 1.8.6  
+**Release Date:** June 11, 2026  
+**Version:** 1.9.1  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -302,9 +302,20 @@ CLIENT                      BLUES NOTEHUB              SERVER
 ## 📖 Documentation
 
 ### Installation & Setup
+- **Tutorials Index:** [Tutorials/Tutorials-112025/README.md](Tutorials/Tutorials-112025/README.md)
 - **Client:** [TankAlarm-112025-Client-BluesOpta/README.md](TankAlarm-112025-Client-BluesOpta/README.md)
 - **Server:** [TankAlarm-112025-Server-BluesOpta/README.md](TankAlarm-112025-Server-BluesOpta/README.md)
 - **Fleet Setup:** [TankAlarm-112025-Server-BluesOpta/FLEET_SETUP.md](TankAlarm-112025-Server-BluesOpta/FLEET_SETUP.md)
+
+### Firmware Updates & Provisioning
+- **Firmware Update Guide (OTA):** [Tutorials/Tutorials-112025/FIRMWARE_UPDATE_GUIDE.md](Tutorials/Tutorials-112025/FIRMWARE_UPDATE_GUIDE.md)
+- **Client MCUboot Provisioning:** [Tutorials/Tutorials-112025/CLIENT_MCUBOOT_PROVISIONING_GUIDE.md](Tutorials/Tutorials-112025/CLIENT_MCUBOOT_PROVISIONING_GUIDE.md)
+- **MCUboot Bootloader Options:** [CODE REVIEW/MCUBOOT_BOOTLOADER_OPTIONS.md](CODE%20REVIEW/MCUBOOT_BOOTLOADER_OPTIONS.md)
+- **Server/Viewer Update Strategy:** [CODE REVIEW/MCUBOOT_SERVER_VIEWER_SUGGESTIONS_06112026.md](CODE%20REVIEW/MCUBOOT_SERVER_VIEWER_SUGGESTIONS_06112026.md)
+
+> **Update model:** The **Client** (field-deployed) supports secure, rollback-protected
+> over-the-air (OTA) updates via MCUboot. The **Server** and **Viewer** are updated locally
+> over USB. See the Server/Viewer strategy note above for the rationale.
 
 ### Advanced Features
 - **Relay Control:** [TankAlarm-112025-Client-BluesOpta/RELAY_CONTROL.md](TankAlarm-112025-Client-BluesOpta/RELAY_CONTROL.md)
@@ -345,7 +356,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
   - [ ] Ethernet connectivity stable
   
 - [ ] **Software Validation**
-  - [ ] Firmware version 1.8.6 confirmed
+  - [ ] Firmware version 1.9.1 confirmed
   - [ ] All clients reporting to server
   - [ ] Alarms triggering correctly
   - [ ] SMS/email alerts delivering
@@ -365,7 +376,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
 
 ### Deployment Checklist
 
-1. Flash all devices with v1.8.6 firmware
+1. Flash all devices with v1.9.1 firmware
 2. Configure Blues Notehub fleet assignments
 3. Set server IP address and network configuration
 4. Configure SMS/email recipients
@@ -429,6 +440,12 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.9.1 (June 11, 2026)
+- **Client MCUboot OTA:** The Client now updates over-the-air through the Arduino MCUboot bootloader, providing atomic A/B image swap and automatic rollback on a failed boot. Builds are compiled with `-DTANKALARM_DFU_MCUBOOT` and published as a signed/encrypted `.slot.bin`.
+- **QSPI storage redesign:** The Client mounts its LittleFS configuration store on QSPI **partition 4** and never reformats the whole device, reserving **partition 2** for MCUboot OTA staging. `KeyProvisioning` now creates the full MBR partition table (p1 WiFi / p2 OTA / p3 KVStore / p4 user) before formatting the OTA partition.
+- **Client-only update model:** The Server (HQ) and Viewer (separate office) are updated locally over USB with their raw `.bin` and are intentionally **not** built with MCUboot, keeping them identical and avoiding QSPI partitioning. See [CODE REVIEW/MCUBOOT_SERVER_VIEWER_SUGGESTIONS_06112026.md](CODE%20REVIEW/MCUBOOT_SERVER_VIEWER_SUGGESTIONS_06112026.md).
+- **New provisioning tutorial:** [Tutorials/Tutorials-112025/CLIENT_MCUBOOT_PROVISIONING_GUIDE.md](Tutorials/Tutorials-112025/CLIENT_MCUBOOT_PROVISIONING_GUIDE.md) documents the one-time USB provisioning flow.
 
 ### v1.8.6 (June 9, 2026)
 - **Reverted Client to IAP firmware updates:** Undid the v1.8.5 "Coordinated ODFU" change on the Client. The Blues Wireless for Opta carrier communicates with the Opta over the AUX/I2C expansion bus and does **not** route the STM32H747 `BOOT0`/`NRST`/`USART1` lines required for Notecard Outboard DFU (ODFU). The v1.8.5 outboard `card.dfu` path therefore failed in the field with `{odfu-fail}: stmConnectToBootloader: timeout`. The Client now uses host-driven IAP (`dfu.get` + `FlashIAP`) again — the mechanism that successfully delivered OTA host updates from v1.3.0 through v1.8.4.
@@ -539,4 +556,4 @@ SenaxTankAlarm/
 
 **Built with ❤️ for industrial IoT applications**
 
-*Last Updated: March 13, 2026*
+*Last Updated: June 11, 2026*
