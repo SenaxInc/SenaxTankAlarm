@@ -8,7 +8,7 @@
 
 This directory contains comprehensive, step-by-step tutorials for deploying and managing the TankAlarm 112025 tank monitoring system. All tutorials follow a consistent SparkFun-style format with clear instructions, troubleshooting sections, and helpful diagrams.
 
-**Tutorial Count:** 16 comprehensive guides covering installation, configuration, communication, operations, and advanced features.
+**Tutorial Count:** 17 comprehensive guides covering installation, configuration, communication, operations, and advanced features.
 
 ---
 
@@ -191,6 +191,27 @@ Perfect for:
 - New firmware binary
 
 **Time:** 15-30 minutes (update propagation takes 1-6 hours)
+
+---
+
+### [Client MCUboot Provisioning Guide](CLIENT_MCUBOOT_PROVISIONING_GUIDE.md) ⭐
+
+*One-time USB setup that enables secure, rollback-protected OTA updates on field Clients*
+
+**Covers:**
+- Installing the MCUboot-capable bootloader (M7 core)
+- Loading default signing/encryption keys and building the QSPI partition layout
+- Compiling and flashing the first **signed** application (`security=sien`)
+- The Partition 2 (OTA) vs Partition 4 (config) storage rule
+- Bench-test matrix for staging, swap, and rollback
+- Troubleshooting DFU and partition recovery
+
+**Prerequisites:**
+- Arduino Opta with USB access
+- Arduino Mbed OS Opta core installed
+- This repository checked out locally
+
+**Time:** 20-40 minutes per device (one-time)
 
 ---
 
@@ -599,7 +620,8 @@ Tutorials/
 │   ├── CLIENT_INSTALLATION_GUIDE.md (~10,000 words)
 │   ├── SERVER_INSTALLATION_GUIDE.md (~12,000 words)
 │   ├── FLEET_SETUP_GUIDE.md (~11,000 words)
-│   └── FIRMWARE_UPDATE_GUIDE.md (~6,000 words)
+│   ├── FIRMWARE_UPDATE_GUIDE.md (~6,000 words)
+│   └── CLIENT_MCUBOOT_PROVISIONING_GUIDE.md (~2,500 words)
 │
 ├── Advanced Feature Guides/
 │   ├── SENSOR_CALIBRATION_GUIDE.md (~6,000 words)
