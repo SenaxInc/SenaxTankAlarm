@@ -60,12 +60,21 @@ enum FluidType : uint8_t;
 // Filesystem support - Mbed OS filesystem instance
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   #include "rtos/ThisThread.h"
+  #include "MBRBlockDevice.h"
   using namespace std::chrono;
   using namespace std::chrono_literals;
-  
+
+  // QSPI is MBR-partitioned by KeyProvisioning (standard Arduino Opta layout):
+  //   p1 WiFi (unused) | p2 MCUboot OTA staging | p3 KVStore (unused) | p4 user data.
+  // This application's LittleFS config store lives on partition 4. We mount/format
+  // ONLY that partition: reformatting the whole device would destroy the MCUboot
+  // OTA partition (p2) and break firmware updates.
+  #define TANKALARM_APP_DATA_PARTITION 4
+
   // Mbed OS filesystem instance - mounted at "/fs" for POSIX path compatibility
   static LittleFileSystem *mbedFS = nullptr;
   static BlockDevice *mbedBD = nullptr;
+  static mbed::MBRBlockDevice *mbedAppPart = nullptr;
   static MbedWatchdogHelper mbedWatchdog;
   static bool gStorageAvailable = false;
   
@@ -2230,7 +2239,12 @@ static void recoverOrphanedTmpFiles() {
 static void initializeStorage() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    // Mbed OS LittleFileSystem initialization
+    // Mbed OS LittleFileSystem initialization.
+    //
+    // The QSPI flash is MBR-partitioned (see KeyProvisioning). We mount LittleFS
+    // on partition 4 (user data) ONLY, leaving partition 2 reserved for MCUboot
+    // OTA staging. We must NEVER reformat the whole device, or we would destroy
+    // the OTA partition and break firmware updates.
     gStorageAvailable = false;
     mbedBD = BlockDevice::get_default_instance();
     if (!mbedBD) {
@@ -2238,13 +2252,27 @@ static void initializeStorage() {
       Serial.println(F("Warning: Filesystem not available - configuration will not persist"));
       return;
     }
-    
+
+    // Wrap partition 4 (requires an MBR created by KeyProvisioning).
+    mbedAppPart = new mbed::MBRBlockDevice(mbedBD, TANKALARM_APP_DATA_PARTITION);
+    if (mbedAppPart->init() != 0) {
+      // No MBR / partition 4 present -> board not provisioned for the MCUboot
+      // layout. Do NOT reformat the whole device (that would erase the OTA
+      // partition). Run without persistence and tell the operator to provision.
+      Serial.println(F("ERROR: QSPI partition 4 not found - board not provisioned for MCUboot layout."));
+      Serial.println(F("Run TankAlarm-112025-KeyProvisioning to create the MBR partition table."));
+      Serial.println(F("Running without persistence to protect the OTA partition."));
+      delete mbedAppPart;
+      mbedAppPart = nullptr;
+      return;
+    }
+
     mbedFS = new LittleFileSystem("fs");
-    int err = mbedFS->mount(mbedBD);
+    int err = mbedFS->mount(mbedAppPart);
     if (err) {
-      // Try to reformat if mount fails
-      Serial.println(F("Filesystem mount failed, attempting to reformat..."));
-      err = mbedFS->reformat(mbedBD);
+      // Format ONLY partition 4 (never the whole device).
+      Serial.println(F("Filesystem mount failed, formatting app partition (p4)..."));
+      err = mbedFS->reformat(mbedAppPart);
       if (err) {
         Serial.println(F("LittleFS format failed; running without persistence"));
         delete mbedFS;
@@ -2253,7 +2281,7 @@ static void initializeStorage() {
       }
     }
     gStorageAvailable = true;
-    Serial.println(F("Mbed OS LittleFileSystem initialized"));
+    Serial.println(F("Mbed OS LittleFileSystem initialized (QSPI partition 4)"));
     // Recover from any interrupted atomic writes (power loss during rename)
     recoverOrphanedTmpFiles();
   #else

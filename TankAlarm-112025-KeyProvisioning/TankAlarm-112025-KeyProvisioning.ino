@@ -55,32 +55,58 @@ void printProgress(uint32_t offset, uint32_t size, uint32_t threshold, bool rese
 }
 
 void setupMCUBootOTAData() {
-  mbed::MBRBlockDevice ota_data(&root, 2);
-  mbed::FATFileSystem ota_data_fs("fs_ota");
-  
-  // Try to mount the partition first to reduce commissions wear
-  int mount_err = ota_data_fs.mount(&ota_data);
-  if (mount_err == 0) {
-    FILE* f_up = fopen("/fs_ota/update.bin", "rb");
-    FILE* f_sc = fopen("/fs_ota/scratch.bin", "rb");
-    if (f_up && f_sc) {
-      Serial.println("QSPI partition already provisioned and healthy. Skipping format.");
-      fclose(f_up);
-      fclose(f_sc);
-      return;
+  // 1) Fast path: if partition 2 already holds update.bin + scratch.bin, skip
+  //    re-formatting to reduce flash wear.
+  {
+    mbed::MBRBlockDevice ota_data(&root, 2);
+    mbed::FATFileSystem ota_data_fs("fs_ota");
+    if (ota_data_fs.mount(&ota_data) == 0) {
+      FILE* f_up = fopen("/fs_ota/update.bin", "rb");
+      FILE* f_sc = fopen("/fs_ota/scratch.bin", "rb");
+      bool healthy = (f_up != NULL) && (f_sc != NULL);
+      if (f_up) fclose(f_up);
+      if (f_sc) fclose(f_sc);
+      ota_data_fs.unmount();
+      if (healthy) {
+        Serial.println("QSPI partition already provisioned and healthy. Skipping format.");
+        return;
+      }
     }
-    if (f_up) fclose(f_up);
-    if (f_sc) fclose(f_sc);
-    ota_data_fs.unmount();
   }
 
+  // 2) Create the standard Arduino Opta MBR partition table.
+  //    Mirrors STM32H747_System/examples/QSPIFormat so the OTA region lands on
+  //    partition 2 (where MCUboot and the updater expect it):
+  //      p1 0..1 MB   WiFi firmware/certs (unused by TankAlarm)
+  //      p2 1..6 MB   MCUboot OTA staging (update.bin + scratch.bin)
+  //      p3 6..7 MB   Provisioning KVStore (unused by TankAlarm)
+  //      p4 7..14 MB  User data (application LittleFS config store)
+  Serial.println("\nCreating MBR partition table (p1 WiFi, p2 OTA, p3 KVStore, p4 user)...");
+  if (root.init() != 0) {
+    Serial.println("Error: QSPI init failed. Cannot create partitions.");
+    return;
+  }
+  // Wipe the MBR sector so the partition table is written cleanly.
+  root.erase(0x0, root.get_erase_size());
+  int e1 = mbed::MBRBlockDevice::partition(&root, 1, 0x0B, 0,                1 * 1024 * 1024);
+  int e2 = mbed::MBRBlockDevice::partition(&root, 2, 0x0B, 1 * 1024 * 1024,  6 * 1024 * 1024);
+  int e3 = mbed::MBRBlockDevice::partition(&root, 3, 0x0B, 6 * 1024 * 1024,  7 * 1024 * 1024);
+  int e4 = mbed::MBRBlockDevice::partition(&root, 4, 0x0B, 7 * 1024 * 1024, 14 * 1024 * 1024);
+  if (e1 || e2 || e3 || e4) {
+    Serial.println("Error creating MBR partitions! Aborting.");
+    return;
+  }
+  Serial.println("MBR partition table created.");
+
+  // 3) Format partition 2 (OTA) as FAT.
+  mbed::MBRBlockDevice ota_data(&root, 2);
+  mbed::FATFileSystem ota_data_fs("fs_ota");
   int err = ota_data_fs.reformat(&ota_data);
   if (err) {
-    Serial.println("Error creating MCUboot FAT partition! Please partition QSPI manually first.");
+    Serial.println("Error creating MCUboot FAT partition on p2! Aborting.");
     return;
-  } else {
-    Serial.println("FAT Partition MBR2 reformatted successfully.");
   }
+  Serial.println("FAT Partition MBR2 reformatted successfully.");
 
   // Pre-allocate scratch and update bin files with 0xFF bytes to save flash wear on OTA downloads
   FILE* fp = fopen("/fs_ota/scratch.bin", "wb");

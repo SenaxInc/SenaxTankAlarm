@@ -1,5 +1,14 @@
 # MCUboot Hardware Provisioning and Bench Testing Guide
 
+> 🛑 **BLOCKER (2026-06-10): This runbook is paused at Step 3.** Bench provisioning of the first
+> Client unit revealed that KeyProvisioning does **not** create the QSPI MBR partition (it only
+> reformats an existing one), and — more importantly — the Client/Server application reformats the
+> **entire** QSPI as a whole-device LittleFS, which is incompatible with MCUboot's requirement that
+> the update image live in **MBR partition 2**. Booting the Client/Server app would destroy the OTA
+> partition. **Do not proceed past Step 3** until the storage architecture is resolved. Full
+> analysis: [MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md](MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md).
+> Bootloader options/verification: [MCUBOOT_BOOTLOADER_OPTIONS.md](MCUBOOT_BOOTLOADER_OPTIONS.md).
+
 This document outlines the step-by-step procedure for provisioning a brand-new or existing hardware unit with MCUboot, loading security keys, preparing the QSPI storage structures, and executing the validation testing matrix.
 
 For architectural logic and design constraints, consult [CODE REVIEW/CODE_REVIEW_06092026_UPDATE_SYSTEM_v1.9.0_PROPOSED_FIXES.md](CODE%20REVIEW/CODE_REVIEW_06092026_UPDATE_SYSTEM_v1.9.0_PROPOSED_FIXES.md).
@@ -24,14 +33,19 @@ Every Arduino Opta device must be prepared **once via USB** before it is capable
   - When prompted `Do you want to proceed and load the default keys? Y/[n]`, press **Y**.
   - The tool will:
     - Attempt to mount the QSPI partition `fs_ota`. If `/fs_ota/update.bin` and `/fs_ota/scratch.bin` are already intact, it will skip re-formatting to prevent write cycles wear.
-    - If empty or corrupted, it partitions and formats MBR block 2 with `fs_ota` FAT filesystem.
+    - ⚠️ **CORRECTION (verified 2026-06-10):** the current sketch does **NOT** create the MBR partition table. It constructs `MBRBlockDevice(&root, 2)` and calls `reformat()` on an *already-existing* partition 2; if the chip has no MBR (e.g. a unit previously running the whole-device-LittleFS app), this **fails** with `Error creating MCUboot FAT partition! Please partition QSPI manually first.` and `update.bin`/`scratch.bin` are never created. A full MBR must be created first (core `QSPIFormat` sketch, or a future KeyProvisioning enhancement). See [MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md](MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md) §4.
     - Pre-allocates a contiguous `/fs_ota/scratch.bin` (0x20000 bytes).
     - Pre-allocates a contiguous `/fs_ota/update.bin` (0x1E0000 bytes).
     - Programs the default public verification key to flash descriptor offset `SIGNING_KEY_ADDR 0x8000300`.
     - Programs the default private decryption key to flash descriptor offset `ENCRYPT_KEY_ADDR 0x8000400`.
-  - *Verify:* Wait until the serial monitor outputs `Default Security Keys provisioned successfully.` and `System provisioned. It's now safe to reboot or disconnect your board.`.
+  - *Verify:* Wait until the serial monitor outputs `Default Security Keys provisioned successfully.` and `System provisioned. It's now safe to reboot or disconnect your board.`. ⚠️ **Note:** these success messages print even if the QSPI partition step failed (key programming runs regardless). Confirm there was **no** `Error creating MCUboot FAT partition!` line earlier in the output.
 
 - [ ] **Step 4: Initial Device Core Setup**
+  - 🛑 **BLOCKED for Client/Server (2026-06-10):** flashing the Client or Server application at this
+    point will reformat the entire QSPI as whole-device LittleFS and **destroy** the MCUboot OTA
+    partition. Do not perform this step for those roles until the storage architecture is fixed
+    (see [MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md](MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md) §7).
+    The **Viewer** does not use local QSPI storage and is not subject to this conflict.
   - Flash the running application firmware matching the device's role (Client, Server, or Viewer) using local USB, compiled with the MCUboot flag on.
   - *Verify:* Upon boot, ensure the local console outputs `v1.9.1` and confirms memory initialization success.
 
