@@ -8495,28 +8495,33 @@ static void initializeEthernet() {
     return;
   }
 
-  // Retrieve hardware MAC address if not set. On PortentaEthernet the
-  // factory MAC is not readable until AFTER Ethernet.begin() has brought
-  // the PHY up, so before first begin() gMacAddress may still be zero.
-  bool usingFactoryMac = true;
-  if (!(gMacAddress[0] == 0 && gMacAddress[1] == 0 && gMacAddress[2] == 0 &&
-        gMacAddress[3] == 0 && gMacAddress[4] == 0 && gMacAddress[5] == 0)) {
-    // Application-provided MAC overrides the factory one.
-    usingFactoryMac = false;
+  // Get raw hardware MAC address directly from the STM32 OTP/registers via PortentaEthernet
+  if (gMacAddress[0] == 0 && gMacAddress[1] == 0 && gMacAddress[2] == 0 &&
+      gMacAddress[3] == 0 && gMacAddress[4] == 0 && gMacAddress[5] == 0) {
+    Ethernet.MACAddress(gMacAddress);
   }
 
-  // Retry DHCP a few times. The first attempt often fails because the
-  // PHY link has not finished auto-negotiating yet; spacing the retries
-  // out by 1.5s lets the switch/router learn the port and respond.
+  // Fallback to a valid default MAC if the hardware registers did not return any MAC bytes
+  if (gMacAddress[0] == 0 && gMacAddress[1] == 0 && gMacAddress[2] == 0 &&
+      gMacAddress[3] == 0 && gMacAddress[4] == 0 && gMacAddress[5] == 0) {
+    gMacAddress[0] = 0x02; gMacAddress[1] = 0x00; gMacAddress[2] = 0x01;
+    gMacAddress[3] = 0x11; gMacAddress[4] = 0x20; gMacAddress[5] = 0x10;
+  }
+
+  // Spacing out DHCP retries by 1.5 seconds lets the switch or router learn terminal connection,
+  // negotiate, and respond appropriately. Spaced retries are critical for DHCP reservations.
   const int kMaxAttempts = 4;
   int status = 0;
+  bool triedStatic = false;
+  bool triedDhcp = false;
+  bool useStaticForAttempt = gConfig.useStaticIp;
+
   for (int attempt = 1; attempt <= kMaxAttempts && status == 0; ++attempt) {
-    if (gConfig.useStaticIp) {
+    if (useStaticForAttempt) {
+      triedStatic = true;
       status = Ethernet.begin(gMacAddress, gStaticIp, gStaticDns, gStaticGateway, gStaticSubnet);
-    } else if (usingFactoryMac) {
-      // No caller-supplied MAC: let PortentaEthernet use the factory MAC.
-      status = Ethernet.begin();
     } else {
+      triedDhcp = true;
       status = Ethernet.begin(gMacAddress);
     }
     if (status == 0) {
@@ -8532,21 +8537,29 @@ static void initializeEthernet() {
     }
   }
 
+  // Fail-Safe IP State Machine Fallback (v1.8.3):
+  // If DHCP fails or static is misconfigured, automatically try the alternative network mode.
   if (status == 0) {
-    Serial.println(F(" FAILED - Could not configure Ethernet!"));
+    if (gConfig.useStaticIp && !triedDhcp) {
+      Serial.println(F(" FAILED - Could not configure Ethernet via Static IP!"));
+      Serial.println(F("Static IP failed after retries. Falling back to DHCP as safety..."));
+      status = Ethernet.begin(gMacAddress);
+    } else if (!gConfig.useStaticIp && !triedStatic) {
+      Serial.println(F(" FAILED - Could not configure Ethernet via DHCP!"));
+      Serial.println(F("DHCP failed after retries. Falling back to default static IP: 192.168.7.200"));
+      status = Ethernet.begin(gMacAddress, gStaticIp, gStaticDns, gStaticGateway, gStaticSubnet);
+    }
+  }
+
+  if (status == 0) {
+    Serial.println(F(" FAILED - Could not configure Ethernet (even with fallback)!"));
     if (!gConfig.useStaticIp) {
-      Serial.println(F("ERROR: DHCP failed after retries. Check network cable and DHCP server."));
+      Serial.println(F("ERROR: DHCP and static IP fallback both failed. Check network cable and DHCP server."));
     } else {
       Serial.println(F("ERROR: Static IP configuration failed."));
     }
     // Don't halt, just return and let the main loop handle the lack of network
     return;
-  }
-
-  // If the caller didn't supply a MAC, pull the factory MAC now (post-begin)
-  // so we can log it and reuse it elsewhere.
-  if (usingFactoryMac) {
-    Ethernet.MACAddress(gMacAddress);
   }
   
   // Check link status
@@ -8561,7 +8574,7 @@ static void initializeEthernet() {
         if (gMacAddress[i] < 16) Serial.print("0");
         Serial.print(gMacAddress[i], HEX);
     }
-    Serial.println(usingFactoryMac ? " (Hardware)" : " (Static)");
+    Serial.println();
     Serial.print(F("IP Address: "));
     Serial.println(Ethernet.localIP());
     Serial.print(F("Gateway: "));
