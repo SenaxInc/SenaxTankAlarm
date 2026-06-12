@@ -1406,6 +1406,15 @@ void setup() {
   Serial.print(F(FIRMWARE_BUILD_DATE));
   Serial.println(F(")"));
 
+#if defined(TANKALARM_DFU_MCUBOOT)
+  // Confirm this image unconditionally as early as possible so MCUboot does not
+  // roll back even when QSPI storage or Notecard are unavailable (e.g. right
+  // after a USB flash that erased the QSPI MBR). The loop() gate below provides
+  // a belt-and-suspenders second confirmation once peripherals are fully up.
+  MCUboot::confirmSketch();
+  Serial.println(F("MCUboot: sketch confirmed (early, unconditional)"));
+#endif
+
   // Initialize serial log buffer
   memset(&gSerialLog, 0, sizeof(ClientSerialLog));
 
@@ -1676,10 +1685,10 @@ void setup() {
 
 void loop() {
 #if defined(TANKALARM_DFU_MCUBOOT)
-  // 15.6 Client Offline-Safe Local Health Gate
-  if (isStorageAvailable() && gNotecardAvailable) {
-    tankalarm_markFirmwareHealthy();
-  }
+  // Belt-and-suspenders secondary confirmation once peripherals are up.
+  // The unconditional early confirmSketch() in setup() is the primary gate;
+  // this catches the case where loop() is reached with Notecard available.
+  tankalarm_markFirmwareHealthy();
 #endif
 
   unsigned long now = millis();
@@ -1999,7 +2008,7 @@ void loop() {
   // ---- Update power conservation state (after polling battery sources) ----
   updatePowerState();
   
-  // Periodic firmware update check via Notecard Coordinated ODFU DFU
+  // Periodic firmware update check via Notecard host-pull MCUboot DFU
   // Interval matches inbound poll: 10 min (grid) / 1 hour (solar)
   // Skip in LOW_POWER and CRITICAL — firmware updates are not urgent
   if (gPowerState <= POWER_STATE_ECO) {
@@ -3589,8 +3598,35 @@ static void initializeNotecard() {
   // when the Notecard next responds, ensuring inbound sync is established).
   configureNotecardHubMode();
 
+  // Enable user DFU before the first startup sync so Notehub firmware is
+  // accepted into the host-pull channel instead of any persisted ODFU channel.
+  tankalarm_enableIapDfu(notecard);
+
+  // Take the Notecard OUT of outboard DFU (ODFU) mode. The Blues Wireless for
+  // Opta carrier does not route the BOOT0/NRST/USART1 lines the Notecard needs
+  // to flash the STM32 host directly, so any ODFU attempt always fails with
+  // "stmConnectToBootloader: timeout" ({odfu-fail}). Setting name:"-" clears
+  // the outboard host MCU type so Notehub never tries to push firmware to the
+  // host itself. Instead the delivered image stays in Notecard storage and the
+  // host pulls it via dfu.get + applies it with MCUboot
+  // (tankalarm_performMcubootUpdate). off:true is kept as a belt-and-suspenders
+  // guard against any autonomous host reset.
+  {
+    J *dfuReq = notecard.newRequest("card.dfu");
+    if (dfuReq) {
+      JAddStringToObject(dfuReq, "name", "-");
+      JAddBoolToObject(dfuReq, "off", true);
+      J *dfuRsp = notecard.requestAndResponse(dfuReq);
+      if (dfuRsp) {
+        notecard.deleteResponse(dfuRsp);
+      }
+    }
+  }
+
   // Force an immediate sync so any inbound notes queued on Notehub
-  // (e.g. config.qi) are pulled down right away at startup.
+  // (e.g. config.qi) are pulled down right away at startup. This must happen
+  // after clearing ODFU so a persisted stm32 host type cannot trigger a failed
+  // outboard DFU attempt during the first sync after a USB update.
   J *syncReq = notecard.newRequest("hub.sync");
   if (syncReq) {
     J *syncRsp = notecard.requestAndResponse(syncReq);
@@ -3603,24 +3639,6 @@ static void initializeNotecard() {
         Serial.println(F("Startup hub.sync initiated"));
       }
       notecard.deleteResponse(syncRsp);
-    }
-  }
-
-  // Enable user DFU status checks so Notecard downloads host firmware from Notehub in background.
-  tankalarm_enableIapDfu(notecard);
-
-  // Initialize card.dfu on the Notecard for stm32, but set "off" to true to
-  // prevent any autonomous or untimely resets from occurring until the Opta host
-  // explicitly quiesces the serial bus and authorizes the flash reset.
-  {
-    J *dfuReq = notecard.newRequest("card.dfu");
-    if (dfuReq) {
-      JAddStringToObject(dfuReq, "name", "stm32");
-      JAddBoolToObject(dfuReq, "off", true);
-      J *dfuRsp = notecard.requestAndResponse(dfuReq);
-      if (dfuRsp) {
-        notecard.deleteResponse(dfuRsp);
-      }
     }
   }
 
@@ -3851,11 +3869,9 @@ static void scheduleNextDailyReport() {
 }
 
 // ============================================================================
-// Device Firmware Update (DFU) via Blues Notecard — Coordinated ODFU Mode
-// True brick-proof hardware-managed Outboard DFU (ODFU) over proprietary
-// side-connector DIN bus. 
-// Handshake: boot disabled ("off":true), checked periodically, and applied 
-// explicitly by quiescing/isolating RS-485 and resetting the STM32 via card.dfu.
+// Device Firmware Update (DFU) via Blues Notecard — host-pull MCUboot mode
+// Firmware is downloaded by the Notecard, then the host pulls it with dfu.get,
+// stages it in the MCUboot secondary slot, and reboots into the trial image.
 // ============================================================================
 
 // Firmware length from last dfu.status (needed by enableDfuMode)

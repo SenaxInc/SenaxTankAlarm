@@ -198,18 +198,21 @@ Validate staging, swap, and rollback on the bench before shipping the unit:
 ### QSPI staging upload fails (`ERASE_PAGE` / `LIBUSB_ERROR_PIPE`)
 
 - **Symptom:** `dfuse_download: libusb_control_transfer returned -9` or `Error during special command "ERASE_PAGE"` during a secure (`security=sien`) upload to the QSPI region.
-- **Cause:** The QSPI MBR partition table is missing or destroyed — usually because an older, un-partitioned firmware reformatted the whole device. Secure uploads to the QSPI staging region cannot resolve block locations without it.
+- **Cause:** The QSPI MBR partition table is missing or destroyed — usually because an older, un-partitioned firmware reformatted the whole device (e.g. running raw whole-device LittleFS apps that lacked partition mapping bounds). Secure uploads to the QSPI staging region cannot resolve block locations without it.
 - **Resolution:**
   1. Double-tap RESET to enter DFU mode.
-  2. Flash the **unsigned** `KeyProvisioning` build directly to internal flash (alt interface 0) at `0x08040000`.
-  3. Press RESET once to boot it.
-  4. It runs from internal flash, rebuilds the QSPI MBR, restores Partition 2, and reloads the keys.
-  5. Resume from **Step 3** — secure uploads now resolve correctly.
+  2. Flash the **signed** `KeyProvisioning` build (`keyprov-signed\TankAlarm-112025-KeyProvisioning.ino.bin`) directly to internal flash (alt interface 0) at address **`0x08020000`** instead of address `0x08040000`.
+     - *Crucial Node:* Since keys are already loaded, the secure bootloader will reject raw *unsigned* images at `0x08040000` and immediately fall back to DFU mode.
+  3. Once flashed, **power-cycle the device completely by disconnecting both physical external 12V battery rails and USB cables** to perform a cold power-on reset.
+  4. The secure bootloader will parse the signed vector, boot the tool, and register virtual COM port maps.
+  5. Connect to the board over serial with **DTR (Data Terminal Ready) and RTS (Request to Send) lines turned OFF** (setting `DtrEnable = $false`). Default serial managers like Arduino IDE or script monitors toggle DTR on connection, which instructs the bootloader to immediately abort and re-enter DFU mode.
+  6. Transmit uppercase **`Y`** followed by `\r\n` to complete secure key loading and Partition 2 FAT structuring.
+  7. Resume from **Step 3** — secure uploads now resolve correctly.
 
 ### Board only re-appears in DFU mode (`2341:0364`) after flashing
 
-- **Cause:** An **unsigned** image was flashed after keys were loaded; the secure bootloader refuses to boot it.
-- **Resolution:** Re-flash using the `security=sien` signed image (Step 3). After keys are loaded, **every** application flash must be signed.
+- **Cause:** An **unsigned** image was flashed after keys were loaded; the secure bootloader refuses to boot it. It can also occur if a signed image was uploaded but was never padded/confirmed in its trailer sectors, leading the bootloader to assume it lacks validation flags.
+- **Resolution:** Re-flash using the `security=sien` signed image (Step 3). After keys are loaded, **every** application flash must be signed. If writing directly to base addresses (bypassing QSPI OTA swaps), ensure the image is signed with the `--confirm` tag and padded to the full flash partition slot boundary (`0x1E0000`) so boot trailers are properly parsed at offset bounds.
 
 ### Console prints "QSPI partition 4 not found"
 

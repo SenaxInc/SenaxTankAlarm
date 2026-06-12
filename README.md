@@ -1,7 +1,7 @@
-# TankAlarm v1.9.1 - Industrial Tank Monitoring System
+# TankAlarm v1.9.3 - Industrial Tank Monitoring System
 
 **Release Date:** June 11, 2026  
-**Version:** 1.9.1  
+**Version:** 1.9.3  
 **Platform:** Arduino Opta + Blues Wireless Notecard
 
 A production-ready industrial monitoring system for remote tank level monitoring, alarm management, and fleet coordination using cellular IoT connectivity.
@@ -356,7 +356,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
   - [ ] Ethernet connectivity stable
   
 - [ ] **Software Validation**
-  - [ ] Firmware version 1.9.1 confirmed
+  - [ ] Firmware version 1.9.3 confirmed
   - [ ] All clients reporting to server
   - [ ] Alarms triggering correctly
   - [ ] SMS/email alerts delivering
@@ -376,7 +376,7 @@ CLIENT                      BLUES NOTEHUB              SERVER
 
 ### Deployment Checklist
 
-1. Flash all devices with v1.9.1 firmware
+1. Flash all devices with v1.9.3 firmware
 2. Configure Blues Notehub fleet assignments
 3. Set server IP address and network configuration
 4. Configure SMS/email recipients
@@ -440,6 +440,14 @@ SenaxTankAlarm/
 ---
 
 ## 📋 Changelog
+
+### v1.9.3 (June 11, 2026)
+- **Fixed Client OTA blocker (ODFU regression):** The Client boot sequence was again configuring the Notecard for STM32 Outboard DFU (`card.dfu {"name":"stm32"}`) — the same setting v1.8.6 removed because the Blues Wireless for Opta carrier cannot drive ODFU. This caused every Notehub firmware update to fail with `{odfu-fail}: stmConnectToBootloader: timeout` even though the image downloaded into the Notecard completely. The Client now sends `card.dfu {"name":"-"}` at boot to **actively clear** the outboard host type (more robust than simply omitting the call, since the Notecard persists the prior setting). Notehub-delivered firmware now stays in Notecard storage for the host to pull via `dfu.get` and apply through MCUboot.
+- **Clears ODFU before startup sync:** The Client now enables the `user` DFU channel and clears the persisted outboard host type before the first boot-time `hub.sync`, preventing the first sync after a USB update from re-entering the failing ODFU path.
+
+### v1.9.2 (June 11, 2026)
+- **First OTA-test release for the MCUboot Client.** Build sequence advanced to 192 so the field Client (running 1.9.1 / build 191) can perform a genuine MCUboot A/B swap to a higher version. This is the target image used to validate the staging → swap → confirm → rollback path on the bench before fleet rollout.
+- No functional code changes vs 1.9.1; version/build-sequence bump only.
 
 ### v1.9.1 (June 11, 2026)
 - **Client MCUboot OTA:** The Client now updates over-the-air through the Arduino MCUboot bootloader, providing atomic A/B image swap and automatic rollback on a failed boot. Builds are compiled with `-DTANKALARM_DFU_MCUBOOT` and published as a signed/encrypted `.slot.bin`.

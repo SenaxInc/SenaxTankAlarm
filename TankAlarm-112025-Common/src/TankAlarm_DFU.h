@@ -1137,6 +1137,7 @@ mcuboot_restore_hub:
     if (req) {
       JAddBoolToObject(req, "stop", true);
       JAddStringToObject(req, "status", "firmware update failed");
+      JAddStringToObject(req, "name", "user");
       J *rsp = notecard.requestAndResponse(req);
       if (rsp) notecard.deleteResponse(rsp);
     }
