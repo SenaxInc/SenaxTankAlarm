@@ -707,6 +707,7 @@ struct ClientConfig {
   // Remote-tunable health check interval (0 = use compile-time default)
   uint32_t healthCheckBaseIntervalMs;  // Base Notecard health check interval in ms
   uint8_t updatePolicy;                // Choice: 0=Disabled, 1=AlertOnly, 2=AutoMCUboot
+  uint32_t configEpoch;                // Generation timestamp of the currently active configuration
 };
 
 struct MonitorRuntime {
@@ -3077,6 +3078,9 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
   // Load update policy
   cfg.updatePolicy = doc["updatePolicy"].is<int>() ? (uint8_t)doc["updatePolicy"].as<int>() : CLIENT_UPDATE_POLICY_DISABLED;
 
+  // Load config epoch timestamp
+  cfg.configEpoch = doc["configEpoch"].is<int>() ? (uint32_t)doc["configEpoch"].as<int>() : 0;
+
   // Support both "sensors" (from server) and "monitors" (local config) array names
   JsonArray monitorsArray = doc["sensors"].as<JsonArray>();
   if (!monitorsArray) {
@@ -3341,6 +3345,9 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
 
   // Save update policy
   doc["updatePolicy"] = cfg.updatePolicy;
+
+  // Save config epoch
+  doc["configEpoch"] = cfg.configEpoch;
 
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     // Mbed OS — atomic write-to-temp-then-rename
@@ -4100,20 +4107,35 @@ static void pollForConfigUpdates() {
         if (!err) {
           // Extract config version hash for ACK tracking (injected by server)
           const char *cv = doc["_cv"] | "";
-          applyConfigUpdate(doc);
-          // BugFix v1.6.2 (I-11): Defer ACK until persistence succeeds.
-          // Store the config version and mark pending — persistConfigIfDirty()
-          // will send the ACK after saveConfigToFlash() completes.
-          strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
-          gPendingConfigAck = true;
-          gPendingConfigAckSuccess = true;
-          strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
-          gPendingConfigAckRetryAt = 0;
-          gPendingConfigAckRetryDelayMs = 5000UL;
-          gConfigDirty = true;
-          // Delete the inbound note now — the config is in memory and will be
-          // persisted shortly. If persistence fails, a failure ACK is sent.
-          ackSent = true;
+          uint32_t inboundTs = doc["_ts"] | (uint32_t)0;
+          
+          if (inboundTs > 0 && inboundTs <= gConfig.configEpoch) {
+            Serial.print(F("Ignoring obsolete queued config (newer version already active). Inbound TS: "));
+            Serial.print(inboundTs);
+            Serial.print(F(" Active TS: "));
+            Serial.println(gConfig.configEpoch);
+            // Send config ACK indicating that we took it but bypassed it to prevent overwriting
+            sendConfigAck(true, "Config bypassed: newer version already exists", cv);
+            ackSent = true;
+          } else {
+            if (inboundTs > 0) {
+              gConfig.configEpoch = inboundTs;
+            }
+            applyConfigUpdate(doc);
+            // BugFix v1.6.2 (I-11): Defer ACK until persistence succeeds.
+            // Store the config version and mark pending — persistConfigIfDirty()
+            // will send the ACK after saveConfigToFlash() completes.
+            strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
+            gPendingConfigAck = true;
+            gPendingConfigAckSuccess = true;
+            strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
+            gPendingConfigAckRetryAt = 0;
+            gPendingConfigAckRetryDelayMs = 5000UL;
+            gConfigDirty = true;
+            // Delete the inbound note now — the config is in memory and will be
+            // persisted shortly. If persistence fails, a failure ACK is sent.
+            ackSent = true;
+          }
         } else {
           Serial.println(F("Config update invalid JSON"));
           sendConfigAck(false, "Invalid JSON", nullptr);
@@ -7141,17 +7163,10 @@ static void sendDailyReport() {
   bool queuedAny = false;
 
   // Best available voltage for daily report:
-  //   1. Analog Vin divider (actual battery, most accurate if installed)
-  //   2. Notecard battery monitor (card.voltage with trend data)
-  //   3. Notecard card.voltage (simple one-shot read)
-  float vinVoltage = 0.0f;
-  if (gConfig.vinMonitor.enabled && gVinVoltage > 0.5f) {
-    vinVoltage = gVinVoltage;
-  } else if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f) {
-    vinVoltage = gBatteryData.voltage;
-  } else {
-    vinVoltage = readNotecardVinVoltage();
-  }
+  // Sourced strictly from getEffectiveBatteryVoltage() which maps to active Vin loop,
+  // RS-485 Modbus, and batteryMonitor offsets. If none of these are configured,
+  // we do not include a dummy/LDO Notecard reading (which reads 5V system LDO).
+  float vinVoltage = getEffectiveBatteryVoltage();
 
   while (monitorCursor < eligibleCount) {
     JsonDocument doc;
