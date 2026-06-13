@@ -341,6 +341,7 @@ jobs:
           
           # Install imgtool and build secure .slot.bin artifact automatically in development
           pip install imgtool
+          python -c "import imgtool.image; f=imgtool.image.__file__; s=open(f).read().replace('self.header_size,', 'self.header_size & 0xFFFF,'); open(f, 'w').write(s)"
           imgtool sign \
             --key mcuboot_keys/ecdsa-p256-signing-priv-key.pem \
             --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \

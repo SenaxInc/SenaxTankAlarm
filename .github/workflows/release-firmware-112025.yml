@@ -142,7 +142,9 @@ jobs:
           cp "$BIN_SOURCE" "TankAlarm-Viewer-v${{ steps.version.outputs.version }}.bin"
 
       - name: Install imgtool
-        run: pip install imgtool
+        run: |
+          pip install imgtool
+          python -c "import imgtool.image; f=imgtool.image.__file__; s=open(f).read().replace('self.header_size,', 'self.header_size & 0xFFFF,'); open(f, 'w').write(s)"
 
       - name: Sign & Format MCUboot Image (Client only)
         shell: bash
