@@ -1001,6 +1001,18 @@ struct ClientConfigSnapshot {
   double lastDispatchEpoch;  // When the most recent dispatch attempt occurred
 };
 
+// Sensor display fields resolved from a client's cached config snapshot. Used so the
+// dashboard/site-config show the operator-configured name/type/unit/contents instead of a
+// client's stale self-reported telemetry defaults (e.g. before the client applies new config
+// or while it runs older firmware). Field sizes mirror SensorRecord.
+struct ConfiguredSensorDisplay {
+  char name[24];
+  char monitorType[16];
+  char measurementUnit[8];
+  char contents[24];
+  bool found;
+};
+
 // Maximum number of config dispatch retries before auto-cancel
 #ifndef MAX_CONFIG_DISPATCH_RETRIES
 #define MAX_CONFIG_DISPATCH_RETRIES 5
@@ -2320,6 +2332,7 @@ static void loadClientConfigSnapshots();
 static void saveClientConfigSnapshots();
 static bool cacheClientConfigFromBuffer(const char *clientUid, const char *buffer);
 static ClientConfigSnapshot *findClientConfigSnapshot(const char *clientUid);
+static void getConfiguredSensorDisplay(const char *clientUid, uint8_t sensorIndex, ConfiguredSensorDisplay &out);
 static bool sendConfigViaNotecard(const char *clientUid, const char *jsonPayload);
 static void checkGitHubForUpdate();
 static uint8_t purgePendingConfigNotes(const char *clientUid);
@@ -9802,7 +9815,12 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
     if (!clientObj) {
       clientObj = clientsArr.add<JsonObject>();
       clientObj["c"] = rec.clientUid;
-      clientObj["s"] = rec.site;
+      // Prefer the configured site name (set via the config generator and stored
+      // in the client's config snapshot) over the client-reported site. A client
+      // keeps reporting its factory-default site ("Opta Tank Site") until it has
+      // applied its configuration, so the configured name is the source of truth.
+      const ClientConfigSnapshot *cfgSnap = findClientConfigSnapshot(rec.clientUid);
+      clientObj["s"] = (cfgSnap && cfgSnap->site[0] != '\0') ? cfgSnap->site : rec.site;
       clientObj["a"] = false;
       clientObj["u"] = 0.0;
       
@@ -9834,8 +9852,20 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
 
     const char *existingSite = clientObj["s"] ? clientObj["s"].as<const char *>() : nullptr;
     if (!existingSite || strlen(existingSite) == 0) {
-      clientObj["s"] = rec.site;
+      const ClientConfigSnapshot *cfgSnap = findClientConfigSnapshot(rec.clientUid);
+      clientObj["s"] = (cfgSnap && cfgSnap->site[0] != '\0') ? cfgSnap->site : rec.site;
     }
+
+    // Resolve display fields (name, monitor type, unit, contents) from the cached config
+    // snapshot, preferring them over the client's self-reported telemetry. A client keeps
+    // reporting its factory defaults ("Primary Tank"/"tank"/"inches") until it applies the
+    // operator's configuration, so the configured values are the source of truth for display.
+    ConfiguredSensorDisplay cfgDisp;
+    getConfiguredSensorDisplay(rec.clientUid, rec.sensorIndex, cfgDisp);
+    const bool useCfgName = cfgDisp.found && cfgDisp.name[0] != '\0';
+    const bool useCfgType = cfgDisp.found && cfgDisp.monitorType[0] != '\0';
+    const bool useCfgUnit = cfgDisp.found && cfgDisp.measurementUnit[0] != '\0';
+    const bool useCfgContents = cfgDisp.found && cfgDisp.contents[0] != '\0';
 
     if (rec.alarmActive) {
       clientObj["a"] = true;
@@ -9844,7 +9874,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
 
     double previousUpdate = clientObj["u"].is<double>() ? clientObj["u"].as<double>() : 0.0;
     if (rec.lastUpdateEpoch > previousUpdate) {
-      clientObj["n"] = rec.label;
+      if (useCfgName) { clientObj["n"] = cfgDisp.name; } else { clientObj["n"] = rec.label; }
       clientObj["k"] = rec.sensorIndex;
       if (rec.userNumber > 0) {
         clientObj["un"] = rec.userNumber;
@@ -9857,10 +9887,14 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       clientObj["u"] = rec.lastUpdateEpoch;
       clientObj["at"] = rec.alarmType;
       // Include object type and measurement unit at client level for dashboard
-      if (rec.objectType[0] != '\0') {
+      if (useCfgType) {
+        clientObj["ot"] = cfgDisp.monitorType;
+      } else if (rec.objectType[0] != '\0') {
         clientObj["ot"] = rec.objectType;
       }
-      if (rec.measurementUnit[0] != '\0') {
+      if (useCfgUnit) {
+        clientObj["mu"] = cfgDisp.measurementUnit;
+      } else if (rec.measurementUnit[0] != '\0') {
         clientObj["mu"] = rec.measurementUnit;
       }
     }
@@ -9872,7 +9906,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       sensorList = clientObj["ts"].as<JsonArray>();
     }
     JsonObject sensorObj = sensorList.add<JsonObject>();
-    sensorObj["n"] = rec.label;
+    if (useCfgName) { sensorObj["n"] = cfgDisp.name; } else { sensorObj["n"] = rec.label; }
     sensorObj["k"] = rec.sensorIndex;
     if (rec.userNumber > 0) {
       sensorObj["un"] = rec.userNumber;
@@ -9886,16 +9920,22 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
     if (rec.sensorType[0] != '\0') {
       sensorObj["st"] = rec.sensorType;
     }
-    // Include object type (tank, gas, rpm, etc.)
-    if (rec.objectType[0] != '\0') {
+    // Include object type (tank, gas, rpm, etc.) — prefer the configured monitor type
+    if (useCfgType) {
+      sensorObj["ot"] = cfgDisp.monitorType;
+    } else if (rec.objectType[0] != '\0') {
       sensorObj["ot"] = rec.objectType;
     }
-    // Include measurement unit
-    if (rec.measurementUnit[0] != '\0') {
+    // Include measurement unit — prefer the configured unit
+    if (useCfgUnit) {
+      sensorObj["mu"] = cfgDisp.measurementUnit;
+    } else if (rec.measurementUnit[0] != '\0') {
       sensorObj["mu"] = rec.measurementUnit;
     }
-    // Include contents (e.g. "Diesel", "Water", "Propane")
-    if (rec.contents[0] != '\0') {
+    // Include contents (e.g. "Diesel", "Water", "Propane") — prefer the configured contents
+    if (useCfgContents) {
+      sensorObj["ct"] = cfgDisp.contents;
+    } else if (rec.contents[0] != '\0') {
       sensorObj["ct"] = rec.contents;
     }
     // Include 24hr change if available
@@ -11673,7 +11713,18 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   // Check if this is part 0 (new) or part 1 (legacy) of the daily report
   uint8_t part = doc["p"].as<uint8_t>();
   bool isFirstPart = (part == 0 || part == 1);
+  // Prefer the SunSaver MPPT battery voltage (the real 12V pack, read over RS-485 Modbus)
+  // over the top-level "v" field. On clients without a Vin divider, "v" can be the Notecard's
+  // ~5V supply rail rather than the actual battery, which misrepresents the system voltage on
+  // the dashboard. The solar charger reports the true pack voltage in solar.bv.
   float vinVoltage = doc["v"].as<float>();
+  JsonObject dailySolar = doc["solar"];
+  if (!dailySolar.isNull()) {
+    float solarBv = dailySolar["bv"] | 0.0f;
+    if (solarBv > 0.0f) {
+      vinVoltage = solarBv;
+    }
+  }
   if (isFirstPart && vinVoltage > 0.0f) {
     ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
     if (meta) {
@@ -12542,6 +12593,46 @@ static ClientConfigSnapshot *findClientConfigSnapshot(const char *clientUid) {
     }
   }
   return nullptr;
+}
+
+// Resolve a sensor's display fields (name, monitor type, unit, contents) from the client's
+// cached config snapshot, matched by sensor "number". Leaves out.found=false when no snapshot
+// or matching sensor exists. The dashboard and site-config prefer these configured values over
+// a client's stale self-reported telemetry (e.g. the factory "Primary Tank"/"tank"/"inches"
+// defaults a client emits before it applies its configuration).
+static void getConfiguredSensorDisplay(const char *clientUid, uint8_t sensorIndex, ConfiguredSensorDisplay &out) {
+  out.name[0] = '\0';
+  out.monitorType[0] = '\0';
+  out.measurementUnit[0] = '\0';
+  out.contents[0] = '\0';
+  out.found = false;
+
+  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (!snap || snap->payload[0] == '\0') {
+    return;
+  }
+
+  JsonDocument cfgDoc;
+  if (deserializeJson(cfgDoc, snap->payload) != DeserializationError::Ok) {
+    return;
+  }
+
+  JsonArrayConst sensors = cfgDoc["sensors"].as<JsonArrayConst>();
+  if (sensors.isNull()) {
+    return;
+  }
+
+  for (JsonObjectConst s : sensors) {
+    uint8_t num = s["number"] | 0;
+    if (num == sensorIndex) {
+      strlcpy(out.name, s["name"] | "", sizeof(out.name));
+      strlcpy(out.monitorType, s["monitorType"] | "", sizeof(out.monitorType));
+      strlcpy(out.measurementUnit, s["measurementUnit"] | "", sizeof(out.measurementUnit));
+      strlcpy(out.contents, s["contents"] | "", sizeof(out.contents));
+      out.found = true;
+      return;
+    }
+  }
 }
 
 // GET /api/client?uid=dev:xxx  → return cached config for a single client
