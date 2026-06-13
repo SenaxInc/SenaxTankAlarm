@@ -7456,11 +7456,12 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   // fileName is already a plain .qo notefile name (e.g., "telemetry.qo")
   // Cross-device routing is handled by Notehub Routes — no fleet: prefix needed
 
-  // Stamp the schema version INTO the document before serialization so it is native to the
-  // payload. This guarantees _sv survives the offline flash buffer and flushBufferedNotes()
+  // Stamp the schema version and firmware version INTO the document before serialization so it is native to the
+  // payload. This guarantees _sv and fv survive the offline flash buffer and flushBufferedNotes()
   // (which re-send the serialized string verbatim) — previously _sv was added to the CJSON
   // body only on the live path and was lost for any buffered/flushed note.
   doc["_sv"] = NOTEFILE_SCHEMA_VERSION;
+  doc["fv"] = FIRMWARE_VERSION;
 
   // Measure JSON first to handle oversized payloads via dynamic allocation
   size_t needed = measureJson(doc);
