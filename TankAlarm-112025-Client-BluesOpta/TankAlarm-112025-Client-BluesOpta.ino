@@ -726,7 +726,6 @@ struct ClientConfig {
   float powerCriticalExitV;   // Exit CRITICAL above this voltage
   // Remote-tunable health check interval (0 = use compile-time default)
   uint32_t healthCheckBaseIntervalMs;  // Base Notecard health check interval in ms
-  uint8_t updatePolicy;                // Choice: 0=Disabled, 1=AlertOnly, 2=AutoMCUboot
   uint32_t configEpoch;                // Generation timestamp of the currently active configuration
 };
 
@@ -2084,8 +2083,9 @@ void loop() {
       gLastDfuCheckMillis = now;
       if (!gDfuInProgress && gNotecardAvailable) {
         checkForFirmwareUpdate();
-        // Auto-apply firmware updates when available & policy permits
-        if (gDfuUpdateAvailable && gConfig.updatePolicy == CLIENT_UPDATE_POLICY_AUTO_MCUBOOT) {
+        // Always apply a pushed OTA update from Notehub when one is available. The per-client
+        // update policy was removed — the device unconditionally accepts firmware pushed to it.
+        if (gDfuUpdateAvailable) {
           Serial.println(F("Auto-DFU: Applying available firmware update (MCUboot)..."));
           enableDfuMode();
         }
@@ -2133,7 +2133,8 @@ void loop() {
       checkForFirmwareUpdate();
       // Apply regardless of power state — recovery from broken/old firmware takes priority over
       // power conservation. enableDfuMode() kicks the watchdog throughout the staging operation.
-      if (gDfuUpdateAvailable && gConfig.updatePolicy == CLIENT_UPDATE_POLICY_AUTO_MCUBOOT) {
+      // The per-client update policy was removed: a pushed OTA is always accepted.
+      if (gDfuUpdateAvailable) {
         Serial.println(F("Daily DFU window: applying available firmware update (MCUboot)..."));
         addSerialLog("Daily DFU apply (low-power override)");
         enableDfuMode();
@@ -2554,7 +2555,6 @@ static void createDefaultConfig(ClientConfig &cfg) {
   
   // Solar-Only (No Battery) mode defaults (disabled)
   initSolarOnlyConfig(&cfg.solarOnlyConfig);                 // Disabled by default
-  cfg.updatePolicy = CLIENT_UPDATE_POLICY_DISABLED;         // Disabled by default
 }
 
 // ============================================================================
@@ -3187,9 +3187,6 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
     ? (uint32_t)doc["healthCheckBaseIntervalMs"].as<int>() 
     : 0;
 
-  // Load update policy
-  cfg.updatePolicy = doc["updatePolicy"].is<int>() ? (uint8_t)doc["updatePolicy"].as<int>() : CLIENT_UPDATE_POLICY_DISABLED;
-
   // Load config epoch timestamp
   cfg.configEpoch = doc["configEpoch"].is<int>() ? (uint32_t)doc["configEpoch"].as<int>() : 0;
 
@@ -3454,9 +3451,6 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
 
   // Save remote-tunable health check interval (only if non-default)
   if (cfg.healthCheckBaseIntervalMs > 0) doc["healthCheckBaseIntervalMs"] = cfg.healthCheckBaseIntervalMs;
-
-  // Save update policy
-  doc["updatePolicy"] = cfg.updatePolicy;
 
   // Save config epoch
   doc["configEpoch"] = cfg.configEpoch;
@@ -4640,11 +4634,6 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   // Handle remote-tunable health check interval
   if (!doc["healthCheckBaseIntervalMs"].isNull()) {
     gConfig.healthCheckBaseIntervalMs = (uint32_t)doc["healthCheckBaseIntervalMs"].as<int>();
-  }
-
-  // Handle update policy
-  if (!doc["updatePolicy"].isNull()) {
-    gConfig.updatePolicy = (uint8_t)doc["updatePolicy"].as<int>();
   }
 
   if (!doc["sensors"].isNull()) {
