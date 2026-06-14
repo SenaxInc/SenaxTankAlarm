@@ -265,6 +265,15 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define CURRENT_LOOP_FAULT_MA 3.6f
 #endif
 
+#ifndef CURRENT_LOOP_GATED_SETTLE_MS
+// Minimum inter-sample settle (ms) for power-gated 4-20mA reads. The A0602 current-loop ADC
+// needs time to deliver a fresh conversion after the channel is selected; the validated
+// standalone gating test (P1_Transistor_Gating_Test) sampled at 300ms and read correctly,
+// while a too-small configured delay returns stale/constant values that look like a pegged
+// reading. When gating is on, the effective settle is floored to this value.
+#define CURRENT_LOOP_GATED_SETTLE_MS 300
+#endif
+
 #ifndef MAX_ALARMS_PER_HOUR
 #define MAX_ALARMS_PER_HOUR 10  // Maximum alarms per monitor per hour
 #endif
@@ -5205,6 +5214,32 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
+  // Inter-sample settle. The A0602 current-loop ADC needs time to deliver a fresh conversion
+  // after the channel is selected. The validated standalone gating test (P1_Transistor_Gating_Test)
+  // sampled at 300ms spacing and read the transmitter correctly; the small production default
+  // (e.g. 5ms) is too aggressive and can return a stale, constant high value that looks like a
+  // pegged reading. When gating is enabled, floor the settle to the proven cadence regardless of
+  // the configured pwmGatingSampleDelay.
+  const uint32_t sampleSettleMs = cfg.pwmGatingEnabled
+      ? (((uint32_t)cfg.pwmGatingSampleDelay > (uint32_t)CURRENT_LOOP_GATED_SETTLE_MS)
+            ? (uint32_t)cfg.pwmGatingSampleDelay : (uint32_t)CURRENT_LOOP_GATED_SETTLE_MS)
+      : 5UL;
+
+  // Priming read (gated sensors only): select the channel and discard one conversion, then
+  // settle, so the averaged samples below reflect the freshly-powered transmitter rather than a
+  // stale pre-warmup ADC value. This mirrors the proven P1_Transistor_Gating_Test sequence.
+  if (cfg.pwmGatingEnabled) {
+    (void)readCurrentLoopMilliamps(channel);
+    delay(sampleSettleMs);
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    mbedWatchdog.kick();
+  #else
+    IWatchdog.reload();
+  #endif
+#endif
+  }
+
   // BugFix v1.6.2 (M-1): Multi-sample averaging for current-loop sensors.
   // I2C reads are slower than ADC, so we use 4 samples (vs 8 for analog).
   const uint8_t numSamples = 4;
@@ -5217,9 +5252,9 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       validSamples++;
     }
     if (s < numSamples - 1) {
-      delay(cfg.pwmGatingEnabled ? cfg.pwmGatingSampleDelay : 5);
+      delay(sampleSettleMs);
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
-      // Inter-sample debounce can be long (e.g. 300ms x3) when gating is on; kick the WDT.
+      // Settle can total ~1s across samples when gating is on; kick the WDT.
       if (cfg.pwmGatingEnabled) {
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
         mbedWatchdog.kick();
