@@ -369,6 +369,19 @@ enum PowerState : uint8_t {
 #define POWER_CRITICAL_SLEEP_MS            300000    // 5 minutes
 #endif
 
+// Daily firmware-update safety net (power-state override). In LOW_POWER and
+// CRITICAL_HIBERNATE the frequent DFU check is skipped to conserve energy, but an OTA must
+// NEVER be permanently blocked by power state. At least once per this interval the device
+// force-checks (and applies) a pending firmware update regardless of voltage or power state.
+#ifndef DAILY_DFU_CHECK_INTERVAL_MS
+#define DAILY_DFU_CHECK_INTERVAL_MS        86400000UL  // 24 hours
+#endif
+// Grace period after boot before the first low-power DFU check, so the Notecard has time to
+// connect/sync before we query it.
+#ifndef DAILY_DFU_BOOT_GRACE_MS
+#define DAILY_DFU_BOOT_GRACE_MS            120000UL    // 2 minutes
+#endif
+
 #ifndef POWER_STATE_PERIODIC_LOG_MS
 #define POWER_STATE_PERIODIC_LOG_MS        1800000UL // 30 minutes
 #endif
@@ -834,6 +847,9 @@ static double gNextDailyReportEpoch = 0.0;
 
 // DFU (Device Firmware Update) state tracking
 static unsigned long gLastDfuCheckMillis = 0;
+// Last forced daily DFU check while in a low-power state (LOW_POWER/CRITICAL_HIBERNATE).
+// 0 = not yet run this boot; the first check fires after DAILY_DFU_BOOT_GRACE_MS.
+static unsigned long gLastDailyDfuCheckMillis = 0;
 static bool gDfuUpdateAvailable = false;
 static char gDfuVersion[32] = {0};
 static bool gDfuInProgress = false;
@@ -2073,6 +2089,54 @@ void loop() {
           Serial.println(F("Auto-DFU: Applying available firmware update (MCUboot)..."));
           enableDfuMode();
         }
+      }
+    }
+  }
+
+  // ---- Daily firmware-update safety net (power-state override) ----
+  // The frequent DFU check above is intentionally skipped in LOW_POWER and CRITICAL_HIBERNATE
+  // to conserve energy. But an OTA must NEVER be permanently blocked by power state — otherwise
+  // a device that mis-reads its voltage (or has a genuinely weak battery) could get stuck on
+  // broken firmware with no remote way to recover. So at least once per day, regardless of
+  // voltage or power state, force a sync + DFU check and apply any pending update. The device
+  // already wakes every POWER_CRITICAL_SLEEP_MS (5 min) even in hibernate, so this needs no RTC
+  // alarm — it just runs on a normal loop iteration once the daily interval has elapsed.
+  if (gPowerState > POWER_STATE_ECO) {  // only LOW_POWER / CRITICAL_HIBERNATE (ECO/NORMAL handled above)
+    bool dailyDfuDue = (gLastDailyDfuCheckMillis == 0)
+        ? (now >= DAILY_DFU_BOOT_GRACE_MS)
+        : (now - gLastDailyDfuCheckMillis >= DAILY_DFU_CHECK_INTERVAL_MS);
+    if (dailyDfuDue && !gDfuInProgress && gNotecardAvailable) {
+      gLastDailyDfuCheckMillis = now;
+      Serial.println(F("Daily DFU window: checking for firmware update (power-state override)"));
+      addSerialLog("Daily DFU check (low-power override)");
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+      mbedWatchdog.kick();
+  #else
+      IWatchdog.reload();
+  #endif
+#endif
+      // Force a sync so the Notecard pulls the latest dfu.status/firmware from Notehub even
+      // though inbound polling is otherwise suspended in this state.
+      J *dfuSyncReq = notecard.newRequest("hub.sync");
+      if (dfuSyncReq) {
+        J *dfuSyncRsp = notecard.requestAndResponse(dfuSyncReq);
+        if (dfuSyncRsp) notecard.deleteResponse(dfuSyncRsp);
+      }
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+      mbedWatchdog.kick();
+  #else
+      IWatchdog.reload();
+  #endif
+#endif
+      checkForFirmwareUpdate();
+      // Apply regardless of power state — recovery from broken/old firmware takes priority over
+      // power conservation. enableDfuMode() kicks the watchdog throughout the staging operation.
+      if (gDfuUpdateAvailable && gConfig.updatePolicy == CLIENT_UPDATE_POLICY_AUTO_MCUBOOT) {
+        Serial.println(F("Daily DFU window: applying available firmware update (MCUboot)..."));
+        addSerialLog("Daily DFU apply (low-power override)");
+        enableDfuMode();
       }
     }
   }
