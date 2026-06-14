@@ -11412,6 +11412,46 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   rec->levelInches = newLevel;
   rec->lastUpdateEpoch = now;
   gSensorRegistryDirty = true;
+
+  // Self-clear a stale latched "sensor-stuck" alarm. A sensor-stuck alarm is only set by
+  // handleAlarm and is normally cleared by a client "sensor-recovered" note — but if the
+  // client's runtime failed-state was reset (e.g. a firmware reflash/reboot) or stuck
+  // detection was turned off, the client will never send that recovery note, leaving the
+  // alarm latched forever until a config is re-dispatched. Here: fresh telemetry is arriving
+  // for this sensor (proof it is actively reporting, not failed), so if the sensor's current
+  // config has stuck detection disabled, any lingering sensor-stuck alarm is definitively
+  // stale and is cleared without requiring a config re-push. Scoped to the stuck-disabled
+  // case so a genuine stuck condition under active detection is never masked.
+  if (rec->alarmActive && strcmp(rec->alarmType, "sensor-stuck") == 0) {
+    bool stuckDisabledInConfig = false;
+    const ClientConfigSnapshot *stuckSnap = findClientConfigSnapshot(clientUid);
+    if (stuckSnap && stuckSnap->payload[0] != '\0') {
+      JsonDocument stuckCfg;
+      if (deserializeJson(stuckCfg, stuckSnap->payload) == DeserializationError::Ok) {
+        JsonArrayConst cfgSensors = stuckCfg["sensors"].as<JsonArrayConst>();
+        if (!cfgSensors.isNull()) {
+          for (JsonObjectConst ct : cfgSensors) {
+            uint8_t ctn = ct["number"] | 0;
+            if (ctn == sensorIndex) {
+              // Client default is opt-in/off, so a missing field also counts as disabled.
+              stuckDisabledInConfig = !(ct["stuckDetection"] | false);
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (stuckDisabledInConfig) {
+      rec->alarmActive = false;
+      strlcpy(rec->alarmType, "clear", sizeof(rec->alarmType));
+      clearAlarmEvent(clientUid, sensorIndex);
+      Serial.print(F("Cleared stale sensor-stuck alarm (stuck detection disabled) for "));
+      Serial.print(clientUid);
+      Serial.print(F(" sensor "));
+      Serial.println(sensorIndex);
+      addServerSerialLog("Stale sensor-stuck alarm auto-cleared on telemetry", "info", "alarm");
+    }
+  }
   
   // Record telemetry snapshot for historical charting
   // Get site name and tank height for history record
