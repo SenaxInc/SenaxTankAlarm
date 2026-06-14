@@ -348,6 +348,14 @@
 #define MAX_NOTES_PER_FILE_PER_POLL 10  // Prevent long blocking notefile drains
 #endif
 
+// Periodic hub.sync safety net. With "sync":true the Notecard pulls inbound telemetry from
+// Notehub in real time, but a stalled/dropped cellular session can silently stop delivering it
+// (the dashboard then freezes until a reboot). Forcing an explicit hub.sync on this interval
+// reconnects the session and drains any queued inbound notes so the dashboard keeps updating.
+#ifndef NOTECARD_FORCED_SYNC_INTERVAL_MS
+#define NOTECARD_FORCED_SYNC_INTERVAL_MS 600000UL  // 10 minutes
+#endif
+
 // Calibration learning system constants
 #ifndef CALIBRATION_LOG_PATH
 #define CALIBRATION_LOG_PATH "/calibration_log.txt"
@@ -4409,6 +4417,21 @@ void loop() {
     }
   }
 
+  // Periodic inbound sync safety net. "sync":true (set in initializeNotecard) delivers inbound
+  // telemetry in real time, but a stalled cellular session can silently stop delivering it,
+  // freezing the dashboard until a reboot. Forcing an explicit hub.sync on a fixed interval
+  // reconnects the session and drains any queued inbound notes; the next pollNotecard() (every
+  // 5 s) then processes whatever it delivered. Fire-and-forget — the sync runs asynchronously.
+  static unsigned long gLastForcedSyncMillis = 0;
+  if (!gPaused && gNotecardAvailable &&
+      (now - gLastForcedSyncMillis > NOTECARD_FORCED_SYNC_INTERVAL_MS)) {
+    gLastForcedSyncMillis = now;
+    J *syncReq = notecard.newRequest("hub.sync");
+    if (syncReq) {
+      notecard.deleteResponse(notecard.requestAndResponse(syncReq));
+    }
+  }
+
   // Auto-retry pending config dispatches every 60 minutes
   static unsigned long gLastPendingDispatchMillis = 0;
   if (!gPaused && (now - gLastPendingDispatchMillis > 3600000UL)) {
@@ -8181,6 +8204,12 @@ static void initializeNotecard() {
     if (gConfig.productUid[0] != '\0') {
       JAddStringToObject(req, "product", gConfig.productUid);
       JAddStringToObject(req, "mode", "continuous");
+      // Real-time inbound delivery: in continuous mode "sync":true tells Notehub to notify the
+      // Notecard the moment an inbound note (client telemetry routed to the server) is queued, so
+      // the Notecard syncs immediately. Without this the server — which rarely sends outbound —
+      // would only pull inbound telemetry when it happened to sync for another reason, leaving the
+      // dashboard stale for long stretches until a reboot forced a sync.
+      JAddBoolToObject(req, "sync", true);
       // Join the server fleet so fleet-targeted notes from clients are delivered
       const char *fleet = (gConfig.serverFleet[0] != '\0') ? gConfig.serverFleet : "tankalarm-server";
       JAddStringToObject(req, "fleet", fleet);
