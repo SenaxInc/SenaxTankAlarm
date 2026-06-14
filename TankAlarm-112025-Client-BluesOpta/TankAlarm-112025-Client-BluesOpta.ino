@@ -5160,9 +5160,13 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   // transmitter is unpowered. Return NAN so validateSensorReading() escalates a sensor-fault
   // instead of reporting a plausible-but-wrong level. This guard sits BEFORE the calibration
   // branch so it protects both the learned-calibration and theoretical paths (a learned fit
-  // would otherwise resolve 0mA to calOffset, a healthy-looking static depth). Gas pressure
-  // monitors report raw pressure and can legitimately sit low, so they are exempt.
-  if (cfg.objectType != OBJECT_GAS && milliamps < CURRENT_LOOP_FAULT_MA) {
+  // would otherwise resolve 0mA to calOffset, a healthy-looking static depth).
+  //
+  // This applies to gas pressure monitors too: a healthy 4-20mA transmitter sitting at true
+  // zero pressure still sources 4mA (the live zero), so an under-range reading is ALWAYS a
+  // loop fault, never a legitimate 0 PSI. Without this gate an unpowered/open gas loop would
+  // read ~0mA and be reported as a real 0.0 reading instead of a sensor fault.
+  if (milliamps < CURRENT_LOOP_FAULT_MA) {
     return NAN;
   }
 
