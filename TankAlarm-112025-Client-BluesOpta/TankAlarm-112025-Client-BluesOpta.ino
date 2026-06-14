@@ -7041,7 +7041,14 @@ static float getEffectiveBatteryVoltage() {
   }
   
   // Source 2: Notecard card.voltage (direct battery connection)
-  if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f) {
+  // Skip when the Notecard reports it is USB-powered: card.voltage then reflects the USB/V+
+  // supply rail (~4.66-5V), NOT the battery. Including it — especially via the conservative
+  // min() below — would falsely drag the effective battery voltage down and trip a bogus
+  // CRITICAL_HIBERNATE that suspends telemetry and (because DFU apply is gated by power state)
+  // blocks the very OTA update that could correct it. Only trust card.voltage as a battery
+  // reading when the Notecard is running off that battery (not USB).
+  if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f &&
+      !gBatteryData.usbPowered) {
     if (!hasVoltage) {
       voltage = gBatteryData.voltage;
       hasVoltage = true;
