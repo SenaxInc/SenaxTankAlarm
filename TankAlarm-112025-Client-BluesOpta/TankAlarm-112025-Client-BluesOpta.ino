@@ -159,6 +159,13 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define CLIENT_CONFIG_PATH "/client_config.json"
 #endif
 
+// Persisted record of the firmware build sequence that last booted on this device.
+// Compared on boot to FIRMWARE_BUILD_SEQ to detect a just-installed firmware (OTA or USB)
+// and trigger an immediate confirmation telemetry sync. Lives on the app data partition.
+#ifndef FIRMWARE_MARKER_FILE
+#define FIRMWARE_MARKER_FILE "/fs/fw_marker.json"
+#endif
+
 // ============================================================================
 // Client Notefile Names — Outbound (.qo) and Inbound (.qi)
 // These override the common header where client perspective differs.
@@ -782,6 +789,10 @@ static double gSolarOnlyLastReportEpoch = 0.0;    // Last daily report epoch (pe
 static uint32_t gSolarOnlyBootCount = 0;          // Boot counter (persisted to flash)
 static bool gSolarOnlyBatteryFailed = false;      // Battery failure fallback active?
 static uint8_t gSolarOnlyBatFailCount = 0;        // Consecutive critical battery readings
+// Set true on the first boot after a firmware version change (OTA or USB update). Triggers an
+// immediate confirmation telemetry sync so transmission can be verified without waiting for the
+// next periodic/daily sync window.
+static bool gFirmwareJustUpdated = false;
 static unsigned long gSolarOnlyBatFailLastIncrMillis = 0; // When bat-fail count was last incremented
 static bool gSolarOnlyStateSaved = false;         // Has state been saved during sunset?
 
@@ -1339,6 +1350,8 @@ static unsigned long getPowerStateSleepMs(PowerState state);
 // Solar-only (no battery) mode
 static void loadSolarStateFromFlash();
 static void saveSolarStateToFlash();
+// Firmware-update detection: compares persisted build seq to FIRMWARE_BUILD_SEQ at boot
+static void checkFirmwareUpdateMarker();
 static void performStartupDebounce();
 static void checkSolarOnlySunsetProtocol(unsigned long now);
 static bool isSensorVoltageGateOpen();
@@ -1644,6 +1657,11 @@ void setup() {
     gSolarOnlySensorsReady = true;
   }
 
+  // Detect a just-installed firmware (version changed since the last boot, via OTA or USB).
+  // When true, we force an immediate sync after the boot note below so transmission can be
+  // confirmed right away instead of waiting for the next periodic/daily sync window.
+  checkFirmwareUpdateMarker();
+
   // Immediate boot telemetry so the server sees this device right away
   // instead of waiting for the first sample interval (default 30 min).
   // Solar-only clients with monitors configured skip this to avoid
@@ -1677,6 +1695,36 @@ void setup() {
     Serial.println(F("No monitors configured — sending registration..."));
     addSerialLog("Boot registration (no monitors)");
     sendRegistration("boot");
+  }
+
+  // Firmware-update confirmation: if a new firmware version just booted, force an immediate
+  // sync so the boot note above (telemetry for configured clients, registration otherwise)
+  // transmits right now. This lets an operator verify two-way communication immediately after
+  // an update rather than waiting up to the periodic outbound window (6 h on solar clients).
+  if (gFirmwareJustUpdated) {
+    Serial.println(F("Firmware updated — forcing immediate sync to confirm transmission"));
+    addSerialLog("Firmware updated - immediate transmission test");
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    mbedWatchdog.kick();
+  #else
+    IWatchdog.reload();
+  #endif
+#endif
+    J *fwSyncReq = notecard.newRequest("hub.sync");
+    if (fwSyncReq) {
+      J *fwSyncRsp = notecard.requestAndResponse(fwSyncReq);
+      if (fwSyncRsp) {
+        const char *fwSyncErr = JGetString(fwSyncRsp, "err");
+        if (fwSyncErr && fwSyncErr[0] != '\0') {
+          Serial.print(F("Firmware-update sync warning: "));
+          Serial.println(fwSyncErr);
+        } else {
+          Serial.println(F("Firmware-update confirmation sync initiated"));
+        }
+        notecard.deleteResponse(fwSyncRsp);
+      }
+    }
   }
 
   Serial.println(F("Client setup complete"));
@@ -6692,6 +6740,78 @@ static void saveSolarStateToFlash() {
     if (!tankalarm_littlefs_write_file_atomic(SOLAR_STATE_FILE,
             (const uint8_t *)buf, len)) {
       Serial.println(F("Warning: Failed to save solar state (LittleFS)"));
+    }
+  #endif
+#endif
+}
+
+/**
+ * Detect whether the firmware was just installed (version changed since the last boot).
+ *
+ * Compares the running FIRMWARE_BUILD_SEQ against a small marker file persisted on the app
+ * data partition. On a mismatch (a fresh OTA or USB flash, or the very first boot of this
+ * firmware) it sets gFirmwareJustUpdated and records the new sequence so the check fires
+ * only once per update. setup() uses the flag to force an immediate confirmation telemetry
+ * sync, so an operator can verify two-way communication right after an update instead of
+ * waiting for the next periodic/daily sync window (up to 6 h on solar clients).
+ */
+static void checkFirmwareUpdateMarker() {
+#ifdef FILESYSTEM_AVAILABLE
+  uint16_t storedSeq = 0;
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!mbedFS) return;
+    FILE *file = fopen(FIRMWARE_MARKER_FILE, "r");
+    if (file) {
+      char buf[96];
+      size_t len = fread(buf, 1, sizeof(buf) - 1, file);
+      fclose(file);
+      buf[len] = '\0';
+      JsonDocument doc;
+      if (deserializeJson(doc, buf) == DeserializationError::Ok) {
+        storedSeq = doc["seq"].is<uint16_t>() ? doc["seq"].as<uint16_t>() : 0;
+      }
+    }
+  #else
+    if (LittleFS.exists(FIRMWARE_MARKER_FILE)) {
+      File file = LittleFS.open(FIRMWARE_MARKER_FILE, "r");
+      if (file) {
+        char buf[96];
+        size_t len = file.readBytes(buf, sizeof(buf) - 1);
+        file.close();
+        buf[len] = '\0';
+        JsonDocument doc;
+        if (deserializeJson(doc, buf) == DeserializationError::Ok) {
+          storedSeq = doc["seq"].is<uint16_t>() ? doc["seq"].as<uint16_t>() : 0;
+        }
+      }
+    }
+  #endif
+
+  if (storedSeq == (uint16_t)FIRMWARE_BUILD_SEQ) {
+    return;  // Same firmware as the last boot — no confirmation needed.
+  }
+
+  gFirmwareJustUpdated = true;
+  Serial.print(F("Firmware change detected (stored seq "));
+  Serial.print(storedSeq);
+  Serial.print(F(" -> running seq "));
+  Serial.print(FIRMWARE_BUILD_SEQ);
+  Serial.println(F("); will send immediate confirmation telemetry"));
+
+  // Record the running build sequence so this only fires once per update.
+  JsonDocument out;
+  out["seq"] = (uint16_t)FIRMWARE_BUILD_SEQ;
+  out["v"] = FIRMWARE_VERSION;
+  char obuf[96];
+  size_t olen = serializeJson(out, obuf, sizeof(obuf));
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!tankalarm_posix_write_file_atomic(FIRMWARE_MARKER_FILE, obuf, olen)) {
+      Serial.println(F("Warning: failed to write firmware marker"));
+    }
+  #else
+    if (!tankalarm_littlefs_write_file_atomic(FIRMWARE_MARKER_FILE,
+            (const uint8_t *)obuf, olen)) {
+      Serial.println(F("Warning: failed to write firmware marker (LittleFS)"));
     }
   #endif
 #endif
