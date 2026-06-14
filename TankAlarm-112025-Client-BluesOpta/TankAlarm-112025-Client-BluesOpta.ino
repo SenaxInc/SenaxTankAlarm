@@ -6324,6 +6324,20 @@ static void configureBatteryMonitoring(const BatteryConfig &cfg) {
  * Returns true if data was successfully retrieved.
  */
 static bool pollBatteryVoltage(BatteryData &data, const BatteryConfig &cfg) {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  // HARDWARE LIMITATION (Blues "Wireless for Opta"): the Notecard's V+ is supplied through the
+  // carrier's DC-DC converter, which regulates it to ~5V. card.voltage therefore reads that
+  // regulated rail and physically cannot exceed ~5V — it can NEVER represent the 12V battery.
+  // Using it would misreport the battery and (via the conservative min() in
+  // getEffectiveBatteryVoltage) trip a bogus CRITICAL_HIBERNATE that halts telemetry and blocks
+  // OTA recovery. On this hardware the battery voltage comes only from the SunSaver MPPT
+  // (RS-485 Modbus) and/or the analog Vin voltage divider, so the Notecard is never used as a
+  // battery source. This single chokepoint also disables Notecard battery alerts and the daily
+  // battery section, which both gate on a successful poll / gBatteryData.valid.
+  (void)cfg;
+  data.valid = false;
+  return false;
+#else
   J *req = notecard.newRequest("card.voltage");
   if (!req) {
     data.valid = false;
@@ -6400,6 +6414,7 @@ static bool pollBatteryVoltage(BatteryData &data, const BatteryConfig &cfg) {
   Serial.println();
   
   return true;
+#endif
 }
 
 /**
@@ -7024,7 +7039,9 @@ static void checkSolarOnlySunsetProtocol(unsigned long now) {
  *
  * Sources (in priority order):
  *   1. SunSaver MPPT via Modbus RS-485 (most accurate, directly from charge controller)
- *   2. Notecard card.voltage (direct battery connection, includes trend analysis)
+ *   2. Notecard card.voltage (non-Opta only; on the Wireless-for-Opta carrier the Notecard V+
+ *      is regulated to ~5V and cannot read the 12V battery, so pollBatteryVoltage() is a no-op
+ *      there and this source is inert)
  *   3. Analog Vin voltage divider (direct ADC reading of battery via resistor divider)
  */
 static float getEffectiveBatteryVoltage() {
@@ -7040,15 +7057,12 @@ static float getEffectiveBatteryVoltage() {
     }
   }
   
-  // Source 2: Notecard card.voltage (direct battery connection)
-  // Skip when the Notecard reports it is USB-powered: card.voltage then reflects the USB/V+
-  // supply rail (~4.66-5V), NOT the battery. Including it — especially via the conservative
-  // min() below — would falsely drag the effective battery voltage down and trip a bogus
-  // CRITICAL_HIBERNATE that suspends telemetry and (because DFU apply is gated by power state)
-  // blocks the very OTA update that could correct it. Only trust card.voltage as a battery
-  // reading when the Notecard is running off that battery (not USB).
-  if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f &&
-      !gBatteryData.usbPowered) {
+  // Source 2: Notecard card.voltage — only valid where the Notecard is wired directly to the
+  // battery (non-Opta builds). On the Blues "Wireless for Opta" carrier the Notecard V+ is
+  // regulated to ~5V by a DC-DC converter and physically cannot read the 12V battery, so
+  // pollBatteryVoltage() is a no-op there and gBatteryData.valid stays false — this source is
+  // skipped and can never drive the power-state machine on that hardware.
+  if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f) {
     if (!hasVoltage) {
       voltage = gBatteryData.voltage;
       hasVoltage = true;
