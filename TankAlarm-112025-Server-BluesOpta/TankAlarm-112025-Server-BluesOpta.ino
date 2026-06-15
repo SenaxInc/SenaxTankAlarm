@@ -4429,6 +4429,11 @@ void loop() {
       IWatchdog.reload();
   #endif
 #endif
+      // v1.9.26: free the old LISTEN PCB before re-initializing. The Opta LWIP socket pool is only
+      // 4 deep; calling gWebServer.begin() again without first ending the previous listener leaks a
+      // LISTEN socket each recovery cycle, eventually starving port 80 / FTPS. Mirror the
+      // end()-before-begin pattern already used around the FTP backup/restore paths.
+      gWebServer.end();
       initializeEthernet();   // re-read MAC (if needed) + Ethernet.begin() + DHCP/static fallback
       gWebServer.begin();     // restart the listener on the (possibly new) socket
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
