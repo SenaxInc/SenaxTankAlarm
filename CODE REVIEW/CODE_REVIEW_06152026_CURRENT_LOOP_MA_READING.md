@@ -349,3 +349,21 @@ Following the Section 15 fix sequence, and because the protocol rewrite cannot b
 - **Staged (needs hardware-in-the-loop validation, item 3 + item 5):** replace the production read with the framed `ARG_OA_CH_ADC` configure + `ARG_OA_GET_ADC` read (with CRC validation), or adopt the official `Arduino_Opta_Blueprint` API. Must be validated on a freshly-reset A0602 (raw-before-config vs configured-read) and checked for coexistence with the handcrafted PWM path and expansion addressing. The new `pg` telemetry + the on-device `Blueprint_CH0_Test` capture should confirm H1 before this lands.
 
 **Net effect now:** the system can no longer report a confident-but-false 43.8 psi when the loop isn't powered (it faults instead), and we gain the remote signal needed to finish the root fix safely. Shipped as v1.9.22.
+
+---
+
+## 17. Root Fix Implemented (v1.9.23)
+
+**Date:** 2026-06-15
+
+The staged protocol rewrite was implemented, with all frame constants copied verbatim from the installed `Arduino_Opta_Blueprint` source (per Section 15 item 6 — not guessed). Files read to extract the exact protocol: `OptaAnalogProtocol.h`, `OptaBlueProtocol.h`, `OptaCrc.h`, `OptaMsgCommon.cpp`, `AnalogExpansion.cpp` (`beginChannelAsAdc`, `msg_begin_adc`, `msg_get_adc`, `parse_ans_get_adc`, `pinCurrent`), `OptaController.cpp` (`send`, `_send`, `wait_for_device_answer`).
+
+**Exact protocol now used (new helpers in `TankAlarm_I2C.h`):**
+- **Configure channel** — `tankalarm_configureCurrentAdcChannel()` sends `SET ARG_OA_CH_ADC (0x09)`, 7-byte payload `[ch][type=OA_CURRENT_ADC=1][pull_down=DISABLE=2][rejection=ENABLE=1][diagnostic=DISABLE=2][moving_avg=0][adding_adc=DISABLE=2]`, CRC8 (poly 0x07, init 0). Mirrors `beginChannelAsCurrentAdc → beginChannelAsAdc(ch, OA_CURRENT_ADC, false, true, false, 0)`.
+- **Read value** — `tankalarm_readCurrentAdcFramed()` sends `GET ARG_OA_GET_ADC (0x0A)` then reads the 7-byte answer `[BP_ANS_GET=0x03][0x0A][LEN=0x03][ch][lo][hi][CRC]`, validates header + CRC, decodes the little-endian 16-bit value, and returns **`mA = 25.0 * raw / 65535`** (the A0602 current-ADC scale from `pinCurrent`). **This formula also corrects H6** — the legacy `4 + raw/65535*16` mapping was wrong even on a good read.
+
+**Integration (client `readCurrentLoopSensor`):** after P1 gate ON + warmup, the channel is (re)configured every powered read (the config is lost when P1 powers off in the low-power gating cycle), then a primed framed read is discarded and 4 framed samples are averaged. Any I2C/framing/CRC failure returns `-1` → counted invalid → the v1.9.22 fault path returns `NAN` (sensor fault). So a wrong/incompatible frame **fails safe to "sensor fault," never a fabricated pressure.** The legacy bare-read helper is retained only for the diagnostic sketches.
+
+**Why it should work without `OptaController.begin()` discovery:** production `tankalarm_setPwm()` already drives the A0602 with the same framed style at the fixed address (0x64) and demonstrably switches P1, proving the module accepts framed commands at that address without running the library's discovery/addressing. The read uses the identical write-then-`requestFrom` handshake the library's `_send`/`wait_for_device_answer` use.
+
+**VALIDATION CAVEAT (important):** this could not be hardware-validated before release (the server is USB-only and the client is remote/cellular). It is built from exact source constants and is fault-safe, but the I2C read-back timing and the fixed-address assumption should be confirmed on the **USB-accessible client**: flash v1.9.23, watch serial / the `ma` + `pg` telemetry for a correct ~4 mA at 0 psi, and cross-check with `Blueprint_CH0_Test`. If the framed read does not validate, the sensor reports a fault (safe) rather than a false value, and we iterate with the client on USB. Shipped as v1.9.23.

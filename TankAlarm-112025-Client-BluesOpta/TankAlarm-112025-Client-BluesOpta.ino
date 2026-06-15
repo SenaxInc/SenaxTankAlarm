@@ -5280,6 +5280,26 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
+  // Configure the A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol
+  // BEFORE reading (v1.9.23). The legacy bare read never configured the channel and returned a
+  // stale register (the constant ~18mA / 43.8psi symptom). In the power-gated model the channel
+  // loses its config when P1 is switched off, so we (re)configure here on every powered read,
+  // after the warmup so the rail is up. A failed config is non-fatal: the framed read below
+  // CRC-validates the answer and faults (NAN) rather than trusting a bad frame.
+  bool adcConfigOk = tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr);
+  if (!adcConfigOk) {
+    Serial.print(F("WARNING: A0602 current-ADC channel config NACK on ch "));
+    Serial.println(channel);
+  }
+  delay(2);
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    mbedWatchdog.kick();
+  #else
+    IWatchdog.reload();
+  #endif
+#endif
+
   // Inter-sample settle. The A0602 current-loop ADC needs time to deliver a fresh conversion
   // after the channel is selected. The validated standalone gating test (P1_Transistor_Gating_Test)
   // sampled at 300ms spacing and read the transmitter correctly; the small production default
@@ -5291,11 +5311,11 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
             ? (uint32_t)cfg.pwmGatingSampleDelay : (uint32_t)CURRENT_LOOP_GATED_SETTLE_MS)
       : 5UL;
 
-  // Priming read (gated sensors only): select the channel and discard one conversion, then
-  // settle, so the averaged samples below reflect the freshly-powered transmitter rather than a
-  // stale pre-warmup ADC value. This mirrors the proven P1_Transistor_Gating_Test sequence.
+  // Priming read (gated sensors only): take one framed conversion and discard it, then settle,
+  // so the averaged samples below reflect the freshly-powered+configured transmitter rather than
+  // a stale pre-warmup ADC value. This mirrors the proven P1_Transistor_Gating_Test sequence.
   if (cfg.pwmGatingEnabled) {
-    (void)readCurrentLoopMilliamps(channel);
+    (void)tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
     delay(sampleSettleMs);
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -5312,7 +5332,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   float total = 0.0f;
   uint8_t validSamples = 0;
   for (uint8_t s = 0; s < numSamples; ++s) {
-    float sample = readCurrentLoopMilliamps(channel);
+    float sample = tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
     if (sample >= 0.0f) {
       total += sample;
       validSamples++;

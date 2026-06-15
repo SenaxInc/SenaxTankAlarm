@@ -358,4 +358,117 @@ static inline float tankalarm_readCurrentLoopMilliamps(
   return -1.0f;  // All retries exhausted
 }
 
+// ============================================================================
+// Current Loop Reading — Official Blueprint Framed Protocol (A0602)  [v1.9.23]
+// ============================================================================
+// The legacy tankalarm_readCurrentLoopMilliamps() above does a bare
+// `write(channel) / requestFrom(2)` shortcut that NEVER configures the A0602 input
+// channel into 4-20mA current-ADC mode and does not use a real Blueprint GET frame.
+// On standard A0602 firmware that returns a stale/default register (the constant ~18mA
+// / 43.8psi symptom). The functions below speak the SAME framed protocol the official
+// Arduino_Opta_Blueprint library uses (and that the proven Blueprint_CH0_Test relies on):
+//   - configure the channel:  SET ARG_OA_CH_ADC (0x09), 7-byte payload, CRC8
+//   - read the value:         GET ARG_OA_GET_ADC (0x0A), CRC8, answer parsed + CRC-verified
+// All command IDs, payload byte order, the CRC (poly 0x07, init 0) and the 0-25mA ADC
+// scale were copied verbatim from the installed library source (OptaAnalogProtocol.h,
+// OptaMsgCommon.cpp, AnalogExpansion.cpp) — not guessed.
+//
+// Blueprint protocol constants (literal values mirrored from the library headers):
+//   BP_CMD_SET=0x01 BP_CMD_GET=0x02 BP_ANS_GET=0x03 ; header is [CMD][ARG][LEN] then payload then CRC
+//   ARG_OA_CH_ADC=0x09  LEN_OA_CH_ADC=0x07
+//   ARG_OA_GET_ADC=0x0A LEN_OA_GET_ADC=0x01 ; ANS_LEN_OA_GET_ADC=0x03 (channel + 16-bit LE value)
+//   OA_VOLTAGE_ADC=0 OA_CURRENT_ADC=1 ; OA_ENABLE=0x01 OA_DISABLE=0x02
+// beginChannelAsCurrentAdc => beginChannelAsAdc(ch, OA_CURRENT_ADC, pull_down=false,
+//   rejection=true, diagnostic=false, moving_avg=0, adding_adc=false).
+// pinCurrent (plain current ADC channel) => mA = 25.0 * raw / 65535.0.
+
+// CRC-8, polynomial 0x07, initial value 0x00 (Opta Blueprint frame CRC).
+static inline uint8_t tankalarm_optaCrc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; ++b) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+/**
+ * Configure an A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol.
+ * Must be called AFTER loop power is applied (e.g. after the P1 gate warmup) and BEFORE
+ * tankalarm_readCurrentAdcFramed(); in the power-gated low-power model the channel config
+ * is re-applied on every power-on cycle.
+ *
+ * @return true if the config frame was written (endTransmission ACK), false on I2C NACK.
+ */
+static inline bool tankalarm_configureCurrentAdcChannel(uint8_t channel, uint8_t i2cAddr) {
+  uint8_t buf[11];
+  buf[0] = 0x01;          // BP_CMD_SET
+  buf[1] = 0x09;          // ARG_OA_CH_ADC
+  buf[2] = 0x07;          // LEN_OA_CH_ADC (7-byte payload)
+  buf[3] = channel;       // OA_CH_ADC_CHANNEL_POS
+  buf[4] = 0x01;          // OA_CH_ADC_TYPE_POS = OA_CURRENT_ADC
+  buf[5] = 0x02;          // OA_CH_ADC_PULL_DOWN_POS = OA_DISABLE (false)
+  buf[6] = 0x01;          // OA_CH_ADC_REJECTION_POS = OA_ENABLE (true)
+  buf[7] = 0x02;          // OA_CH_ADC_DIAGNOSTIC_POS = OA_DISABLE (false)
+  buf[8] = 0x00;          // OA_CH_ADC_MOVING_AVE_POS = 0
+  buf[9] = 0x02;          // OA_CH_ADC_ADDING_ADC_POS = OA_DISABLE (single ADC)
+  buf[10] = tankalarm_optaCrc8(buf, 10);
+
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(buf, 11);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  // Drain the SET acknowledge frame (header 3 + CRC 1 = 4 bytes; LEN 0) so it does not
+  // pollute the next read. A short/absent ACK is tolerated — the GET below CRC-validates
+  // the real channel state, which is what actually matters.
+  delay(1);
+  (void)Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available()) { (void)Wire.read(); }
+  return true;
+}
+
+/**
+ * Read one 4-20mA sample from an A0602 channel using the framed GET protocol with full
+ * answer header + CRC validation. Returns milliamps on the A0602's 0-25mA current-ADC
+ * scale, or -1.0f on ANY I2C/framing/CRC failure (caller treats <0 as a fault — it never
+ * fabricates a plausible value from a bad frame).
+ */
+static inline float tankalarm_readCurrentAdcFramed(uint8_t channel, uint8_t i2cAddr) {
+  uint8_t req[5];
+  req[0] = 0x02;          // BP_CMD_GET
+  req[1] = 0x0A;          // ARG_OA_GET_ADC
+  req[2] = 0x01;          // LEN_OA_GET_ADC
+  req[3] = channel;       // OA_CH_ADC_CHANNEL_POS
+  req[4] = tankalarm_optaCrc8(req, 4);
+
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(req, 5);
+  if (Wire.endTransmission() != 0) {
+    return -1.0f;
+  }
+  delay(1); // allow the expansion to stage its answer buffer
+  // Answer = [BP_ANS_GET=0x03][ARG=0x0A][LEN=0x03][channel][value_lo][value_hi][CRC] = 7 bytes
+  const uint8_t ANS_LEN = 7;
+  uint8_t got = Wire.requestFrom(i2cAddr, ANS_LEN);
+  uint8_t a[7];
+  uint8_t n = 0;
+  while (Wire.available() && n < ANS_LEN) { a[n++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (got != ANS_LEN || n != ANS_LEN) {
+    return -1.0f;
+  }
+  // Validate framing: command, argument, length, then CRC over the first 6 bytes.
+  if (a[0] != 0x03 || a[1] != 0x0A || a[2] != 0x03) {
+    return -1.0f;
+  }
+  if (tankalarm_optaCrc8(a, 6) != a[6]) {
+    return -1.0f;
+  }
+  uint16_t raw = (uint16_t)a[4] | ((uint16_t)a[5] << 8); // little-endian
+  return 25.0f * (float)raw / 65535.0f; // A0602 current-ADC full scale (matches pinCurrent)
+}
+
 #endif // TANKALARM_I2C_H
