@@ -1317,6 +1317,7 @@ static float readPulseSensorResult(uint8_t idx) {
 }
 static void evaluateAlarms(uint8_t idx);
 static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow);
+static float getEffectiveBatteryVoltage();
 static void sendRegistration(const char *reason);
 static void sendAlarm(uint8_t idx, const char *alarmType, float inches);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
@@ -5784,6 +5785,15 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   doc["r"] = reason;
   // Use acquisition time so stale/reused values do not get a fresh timestamp.
   doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
+
+  // TEMPORARY (2026-06-15): include system voltage in every telemetry note so the dashboard
+  // VIN reflects the live battery/MPPT reading instead of waiting for the once-daily report.
+  // This duplicates the voltage already sent in the daily report and may be REMOVED later once
+  // we are satisfied with daily-only reporting (or replaced by a dedicated power note).
+  float telemetryVoltage = getEffectiveBatteryVoltage();
+  if (telemetryVoltage > 0.0f) {
+    doc["v"] = roundTo(telemetryVoltage, 2);
+  }
 
   publishNote(TELEMETRY_FILE, doc, syncNow);
 }

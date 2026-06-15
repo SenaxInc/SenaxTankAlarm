@@ -11512,6 +11512,21 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // Track client firmware version and reconcile against any expected OTA target.
   noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
+  // TEMPORARY (2026-06-15): clients now include live system voltage "v" in telemetry (not just
+  // the daily report) so the dashboard VIN updates in near-real-time. May be REMOVED later if we
+  // revert to daily-only voltage reporting on the client.
+  {
+    float telemetryVin = doc["v"] | 0.0f;
+    if (telemetryVin > 0.0f) {
+      ClientMetadata *vmeta = findOrCreateClientMetadata(clientUid);
+      if (vmeta) {
+        vmeta->vinVoltage = telemetryVin;
+        vmeta->vinVoltageEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+        gClientMetadataDirty = true;
+      }
+    }
+  }
+
   strlcpy(rec->site, doc["s"] | "", sizeof(rec->site));
   
   // Only update label if provided in message (optional field)
