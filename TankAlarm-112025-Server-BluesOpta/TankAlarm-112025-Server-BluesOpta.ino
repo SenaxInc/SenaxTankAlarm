@@ -472,6 +472,13 @@ struct SensorRecord {
 #define MAX_CLIENT_METADATA 20
 #endif
 
+// An expected-but-not-yet-reported firmware version older than this is flagged "stalled".
+// Sized just over the client's 24h daily DFU window so a healthy client has had at least one
+// chance to pull and apply the update before we raise a stall alert.
+#ifndef OTA_STALL_SECONDS
+#define OTA_STALL_SECONDS (26UL * 3600UL)
+#endif
+
 struct ClientMetadata {
   char clientUid[48];
   float vinVoltage;          // Blues Notecard VIN voltage from daily report
@@ -490,6 +497,12 @@ struct ClientMetadata {
   double tempCacheEpoch;     // When temperature was last fetched
   // Client firmware version tracking
   char firmwareVersion[16];  // Firmware version string from client telemetry/daily
+  // OTA update management (expected-vs-reported reconciliation for operator visibility)
+  char expectedFirmwareVersion[16]; // Version the operator pushed/expects ("" = none expected)
+  char otaState[16];                // "", pending, stalled, reverted, stage-failed, ok
+  char otaDetail[48];               // Human-readable detail/reason for the current OTA state
+  double otaStateEpoch;             // When the expectation was set (reference for stall timing)
+  uint8_t otaAttempts;              // Count of failed OTA attempts reported by the client
   // Stale alerting state
   bool staleAlertSent;       // Whether a stale alert has been sent for this client
   bool staleDeletionPending; // Whether deletion of this stale client is pending operator approval
@@ -2169,7 +2182,7 @@ state.sparkData=map;renderSparklines();}catch(e){console.warn('Sparkline data un
 function renderSparklines(){
 document.querySelectorAll('.dc-sparkline[data-spark-key]').forEach(el=>{
 const key=el.dataset.sparkKey;const readings=state.sparkData[key];if(readings&&readings.length>=2){el.innerHTML='';drawSparkline(el,readings,el.dataset.sparkColor);}});}
-function buildSiteModel(rawClients){const sites={};rawClients.forEach(c=>{const uid=c.c||'';const site=c.s||'Unknown Site';if(!sites[site])sites[site]={name:site,clients:{}};if(!sites[site].clients[uid])sites[site].clients[uid]={uid:uid,alarm:!!c.a,lastUpdate:c.u||0,vinVoltage:c.v,vinVoltageEpoch:c.ve,sensors:[]};const cl=sites[site].clients[uid];if(c.a)cl.alarm=true;if(c.u>cl.lastUpdate)cl.lastUpdate=c.u;const sensors=Array.isArray(c.ts)?c.ts:[];if(sensors.length){sensors.forEach((t,idx)=>{cl.sensors.push({label:t.n||c.n||'Sensor',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,sensorMa:t.ma,sensorType:t.st||'',objectType:t.ot||'tank',measurementUnit:t.mu||'',contents:t.ct||'',alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,change24h:t.d,sensorIdx:idx,_clientUid:uid});});}else if(c.u){cl.sensors.push({label:c.n||'Sensor',sensorIndex:c.k||'',userNumber:c.un||0,levelInches:c.l,sensorMa:c.ma,sensorType:'',objectType:'tank',measurementUnit:'',contents:'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,change24h:undefined,sensorIdx:0,_clientUid:uid});}});return sites;}
+function buildSiteModel(rawClients){const sites={};rawClients.forEach(c=>{const uid=c.c||'';const site=c.s||'Unknown Site';if(!sites[site])sites[site]={name:site,clients:{}};if(!sites[site].clients[uid])sites[site].clients[uid]={uid:uid,alarm:!!c.a,lastUpdate:c.u||0,vinVoltage:c.v,vinVoltageEpoch:c.ve,otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sensors:[]};const cl=sites[site].clients[uid];if(c.a)cl.alarm=true;if(c.u>cl.lastUpdate)cl.lastUpdate=c.u;const sensors=Array.isArray(c.ts)?c.ts:[];if(sensors.length){sensors.forEach((t,idx)=>{cl.sensors.push({label:t.n||c.n||'Sensor',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,sensorMa:t.ma,sensorType:t.st||'',objectType:t.ot||'tank',measurementUnit:t.mu||'',contents:t.ct||'',alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,change24h:t.d,sensorIdx:idx,_clientUid:uid});});}else if(c.u){cl.sensors.push({label:c.n||'Sensor',sensorIndex:c.k||'',userNumber:c.un||0,levelInches:c.l,sensorMa:c.ma,sensorType:'',objectType:'tank',measurementUnit:'',contents:'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,change24h:undefined,sensorIdx:0,_clientUid:uid});}});return sites;}
 )HTML" R"HTML(
 function clientStatusColor(cl){if(cl.alarm)return'red';if(!cl.lastUpdate||isStale(cl.lastUpdate))return'yellow';return'green';}
 function renderSites(){const container=els.siteContainer;container.innerHTML='';const siteNames=Object.keys(state.sites).sort();if(!siteNames.length){container.innerHTML='<div class="no-data">No telemetry available yet.</div>';return;}
@@ -2183,7 +2196,7 @@ const staleBadge=stale&&t.lastUpdate?`<span class="status-pill stale">Stale</spa
 let sparkHtml='';if(SPARKLINE_TYPES.has(ot)){const sparkKey=escapeHtml(t._clientUid)+'|'+(t.sensorIndex||1);const sparkColor=ot==='gas'?'#f59e0b':ot==='flow'?'#10b981':'#2563eb';sparkHtml=`<div class="dc-sparkline" data-spark-key="${sparkKey}" data-spark-color="${sparkColor}"><span class="spark-label">Loading trend...</span></div>`;}
 card.innerHTML=`<div class="dc-type">${objectTypeLabel(ot)} ${staleBadge}</div><div class="dc-name">${escapeHtml(t.label||'Sensor')}${t.userNumber?' #'+t.userNumber:''}</div>${contentsHtml}<div class="dc-value">${val} <small>${escapeHtml(mu)}</small></div>${sparkHtml}${changeHtml}${alarmHtml}<div class="dc-meta"><span>${t.lastUpdate?'Updated '+timeAgo(t.lastUpdate):'No data yet'}</span>${t._vinVoltage&&t._vinVoltage>0?'<span>VIN: '+t._vinVoltage.toFixed(2)+'V</span>':''}</div><div class="dc-actions"><button class="secondary btn-small" onclick="refreshSensor('${escapeHtml(t._clientUid)}')" ${state.refreshing?'disabled':''}>Refresh</button><button class="secondary btn-small" onclick="clearRelays('${escapeHtml(t._clientUid)}',${t.sensorIdx||0})" ${state.refreshing?'disabled':''}>Clear Relay</button></div>`;return card;}
 )HTML" R"HTML(
-function toggleDotInfo(section,cl,siteName){const slot=section.querySelector('.cdot-info-slot');if(state.expandedDot===cl.uid){slot.innerHTML='';state.expandedDot=null;return;}state.expandedDot=cl.uid;const color=clientStatusColor(cl);const statusText=cl.alarm?'ALARM':isStale(cl.lastUpdate)?'Stale / No Data':'Online';const sensorCount=cl.sensors.length;slot.innerHTML=`<div class="cdot-info open"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;"><div><strong>${escapeHtml(cl.uid)}</strong><span class="status-pill ${color==='red'?'alarm':color==='yellow'?'stale':'ok'}" style="margin-left:8px;">${statusText}</span></div><div style="display:flex;gap:6px;"><a class="pill secondary" style="font-size:0.75rem;padding:2px 10px;" href="/config-generator?uid=${encodeURIComponent(cl.uid)}">Edit Config</a><a class="pill secondary" style="font-size:0.75rem;padding:2px 10px;" href="/site-config?site=${encodeURIComponent(siteName)}">Site Config</a><button class="pill secondary" style="font-size:0.75rem;padding:2px 10px;color:var(--danger);border-color:var(--danger);" onclick="deleteClient('${escapeHtml(cl.uid)}')">Remove Client</button></div></div><div style="margin-top:6px;color:var(--muted);font-size:0.85rem;">${sensorCount} sensor${sensorCount!==1?'s':''} &middot; Last update: ${formatEpoch(cl.lastUpdate)} &middot; VIN: ${formatVoltage(cl.vinVoltage)}</div></div>`;}
+function toggleDotInfo(section,cl,siteName){const slot=section.querySelector('.cdot-info-slot');if(state.expandedDot===cl.uid){slot.innerHTML='';state.expandedDot=null;return;}state.expandedDot=cl.uid;const color=clientStatusColor(cl);const statusText=cl.alarm?'ALARM':isStale(cl.lastUpdate)?'Stale / No Data':'Online';const sensorCount=cl.sensors.length;slot.innerHTML=`<div class="cdot-info open"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;"><div><strong>${escapeHtml(cl.uid)}</strong><span class="status-pill ${color==='red'?'alarm':color==='yellow'?'stale':'ok'}" style="margin-left:8px;">${statusText}</span>${cl.otaState&&cl.otaState!=='ok'?'<span style="margin-left:8px;background:'+(cl.otaState==='pending'?'#f59e0b':'#dc2626')+';color:#fff;padding:1px 6px;border-radius:3px;font-size:0.72rem;" title="'+escapeHtml(cl.otaDetail||'')+'">OTA '+escapeHtml(cl.otaState)+(cl.expectedFw?'&rarr;v'+escapeHtml(cl.expectedFw):'')+'</span>':''}</div><div style="display:flex;gap:6px;"><a class="pill secondary" style="font-size:0.75rem;padding:2px 10px;" href="/config-generator?uid=${encodeURIComponent(cl.uid)}">Edit Config</a><a class="pill secondary" style="font-size:0.75rem;padding:2px 10px;" href="/site-config?site=${encodeURIComponent(siteName)}">Site Config</a><button class="pill secondary" style="font-size:0.75rem;padding:2px 10px;color:var(--danger);border-color:var(--danger);" onclick="deleteClient('${escapeHtml(cl.uid)}')">Remove Client</button></div></div><div style="margin-top:6px;color:var(--muted);font-size:0.85rem;">${sensorCount} sensor${sensorCount!==1?'s':''} &middot; Last update: ${formatEpoch(cl.lastUpdate)} &middot; VIN: ${formatVoltage(cl.vinVoltage)}</div></div>`;}
 function updateStats(){const allClients=Object.values(state.sites).flatMap(s=>Object.values(s.clients));const allSensors=allClients.flatMap(c=>c.sensors);const clientIds=new Set(allClients.map(c=>c.uid));if(els.statClients)els.statClients.textContent=clientIds.size;if(els.statTanks)els.statTanks.textContent=allSensors.length;if(els.statAlarms)els.statAlarms.textContent=allSensors.filter(t=>t.alarm).length;const stale=allSensors.filter(t=>isStale(t.lastUpdate)).length;if(els.statStale)els.statStale.textContent=stale;}
 )HTML" R"HTML(
 function renderPauseButton(){const btn=els.pauseBtn;if(!btn)return;if(state.paused){btn.classList.add('paused');btn.style.display='';btn.textContent='Unpause';btn.title='Resume data flow';}else{btn.classList.remove('paused');btn.style.display='none';}}
@@ -2225,7 +2238,7 @@ async function fetchLocationInfo(clientUid){if(!clientUid || !els.locationInfo)r
 if(els.refreshSelectedBtn)els.refreshSelectedBtn.addEventListener('click',()=>{if(!state.selected){showToast('Select a client first.',true);return;}triggerManualRefresh(state.selected);});if(els.requestLocationBtn)els.requestLocationBtn.addEventListener('click',()=>{requestLocation(state.selected);});refreshData().then(()=>{if(state.selected)fetchLocationInfo(state.selected);});async function approveDeletion(uid){const pin=prompt('Enter your admin command pin to approve and execute deletion for client: '+uid);if(pin===null)return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid,pin:pin})});if(!res.ok){throw new Error(await res.text()||'Deletion failed');}showToast('Client removed: '+uid);state.selected=null;await refreshData();}catch(err){showToast(err.message||'Failed to remove client',true);}}window.approveDeletion=approveDeletion;})();
 </script></body></html>)HTML";
 
-static const char SITE_CONFIG_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Site Configuration - Tank Alarm Server</title><link rel="stylesheet" href="/style.css"><style>.site-title{font-size:1.5rem;font-weight:700;margin:0;}.site-subtitle{color:var(--muted);font-size:0.9rem;margin-top:4px;}.client-grid{display:grid;gap:16px;margin-top:16px;}.client-card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;padding:16px;}.client-card.has-alarm{border-left:4px solid var(--danger);}.client-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;}.client-name{font-weight:600;font-size:1.05rem;}.client-uid{font-family:monospace;font-size:0.8rem;color:var(--muted);margin-top:2px;}.sensor-list{display:grid;gap:8px;}.sensor-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:0.9rem;}.sensor-row.alarm{background:rgba(220,38,38,0.08);}.sensor-level{font-weight:600;font-size:1.1rem;}.sensor-status{font-size:0.85rem;}.uid-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:0.9rem;}.uid-table th,.uid-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--card-border);}.uid-table th{font-weight:600;color:var(--muted);font-size:0.8rem;text-transform:uppercase;}.uid-table td code{font-size:0.85rem;cursor:pointer;}.uid-table td code:hover{color:var(--accent);}.copy-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;padding:8px 16px;border-radius:6px;font-size:0.85rem;opacity:0;transition:opacity 0.3s;pointer-events:none;}.copy-toast.show{opacity:1;}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;"><div><h1 class="site-title" id="siteTitle">Loading...</h1><p class="site-subtitle" id="siteSubtitle"></p></div><div style="display:flex;gap:8px;flex-wrap:wrap;"><button id="addClientBtn" class="pill">+ Add Client</button><button id="backBtn" class="pill secondary" onclick="window.location.href='/client-console'">Back to Console</button></div></div></div><div class="card"><h2 style="margin-top:0;">Client Devices</h2><div id="clientGrid" class="client-grid"><div class="empty-state">Loading site data...</div></div></div><div class="card"><h2 style="margin-top:0;">Client UID Quick Reference</h2><p style="color:var(--muted);font-size:0.9rem;margin-bottom:8px;">Click any UID to copy it. Use these UIDs for relay target configuration.</p><table class="uid-table"><thead><tr><th>Device Label</th><th>Client UID</th><th>Sensors</th><th>Firmware</th><th>Status</th></tr></thead><tbody id="uidTableBody"></tbody></table></div></main><div id="toast"></div><div class="copy-toast" id="copyToast">UID copied to clipboard</div>)HTML" R"HTML(<script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);function escapeHtml(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}function formatNumber(v){return(typeof v==='number'&&isFinite(v))?v.toFixed(1):'--';}function formatEpoch(e){if(!e)return'--';const d=new Date(e*1000);if(isNaN(d.getTime()))return'--';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}function getQueryParam(n){return new URLSearchParams(window.location.search).get(n)||'';}const siteName=getQueryParam('site');if(!siteName){document.getElementById('siteTitle').textContent='No site specified';document.getElementById('clientGrid').innerHTML='<div class="empty-state">Use ?site=SiteName in the URL or navigate from the Client Console.</div>';return;}document.getElementById('siteTitle').textContent=siteName;document.title=siteName+' - Site Configuration';document.getElementById('addClientBtn').addEventListener('click',()=>{window.location.href='/config-generator?site='+encodeURIComponent(siteName);});function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}function copyUid(uid){navigator.clipboard.writeText(uid).then(()=>{const ct=document.getElementById('copyToast');ct.classList.add('show');setTimeout(()=>ct.classList.remove('show'),1500);}).catch(()=>{showToast('Copy failed',true);});}window.copyUid=copyUid;)HTML" R"HTML(async function loadSiteData(){try{const r=await fetch('/api/clients?summary=1');if(!r.ok)throw new Error('Failed to fetch');const raw=await r.json();const srv=raw.srv||{};const allClients=(raw.cs||[]).map(c=>({uid:c.c||'',site:c.s||'Unknown Site',label:c.n||'',sensorIndex:c.k||'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,levelInches:c.l,sensorMa:c.ma,vinVoltage:c.v,vinVoltageEpoch:c.ve,firmwareVersion:c.fv||'',sensorCount:c.tc||1,sensors:(c.ts||[]).map(t=>({label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,sensorType:t.st||'',objectType:t.ot||'',measurementUnit:t.mu||'',contents:t.ct||'',change24h:t.d}))}));const siteClients=allClients.filter(c=>c.site===siteName);const uniqueMap=new Map();siteClients.forEach(c=>{if(!uniqueMap.has(c.uid)){uniqueMap.set(c.uid,{uid:c.uid,label:c.label,alarm:false,vinVoltage:c.vinVoltage,vinVoltageEpoch:c.vinVoltageEpoch,firmwareVersion:c.firmwareVersion,sensors:[]});}const entry=uniqueMap.get(c.uid);if(c.sensors&&c.sensors.length){c.sensors.forEach(t=>entry.sensors.push(t));}else{entry.sensors.push({label:c.label||'',sensorIndex:c.sensorIndex,levelInches:c.levelInches,alarm:c.alarm,alarmType:c.alarmType,lastUpdate:c.lastUpdate,objectType:'',measurementUnit:'',contents:''});}if(c.alarm)entry.alarm=true;entry.sensors.forEach(t=>{if(t.alarm)entry.alarm=true;});});const clients=Array.from(uniqueMap.values());document.getElementById('siteSubtitle').textContent=clients.length+' client device'+(clients.length===1?'':'s')+' at this site';renderClients(clients);renderUidTable(clients);}catch(e){console.error(e);document.getElementById('clientGrid').innerHTML='<div class="empty-state">Error loading site data.</div>';}}function objectTypeLabel(ot){const map={tank:'Tank',gas:'Gas Monitor',engine:'Engine',pump:'Pump',flow:'Flow Meter'};return map[ot]||'Sensor';}function sensorDisplayName(t){const ot=t.objectType||'';const lbl=t.label||objectTypeLabel(ot);return lbl+(t.userNumber?' #'+t.userNumber:'');}function unitLabel(mu,ot){const abr={inches:'in',psi:'psi',rpm:'rpm',gpm:'gpm'};if(mu){const k=mu.toLowerCase();return abr[k]||mu;}if(ot==='gas')return'psi';if(ot==='rpm')return'rpm';if(ot==='flow')return'gpm';return'in';}function renderClients(clients){const grid=document.getElementById('clientGrid');grid.innerHTML='';if(!clients.length){grid.innerHTML='<div class="empty-state">No client devices found at this site.</div>';return;})HTML" R"HTML(clients.forEach(client=>{const card=document.createElement('div');card.className='client-card'+(client.alarm?' has-alarm':'');let tanksHtml='';client.sensors.forEach(t=>{const alarmClass=t.alarm?' alarm':'';const statusHtml=t.alarm?`<span class="sensor-status" style="color:var(--danger);font-weight:600;">ALARM: ${escapeHtml(t.alarmType)}</span>`:'<span class="sensor-status" style="color:#10b981;">Normal</span>';const mu=unitLabel(t.measurementUnit,t.objectType);const changeHtml=(typeof t.change24h==='number')?`<span style="font-size:0.8rem;color:var(--muted);">${t.change24h>=0?'+':''}${t.change24h.toFixed(1)} ${mu}/24h</span>`:'';const contentsHtml=t.contents?`<span style="font-size:0.8rem;color:var(--muted);margin-left:6px;">(${escapeHtml(t.contents)})</span>`:'';tanksHtml+=`<div class="sensor-row${alarmClass}"><div><strong>${escapeHtml(sensorDisplayName(t))}</strong>${contentsHtml} ${changeHtml}</div><div style="text-align:right;"><span class="sensor-level">${formatNumber(t.levelInches)}</span> <small style="color:var(--muted)">${mu}</small><div style="font-size:0.8rem;color:var(--muted);">${formatEpoch(t.lastUpdate)}</div></div></div>`;});const voltageHtml=(typeof client.vinVoltage==='number'&&client.vinVoltage>=6.0)?`<span style="font-size:0.85rem;color:var(--muted);">VIN: ${client.vinVoltage.toFixed(2)}V</span>`:'';const versionHtml=client.firmwareVersion?`<span style="font-size:0.75rem;color:var(--muted);margin-left:8px;background:var(--chip);padding:2px 6px;text-transform:lowercase;font-weight:600;">v${escapeHtml(client.firmwareVersion)}</span>`:'';card.innerHTML=`<div class="client-header"><div><div class="client-name" style="display:flex;align-items:center;flex-wrap:wrap;">${escapeHtml(client.label||'Client Device')}${versionHtml}</div><div class="client-uid">${escapeHtml(client.uid)}</div>${voltageHtml}</div><div style="display:flex;gap:6px;"><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;" onclick="window.location.href='/config-generator?uid=${encodeURIComponent(client.uid)}'">Edit Config</button><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;color:var(--danger);border-color:var(--danger);" onclick="deleteClient('${escapeHtml(client.uid)}')">Remove Client</button></div></div><div class="sensor-list">${tanksHtml}</div>`;grid.appendChild(card);});}async function deleteClient(uid){if(!confirm('Remove client '+uid+' and all its sensor data? This action cannot be undone.'))return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid})});if(!res.ok){throw new Error(await res.text()||'Delete failed');}showToast('Client removed successfully');loadSiteData();}catch(err){showToast(err.message||'Failed to remove client',true);}}function renderUidTable(clients){const tbody=document.getElementById('uidTableBody');tbody.innerHTML='';if(!clients.length){tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);">No clients at this site.</td></tr>';return;}clients.forEach(client=>{const tr=document.createElement('tr');const hasAlarm=client.sensors.some(t=>t.alarm);const statusHtml=hasAlarm?'<span style="color:var(--danger);font-weight:600;">ALARM</span>':'<span style="color:#10b981;">Normal</span>';tr.innerHTML=`<td>${escapeHtml(client.label||'Client Device')}</td><td><code onclick="copyUid('${escapeHtml(client.uid)}')" title="Click to copy">${escapeHtml(client.uid)}</code></td><td>${client.sensors.length}</td><td>${escapeHtml(client.firmwareVersion?'v'+client.firmwareVersion:'--')}</td><td>${statusHtml}</td>`;tbody.appendChild(tr);});}loadSiteData();setInterval(loadSiteData,30000);})();</script></body></html>)HTML";
+static const char SITE_CONFIG_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Site Configuration - Tank Alarm Server</title><link rel="stylesheet" href="/style.css"><style>.site-title{font-size:1.5rem;font-weight:700;margin:0;}.site-subtitle{color:var(--muted);font-size:0.9rem;margin-top:4px;}.client-grid{display:grid;gap:16px;margin-top:16px;}.client-card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;padding:16px;}.client-card.has-alarm{border-left:4px solid var(--danger);}.client-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;}.client-name{font-weight:600;font-size:1.05rem;}.client-uid{font-family:monospace;font-size:0.8rem;color:var(--muted);margin-top:2px;}.sensor-list{display:grid;gap:8px;}.sensor-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:0.9rem;}.sensor-row.alarm{background:rgba(220,38,38,0.08);}.sensor-level{font-weight:600;font-size:1.1rem;}.sensor-status{font-size:0.85rem;}.uid-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:0.9rem;}.uid-table th,.uid-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--card-border);}.uid-table th{font-weight:600;color:var(--muted);font-size:0.8rem;text-transform:uppercase;}.uid-table td code{font-size:0.85rem;cursor:pointer;}.uid-table td code:hover{color:var(--accent);}.copy-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;padding:8px 16px;border-radius:6px;font-size:0.85rem;opacity:0;transition:opacity 0.3s;pointer-events:none;}.copy-toast.show{opacity:1;}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;"><div><h1 class="site-title" id="siteTitle">Loading...</h1><p class="site-subtitle" id="siteSubtitle"></p></div><div style="display:flex;gap:8px;flex-wrap:wrap;"><button id="addClientBtn" class="pill">+ Add Client</button><button id="backBtn" class="pill secondary" onclick="window.location.href='/client-console'">Back to Console</button></div></div></div><div class="card"><h2 style="margin-top:0;">Client Devices</h2><div id="clientGrid" class="client-grid"><div class="empty-state">Loading site data...</div></div></div><div class="card"><h2 style="margin-top:0;">Client UID Quick Reference</h2><p style="color:var(--muted);font-size:0.9rem;margin-bottom:8px;">Click any UID to copy it. Use these UIDs for relay target configuration.</p><table class="uid-table"><thead><tr><th>Device Label</th><th>Client UID</th><th>Sensors</th><th>Firmware</th><th>Status</th></tr></thead><tbody id="uidTableBody"></tbody></table></div></main><div id="toast"></div><div class="copy-toast" id="copyToast">UID copied to clipboard</div>)HTML" R"HTML(<script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);function escapeHtml(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}function otaBadge(c){if(!c||!c.otaState||c.otaState==='ok')return '';var col=c.otaState==='pending'?'#f59e0b':'#dc2626';var tgt=c.expectedFw?'&rarr;v'+escapeHtml(c.expectedFw):'';return ' <span title="'+escapeHtml(c.otaDetail||'')+'" style="background:'+col+';color:#fff;padding:1px 5px;border-radius:3px;font-size:0.7rem;white-space:nowrap;">OTA '+escapeHtml(c.otaState)+tgt+'</span>';}async function expectUpdate(uid){const v=prompt('Expected firmware version for this client (leave blank to use the server build):');if(v===null)return;try{const r=await fetch('/api/ota/expect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid,version:(v||'').trim()})});const t=await r.text();showToast(t||(r.ok?'Expectation set':'Failed'),!r.ok);if(r.ok)setTimeout(loadSiteData,500);}catch(e){showToast('Request failed',true);}}function formatNumber(v){return(typeof v==='number'&&isFinite(v))?v.toFixed(1):'--';}function formatEpoch(e){if(!e)return'--';const d=new Date(e*1000);if(isNaN(d.getTime()))return'--';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}function getQueryParam(n){return new URLSearchParams(window.location.search).get(n)||'';}const siteName=getQueryParam('site');if(!siteName){document.getElementById('siteTitle').textContent='No site specified';document.getElementById('clientGrid').innerHTML='<div class="empty-state">Use ?site=SiteName in the URL or navigate from the Client Console.</div>';return;}document.getElementById('siteTitle').textContent=siteName;document.title=siteName+' - Site Configuration';document.getElementById('addClientBtn').addEventListener('click',()=>{window.location.href='/config-generator?site='+encodeURIComponent(siteName);});function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}function copyUid(uid){navigator.clipboard.writeText(uid).then(()=>{const ct=document.getElementById('copyToast');ct.classList.add('show');setTimeout(()=>ct.classList.remove('show'),1500);}).catch(()=>{showToast('Copy failed',true);});}window.copyUid=copyUid;)HTML" R"HTML(async function loadSiteData(){try{const r=await fetch('/api/clients?summary=1');if(!r.ok)throw new Error('Failed to fetch');const raw=await r.json();const srv=raw.srv||{};const allClients=(raw.cs||[]).map(c=>({uid:c.c||'',site:c.s||'Unknown Site',label:c.n||'',sensorIndex:c.k||'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,levelInches:c.l,sensorMa:c.ma,vinVoltage:c.v,vinVoltageEpoch:c.ve,firmwareVersion:c.fv||'',otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sensorCount:c.tc||1,sensors:(c.ts||[]).map(t=>({label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,levelInches:t.l,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,sensorType:t.st||'',objectType:t.ot||'',measurementUnit:t.mu||'',contents:t.ct||'',change24h:t.d}))}));const siteClients=allClients.filter(c=>c.site===siteName);const uniqueMap=new Map();siteClients.forEach(c=>{if(!uniqueMap.has(c.uid)){uniqueMap.set(c.uid,{uid:c.uid,label:c.label,alarm:false,vinVoltage:c.vinVoltage,vinVoltageEpoch:c.vinVoltageEpoch,firmwareVersion:c.firmwareVersion,otaState:c.otaState,expectedFw:c.expectedFw,otaDetail:c.otaDetail,sensors:[]});}const entry=uniqueMap.get(c.uid);if(c.sensors&&c.sensors.length){c.sensors.forEach(t=>entry.sensors.push(t));}else{entry.sensors.push({label:c.label||'',sensorIndex:c.sensorIndex,levelInches:c.levelInches,alarm:c.alarm,alarmType:c.alarmType,lastUpdate:c.lastUpdate,objectType:'',measurementUnit:'',contents:''});}if(c.alarm)entry.alarm=true;entry.sensors.forEach(t=>{if(t.alarm)entry.alarm=true;});});const clients=Array.from(uniqueMap.values());document.getElementById('siteSubtitle').textContent=clients.length+' client device'+(clients.length===1?'':'s')+' at this site';renderClients(clients);renderUidTable(clients);}catch(e){console.error(e);document.getElementById('clientGrid').innerHTML='<div class="empty-state">Error loading site data.</div>';}}function objectTypeLabel(ot){const map={tank:'Tank',gas:'Gas Monitor',engine:'Engine',pump:'Pump',flow:'Flow Meter'};return map[ot]||'Sensor';}function sensorDisplayName(t){const ot=t.objectType||'';const lbl=t.label||objectTypeLabel(ot);return lbl+(t.userNumber?' #'+t.userNumber:'');}function unitLabel(mu,ot){const abr={inches:'in',psi:'psi',rpm:'rpm',gpm:'gpm'};if(mu){const k=mu.toLowerCase();return abr[k]||mu;}if(ot==='gas')return'psi';if(ot==='rpm')return'rpm';if(ot==='flow')return'gpm';return'in';}function renderClients(clients){const grid=document.getElementById('clientGrid');grid.innerHTML='';if(!clients.length){grid.innerHTML='<div class="empty-state">No client devices found at this site.</div>';return;})HTML" R"HTML(clients.forEach(client=>{const card=document.createElement('div');card.className='client-card'+(client.alarm?' has-alarm':'');let tanksHtml='';client.sensors.forEach(t=>{const alarmClass=t.alarm?' alarm':'';const statusHtml=t.alarm?`<span class="sensor-status" style="color:var(--danger);font-weight:600;">ALARM: ${escapeHtml(t.alarmType)}</span>`:'<span class="sensor-status" style="color:#10b981;">Normal</span>';const mu=unitLabel(t.measurementUnit,t.objectType);const changeHtml=(typeof t.change24h==='number')?`<span style="font-size:0.8rem;color:var(--muted);">${t.change24h>=0?'+':''}${t.change24h.toFixed(1)} ${mu}/24h</span>`:'';const contentsHtml=t.contents?`<span style="font-size:0.8rem;color:var(--muted);margin-left:6px;">(${escapeHtml(t.contents)})</span>`:'';tanksHtml+=`<div class="sensor-row${alarmClass}"><div><strong>${escapeHtml(sensorDisplayName(t))}</strong>${contentsHtml} ${changeHtml}</div><div style="text-align:right;"><span class="sensor-level">${formatNumber(t.levelInches)}</span> <small style="color:var(--muted)">${mu}</small><div style="font-size:0.8rem;color:var(--muted);">${formatEpoch(t.lastUpdate)}</div></div></div>`;});const voltageHtml=(typeof client.vinVoltage==='number'&&client.vinVoltage>=6.0)?`<span style="font-size:0.85rem;color:var(--muted);">VIN: ${client.vinVoltage.toFixed(2)}V</span>`:'';const versionHtml=client.firmwareVersion?`<span style="font-size:0.75rem;color:var(--muted);margin-left:8px;background:var(--chip);padding:2px 6px;text-transform:lowercase;font-weight:600;">v${escapeHtml(client.firmwareVersion)}</span>`:'';card.innerHTML=`<div class="client-header"><div><div class="client-name" style="display:flex;align-items:center;flex-wrap:wrap;">${escapeHtml(client.label||'Client Device')}${versionHtml}${otaBadge(client)}</div><div class="client-uid">${escapeHtml(client.uid)}</div>${voltageHtml}</div><div style="display:flex;gap:6px;"><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;" onclick="window.location.href='/config-generator?uid=${encodeURIComponent(client.uid)}'">Edit Config</button><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;" onclick="expectUpdate('${escapeHtml(client.uid)}')">Expect Update</button><button class="pill secondary" style="font-size:0.8rem;padding:4px 12px;color:var(--danger);border-color:var(--danger);" onclick="deleteClient('${escapeHtml(client.uid)}')">Remove Client</button></div></div><div class="sensor-list">${tanksHtml}</div>`;grid.appendChild(card);});}async function deleteClient(uid){if(!confirm('Remove client '+uid+' and all its sensor data? This action cannot be undone.'))return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid})});if(!res.ok){throw new Error(await res.text()||'Delete failed');}showToast('Client removed successfully');loadSiteData();}catch(err){showToast(err.message||'Failed to remove client',true);}}function renderUidTable(clients){const tbody=document.getElementById('uidTableBody');tbody.innerHTML='';if(!clients.length){tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);">No clients at this site.</td></tr>';return;}clients.forEach(client=>{const tr=document.createElement('tr');const hasAlarm=client.sensors.some(t=>t.alarm);const statusHtml=hasAlarm?'<span style="color:var(--danger);font-weight:600;">ALARM</span>':'<span style="color:#10b981;">Normal</span>';tr.innerHTML=`<td>${escapeHtml(client.label||'Client Device')}</td><td><code onclick="copyUid('${escapeHtml(client.uid)}')" title="Click to copy">${escapeHtml(client.uid)}</code></td><td>${client.sensors.length}</td><td>${escapeHtml(client.firmwareVersion?'v'+client.firmwareVersion:'--')}${otaBadge(client)}</td><td>${statusHtml}</td>`;tbody.appendChild(tr);});}loadSiteData();setInterval(loadSiteData,30000);})();</script></body></html>)HTML";
 
 static void initializeStorage();
 static void ensureConfigLoaded();
@@ -2347,6 +2360,11 @@ static uint8_t purgePendingConfigNotes(const char *clientUid);
 static void pruneOrphanedSensorRecords(const char *clientUid);
 static void dispatchPendingConfigs();
 static void handleConfigRetryPost(EthernetClient &client, const String &body);
+static void handleOtaExpectPost(EthernetClient &client, const String &body);
+static void reconcileClientOta(ClientMetadata *meta, double now);
+static void noteClientFirmwareAndReconcile(const char *clientUid, const char *fwVer, double epoch);
+static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, double now);
+static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static float convertMaToLevelWithTemp(const char *clientUid, uint8_t sensorIndex, float mA, float currentTempF);
@@ -9131,6 +9149,12 @@ static void handleWebRequests() {
       queryString = path.substring(queryStart + 1);
     }
     handleDebugSensors(client, method, body, queryString);
+  } else if (method == "POST" && path == "/api/ota/expect") {
+    if (contentLength > 256) {
+      respondStatus(client, 413, "Payload Too Large");
+    } else {
+      handleOtaExpectPost(client, body);
+    }
   } else if (method == "POST" && path == "/api/dfu/check") {
     handleDfuCheckPost(client, body);
   } else if (method == "POST" && path == "/api/dfu/enable") {
@@ -9862,6 +9886,12 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       // Add firmware version from client metadata
       if (meta && meta->firmwareVersion[0] != '\0') {
         clientObj["fv"] = meta->firmwareVersion;
+      }
+      // Add OTA update state (pending/stalled/reverted/stage-failed/ok) for operator visibility
+      if (meta && meta->otaState[0] != '\0') {
+        clientObj["os"] = meta->otaState;
+        if (meta->expectedFirmwareVersion[0] != '\0') clientObj["efv"] = meta->expectedFirmwareVersion;
+        if (meta->otaDetail[0] != '\0') clientObj["od"] = meta->otaDetail;
       }
       // Add stale-deletion-pending flag (operator approval workflow, v1.7.1)
       if (meta && meta->staleDeletionPending) {
@@ -11271,6 +11301,201 @@ static void processNotefile(const char *fileName, void (*handler)(JsonDocument &
   }
 }
 
+// ============================================================================
+// OTA Update Management — expected-vs-reported reconciliation
+// ============================================================================
+// The MCUboot client already protects itself (trial boot, rollback, blacklist). These helpers
+// give the OPERATOR visibility: the server remembers which version it expects each client to be
+// running and flags stalled/failed updates on the dashboard (and via SMS), instead of the
+// failure only living in Notehub's dfu.status.
+
+static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, double now) {
+  if (!meta || !ver) return;
+  strlcpy(meta->expectedFirmwareVersion, ver, sizeof(meta->expectedFirmwareVersion));
+  meta->otaStateEpoch = now;
+  meta->otaAttempts = 0;
+  // If the client already reports this version (or newer), it's already done.
+  if (meta->firmwareVersion[0] != '\0' &&
+      compareFirmwareVersions(meta->firmwareVersion, ver) >= 0) {
+    meta->expectedFirmwareVersion[0] = '\0';
+    strlcpy(meta->otaState, "ok", sizeof(meta->otaState));
+    meta->otaDetail[0] = '\0';
+  } else {
+    strlcpy(meta->otaState, "pending", sizeof(meta->otaState));
+    snprintf(meta->otaDetail, sizeof(meta->otaDetail), "expected %s", ver);
+  }
+}
+
+static void reconcileClientOta(ClientMetadata *meta, double now) {
+  if (!meta || meta->expectedFirmwareVersion[0] == '\0') return;
+  const char *reported = meta->firmwareVersion;
+
+  // Success: client reached (or passed) the expected version.
+  if (reported[0] != '\0' &&
+      compareFirmwareVersions(reported, meta->expectedFirmwareVersion) >= 0) {
+    Serial.print(F("OTA reconcile: "));
+    Serial.print(meta->clientUid);
+    Serial.print(F(" reached "));
+    Serial.println(meta->expectedFirmwareVersion);
+    logTransmission(meta->clientUid, "", "ota", "applied", "Client reached expected firmware");
+    meta->expectedFirmwareVersion[0] = '\0';
+    strlcpy(meta->otaState, "ok", sizeof(meta->otaState));
+    meta->otaDetail[0] = '\0';
+    meta->otaStateEpoch = now;
+    meta->otaAttempts = 0;
+    gClientMetadataDirty = true;
+    return;
+  }
+
+  // Client explicitly reported a failure (reverted / stage-failed). Keep it sticky.
+  if (strcmp(meta->otaState, "reverted") == 0 ||
+      strcmp(meta->otaState, "stage-failed") == 0) {
+    return;
+  }
+
+  // Still behind, no explicit failure yet -> pending until the stall window elapses.
+  double refEpoch = (meta->otaStateEpoch > 0.0) ? meta->otaStateEpoch : now;
+  bool stalled = (now - refEpoch) >= (double)OTA_STALL_SECONDS;
+  const char *want = stalled ? "stalled" : "pending";
+  if (strcmp(meta->otaState, want) != 0) {
+    strlcpy(meta->otaState, want, sizeof(meta->otaState));
+    snprintf(meta->otaDetail, sizeof(meta->otaDetail), "reported %s, expected %s",
+             reported[0] ? reported : "?", meta->expectedFirmwareVersion);
+    gClientMetadataDirty = true;
+    if (stalled) {
+      Serial.print(F("OTA STALLED: "));
+      Serial.println(meta->clientUid);
+      logTransmission(meta->clientUid, "", "ota", "stalled", meta->otaDetail);
+      char sms[160];
+      snprintf(sms, sizeof(sms),
+               "TankAlarm: OTA stalled on %s - still %s, expected %s after %luh",
+               meta->clientUid, reported[0] ? reported : "?",
+               meta->expectedFirmwareVersion, (unsigned long)(OTA_STALL_SECONDS / 3600UL));
+      sendSmsAlert(sms);
+    }
+  }
+}
+
+static void noteClientFirmwareAndReconcile(const char *clientUid, const char *fwVer, double epoch) {
+  if (!clientUid || clientUid[0] == '\0') return;
+  // Only create a metadata slot when we actually have a version to record; otherwise just
+  // reconcile an existing slot (so a stalled client still reporting the OLD version, which
+  // never changes, is still detected).
+  ClientMetadata *meta = (fwVer && fwVer[0] != '\0')
+      ? findOrCreateClientMetadata(clientUid)
+      : findClientMetadata(clientUid);
+  if (!meta) return;
+  if (fwVer && fwVer[0] != '\0' && strcmp(meta->firmwareVersion, fwVer) != 0) {
+    strlcpy(meta->firmwareVersion, fwVer, sizeof(meta->firmwareVersion));
+    gClientMetadataDirty = true;
+  }
+  reconcileClientOta(meta, (epoch > 0.0) ? epoch : currentEpoch());
+}
+
+static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now) {
+  ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
+  if (!meta) return;
+  const char *targetV = doc["target_v"] | "";
+  const char *fromV = doc["from_v"] | "";
+  const char *reason = doc["reason"] | "";
+
+  if (strcmp(status, "ota-applied") == 0) {
+    if (targetV[0] != '\0') {
+      strlcpy(meta->firmwareVersion, targetV, sizeof(meta->firmwareVersion));
+      if (meta->expectedFirmwareVersion[0] != '\0' &&
+          compareFirmwareVersions(targetV, meta->expectedFirmwareVersion) >= 0) {
+        meta->expectedFirmwareVersion[0] = '\0';
+      }
+    }
+    strlcpy(meta->otaState, "ok", sizeof(meta->otaState));
+    meta->otaDetail[0] = '\0';
+    meta->otaStateEpoch = now;
+    meta->otaAttempts = 0;
+    gClientMetadataDirty = true;
+    Serial.print(F("OTA applied confirmed by "));
+    Serial.println(clientUid);
+    logTransmission(clientUid, "", "ota", "applied", targetV[0] ? targetV : "");
+    return;
+  }
+
+  // Failure report: ota-reverted (trial crashed) or ota-stage-failed (never swapped).
+  const char *stateStr = (strcmp(status, "ota-stage-failed") == 0) ? "stage-failed" : "reverted";
+  strlcpy(meta->otaState, stateStr, sizeof(meta->otaState));
+  if (reason[0] != '\0') {
+    strlcpy(meta->otaDetail, reason, sizeof(meta->otaDetail));
+  } else {
+    snprintf(meta->otaDetail, sizeof(meta->otaDetail), "%s of %s",
+             stateStr, targetV[0] ? targetV : "update");
+  }
+  meta->otaStateEpoch = now;
+  if (meta->otaAttempts < 255) meta->otaAttempts++;
+  gClientMetadataDirty = true;
+  Serial.print(F("OTA FAILURE from "));
+  Serial.print(clientUid);
+  Serial.print(F(": "));
+  Serial.println(meta->otaDetail);
+  logTransmission(clientUid, "", "ota", stateStr, meta->otaDetail);
+  char sms[160];
+  snprintf(sms, sizeof(sms), "TankAlarm: OTA %s on %s (%s->%s)%s%s",
+           stateStr, clientUid, fromV[0] ? fromV : "?", targetV[0] ? targetV : "?",
+           reason[0] ? ": " : "", reason[0] ? reason : "");
+  sendSmsAlert(sms);
+}
+
+// POST /api/ota/expect  { pin, client?, version?, all? }
+// Records the firmware version the operator expects a client (or all clients) to run so the
+// server can flag stalled/failed OTA updates. version defaults to the server's own build.
+static void handleOtaExpectPost(EthernetClient &client, const String &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    respondStatus(client, 400, F("Invalid JSON"));
+    return;
+  }
+  const char *pinValue = doc["pin"].as<const char *>();
+  if (!requireValidPin(client, pinValue)) return;
+
+  const char *version = doc["version"] | "";
+  char ver[16];
+  if (version[0] == '\0' || strcmp(version, "server") == 0) {
+    strlcpy(ver, FIRMWARE_VERSION, sizeof(ver));
+  } else {
+    if (version[0] == 'v' || version[0] == 'V') version++;  // tolerate "v1.9.19"
+    strlcpy(ver, version, sizeof(ver));
+  }
+
+  double now = currentEpoch();
+  bool all = doc["all"] | false;
+  uint8_t count = 0;
+
+  if (all) {
+    for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+      if (gClientMetadata[i].clientUid[0] == '\0') continue;
+      setClientOtaExpectation(&gClientMetadata[i], ver, now);
+      count++;
+    }
+  } else {
+    const char *clientUid = doc["client"] | "";
+    if (!clientUid || clientUid[0] == '\0') {
+      respondStatus(client, 400, F("Missing 'client' UID (or set all:true)"));
+      return;
+    }
+    ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
+    if (!meta) {
+      respondStatus(client, 500, F("Client metadata table full"));
+      return;
+    }
+    setClientOtaExpectation(meta, ver, now);
+    count = 1;
+  }
+
+  gClientMetadataDirty = true;
+  saveClientMetadataCache();
+  char msg[80];
+  snprintf(msg, sizeof(msg), "Expecting v%s on %u client(s)", ver, count);
+  Serial.println(msg);
+  respondStatus(client, 200, msg);
+}
+
 static void handleTelemetry(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   uint8_t sensorIndex = doc["k"].as<uint8_t>();
@@ -11284,15 +11509,8 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
     rec->userNumber = doc["un"].as<uint8_t>();
   }
   
-  // Extract client firmware version if provided
-  const char *fwVer = doc["fv"] | "";
-  if (fwVer && strlen(fwVer) > 0) {
-    ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
-    if (meta && strcmp(meta->firmwareVersion, fwVer) != 0) {
-      strlcpy(meta->firmwareVersion, fwVer, sizeof(meta->firmwareVersion));
-      gClientMetadataDirty = true;
-    }
-  }
+  // Track client firmware version and reconcile against any expected OTA target.
+  noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
   strlcpy(rec->site, doc["s"] | "", sizeof(rec->site));
   
@@ -11552,15 +11770,8 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     rec->userNumber = doc["un"].as<uint8_t>();
   }
   
-  // Extract client firmware version if provided
-  const char *fwVer = doc["fv"] | "";
-  if (fwVer && strlen(fwVer) > 0) {
-    ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
-    if (meta && strcmp(meta->firmwareVersion, fwVer) != 0) {
-      strlcpy(meta->firmwareVersion, fwVer, sizeof(meta->firmwareVersion));
-      gClientMetadataDirty = true;
-    }
-  }
+  // Track client firmware version and reconcile against any expected OTA target.
+  noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
   // Store object type if provided
   const char *objectType = doc["ot"] | "";
@@ -11768,15 +11979,8 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     return;
   }
   
-  // Extract client firmware version if provided
-  const char *fwVer = doc["fv"] | "";
-  if (fwVer && strlen(fwVer) > 0) {
-    ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
-    if (meta && strcmp(meta->firmwareVersion, fwVer) != 0) {
-      strlcpy(meta->firmwareVersion, fwVer, sizeof(meta->firmwareVersion));
-      gClientMetadataDirty = true;
-    }
-  }
+  // Track client firmware version and reconcile against any expected OTA target.
+  noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
   // Extract VIN voltage from daily report if present
   // Check if this is part 0 (new) or part 1 (legacy) of the daily report
@@ -13216,6 +13420,15 @@ static void saveClientMetadataCache() {
       if (meta.firmwareVersion[0] != '\0') {
         obj["fv"] = meta.firmwareVersion;
       }
+      if (meta.expectedFirmwareVersion[0] != '\0') {
+        obj["efv"] = meta.expectedFirmwareVersion;
+      }
+      if (meta.otaState[0] != '\0') {
+        obj["os"] = meta.otaState;
+        obj["oe"] = meta.otaStateEpoch;
+        if (meta.otaDetail[0] != '\0') obj["od"] = meta.otaDetail;
+        if (meta.otaAttempts > 0) obj["oa"] = meta.otaAttempts;
+      }
       if (meta.signalBars >= 0) {
         obj["sb"] = meta.signalBars;
         obj["sr"] = meta.signalRssi;
@@ -13312,6 +13525,11 @@ static void loadClientMetadataCache() {
       meta.nwsGridY = obj["gy"] | 0;
       meta.nwsGridValid = (meta.nwsGridOffice[0] != '\0');
       strlcpy(meta.firmwareVersion, obj["fv"] | "", sizeof(meta.firmwareVersion));
+      strlcpy(meta.expectedFirmwareVersion, obj["efv"] | "", sizeof(meta.expectedFirmwareVersion));
+      strlcpy(meta.otaState, obj["os"] | "", sizeof(meta.otaState));
+      meta.otaStateEpoch = obj["oe"] | 0.0;
+      strlcpy(meta.otaDetail, obj["od"] | "", sizeof(meta.otaDetail));
+      meta.otaAttempts = obj["oa"] | (int)0;
       meta.signalBars = obj["sb"] | (int)-1;
       meta.signalRssi = obj["sr"] | (int)0;
       meta.signalRsrp = obj["sp"] | (int)0;
@@ -13623,7 +13841,14 @@ static void handleConfigAck(JsonDocument &doc, double epoch) {
   
   const char *version = doc["cv"] | "";
   const char *status = doc["st"] | "unknown";
-  
+
+  // Firmware-update lifecycle reports piggyback on the config-ack notefile (already routed
+  // client->server) using an "ota-" status namespace, so no new Notehub route is required.
+  if (strncmp(status, "ota-", 4) == 0) {
+    handleOtaResult(clientUid, status, doc, (epoch > 0.0) ? epoch : currentEpoch());
+    return;
+  }
+
   ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
   if (!snap) {
     Serial.print(F("Config ACK from unknown client: "));

@@ -1045,6 +1045,8 @@ static void enableDfuMode();
 static void pollForConfigUpdates();
 static void applyConfigUpdate(const JsonDocument &doc);
 static bool sendConfigAck(bool success, const char *message, const char *configVersion);
+static bool sendOtaReportNote(const char *st, const char *targetV, const char *reason);
+static void reportOtaOutcome();
 static void persistConfigIfDirty();
 static void retryPendingConfigAckIfDue();
 static void sampleMonitors();
@@ -1750,6 +1752,10 @@ void setup() {
       }
     }
   }
+
+  // Report any pending OTA outcome (applied/reverted) to the server so the dashboard reflects
+  // update success/failure instead of it only living in Notehub's dfu.status.
+  reportOtaOutcome();
 
   Serial.println(F("Client setup complete"));
   tankalarm_printHeapStats();
@@ -4070,6 +4076,51 @@ static void dfuKickWatchdog() {
 #endif
 }
 
+static bool sendOtaReportNote(const char *st, const char *targetV, const char *reason) {
+  if (!gNotecardAvailable) return false;
+  J *req = notecard.newRequest("note.add");
+  if (!req) return false;
+  JAddStringToObject(req, "file", CONFIG_ACK_OUTBOX_FILE);
+  JAddBoolToObject(req, "sync", true);
+  J *body = JCreateObject();
+  if (!body) { JDelete(req); return false; }
+  JAddStringToObject(body, "c", gDeviceUID);
+  JAddStringToObject(body, "st", st);
+  if (targetV && targetV[0] != '\0') JAddStringToObject(body, "target_v", targetV);
+  JAddStringToObject(body, "from_v", FIRMWARE_VERSION);
+  if (reason && reason[0] != '\0') JAddStringToObject(body, "reason", reason);
+  JAddNumberToObject(body, "epoch", currentEpoch());
+  JAddItemToObject(req, "body", body);
+  bool ok = false;
+  J *rsp = notecard.requestAndResponse(req);
+  if (rsp) {
+    const char *err = JGetString(rsp, "err");
+    ok = (!err || err[0] == '\0');
+    notecard.deleteResponse(rsp);
+  }
+  Serial.print(F("OTA report ("));
+  Serial.print(st);
+  Serial.print(F("): "));
+  Serial.println(ok ? F("queued") : F("failed"));
+  return ok;
+}
+
+// Bridge any pending MCUboot OTA outcome (applied/reverted) to the server for dashboard
+// visibility. Best-effort, fires once per outcome (deduped on QSPI). Safe no-op if nothing pending.
+static void reportOtaOutcome() {
+#if defined(TANKALARM_DFU_MCUBOOT)
+  TankAlarmOtaReport rep;
+  if (!tankalarm_peekOtaReport(rep)) return;
+  const bool applied = (strcmp(rep.status, "applied") == 0);
+  bool sent = sendOtaReportNote(applied ? "ota-applied" : "ota-reverted", rep.targetV,
+                                applied ? nullptr : "trial boot reverted by MCUboot");
+  if (sent) {
+    tankalarm_markOtaReported(rep.targetV, rep.status);
+    addSerialLog(applied ? "OTA applied reported to server" : "OTA reverted reported to server");
+  }
+#endif
+}
+
 static void enableDfuMode() {
   if (gDfuInProgress) {
     Serial.println(F("DFU already in progress"));
@@ -4121,6 +4172,8 @@ static void enableDfuMode() {
   if (!ok) {
     Serial.println(F("MCUboot DFU failed — resuming normal operation"));
     addSerialLog("MCUboot staging failed");
+    // Tell the server the staging attempt failed (host never swapped) for dashboard visibility.
+    sendOtaReportNote("ota-stage-failed", gDfuStatus.version, "MCUboot staging failed");
     if (gConfig.solarCharger.enabled) {
       gSolarManager.begin(gConfig.solarCharger);
     }

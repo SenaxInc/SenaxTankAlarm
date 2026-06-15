@@ -821,6 +821,88 @@ static inline bool tankalarm_isVersionBlacklisted(const char *version) {
   return false;
 }
 
+// ----------------------------------------------------------------------------
+// OTA outcome reporting bridge (server visibility)
+// ----------------------------------------------------------------------------
+// The host normally only tells Notehub (dfu.status) about a rollback. These helpers let the
+// application read the OTA outcome from pending_ota.json and forward it to the SERVER (over the
+// normal config-ack notefile) so the dashboard can show stalled/failed/applied updates. A
+// separate ota_reported.json dedupes so each outcome is reported once. pending_ota.json is never
+// modified here, preserving the failed_rollback blacklist used by tankalarm_isVersionBlacklisted.
+
+struct TankAlarmOtaReport {
+  char status[16];   // "reverted" | "applied"
+  char targetV[32];  // firmware version the OTA targeted
+};
+
+// Peek at any OTA outcome that has not yet been reported. Returns true and fills `out` if there
+// is something new to report; does not modify any files.
+static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
+  out.status[0] = '\0';
+  out.targetV[0] = '\0';
+
+  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
+  static mbed::FATFileSystem ota_data_fs("fs_ota");
+  if (ota_data_fs.mount(&ota_data) != 0) return false;
+
+  FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
+  if (!fp) { ota_data_fs.unmount(); return false; }
+  char buf[256]; memset(buf, 0, sizeof(buf));
+  size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+  fclose(fp);
+  if (n == 0) { ota_data_fs.unmount(); return false; }
+
+  unsigned int target_seq = 0;
+  char target_v[32]; memset(target_v, 0, sizeof(target_v));
+  char status[32]; memset(status, 0, sizeof(status));
+  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}",
+                      &target_seq, target_v, status);
+  if (parsed < 3) { ota_data_fs.unmount(); return false; }
+
+  const char *reportStatus = nullptr;
+  if (strcmp(status, "failed_rollback") == 0) reportStatus = "reverted";
+  else if (strcmp(status, "confirmed") == 0) reportStatus = "applied";
+  if (!reportStatus) { ota_data_fs.unmount(); return false; }
+
+  // Dedupe against the last reported outcome.
+  FILE *rf = fopen("/fs_ota/ota_reported.json", "r");
+  if (rf) {
+    char rbuf[64]; memset(rbuf, 0, sizeof(rbuf));
+    size_t rn = fread(rbuf, 1, sizeof(rbuf) - 1, rf);
+    fclose(rf);
+    if (rn > 0) {
+      char lastV[32]; memset(lastV, 0, sizeof(lastV));
+      char lastS[16]; memset(lastS, 0, sizeof(lastS));
+      sscanf(rbuf, "{\"v\":\"%[^\"]\",\"s\":\"%[^\"]\"}", lastV, lastS);
+      if (strcmp(lastV, target_v) == 0 && strcmp(lastS, reportStatus) == 0) {
+        ota_data_fs.unmount();
+        return false;
+      }
+    }
+  }
+
+  ota_data_fs.unmount();
+  snprintf(out.status, sizeof(out.status), "%s", reportStatus);
+  snprintf(out.targetV, sizeof(out.targetV), "%s", target_v);
+  return true;
+}
+
+// Record that the given outcome has been reported, so it is not sent again.
+static inline void tankalarm_markOtaReported(const char *targetV, const char *status) {
+  if (!targetV || !status) return;
+  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
+  static mbed::FATFileSystem ota_data_fs("fs_ota");
+  if (ota_data_fs.mount(&ota_data) != 0) return;
+  FILE *wf = fopen("/fs_ota/ota_reported.json", "w");
+  if (wf) {
+    fprintf(wf, "{\"v\":\"%s\",\"s\":\"%s\"}\n", targetV, status);
+    fclose(wf);
+  }
+  ota_data_fs.unmount();
+}
+
 static bool tankalarm_performMcubootUpdate(
     Notecard &notecard,
     const TankAlarmDfuStatus &dfu,   // length + crc32 + name/source for H2
