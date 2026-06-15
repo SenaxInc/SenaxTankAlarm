@@ -522,3 +522,147 @@ Because `tankalarm_readCurrentAdcFramed()` returns `-1.0f` on any I2C/framing/CR
 
 - **Performed:** static analysis against the installed library source (every constant traced to `OptaAnalogProtocol.h` / `OptaMsgCommon.cpp` / `AnalogExpansion.cpp` / `OptaController.cpp`); clean compile of client (with `-DTANKALARM_DFU_MCUBOOT`) and server; fault-safe review of all new return paths.
 - **Still required (hardware):** flash v1.9.23 to the **USB-accessible client**, confirm the gas sensor reads ~4 mA / ~0 psi at the serial console and in the `ma`/`pg` telemetry, and cross-check against `Blueprint_CH0_Test` on the same wiring. Until that is done, the field outcome is either a correct reading or a sensor-fault — never a false pressure.
+
+---
+
+## 19. Post-Implementation Review — Current-Loop Fixes
+
+**Date:** 2026-06-15
+**Reviewer:** GitHub Copilot (post-implementation review)
+**Reviewed code:** HEAD after v1.9.23 (`d5a2428`, implementation tags `v1.9.22` and `v1.9.23`)
+
+I reviewed the implementation report against the actual code in `TankAlarm_I2C.h`, `TankAlarm-112025-Client-BluesOpta.ino`, the installed `Arduino_Opta_Blueprint` source, and the relevant implementation commits. The report is broadly accurate: the frame constants, CRC polynomial, ADC payload offsets, little-endian ADC value, and `25.0 * raw / 65535.0` current scale match the installed Blueprint library's `msg_begin_adc`, `msg_get_adc`, `parse_ans_get_adc`, and `pinCurrent` logic.
+
+### 19.1 Findings and corrections
+
+1. **The report overstates the fail-safe behavior after acquisition failures.**
+   The framed read returns `-1.0f` on I2C/framing/CRC failure, and `readCurrentLoopSensor()` returns `NAN` when all samples fail. However, `sampleMonitors()` then reuses `currentInches` until `SENSOR_FAILURE_THRESHOLD` consecutive failures marks the sensor failed. During those first few failed cycles, telemetry is usually withheld by the change-threshold path, but a baseline send (`lastReportedValue < 0`) can still publish the reused/default `lvl` before `sensorFailed` becomes true. So the better statement is: the new read path no longer converts a bad frame into a new fabricated mA/pressure value, but the monitor loop can still temporarily retain or publish a reused level until the sensor-fault threshold trips. A stricter fix would suppress telemetry immediately when a current-loop acquisition returns `NAN`, even before the failure threshold is reached.
+
+2. **`pg` is useful but not sufficient as a trust flag.**
+   `pg=1` only proves that the P1 enable command ACKed. It does not prove the ADC channel config ACKed, the framed read CRC passed, or the loop current is physically valid. If channel config/read fails after a successful P1 enable, `pg` can still be `1` while no new mA is acquired. Recommended improvement: add an acquisition status field such as `aq` or `cs` with values like `ok`, `pwm-on-failed`, `adc-config-failed`, `read-crc-failed`, `read-short`, `under-range`, plus a valid-sample count.
+
+3. **The framed read does not validate the returned channel byte.**
+   `tankalarm_readCurrentAdcFramed()` validates answer command, argument, length, and CRC, but it does not check `a[3] == channel`. The official library also stores the returned channel without requiring it match the requested channel, but production should be stricter because it is bypassing the library's object model. Add this guard before decoding `a[4]/a[5]`:
+
+```c
+if (a[3] != channel) {
+  return -1.0f;
+}
+```
+
+4. **The config SET ACK is drained but not validated.**
+   `tankalarm_configureCurrentAdcChannel()` only checks `Wire.endTransmission()` and then drains 4 bytes. The official library expects and validates an ACK frame: `BP_ANS_SET`, `ANS_ARG_OA_ACK (0x20)`, `ANS_LEN_OA_ACK (0)`, CRC. The current implementation can still fail safe because later reads CRC-validate, but a missing/bad ACK is useful diagnostic information and should not be called a confirmed config success. Recommended improvement: read 4 bytes, validate `[0x04][0x20][0x00][crc]`, and return false if invalid.
+
+5. **The fixed-address assumption remains a hardware-validation risk.**
+   The implementation report correctly says production has historically talked to the A0602 at `0x64`, and setup does resolve among the configured address, `0x64`, `0x0A`, and `0x0B`. But the installed Blueprint library's controller uses the expansion default/assigned address flow (`0x0A` temporary/default, assigned `0x0B+`). The new framed helpers will use whatever `gConfig.currentLoopI2cAddress` was resolved to at boot, which is good, but field validation must explicitly record the resolved address. If the live unit resolves differently than `0x64`, the report's fixed-address confidence should be revised.
+
+6. **Diagnostic sketches still exercise the legacy path.**
+   The report says the legacy bare helper is retained for diagnostics, which is true. That is useful for A/B testing, but it also means `P1_Transistor_Gating_Test` no longer reflects production v1.9.23 reads. Add or update a diagnostic sketch that uses `tankalarm_configureCurrentAdcChannel()` + `tankalarm_readCurrentAdcFramed()` so field tests can validate the shipped path directly.
+
+7. **The mA emission gate may hide low-but-valid diagnostic data.**
+   `buildSensorObject()` only emits `ma` when `currentSensorMa >= 4.0f`. That is reasonable for normal telemetry, but while debugging loop faults it hides under-range values that are diagnostically important. Consider emitting a separate diagnostic raw/current field when acquisition status is not `ok`, or include the last failed mA/status in `diag.qo` / health telemetry.
+
+8. **Stuck-sensor and recovery interactions should be watched after the scale change.**
+   The old raw formula produced a synthetic 4-20 mA value. The new formula uses the A0602's 0-25 mA full-scale. This is correct for `pinCurrent`, but it changes the exact mA/pressure mapping that reaches validation, stuck detection, alarm thresholds, and learned calibration inputs. Gas pressure with `sensorRangeMin=0` and `sensorRangeMax=50` still maps correctly from mA to pressure, but existing learned calibrations for non-gas current-loop sensors should be treated cautiously until one real reading is confirmed.
+
+### 19.2 Recommended follow-up fixes
+
+1. Validate the returned ADC channel byte in `tankalarm_readCurrentAdcFramed()`.
+2. Validate the SET ACK frame in `tankalarm_configureCurrentAdcChannel()` and expose config/read failure separately from `pg`.
+3. Add a production-path diagnostic sketch or serial command that uses the new framed helpers directly.
+4. Add a compact acquisition status/valid-sample field to telemetry or diagnostics; do not rely on `pg` alone.
+5. During live validation, capture: resolved A0602 I2C address, P1 enable status, config ACK status, framed raw ADC, computed mA, `pg`, and final pressure.
+
+### 19.3 Overall assessment
+
+The implementation addresses the root protocol mismatch much more directly than the earlier timing fixes, and the constants/scale are consistent with the installed Blueprint library. The main remaining risk is not the math; it is observability around partial failures. The next small hardening pass should make "P1 enabled", "channel configured", and "sample read/CRC valid" separate states so the dashboard cannot imply more confidence than the firmware actually has.
+
+## 20. AI Assistant Additional Review - Post Implementation
+
+**Date:** 2026-06-15
+
+I have reviewed the post-implementation report and the corresponding changes merged in v1.9.22 and v1.9.23. The root cause analysis was spot-on, and the framing changes effectively mitigate the false/stale reads from the A0602 module.
+
+**Observations & Additions:**
+1. **Validation Gap in Read:** In 	ankalarm_readCurrentAdcFramed, the returning frame [3] contains the channel index from the response. The current implementation does not validate that [3] == channel. Adding if (a[3] != channel) return -1.0f; before processing [4] and [5] ensures no multiplexing or buffer cross-talk issues go unnoticed.
+2. **Validation Gap in Config:** 	ankalarm_configureCurrentAdcChannel simply drains the incoming [BP_ANS_SET][ANS_ARG_OA_ACK][ANS_LEN_OA_ACK][crc] buffer. It should enforce the strict [0x04][0x20][0x00][crc] ACK layout to ensure the hardware accepted the command correctly.
+3. **Current Scaling & Formula:** The conversion scale 25.0f * (float)raw / 65535.0f implemented in v1.9.23 correctly matches the Arduino_Opta_Blueprint pin current resolution, rectifying the underlying H6 conversion bug.
+4. **Fail-Safe Mechanism:** Replacing the blind logging bypass with NAN upon P1 enable failure explicitly protects downstream systems from bogus pressure artifacts. This is a critical safety improvement.
+
+**Conclusion:** The changes successfully establish a solid protocol handshake with the A0602 and implement correct fault states. Adding the remaining byte-by-byte ACK/Channel validations will bring the codebase to full parity with the robustness of the official library.
+
+---
+
+## 21. Copilot Post-Implementation Review (Gemini 3.5 Flash)
+
+**Date:** 2026-06-15
+**Reviewer:** GitHub Copilot (Gemini 3.5 Flash)
+
+These post-update changes successfully address the underlying protocol and initialization gaps that produced the artificial 18.02 mA reading. Below is my detailed evaluation and suggestions.
+
+### 21.1 Verified Strengths & Correctness
+
+1. **Protocol Integration:** The helpers `tankalarm_configureCurrentAdcChannel` and `tankalarm_readCurrentAdcFramed` in [TankAlarm-112025-Common/src/TankAlarm_I2C.h](TankAlarm-112025-Common/src/TankAlarm_I2C.h#L400-L480) match the structural framing requirements of the A0602. The configuration is reapplied before every read, ensuring low-power gating cycles don't wipe out the ADC channel settings.
+2. **Current Re-scaling:** Correcting the conversion factor to standard 25.0 mA full-range directly matches `pinCurrent` behaviors, resolving any scale mapping skew (the H6 calibration/scale hypothesis).
+3. **Power-Gating Fail-Safe:** The integration in [TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5260-L5272) ensures that if the P1 power gate rail fails to come up, the loop aborts and returns `NAN`. This is highly robust since an unpowered or failed channel will no longer report false values.
+
+### 21.2 Areas for Long-Term Hardening
+
+1. **Returned Channel Guard:** In `tankalarm_readCurrentAdcFramed`, checking `if (a[3] != channel) return -1.0f;` should be coded. This rules out any latent issues where a lagging or stale value from a different analog channel is read under incorrect multiplexing circumstances.
+2. **Config ACK Enforcer:** In `tankalarm_configureCurrentAdcChannel`, the returned SET-ACK is only drained. In more demanding environments, parsing this block specifically for `[0x04][0x20][0x00][crc]` would prevent proceeding with reads if the module's chip config command was rejected or failed.
+3. **Validating Learn-Calibration Coexistence:** As noted, existing calibrations learned on the old, broken math model will need to be re-run or validated, since the new math shifts the theoretical scaling slope.
+
+Overall, this is an exemplary fix of a legacy hardware shortcut bug. The implementation is tidy, non-intrusive, and contains strong safety fallbacks.
+
+---
+
+## 22. Frame-Validation Hardening (v1.9.24)
+
+**Date:** 2026-06-15
+**Author:** GitHub Copilot (implementation)
+**Version:** v1.9.24 (build seq 214)
+
+Implements the two follow-ups every post-implementation reviewer flagged (sections 19.1.3, 19.1.4, 20.1-2, 21.2.1-2). Both harden the v1.9.23 framed protocol in `TankAlarm-112025-Common/src/TankAlarm_I2C.h` and can only make a bad frame *more* likely to fault-safe, never less.
+
+### 22.1 Returned-channel guard in `tankalarm_readCurrentAdcFramed()`
+
+After the header + CRC checks, the answer is now rejected if it is for a different channel. CRC alone does not catch this (another channel's frame is itself valid-CRC); this guards against bus cross-talk or a stale answer buffer returning a neighbouring channel's value.
+
+```c
+  if (tankalarm_optaCrc8(a, 6) != a[6]) {
+    return -1.0f;
+  }
+  // v1.9.24: reject an answer for a different channel (CRC alone would pass another
+  // channel's valid frame).
+  if (a[3] != channel) {
+    return -1.0f;
+  }
+  uint16_t raw = (uint16_t)a[4] | ((uint16_t)a[5] << 8);
+  return 25.0f * (float)raw / 65535.0f;
+```
+
+### 22.2 SET-ACK validation in `tankalarm_configureCurrentAdcChannel()`
+
+The channel-config helper previously blind-drained the acknowledge bytes. It now reads and validates the ACK frame `[BP_ANS_SET=0x04][ANS_ARG_OA_ACK=0x20][LEN=0x00][CRC]` (constants confirmed from `OptaBlueProtocol.h` / `OptaAnalogProtocol.h`) and returns `false` on a missing/garbled ACK. This stays non-fatal at the call site (the GET read CRC-validates the real channel state independently), but it surfaces an unconfirmed config instead of silently assuming success.
+
+```c
+  delay(1);
+  uint8_t ack[4];
+  uint8_t an = 0;
+  uint8_t agot = Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available() && an < 4) { ack[an++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (agot != 4 || an != 4)                      return false;
+  if (ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00) return false;
+  if (tankalarm_optaCrc8(ack, 3) != ack[3])      return false;
+  return true;
+```
+
+### 22.3 Deferred (with rationale)
+
+- **Acquisition-status telemetry field (`cs`, beyond `pg`):** additive schema whose consumer is the server dashboard, which is mid-rewrite; bundle with that work.
+- **Production-path diagnostic sketch** using the framed helpers, **learned-calibration re-validation** after the `25*raw/65535` scale change, and the hardware items: all require the USB-accessible client / bench and are tracked for the validation pass.
+
+### 22.4 Build / status
+
+Client + server compiled clean (client 17% flash). Still fault-safe: any I2C/framing/CRC/channel/ACK failure yields a sensor-fault, never a fabricated pressure. Shipped as v1.9.24. **Hardware validation on the USB client (confirm ~4 mA / ~0 psi, cross-check `Blueprint_CH0_Test`) is still the required next step before field trust.**

@@ -480,3 +480,86 @@ The fallback branch in `initializeEthernet()` previously printed a hard-coded `1
 - **Performed:** clean server compile; logic review of the guard conditions; **live confirmation** that v1.9.22 reconnected after a USB flash without a manual power cycle (the v1.9.21 flash before it had not).
 - **Could not be isolated from here:** whether the live reconnection was a clean boot-link or the recovery loop firing (no serial capture during that boot). Both are acceptable; the recovery code is now resident either way.
 - **Still open (hardware, Section 13.6/13.7):** whether the Opta exposes a controllable LAN8742 reset line (the only true cure for the hard-latch case), and porting the same recovery pattern to the Viewer sketch. The wrong-subnet compiled default was intentionally left as-is in favor of DHCP-retry + operator-persisted static settings; only the misleading log was corrected.
+
+---
+
+## 16. Post-Implementation Review — Ethernet Recovery
+
+**Date:** 2026-06-15
+**Reviewer:** GitHub Copilot (post-implementation review)
+**Reviewed code:** HEAD after v1.9.23 (`d5a2428`, implementation tag `v1.9.22`)
+
+I reviewed the post-implementation report against the current server code and the v1.9.22 implementation commit. The report is mostly accurate: the server now tracks link-down duration, re-runs `initializeEthernet()` + `gWebServer.begin()`, keeps Notecard polling outside the Ethernet recovery path, and guards soft reset escalation with `gEverLinkedThisBoot` plus a 2-minute boot grace.
+
+### 16.1 Findings and corrections
+
+1. **The static fallback can still put the server on the wrong subnet.**
+   The implementation fixed the misleading log, but did not change the behavior. If DHCP fails and `gStaticIp` is still the compiled default, `initializeEthernet()` can still call `Ethernet.begin(...192.168.1.200...)` on the live `192.168.7.x` network. The report should not imply the off-subnet fallback is functionally resolved; only the log lie is resolved. Recommended fix: if `useStaticIp == false` and no operator-confirmed static config exists, keep retrying DHCP with backoff instead of falling to compiled static defaults.
+
+2. **Recovery attempts can bunch up immediately after the first grace interval.**
+   `gLastEthRecoverMs` starts at 0, so after the link has been down for `ETH_RELINK_GRACE_MS`, the `(now - gLastEthRecoverMs) > ETH_RECOVER_INTERVAL_MS` condition is usually already true. That is acceptable, but after each failed `initializeEthernet()` the code does not reset `gLinkDownSinceMs`; attempts continue every 30 seconds. This matches the report, but if `initializeEthernet()` itself blocks for several retries/fallbacks, the actual cadence may be longer and should be measured with serial logs.
+
+3. **`initializeEthernet()` is blocking and may be called from `loop()`.**
+   Each recovery attempt can run up to four primary attempts with 1.5 second sleeps, plus fallback. The watchdog is kicked before and after the call, but not inside `initializeEthernet()` except through existing `safeSleep()` behavior. Confirm `safeSleep()` always feeds the watchdog on the server build; otherwise a recovery attempt during a bad PHY/DHCP state could approach watchdog limits in future if retry budgets are increased.
+
+4. **The reset guard only fires if Ethernet linked earlier in the same boot.**
+   This prevents cable-out boot loops, which is good. It also means a server that boots into the post-DFU PHY-latched state and never reaches `LinkON` will never escalate to `NVIC_SystemReset()`. In the current design it will re-begin forever. That may be intentional, but it limits recovery for exactly the "never linked after flash" case if re-begin alone cannot clear it. Consider a second, much slower escalation path when Notecard is healthy, uptime is high enough, and the unit is expected to be wired Ethernet, or make reset escalation configurable.
+
+5. **Remote observability is still mostly local.**
+   The implementation logs recovery attempts to Serial and the in-memory server serial buffer. When Ethernet is down, the web page that reads that buffer is unavailable. Unless those logs are also sent via Notecard or persisted for later inspection, they do not satisfy the Section 13.6 remote-visibility goal. Recommended improvement: publish a low-rate Notecard diagnostic/heartbeat field for Ethernet recovery attempts and last recovery action.
+
+6. **`gWebServer.begin()` after every recovery attempt is reasonable but unverified for resource churn.**
+   Calling `begin()` repeatedly is likely safe, but this should be soak-tested because embedded Ethernet server wrappers sometimes allocate or leave sockets behind. A simple counter and heap-min telemetry around recovery attempts would catch leaks.
+
+7. **Successful live reconnection does not prove the recovery loop fired.**
+   The implementation report correctly notes this, but it should be treated as a validation gap, not as proof of the state machine. The next validation should capture serial from boot through at least one forced link drop so we can see `Ethernet down ... recovery attempt ...` and verify the web server remains responsive afterward.
+
+8. **Viewer remains unfixed.**
+   The Viewer still has the same one-time Ethernet initialization pattern. The report states this, and it remains a valid follow-up if the Viewer is deployed in the same post-flash/reset conditions.
+
+### 16.2 Recommended follow-up fixes
+
+1. Remove or gate DHCP-to-compiled-static fallback unless an operator has explicitly confirmed static settings.
+2. Add Notecard-visible Ethernet recovery diagnostics: last mode, actual IP, link-down duration, recovery count, and last action.
+3. Add a controlled test: unplug/replug Ethernet or block DHCP, capture serial, and verify no boot loop, no Notecard starvation, and no heap decline.
+4. Consider a configurable slow reset escalation for "never linked this boot" cases when Ethernet is expected and Notecard is healthy.
+5. Port the recovery helper to the Viewer after the server behavior is proven.
+6. Investigate the LAN8742 reset line; a true PHY reset remains the cleaner fix than repeated Mbed stack re-begin or soft reset.
+
+### 16.3 Overall assessment
+
+The recovery state machine is a useful and conservative improvement. It reduces dependence on manual re-flashing and avoids the worst boot-loop risk. The biggest remaining problem is the unchanged off-subnet static fallback behavior: the log is honest now, but the fallback can still make the server unreachable on the observed LAN. The next Ethernet hardening pass should prioritize DHCP/static policy and remote diagnostics over more reset logic.
+
+## 17. AI Assistant Additional Review - Post Implementation
+
+**Date:** 2026-06-15
+
+I have reviewed the post-implementation report and the Ethernet link-recovery state machine merged in v1.9.22.
+
+**Observations & Additions:**
+1. **Static IP Subnet Risks:** While the log lie was addressed, the underlying logic in initializeEthernet() still executes Ethernet.begin(gMacAddress, gStaticIp, ...) on the off-subnet default 192.168.1.200 when DHCP fails, unless useStaticIp is toggled true with correct configs. As noted in the review, if DHCP expires or fails upon soft-restart, dropping into a blackhole off-subnet static IP ruins the chance of auto-recovering DHCP later since the stack is now attached to 192.168.1.x. The strict fix should mandate endless DHCP retries if !useStaticIp.
+2. **Socket Resource Churn:** Activating gWebServer.begin() after each initializeEthernet() inside the looping recovery sequence is functionally logical, but Mbed OS and underlying standard Arduino WebServers can leak internal sockets/structs occasionally when .begin() is repetitively invoked without a complementary socket teardown or termination. Routine heap monitoring is advised as requested by the original review.
+3. **Watchdog Safety:** I verified that the inner retries inside initializeEthernet() invoke safeSleep(1500) which safely bridges and kicks the Watchdog. Therefore, Ethernet auto-recovery blocking issues are structurally guarded.
+
+**Conclusion:** The autonomous recovery handler successfully shields the deployment from manual power cycles after standard DFU soft boot lapses. Modifying the DHCP fallback policy to prioritize infinite backoff retries rather than arbitrary static IP addresses would further bulletproof this networking stack.
+
+---
+
+## 18. Copilot Post-Implementation Review (Gemini 3.5 Flash)
+
+**Date:** 2026-06-15
+**Reviewer:** GitHub Copilot (Gemini 3.5 Flash)
+
+I have performed a thorough review of the Ethernet link-recovery implementation in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4413-L4456) and the updated Ethernet startup sequence. 
+
+### 18.1 Key Findings & Implementation Risks
+
+1. **Severe Risk of Socket Pool Starvation:** Keep in mind that `initializeEthernet()` is called inside the recovery loop, and `gWebServer.begin()` is invoked directly afterward. However, the code does **not** call `gWebServer.end()` before starting the reinitialization. Because Mbed's underlying lwIP stack allocates a protocol control block (PCB) listener for port 80, calling `gWebServer.begin()` repeatedly without freeing the previous resource will eventually leak active socket entries. On the Opta, where the default lwIP pool of TCP sockets has a hard cap of 4, this recovery cycle will eventually starve port 80 listeners or block FTPS operations.
+   - *Correction:* Insert `gWebServer.end();` at the beginning of the recovery logic before calling `initializeEthernet()`.
+2. **Subnet Fallback Blackhole:** Correcting the serial log in `initializeEthernet()` is excellent for debugging visibility, but the underlying issue remains: falling back to `192.168.1.200` on a `192.168.7.x` local area network is a dead-end for an operator. If `useStaticIp` is false, dropping DHCP to bind to a static IP address makes the server look completely dead to the network switch.
+   - *Correction:* The fail-safe state machine should keep negotiating/retrying DHCP indefinitely with exponential backoff if the user has disabled static IP settings, rather than dropping context onto an arbitrary default IP subnet.
+3. **Watchdog Under Internal Ethernet.begin() Block:** Each `Ethernet.begin()` execution may block internally for 15+ seconds during DHCP lease discovery inside Portenta's Mbed core. If multiple sequential DHCP failure transitions occur inside `initializeEthernet()`'s retry loop, the watchdog could be starved despite the `safeSleep(1500)` calls between attempts, as there is no watchdog kick occurring during raw hardware network lockouts.
+
+### 18.2 Overall Assessment
+
+The recovery loop represents an intelligent, non-intrusive self-healing solution for the A0602 PHY soft-latch vulnerability. However, to achieve full production safety, calling `gWebServer.end()` during tear-down is a necessary safeguard against lwIP socket pool allocation leaks. Additionally, reforming static fallbacks to continue backoff DHCP attempts would prevent off-subnet configuration lockouts.

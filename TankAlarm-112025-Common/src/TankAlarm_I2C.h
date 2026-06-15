@@ -421,12 +421,26 @@ static inline bool tankalarm_configureCurrentAdcChannel(uint8_t channel, uint8_t
   if (Wire.endTransmission() != 0) {
     return false;
   }
-  // Drain the SET acknowledge frame (header 3 + CRC 1 = 4 bytes; LEN 0) so it does not
-  // pollute the next read. A short/absent ACK is tolerated — the GET below CRC-validates
-  // the real channel state, which is what actually matters.
+  // Read and validate the SET acknowledge frame: [BP_ANS_SET=0x04][ANS_ARG_OA_ACK=0x20]
+  // [LEN=0x00][CRC]. v1.9.24 (post-impl review): a missing/garbled ACK means the channel-config
+  // command was NOT confirmed by the module. This stays non-fatal at the call site (the GET read
+  // CRC-validates the real channel state independently), but returning false surfaces the failed
+  // config so it can be logged/diagnosed instead of being silently assumed successful.
   delay(1);
-  (void)Wire.requestFrom(i2cAddr, (uint8_t)4);
+  uint8_t ack[4];
+  uint8_t an = 0;
+  uint8_t agot = Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available() && an < 4) { ack[an++] = Wire.read(); }
   while (Wire.available()) { (void)Wire.read(); }
+  if (agot != 4 || an != 4) {
+    return false;
+  }
+  if (ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00) {
+    return false;
+  }
+  if (tankalarm_optaCrc8(ack, 3) != ack[3]) {
+    return false;
+  }
   return true;
 }
 
@@ -465,6 +479,12 @@ static inline float tankalarm_readCurrentAdcFramed(uint8_t channel, uint8_t i2cA
     return -1.0f;
   }
   if (tankalarm_optaCrc8(a, 6) != a[6]) {
+    return -1.0f;
+  }
+  // v1.9.24 (post-impl review): reject an answer for a different channel. Guards against bus
+  // cross-talk or a stale answer buffer from a prior transaction returning another channel's
+  // value, which CRC alone would not catch (a different channel's frame is still valid CRC).
+  if (a[3] != channel) {
     return -1.0f;
   }
   uint16_t raw = (uint16_t)a[4] | ((uint16_t)a[5] << 8); // little-endian
