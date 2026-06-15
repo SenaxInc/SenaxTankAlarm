@@ -8819,35 +8819,83 @@ static void serveFile(EthernetClient &client, const char* htmlContent) {
   respondHtml(client, body);
 }
 
+static void streamProgmemRange(EthernetClient &client, const char *flashPtr, size_t start, size_t end) {
+  if (start >= end) return;
+  const size_t chunkSize = 512;
+  uint8_t buffer[chunkSize];
+  size_t remaining = end - start;
+  size_t offset = start;
+  while (remaining > 0) {
+    size_t toWrite = (remaining < chunkSize) ? remaining : chunkSize;
+    for (size_t i = 0; i < toWrite; i++) {
+      buffer[i] = pgm_read_byte_near(flashPtr + offset + i);
+    }
+    client.write(buffer, toWrite);
+    offset += toWrite;
+    remaining -= toWrite;
+  }
+}
+
 static void serveServerSettingsPage(EthernetClient &client) {
-  const size_t htmlLen = strlen_P(SERVER_SETTINGS_HTML);
-  const size_t injectionLen = strlen_P(SERVER_SETTINGS_DFU_TARGET_INJECTION);
-  String body;
-  body.reserve(htmlLen + injectionLen + 64);
+  const size_t htmlLen = strlen(SERVER_SETTINGS_HTML);
+  const size_t injectionLen = strlen(SERVER_SETTINGS_DFU_TARGET_INJECTION);
 
-  for (size_t i = 0; i < htmlLen; ++i) {
-    body += (char)pgm_read_byte_near(SERVER_SETTINGS_HTML + i);
+  const char *bodyTag = strstr(SERVER_SETTINGS_HTML, "<body");
+  size_t bodyEndIdx = 0;
+  if (bodyTag) {
+    const char *tagEnd = strchr(bodyTag, '>');
+    if (tagEnd) {
+      bodyEndIdx = (tagEnd - SERVER_SETTINGS_HTML) + 1;
+    }
   }
 
-  String injection;
-  injection.reserve(injectionLen + 1);
-  for (size_t i = 0; i < injectionLen; ++i) {
-    injection += (char)pgm_read_byte_near(SERVER_SETTINGS_DFU_TARGET_INJECTION + i);
+  // Use the LAST "</body>" (matches respondHtml's lastIndexOf convention) so a
+  // literal "</body>" inside inline script cannot create an early injection point.
+  const char *bodyCloseTag = nullptr;
+  for (const char *p = strstr(SERVER_SETTINGS_HTML, "</body>"); p != nullptr;
+       p = strstr(p + 1, "</body>")) {
+    bodyCloseTag = p;
+  }
+  size_t insertAt = htmlLen;
+  if (bodyCloseTag) {
+    insertAt = bodyCloseTag - SERVER_SETTINGS_HTML;
   }
 
-  const int insertAt = body.lastIndexOf(F("</body>"));
-  if (insertAt >= 0) {
-    String merged;
-    merged.reserve(body.length() + injection.length() + 1);
-    merged = body.substring(0, insertAt);
-    merged += injection;
-    merged += body.substring(insertAt);
-    body = merged;
+  const char *overlayMarkup = "<div id=\"loading-overlay\"><div class=\"spinner\"></div></div>";
+  const char *hideScript = "<script>setTimeout(function(){var o=document.getElementById('loading-overlay');if(o)o.style.display='none'},5000);window.addEventListener('load',()=>{const ov=document.getElementById('loading-overlay');if(ov){ov.style.display='none';ov.classList.add('hidden');}});</script>";
+
+  const size_t overlayLen = strlen(overlayMarkup);
+  const size_t scriptLen = strlen(hideScript);
+
+  size_t totalLen = htmlLen + injectionLen + scriptLen;
+  if (bodyEndIdx > 0) {
+    totalLen += overlayLen;
+  }
+
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: text/html"));
+  client.println(F("Connection: close"));
+  client.println(F("Cache-Control: no-store"));
+  client.print(F("Content-Length: "));
+  client.println(totalLen);
+  client.println();
+
+  if (bodyEndIdx > 0) {
+    streamProgmemRange(client, SERVER_SETTINGS_HTML, 0, bodyEndIdx);
+    client.write((const uint8_t*)overlayMarkup, overlayLen);
+    streamProgmemRange(client, SERVER_SETTINGS_HTML, bodyEndIdx, insertAt);
   } else {
-    body += injection;
+    streamProgmemRange(client, SERVER_SETTINGS_HTML, 0, insertAt);
   }
 
-  respondHtml(client, body);
+  // Stream injection script
+  streamProgmemRange(client, SERVER_SETTINGS_DFU_TARGET_INJECTION, 0, injectionLen);
+
+  // Stream hide script
+  client.write((const uint8_t*)hideScript, scriptLen);
+
+  // Stream remainder
+  streamProgmemRange(client, SERVER_SETTINGS_HTML, insertAt, htmlLen);
 }
 
 static void handleSessionCheck(EthernetClient &client, const char *sessionHdr) {
