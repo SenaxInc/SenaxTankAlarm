@@ -367,3 +367,158 @@ The staged protocol rewrite was implemented, with all frame constants copied ver
 **Why it should work without `OptaController.begin()` discovery:** production `tankalarm_setPwm()` already drives the A0602 with the same framed style at the fixed address (0x64) and demonstrably switches P1, proving the module accepts framed commands at that address without running the library's discovery/addressing. The read uses the identical write-then-`requestFrom` handshake the library's `_send`/`wait_for_device_answer` use.
 
 **VALIDATION CAVEAT (important):** this could not be hardware-validated before release (the server is USB-only and the client is remote/cellular). It is built from exact source constants and is fault-safe, but the I2C read-back timing and the fixed-address assumption should be confirmed on the **USB-accessible client**: flash v1.9.23, watch serial / the `ma` + `pg` telemetry for a correct ~4 mA at 0 psi, and cross-check with `Blueprint_CH0_Test`. If the framed read does not validate, the sensor reports a fault (safe) rather than a false value, and we iterate with the client on USB. Shipped as v1.9.23.
+
+---
+
+## 18. Post-Implementation Report — Current-Loop Fixes (v1.9.22 + v1.9.23)
+
+**Date:** 2026-06-15
+**Author:** GitHub Copilot (implementation)
+**Versions:** v1.9.22 (safety + diagnostics), v1.9.23 (framed-protocol root fix)
+**Commits:** `8ecd502` (v1.9.22), `c50d505` (v1.9.23). Tags `v1.9.22`, `v1.9.23` pushed; release CI built the OTA bins.
+**Build result:** client 349,772 bytes (17% flash), server 921,996 bytes (46% flash), both compiled clean.
+
+### 18.1 Summary of what was done
+
+Three problems were addressed across two releases:
+
+1. **Safety (v1.9.22):** stop publishing a fabricated pressure when the loop is provably unpowered.
+2. **Observability (v1.9.22):** expose the power-gate result in telemetry so the failure mode is visible remotely.
+3. **Root cause (v1.9.23):** replace the bare-shortcut read with the official Blueprint **framed** configure + read protocol, including the correct mA scale.
+
+No hardware-in-the-loop validation was possible (server USB-only, client remote/cellular), so every change was designed to **fail safe to a sensor-fault**, never to a plausible-but-wrong value.
+
+### 18.2 Files changed
+
+| File | Change |
+|---|---|
+| `TankAlarm-112025-Common/src/TankAlarm_I2C.h` | Added `tankalarm_optaCrc8()`, `tankalarm_configureCurrentAdcChannel()`, `tankalarm_readCurrentAdcFramed()` (framed Blueprint protocol). Legacy `tankalarm_readCurrentLoopMilliamps()` left in place for the diagnostic sketches. |
+| `TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino` | `MonitorRuntime` gained `lastPwmEnableOk`. `readCurrentLoopSensor()`: P1-enable-failure now returns `NAN`; added framed channel-config after warmup; priming + sampling now use the framed read. `buildSensorObject()` emits `pg`. |
+| `TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino` | Config-generator `pwm-gating-sample-delay` default `5` → `300` ms; tooltip text updated. |
+| `TankAlarm-112025-Common/src/TankAlarm_Common.h`, `library.properties` | Version bumps to 1.9.22 then 1.9.23. |
+
+### 18.3 v1.9.22 — Safety: fail instead of fabricating
+
+Previously, if the P1 high-side switch failed to enable, the code logged a warning and **read the unpowered channel anyway**, producing the bogus in-range ~18 mA. The failure path now refuses to sample:
+
+```c
+    } else {
+      Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
+      Serial.print(cfg.pwmGatingChannel + 1);
+      Serial.println(F(" via I2C"));
+      // Safety (v1.9.22): the transmitter is UNPOWERED — do NOT sample. Record the failed
+      // enable, drive P1 off defensively, and return a sensor fault so validateSensorReading()
+      // escalates instead of publishing a fabricated pressure.
+      gMonitorState[idx].lastPwmEnableOk = false;
+      gMonitorState[idx].currentSensorMa = 0.0f;
+      gMonitorState[idx].sampleReused = true;
+      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      return NAN;
+    }
+```
+
+### 18.4 v1.9.22 — Observability: `pg` in telemetry
+
+`MonitorRuntime` gained `bool lastPwmEnableOk;` (set `true` on a successful enable, `false` on failure above). `buildSensorObject()` now emits it for gated current-loop sensors so a floating/stale vs. real read is visible on Notehub/dashboard with no serial cable:
+
+```c
+    case SENSOR_CURRENT_LOOP:
+      o["st"] = "currentLoop";
+      if (state.currentSensorMa >= 4.0f) o["ma"] = roundTo(state.currentSensorMa, 2);
+      // v1.9.22: surface the power-gate enable result so a floating/stale read vs a real
+      // reading is distinguishable remotely (Notehub/dashboard) without a serial cable.
+      if (cfg.pwmGatingEnabled) o["pg"] = state.lastPwmEnableOk ? 1 : 0;
+      break;
+```
+
+### 18.5 v1.9.23 — Root fix: the framed Blueprint protocol
+
+**New CRC-8** (poly 0x07, init 0 — identical to what `tankalarm_setPwm()` already used, now factored out):
+
+```c
+static inline uint8_t tankalarm_optaCrc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; ++b) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+```
+
+**New channel-configure** — `SET ARG_OA_CH_ADC (0x09)`, 7-byte payload, mirroring `beginChannelAsCurrentAdc → beginChannelAsAdc(ch, OA_CURRENT_ADC, pull_down=false, rejection=true, diagnostic=false, ma=0)`. Every payload byte and position was copied from `OptaAnalogProtocol.h` / `AnalogExpansion.cpp::msg_begin_adc`:
+
+```c
+static inline bool tankalarm_configureCurrentAdcChannel(uint8_t channel, uint8_t i2cAddr) {
+  uint8_t buf[11];
+  buf[0] = 0x01;          // BP_CMD_SET
+  buf[1] = 0x09;          // ARG_OA_CH_ADC
+  buf[2] = 0x07;          // LEN_OA_CH_ADC (7-byte payload)
+  buf[3] = channel;       // OA_CH_ADC_CHANNEL_POS
+  buf[4] = 0x01;          // OA_CH_ADC_TYPE_POS = OA_CURRENT_ADC
+  buf[5] = 0x02;          // OA_CH_ADC_PULL_DOWN_POS = OA_DISABLE (false)
+  buf[6] = 0x01;          // OA_CH_ADC_REJECTION_POS = OA_ENABLE (true)
+  buf[7] = 0x02;          // OA_CH_ADC_DIAGNOSTIC_POS = OA_DISABLE (false)
+  buf[8] = 0x00;          // OA_CH_ADC_MOVING_AVE_POS = 0
+  buf[9] = 0x02;          // OA_CH_ADC_ADDING_ADC_POS = OA_DISABLE (single ADC)
+  buf[10] = tankalarm_optaCrc8(buf, 10);
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(buf, 11);
+  if (Wire.endTransmission() != 0) return false;
+  delay(1);
+  (void)Wire.requestFrom(i2cAddr, (uint8_t)4); // drain the SET-ACK frame
+  while (Wire.available()) { (void)Wire.read(); }
+  return true;
+}
+```
+
+**New framed read** — `GET ARG_OA_GET_ADC (0x0A)`, then the 7-byte answer is header- and CRC-validated, the value decoded little-endian (`parse_ans_get_adc`), and converted with the A0602 current-ADC scale from `pinCurrent` (`25·raw/65535` — **this also fixes H6**, the legacy `4 + raw/65535·16` was wrong):
+
+```c
+static inline float tankalarm_readCurrentAdcFramed(uint8_t channel, uint8_t i2cAddr) {
+  uint8_t req[5] = { 0x02 /*BP_CMD_GET*/, 0x0A /*ARG_OA_GET_ADC*/, 0x01 /*LEN*/, channel, 0 };
+  req[4] = tankalarm_optaCrc8(req, 4);
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(req, 5);
+  if (Wire.endTransmission() != 0) return -1.0f;
+  delay(1);
+  const uint8_t ANS_LEN = 7; // [0x03][0x0A][0x03][ch][lo][hi][CRC]
+  uint8_t got = Wire.requestFrom(i2cAddr, ANS_LEN);
+  uint8_t a[7]; uint8_t n = 0;
+  while (Wire.available() && n < ANS_LEN) { a[n++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (got != ANS_LEN || n != ANS_LEN) return -1.0f;
+  if (a[0] != 0x03 || a[1] != 0x0A || a[2] != 0x03) return -1.0f;
+  if (tankalarm_optaCrc8(a, 6) != a[6]) return -1.0f;
+  uint16_t raw = (uint16_t)a[4] | ((uint16_t)a[5] << 8);
+  return 25.0f * (float)raw / 65535.0f;
+}
+```
+
+### 18.6 v1.9.23 — Integration into the read path
+
+In `readCurrentLoopSensor()`, after the P1 gate is enabled and the warmup completes, the channel is (re)configured on every powered read (the config is lost when P1 powers off in the gating cycle), then the priming discard-read and the 4 averaged samples use the framed read instead of the legacy shortcut:
+
+```c
+  // (re)configure the channel as a 4-20mA current ADC AFTER warmup, BEFORE reading (v1.9.23)
+  bool adcConfigOk = tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr);
+  if (!adcConfigOk) { Serial.print(F("WARNING: A0602 current-ADC channel config NACK on ch ")); Serial.println(channel); }
+  delay(2);
+  ...
+  if (cfg.pwmGatingEnabled) { (void)tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr); delay(sampleSettleMs); ... }
+  ...
+  for (uint8_t s = 0; s < numSamples; ++s) {
+    float sample = tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
+    if (sample >= 0.0f) { total += sample; validSamples++; }
+    ...
+  }
+```
+
+Because `tankalarm_readCurrentAdcFramed()` returns `-1.0f` on any I2C/framing/CRC failure, an incompatible or mistimed frame yields `validSamples == 0`, which the existing fault path turns into `NAN` (sensor fault). **The change cannot regress into a fabricated reading.**
+
+### 18.7 Verification performed and still required
+
+- **Performed:** static analysis against the installed library source (every constant traced to `OptaAnalogProtocol.h` / `OptaMsgCommon.cpp` / `AnalogExpansion.cpp` / `OptaController.cpp`); clean compile of client (with `-DTANKALARM_DFU_MCUBOOT`) and server; fault-safe review of all new return paths.
+- **Still required (hardware):** flash v1.9.23 to the **USB-accessible client**, confirm the gas sensor reads ~4 mA / ~0 psi at the serial console and in the `ma`/`pg` telemetry, and cross-check against `Blueprint_CH0_Test` on the same wiring. Until that is done, the field outcome is either a correct reading or a sensor-fault — never a false pressure.

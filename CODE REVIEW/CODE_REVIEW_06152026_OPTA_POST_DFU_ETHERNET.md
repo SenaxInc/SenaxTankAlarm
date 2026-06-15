@@ -366,3 +366,117 @@ The firmware-side recommendations (priority items 1-5) were implemented; the har
 - **Deferred:** the **wrong-subnet compiled default** (`192.168.1.200` vs the live `192.168.7.x`) was intentionally **not** hard-coded to the customer subnet — per Section 13.1 the right fix is to keep retrying DHCP and only use operator-persisted static settings, which the recovery loop now favors; the log fix removes the immediate confusion. Item 6 (whether the Opta exposes a controllable **LAN8742 reset line**, the only true cure for the hard-latch case) needs the hardware/datasheet investigation and is still open. The Viewer (Section 13.7) was not yet given the same pattern.
 
 **Net effect now:** the common **soft-latch** post-DFU case should self-heal (re-begin, then a guarded soft reset) instead of requiring a human, and the off-subnet log lie is gone. The **hard-latch** case (only a true power-on clears the PHY) is still bounded by the boot-loop guards rather than cured — that awaits the LAN8742-reset investigation. Shipped as v1.9.22.
+
+---
+
+## 15. Post-Implementation Report — Ethernet Recovery (v1.9.22)
+
+**Date:** 2026-06-15
+**Author:** GitHub Copilot (implementation)
+**Version:** v1.9.22
+**Commit:** `8ecd502` (tag `v1.9.22`).
+**Build result:** server 921,996 bytes (46% flash), compiled clean.
+**Live result:** after the v1.9.22 USB flash the server **came back online on its own** (ping + HTTP 200 at `192.168.7.117`) without the manual power cycle that the prior v1.9.21 flash had required.
+
+### 15.1 Summary of what was done
+
+The server gained an **autonomous Ethernet link-recovery state machine** in `loop()`, plus a correctness fix to the DHCP-fallback log. The design follows the reviewers' "re-begin first, reset only as a guarded last resort" guidance, and deliberately keeps Notecard polling alive so client telemetry is still processed while the web side is down. Only firmware-side items were implemented; the LAN8742 hardware-reset-line investigation (the only true cure for the hard-latch case) remains open.
+
+### 15.2 Files changed
+
+| File | Change |
+|---|---|
+| `TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino` | Added recovery tuning `#define`s and state globals; rewrote the `loop()` link-check block to track down-time and run recovery; fixed the DHCP-fallback serial log. |
+| `TankAlarm-112025-Common/src/TankAlarm_Common.h`, `library.properties` | Version bump to 1.9.22. |
+
+### 15.3 New tuning constants and state (near the link-check globals)
+
+```c
+static unsigned long gLastLinkCheckMillis = 0;
+static bool gLastLinkState = false;
+#ifndef ETH_RELINK_GRACE_MS
+#define ETH_RELINK_GRACE_MS 20000UL        // wait this long after a drop before attempting recovery
+#endif
+#ifndef ETH_RECOVER_INTERVAL_MS
+#define ETH_RECOVER_INTERVAL_MS 30000UL    // minimum spacing between recovery attempts
+#endif
+#ifndef ETH_RECOVER_MAX_ATTEMPTS
+#define ETH_RECOVER_MAX_ATTEMPTS 4         // re-begin this many times before escalating to a reset
+#endif
+#ifndef ETH_RECOVER_BOOT_GRACE_MS
+#define ETH_RECOVER_BOOT_GRACE_MS 120000UL // never auto-reset within the first 2 min of boot
+#endif
+static unsigned long gLinkDownSinceMs = 0;   // when the link was first seen down (0 = up)
+static uint8_t gEthRecoverAttempts = 0;      // re-begin attempts since the link went down
+static bool gEverLinkedThisBoot = false;     // gate auto-reset so a cable-out unit never boot-loops
+static unsigned long gLastEthRecoverMs = 0;  // time of the last recovery attempt
+```
+
+### 15.4 Down-time tracking (in the existing 5 s link-check block)
+
+The link-state block now sets `gEverLinkedThisBoot` when the link first comes up, and tracks how long the link has been continuously down:
+
+```c
+    if (linkUp && !gLastLinkState) {
+      gEverLinkedThisBoot = true;            // (then logs "Network link established!" + IP)
+      ...
+    } else if (!linkUp && gLastLinkState) {
+      Serial.println(F("WARNING: Network link lost!"));
+    }
+    if (linkUp) {
+      gLinkDownSinceMs = 0;
+      gEthRecoverAttempts = 0;
+    } else if (gLinkDownSinceMs == 0) {
+      gLinkDownSinceMs = now;
+    }
+    gLastLinkState = linkUp;
+```
+
+### 15.5 The recovery state machine (new, runs every `loop()`)
+
+Re-begin first; escalate to a soft reset only after repeated failures **and** only when it is safe to do so:
+
+```c
+  if (gLinkDownSinceMs != 0 && Ethernet.linkStatus() != LinkON) {
+    unsigned long downFor = now - gLinkDownSinceMs;
+    if (downFor > ETH_RELINK_GRACE_MS && (now - gLastEthRecoverMs) > ETH_RECOVER_INTERVAL_MS) {
+      gLastEthRecoverMs = now;
+      gEthRecoverAttempts++;
+      Serial.print(F("Ethernet down ")); Serial.print(downFor / 1000UL);
+      Serial.print(F("s - recovery attempt ")); Serial.println(gEthRecoverAttempts);
+      addServerSerialLog("Ethernet link down; re-initializing", "warn", "network");
+      // (watchdog kicked)
+      initializeEthernet();   // re-read MAC + Ethernet.begin() + DHCP/static fallback
+      gWebServer.begin();     // restart the listener on the (possibly new) socket
+      // (watchdog kicked)
+      if (gEthRecoverAttempts >= ETH_RECOVER_MAX_ATTEMPTS &&
+          gEverLinkedThisBoot &&
+          now > ETH_RECOVER_BOOT_GRACE_MS &&
+          Ethernet.linkStatus() != LinkON) {
+        Serial.println(F("Ethernet recovery exhausted - soft reset to re-init the PHY stack"));
+        addServerSerialLog("Ethernet recovery exhausted; soft reset", "warn", "network");
+        Serial.flush();
+        NVIC_SystemReset();
+      }
+    }
+  }
+```
+
+The three-way guard on the reset (`>= MAX_ATTEMPTS && gEverLinkedThisBoot && past boot grace`) is what prevents a deliberately-offline unit, an unplugged cable, or an absent DHCP server from boot-looping the server, and gives the MCUboot health marker time to be written first.
+
+### 15.6 DHCP-fallback log fix
+
+The fallback branch in `initializeEthernet()` previously printed a hard-coded `192.168.7.200` while the compiled default is actually `192.168.1.200`. It now prints the real address:
+
+```c
+      Serial.println(F(" FAILED - Could not configure Ethernet via DHCP!"));
+      Serial.print(F("DHCP failed after retries. Falling back to static IP: "));
+      Serial.println(gStaticIp);
+      status = Ethernet.begin(gMacAddress, gStaticIp, gStaticDns, gStaticGateway, gStaticSubnet);
+```
+
+### 15.7 Verification performed and still open
+
+- **Performed:** clean server compile; logic review of the guard conditions; **live confirmation** that v1.9.22 reconnected after a USB flash without a manual power cycle (the v1.9.21 flash before it had not).
+- **Could not be isolated from here:** whether the live reconnection was a clean boot-link or the recovery loop firing (no serial capture during that boot). Both are acceptable; the recovery code is now resident either way.
+- **Still open (hardware, Section 13.6/13.7):** whether the Opta exposes a controllable LAN8742 reset line (the only true cure for the hard-latch case), and porting the same recovery pattern to the Viewer sketch. The wrong-subnet compiled default was intentionally left as-is in favor of DHCP-retry + operator-persisted static settings; only the misleading log was corrected.
