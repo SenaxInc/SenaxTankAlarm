@@ -744,6 +744,7 @@ struct MonitorRuntime {
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
+  bool lastPwmEnableOk;         // v1.9.22: result of the last P1 power-gate enable (gated 4-20mA)
   float lastReportedValue;   // Last value pushed via change-based telemetry (monitor's own unit)
   float lastDailySentValue;  // Last value included in a daily report (monitor's own unit)
   bool highAlarmLatched;
@@ -5244,6 +5245,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       pwmOnSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 10000, 9999, i2cAddr);
     }
     if (pwmOnSuccess) {
+      gMonitorState[idx].lastPwmEnableOk = true;
       // Feed the watchdog across the (multi-second) warmup so several current-loop
       // monitors read sequentially in one loop() pass can't starve the watchdog.
       // Chunk the stabilization delay and kick between chunks.
@@ -5265,6 +5267,16 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
       Serial.print(cfg.pwmGatingChannel + 1);
       Serial.println(F(" via I2C"));
+      // Safety (v1.9.22): when the P1 high-side switch fails to enable, the transmitter is
+      // UNPOWERED, so reading the channel now would capture a floating/stale value (a
+      // plausible-but-false reading such as ~18mA / 43.8psi). Do NOT sample. Record the failed
+      // enable, drive P1 off defensively, and return a sensor fault so validateSensorReading()
+      // escalates instead of publishing a fabricated pressure.
+      gMonitorState[idx].lastPwmEnableOk = false;
+      gMonitorState[idx].currentSensorMa = 0.0f;
+      gMonitorState[idx].sampleReused = true;
+      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      return NAN;
     }
   }
 
@@ -5744,6 +5756,9 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
     case SENSOR_CURRENT_LOOP:
       o["st"] = "currentLoop";
       if (state.currentSensorMa >= 4.0f) o["ma"] = roundTo(state.currentSensorMa, 2);
+      // v1.9.22: surface the power-gate enable result so a floating/stale read vs a real
+      // reading is distinguishable remotely (Notehub/dashboard) without a serial cable.
+      if (cfg.pwmGatingEnabled) o["pg"] = state.lastPwmEnableOk ? 1 : 0;
       break;
     case SENSOR_ANALOG:
       o["st"] = "analog";
