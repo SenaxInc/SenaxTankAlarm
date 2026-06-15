@@ -1516,6 +1516,7 @@ void setup() {
 
   initializeNotecard();
 #if defined(TANKALARM_DFU_MCUBOOT)
+  tankalarm_otaSelfCheck();   // print OTA partition readiness for diagnostics
   tankalarm_resolvePendingOta(notecard);
 #endif
   ensureTimeSync();
@@ -4014,10 +4015,19 @@ static void checkForFirmwareUpdate() {
     return;  // Notecard communication failure
   }
 
-  // Track downloading state
+  // Track downloading state.
+  // The Notecard reports mode="downloading" while it pulls the image into its
+  // OWN storage — the host has not begun staging yet. We must NOT set
+  // gDfuInProgress here: that flag is owned exclusively by enableDfuMode() to
+  // mark an active host staging/apply. Setting it on a transient Notecard
+  // download would latch it true forever (both loop() DFU paths only call this
+  // function when !gDfuInProgress), permanently suppressing all future checks
+  // so the device never sees the eventual mode="ready". Just clear the
+  // available flags and return; the next check picks up "ready".
   if (dfuStatus.downloading) {
-    Serial.println(F("DFU download in progress..."));
-    gDfuInProgress = true;
+    Serial.println(F("DFU download in progress (Notecard pulling image)..."));
+    gDfuUpdateAvailable = false;
+    gDfuFirmwareLength = 0;
     return;
   }
 
@@ -4036,6 +4046,22 @@ static void checkForFirmwareUpdate() {
       Serial.print(F("DFU: Version "));
       Serial.print(dfuStatus.version);
       Serial.println(F(" is locally blacklisted. Skipping check."));
+      return;
+    }
+
+    // Downgrade guard: only auto-apply a STRICTLY NEWER image. Notehub is
+    // expected to assign the intended target, but a stale/incorrect assignment
+    // (or an older .slot.bin) must never trigger a downgrade-then-rollback loop.
+    // Sequence is major*100 + minor*10 + patch (matches FIRMWARE_BUILD_SEQ).
+    if (tankalarm_versionToSeq(dfuStatus.version) <= (uint32_t)FIRMWARE_BUILD_SEQ) {
+      Serial.print(F("DFU: Offered v"));
+      Serial.print(dfuStatus.version);
+      Serial.print(F(" is not newer than running v"));
+      Serial.print(F(FIRMWARE_VERSION));
+      Serial.println(F(" - ignoring (no downgrade)."));
+      gDfuUpdateAvailable = false;
+      gDfuVersion[0] = '\0';
+      gDfuFirmwareLength = 0;
       return;
     }
 #endif

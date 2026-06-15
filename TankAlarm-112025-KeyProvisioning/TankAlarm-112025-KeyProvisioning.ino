@@ -16,6 +16,12 @@
 #include "MBRBlockDevice.h"
 #include "FATFileSystem.h"
 
+// MCUboot OTA slot geometry (must match TankAlarm_MCUbootConfig.h used by the
+// Client/Server/Viewer updater). Kept as local literals so this provisioning
+// sketch stays standalone (no Common library on its include path).
+#define TANKALARM_PROV_UPDATE_FILE_SIZE   (15 * 128 * 1024)  // 0x1E0000 = 1,966,080 bytes
+#define TANKALARM_PROV_SCRATCH_FILE_SIZE  (128 * 1024)       // 0x20000  =   131,072 bytes
+
 // Include standard Arduino default keys to enable basic A/B rollback
 #include "ecdsa-p256-encrypt-key.h"
 #include "ecdsa-p256-signing-key.h"
@@ -54,25 +60,48 @@ void printProgress(uint32_t offset, uint32_t size, uint32_t threshold, bool rese
   }
 }
 
-void setupMCUBootOTAData() {
-  // 1) Fast path: if partition 2 already holds update.bin + scratch.bin, skip
-  //    re-formatting to reduce flash wear.
+// Return the size of a file in bytes, or -1 if it cannot be opened.
+long tankalarm_provFileSize(const char* path) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return -1;
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fclose(f);
+  return size;
+}
+
+// Provision (or verify) the MCUboot OTA staging partition (MBR partition 2).
+// Returns true ONLY if partition 2 is FAT-formatted and both update.bin and
+// scratch.bin exist at their exact expected sizes. Returns false on ANY failure
+// so the caller never reports a half-provisioned board as healthy.
+bool setupMCUBootOTAData() {
+  // 1) Fast path: partition 2 is only "healthy" if update.bin + scratch.bin
+  //    exist AT THEIR EXACT EXPECTED SIZES. A truncated/0-byte file from an
+  //    aborted prior run opens fine but is NOT usable for staging, so a plain
+  //    fopen()!=NULL check would falsely skip the re-format (the H2/§13.2 bug).
   {
     mbed::MBRBlockDevice ota_data(&root, 2);
     mbed::FATFileSystem ota_data_fs("fs_ota");
     if (ota_data_fs.mount(&ota_data) == 0) {
-      FILE* f_up = fopen("/fs_ota/update.bin", "rb");
-      FILE* f_sc = fopen("/fs_ota/scratch.bin", "rb");
-      bool healthy = (f_up != NULL) && (f_sc != NULL);
-      if (f_up) fclose(f_up);
-      if (f_sc) fclose(f_sc);
+      long upSize = tankalarm_provFileSize("/fs_ota/update.bin");
+      long scSize = tankalarm_provFileSize("/fs_ota/scratch.bin");
+      bool healthy = (upSize == (long)TANKALARM_PROV_UPDATE_FILE_SIZE) &&
+                     (scSize == (long)TANKALARM_PROV_SCRATCH_FILE_SIZE);
       ota_data_fs.unmount();
       if (healthy) {
         Serial.println("QSPI partition already provisioned and healthy. Skipping format.");
-        return;
+        Serial.print("  update.bin size: ");  Serial.println(upSize);
+        Serial.print("  scratch.bin size: "); Serial.println(scSize);
+        return true;
       }
+      Serial.println("QSPI partition present but files missing/wrong size. Re-provisioning...");
+      Serial.print("  update.bin size: ");  Serial.print(upSize);
+      Serial.print(" (expected "); Serial.print((long)TANKALARM_PROV_UPDATE_FILE_SIZE); Serial.println(")");
+      Serial.print("  scratch.bin size: "); Serial.print(scSize);
+      Serial.print(" (expected "); Serial.print((long)TANKALARM_PROV_SCRATCH_FILE_SIZE); Serial.println(")");
     }
   }
+
 
   // 2) Create the standard Arduino Opta MBR partition table.
   //    Mirrors STM32H747_System/examples/QSPIFormat so the OTA region lands on
@@ -84,7 +113,7 @@ void setupMCUBootOTAData() {
   Serial.println("\nCreating MBR partition table (p1 WiFi, p2 OTA, p3 KVStore, p4 user)...");
   if (root.init() != 0) {
     Serial.println("Error: QSPI init failed. Cannot create partitions.");
-    return;
+    return false;
   }
   // Wipe the MBR sector so the partition table is written cleanly.
   root.erase(0x0, root.get_erase_size());
@@ -94,7 +123,7 @@ void setupMCUBootOTAData() {
   int e4 = mbed::MBRBlockDevice::partition(&root, 4, 0x0B, 7 * 1024 * 1024, 14 * 1024 * 1024);
   if (e1 || e2 || e3 || e4) {
     Serial.println("Error creating MBR partitions! Aborting.");
-    return;
+    return false;
   }
   Serial.println("MBR partition table created.");
 
@@ -104,7 +133,7 @@ void setupMCUBootOTAData() {
   int err = ota_data_fs.reformat(&ota_data);
   if (err) {
     Serial.println("Error creating MCUboot FAT partition on p2! Aborting.");
-    return;
+    return false;
   }
   Serial.println("FAT Partition MBR2 reformatted successfully.");
 
@@ -112,12 +141,14 @@ void setupMCUBootOTAData() {
   FILE* fp = fopen("/fs_ota/scratch.bin", "wb");
   if (!fp) {
     Serial.println("Error: Failed to open /fs_ota/scratch.bin for writing!");
-    return;
+    ota_data_fs.unmount();
+    return false;
   }
-  const int scratch_file_size = 128 * 1024;
+  const int scratch_file_size = TANKALARM_PROV_SCRATCH_FILE_SIZE;
   uint8_t buffer[128];
   memset(buffer, 0xFF, sizeof(buffer));
   int size = 0;
+  bool writeOk = true;
 
   Serial.println("\nAllocating scratch file");
   printProgress(size, scratch_file_size, 10, true);
@@ -125,19 +156,26 @@ void setupMCUBootOTAData() {
     int ret = fwrite(buffer, sizeof(buffer), 1, fp);
     if (ret != 1) {
       Serial.println("Error writing scratch file");
+      writeOk = false;
       break;
     }
     size += sizeof(buffer);
     printProgress(size, scratch_file_size, 10, false);
   }
   fclose(fp);
+  if (!writeOk) {
+    Serial.println("FATAL: scratch.bin allocation failed. Aborting.");
+    ota_data_fs.unmount();
+    return false;
+  }
 
   fp = fopen("/fs_ota/update.bin", "wb");
   if (!fp) {
     Serial.println("Error: Failed to open /fs_ota/update.bin for writing!");
-    return;
+    ota_data_fs.unmount();
+    return false;
   }
-  const int update_file_size = 15 * 128 * 1024; // 1.92 MB
+  const int update_file_size = TANKALARM_PROV_UPDATE_FILE_SIZE; // 1.92 MB
   size = 0;
 
   Serial.println("\nAllocating update file (1.92 MB)");
@@ -146,23 +184,56 @@ void setupMCUBootOTAData() {
     int ret = fwrite(buffer, sizeof(buffer), 1, fp);
     if (ret != 1) {
       Serial.println("Error writing update file");
+      writeOk = false;
       break;
     }
     size += sizeof(buffer);
     printProgress(size, update_file_size, 5, false);
   }
-
   fclose(fp);
+  if (!writeOk) {
+    Serial.println("FATAL: update.bin allocation failed. Aborting.");
+    ota_data_fs.unmount();
+    return false;
+  }
+
+  // Verify both files landed at EXACTLY the expected size before declaring success.
+  long upCheck = tankalarm_provFileSize("/fs_ota/update.bin");
+  long scCheck = tankalarm_provFileSize("/fs_ota/scratch.bin");
+  ota_data_fs.unmount();
+  if (upCheck != (long)update_file_size || scCheck != (long)scratch_file_size) {
+    Serial.println("FATAL: post-write size verification failed.");
+    Serial.print("  update.bin: ");  Serial.print(upCheck);  Serial.print(" expected "); Serial.println((long)update_file_size);
+    Serial.print("  scratch.bin: "); Serial.print(scCheck);  Serial.print(" expected "); Serial.println((long)scratch_file_size);
+    return false;
+  }
+
   Serial.println("\nMCUboot QSPI Data ready.");
+  return true;
 }
 
 void applyUpdate() {
   flash.init();
-  setupMCUBootOTAData();
+  bool otaOk = setupMCUBootOTAData();
   flash.program(&enc_priv_key, ENCRYPT_KEY_ADDR, ENCRYPT_KEY_SIZE);
   flash.program(&ecdsa_pub_key, SIGNING_KEY_ADDR, SIGNING_KEY_SIZE);
   flash.deinit();
-  Serial.println("\nDefault Security Keys provisioned successfully.");
+
+  // Print an explicit, per-component provisioning summary so an operator can
+  // never mistake a half-provisioned board for a healthy one (the §11.3 bug).
+  Serial.println("\n================ PROVISIONING SUMMARY ================");
+  Serial.println("  MCUboot keys programmed:        yes");
+  Serial.print("  QSPI OTA partition (p2) ready:  "); Serial.println(otaOk ? "yes" : "NO");
+  Serial.print("  update.bin (0x1E0000) allocated:"); Serial.println(otaOk ? " yes" : " NO");
+  Serial.print("  scratch.bin (0x20000) allocated:"); Serial.println(otaOk ? " yes" : " NO");
+  if (otaOk) {
+    Serial.println("  RESULT: System provisioned for MCUboot OTA.");
+  } else {
+    Serial.println("  RESULT: *** OTA PROVISIONING INCOMPLETE - DO NOT DEPLOY ***");
+    Serial.println("  Keys are written but the OTA partition is not usable.");
+    Serial.println("  Re-run this sketch; if it keeps failing, the QSPI may need a full erase.");
+  }
+  Serial.println("======================================================");
 }
 
 bool waitResponse() {

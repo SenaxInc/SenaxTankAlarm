@@ -670,10 +670,90 @@ iap_restore_hub:
 
 #if defined(TANKALARM_DFU_MCUBOOT)
 #include <MCUboot.h>
-#include "QSPIFBlockDevice.h"
 #include "MBRBlockDevice.h"
 #include "FATFileSystem.h"
 #include "TankAlarm_MCUbootConfig.h"
+
+// ----------------------------------------------------------------------------
+// Shared OTA filesystem access (single owner of the "fs_ota" prefix)
+// ----------------------------------------------------------------------------
+// CRITICAL: every OTA helper below must mount partition 2 through THIS single
+// pair of static objects. Previous revisions declared a separate static
+// QSPIFBlockDevice + MBRBlockDevice + FATFileSystem("fs_ota") inside each
+// function. That was unsafe on Mbed OS for two reasons:
+//   1. A second QSPIFBlockDevice on the same physical pins fights the singleton
+//      the application already created via BlockDevice::get_default_instance()
+//      (which is mapped to partition 4 for the LittleFS config store). Two
+//      drivers asserting the same CS line corrupts driver state / faults the bus.
+//   2. Multiple function-local static FATFileSystem objects all try to register
+//      the same "fs_ota" mount prefix in Mbed's global filesystem table, which
+//      collides and makes later mount() calls fail (-EINVAL/-ENODEV).
+// Routing every helper through tankalarm_otaFsMount()/Unmount() guarantees a
+// single QSPI driver (the default instance) and a single "fs_ota" registration.
+static mbed::MBRBlockDevice *tankalarm_otaPart = nullptr;
+static mbed::FATFileSystem  *tankalarm_otaFs   = nullptr;
+
+// Mount /fs_ota (partition 2) using the application's default QSPI block device.
+// Returns true on success. Safe to call repeatedly; the objects are created once.
+static inline bool tankalarm_otaFsMount() {
+  mbed::BlockDevice *root = mbed::BlockDevice::get_default_instance();
+  if (!root) {
+    Serial.println(F("MCUboot: No default QSPI block device for OTA."));
+    return false;
+  }
+  if (!tankalarm_otaPart) {
+    tankalarm_otaPart = new mbed::MBRBlockDevice(root, 2);
+  }
+  if (!tankalarm_otaFs) {
+    tankalarm_otaFs = new mbed::FATFileSystem("fs_ota");
+  }
+  if (!tankalarm_otaPart || !tankalarm_otaFs) {
+    return false;
+  }
+  // Defensive: release any prior mount first so a re-entry (e.g. after a failed
+  // staging attempt that left the FS mounted) cannot fail with -EINVAL.
+  tankalarm_otaFs->unmount();
+  return (tankalarm_otaFs->mount(tankalarm_otaPart) == 0);
+}
+
+static inline void tankalarm_otaFsUnmount() {
+  if (tankalarm_otaFs) {
+    tankalarm_otaFs->unmount();
+  }
+}
+
+// Boot-time OTA readiness self-check. Prints, over Serial, whether the QSPI OTA
+// partition (p2) mounts and whether update.bin / scratch.bin exist at their
+// expected sizes. This is the single most useful breadcrumb when diagnosing
+// "USB works but OTA fails": if this reports the partition or files missing/
+// wrong-size, the unit was never fully provisioned (run KeyProvisioning) — no
+// OTA can ever stage. Returns true only if the partition is fully provisioned.
+// Safe no-op on a build without MCUboot. Call once from setup() after storage init.
+static inline bool tankalarm_otaSelfCheck() {
+  Serial.println(F("---- OTA readiness self-check ----"));
+  if (!tankalarm_otaFsMount()) {
+    Serial.println(F("  QSPI p2 (fs_ota): MOUNT FAILED -> NOT provisioned. Run KeyProvisioning."));
+    return false;
+  }
+  long upSize = -1, scSize = -1;
+  FILE *fu = fopen("/fs_ota/update.bin", "rb");
+  if (fu) { fseek(fu, 0, SEEK_END); upSize = ftell(fu); fclose(fu); }
+  FILE *fs = fopen("/fs_ota/scratch.bin", "rb");
+  if (fs) { fseek(fs, 0, SEEK_END); scSize = ftell(fs); fclose(fs); }
+  tankalarm_otaFsUnmount();
+
+  const long wantUp = (long)TANKALARM_MCUBOOT_SLOT_SIZE;     // 0x1E0000
+  const long wantSc = (long)TANKALARM_MCUBOOT_SCRATCH_SIZE;  // 0x20000
+  bool ok = (upSize == wantUp) && (scSize == wantSc);
+  Serial.println(F("  QSPI p2 (fs_ota): mounted OK"));
+  Serial.print(F("  update.bin:  "));  Serial.print(upSize);
+  Serial.print(F(" (want "));          Serial.print(wantUp);  Serial.println(upSize == wantUp ? F(") OK") : F(") MISMATCH"));
+  Serial.print(F("  scratch.bin: "));  Serial.print(scSize);
+  Serial.print(F(" (want "));          Serial.print(wantSc);  Serial.println(scSize == wantSc ? F(") OK") : F(") MISMATCH"));
+  Serial.println(ok ? F("  OTA partition: READY") : F("  OTA partition: NOT READY -> run KeyProvisioning"));
+  Serial.println(F("----------------------------------"));
+  return ok;
+}
 
 static inline uint32_t tankalarm_versionToSeq(const char *verStr) {
   if (!verStr || verStr[0] == '\0') return 0;
@@ -683,20 +763,14 @@ static inline uint32_t tankalarm_versionToSeq(const char *verStr) {
 }
 
 static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
-  // Local static initialization of the QSPI block device
-  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
-  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
-  static mbed::FATFileSystem ota_data_fs("fs_ota");
-  
-  int err = ota_data_fs.mount(&ota_data);
-  if (err) {
+  if (!tankalarm_otaFsMount()) {
     Serial.println(F("MCUboot: No QSPI fs_ota available for OTA checking."));
     return;
   }
 
   FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
   if (!fp) {
-    ota_data_fs.unmount();
+    tankalarm_otaFsUnmount();
     return;
   }
 
@@ -708,7 +782,7 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
 
   if (read_bytes == 0) {
     remove("/fs_ota/pending_ota.json");
-    ota_data_fs.unmount();
+    tankalarm_otaFsUnmount();
     return;
   }
 
@@ -775,22 +849,17 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
     }
   }
 
-  ota_data_fs.unmount();
+  tankalarm_otaFsUnmount();
 }
 
 static inline bool tankalarm_isVersionBlacklisted(const char *version) {
   if (!version || version[0] == '\0') return false;
-  
-  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
-  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
-  static mbed::FATFileSystem ota_data_fs("fs_ota");
-  
-  int err = ota_data_fs.mount(&ota_data);
-  if (err) return false;
+
+  if (!tankalarm_otaFsMount()) return false;
 
   FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
   if (!fp) {
-    ota_data_fs.unmount();
+    tankalarm_otaFsUnmount();
     return false;
   }
 
@@ -798,7 +867,7 @@ static inline bool tankalarm_isVersionBlacklisted(const char *version) {
   memset(buf, 0, sizeof(buf));
   size_t read_bytes = fread(buf, 1, sizeof(buf) - 1, fp);
   fclose(fp);
-  ota_data_fs.unmount();
+  tankalarm_otaFsUnmount();
 
   if (read_bytes == 0) return false;
 
@@ -841,29 +910,26 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
   out.status[0] = '\0';
   out.targetV[0] = '\0';
 
-  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
-  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
-  static mbed::FATFileSystem ota_data_fs("fs_ota");
-  if (ota_data_fs.mount(&ota_data) != 0) return false;
+  if (!tankalarm_otaFsMount()) return false;
 
   FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
-  if (!fp) { ota_data_fs.unmount(); return false; }
+  if (!fp) { tankalarm_otaFsUnmount(); return false; }
   char buf[256]; memset(buf, 0, sizeof(buf));
   size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
   fclose(fp);
-  if (n == 0) { ota_data_fs.unmount(); return false; }
+  if (n == 0) { tankalarm_otaFsUnmount(); return false; }
 
   unsigned int target_seq = 0;
   char target_v[32]; memset(target_v, 0, sizeof(target_v));
   char status[32]; memset(status, 0, sizeof(status));
   int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}",
                       &target_seq, target_v, status);
-  if (parsed < 3) { ota_data_fs.unmount(); return false; }
+  if (parsed < 3) { tankalarm_otaFsUnmount(); return false; }
 
   const char *reportStatus = nullptr;
   if (strcmp(status, "failed_rollback") == 0) reportStatus = "reverted";
   else if (strcmp(status, "confirmed") == 0) reportStatus = "applied";
-  if (!reportStatus) { ota_data_fs.unmount(); return false; }
+  if (!reportStatus) { tankalarm_otaFsUnmount(); return false; }
 
   // Dedupe against the last reported outcome.
   FILE *rf = fopen("/fs_ota/ota_reported.json", "r");
@@ -876,13 +942,13 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
       char lastS[16]; memset(lastS, 0, sizeof(lastS));
       sscanf(rbuf, "{\"v\":\"%[^\"]\",\"s\":\"%[^\"]\"}", lastV, lastS);
       if (strcmp(lastV, target_v) == 0 && strcmp(lastS, reportStatus) == 0) {
-        ota_data_fs.unmount();
+        tankalarm_otaFsUnmount();
         return false;
       }
     }
   }
 
-  ota_data_fs.unmount();
+  tankalarm_otaFsUnmount();
   snprintf(out.status, sizeof(out.status), "%s", reportStatus);
   snprintf(out.targetV, sizeof(out.targetV), "%s", target_v);
   return true;
@@ -891,16 +957,13 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
 // Record that the given outcome has been reported, so it is not sent again.
 static inline void tankalarm_markOtaReported(const char *targetV, const char *status) {
   if (!targetV || !status) return;
-  static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
-  static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
-  static mbed::FATFileSystem ota_data_fs("fs_ota");
-  if (ota_data_fs.mount(&ota_data) != 0) return;
+  if (!tankalarm_otaFsMount()) return;
   FILE *wf = fopen("/fs_ota/ota_reported.json", "w");
   if (wf) {
     fprintf(wf, "{\"v\":\"%s\",\"s\":\"%s\"}\n", targetV, status);
     fclose(wf);
   }
-  ota_data_fs.unmount();
+  tankalarm_otaFsUnmount();
 }
 
 static bool tankalarm_performMcubootUpdate(
@@ -987,12 +1050,7 @@ static bool tankalarm_performMcubootUpdate(
 
   // --- Step 3: Mount FAT filesystem and open update file ---
   {
-    static QSPIFBlockDevice qspi_root(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
-    static mbed::MBRBlockDevice ota_data(&qspi_root, 2);
-    static mbed::FATFileSystem ota_data_fs("fs_ota");
-    
-    int err = ota_data_fs.mount(&ota_data);
-    if (err) {
+    if (!tankalarm_otaFsMount()) {
       Serial.println(F("MCUboot DFU: Failed to mount MBR2 FAT filesystem. Run Provisioning Sketch."));
       goto mcuboot_restore_hub;
     }
@@ -1214,6 +1272,7 @@ mcuboot_restore_hub:
     fclose(fp);
     fp = nullptr;
   }
+  tankalarm_otaFsUnmount();
   {
     J *req = notecard.newRequest("dfu.status");
     if (req) {
