@@ -11158,7 +11158,9 @@ static ConfigDispatchStatus dispatchClientConfig(const char *clientUid, JsonVari
   JsonArrayConst sensors = cfgObj["sensors"].as<JsonArrayConst>();
   if (!sensors.isNull()) {
     for (JsonObjectConst t : sensors) {
-      if (t["stuckDetection"].is<bool>() && !t["stuckDetection"].as<bool>()) {
+      // Client default is opt-in/off, so an omitted field also counts as disabled
+      bool isStuckDisabled = !t["stuckDetection"].is<bool>() || !t["stuckDetection"].as<bool>();
+      if (isStuckDisabled) {
         uint8_t sensorIdx = t["number"] | (uint8_t)0;
         if (sensorIdx == 0) continue;
         SensorRecord *rec = findSensorByHash(clientUid, sensorIdx);
@@ -11903,6 +11905,42 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   if (!rec) {
     return;
+  }
+
+  // If an incoming alarm is "sensor-stuck", check if the current configuration has it disabled.
+  // If disabled, treat as an invalid/stale alarm and auto-clear/ignore it rather than letting
+  // it latch in the database (e.g. if the client is running old firmware or has not applied its config yet).
+  if (strcmp(type, "sensor-stuck") == 0) {
+    bool stuckDisabledInConfig = false;
+    const ClientConfigSnapshot *stuckSnap = findClientConfigSnapshot(clientUid);
+    if (stuckSnap && stuckSnap->payload[0] != '\0') {
+      JsonDocument stuckCfg;
+      if (deserializeJson(stuckCfg, stuckSnap->payload) == DeserializationError::Ok) {
+        JsonArrayConst cfgSensors = stuckCfg["sensors"].as<JsonArrayConst>();
+        if (!cfgSensors.isNull()) {
+          for (JsonObjectConst ct : cfgSensors) {
+            uint8_t ctn = ct["number"] | 0;
+            if (ctn == sensorIndex) {
+              // Client default is opt-in/off, so a missing field also counts as disabled.
+              stuckDisabledInConfig = !(ct["stuckDetection"] | false);
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (stuckDisabledInConfig) {
+      rec->alarmActive = false;
+      strlcpy(rec->alarmType, "clear", sizeof(rec->alarmType));
+      clearAlarmEvent(clientUid, sensorIndex);
+      gSensorRegistryDirty = true;
+      Serial.print(F("Auto-cleared incoming sensor-stuck alarm (stuck detection disabled) for "));
+      Serial.print(clientUid);
+      Serial.print(F(" sensor "));
+      Serial.println(sensorIndex);
+      addServerSerialLog("Stale sensor-stuck alarm auto-cleared on arrival", "info", "alarm");
+      return; 
+    }
   }
   
   // Store optional user-assigned display number (0 = unset)
