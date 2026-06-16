@@ -498,3 +498,45 @@ No change needed. The watchdog is already **30 s** (`WATCHDOG_TIMEOUT_SECONDS`) 
 
 *Implementation completed 2026‑06‑15 as v1.9.27. Firmware compiles clean; hardware validation is the §15 runbook on the second computer.*
 
+---
+
+## 16. CI Signing Root Cause & Fix — the `.slot.bin` was built in a divergent format (2026‑06‑15)
+
+**Author:** GitHub Copilot (hardware session + CI fix)
+**Status:** Both CI workflows fixed. v1.9.27 confirmed running on the bench client over USB (`OTA partition: READY`). End‑to‑end OTA still pending the §15 Stage D test with a strictly‑newer version.
+
+### 16.1 What prompted this
+
+During the USB flash of v1.9.27, the **prebuilt `firmware/112025/client/TankAlarm-Client-secure-v1.9.27.slot.bin` wrote to QSPI cleanly but the bootloader did NOT swap it** — the board rebooted into the *old* firmware. Re‑flashing the same sketch compiled locally with `--fqbn arduino:mbed_opta:opta:security=sien` swapped immediately and booted v1.9.27. That proved the two artifacts were **not the same format**, even though both are "signed + encrypted MCUboot images."
+
+### 16.2 Investigation (what was ruled in / out)
+
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| **Key mismatch** (CI signs with keys the device doesn't trust) | **RULED OUT** | Decoded the DER of every key. The repo `mcuboot_keys/*.pem`, the Arduino core `libraries/MCUboot/default_keys/*.pem`, and the keys KeyProvisioning embeds (`ecdsa_pub_key[]`, `enc_priv_key[]`) are **byte‑identical in content**. (The earlier file‑hash difference was PEM *formatting* only.) The USB flash with the core/default‑key build decrypted + swapped, proving the device trusts these keys. |
+| **imgtool flags wrong** | RULED OUT | The CI's manual `imgtool sign` flags (`--align 32 --max-align 32 --header-size 0x20000 --pad-header --slot-size 0x1E0000`, no `--pad`/`--confirm`) are **identical** to the core's `tools.imgtool.flags` (platform.txt L194). |
+| **OTA apply code needs a pre‑padded image** | RULED OUT | `tankalarm_performMcubootUpdate()` streams the image to `/fs_ota/update.bin`, checks magic `0x96f3b83d`, **pads the slot with `0xFF` itself**, then calls `MCUboot::applyUpdate(false)` to write the trailer. So the OTA target must be a *raw* signed+encrypted image (no self‑pad) — which is what both produce. |
+| **Version/build gating** | RULED OUT | `tankalarm_versionToSeq("1.9.27") = 1*100 + 9*10 + 27 = 217 = FIRMWARE_BUILD_SEQ`. The downgrade guard (F3) uses the Notehub version string, not the header build, so the `+0` header build is irrelevant to OTA gating. |
+| **Tooling divergence** | **ROOT CAUSE** | The CI built the app **plain** (`--fqbn …opta`, security=none) then signed it with **`pip install imgtool` (latest, 2.x)** plus a monkeypatch (`self.header_size & 0xFFFF`) and the repo's PEM copies. The Arduino core's `security=sien` build instead signs with its **own bundled imgtool `1.8.0‑arduino.2`** via the post‑objcopy hook. Different imgtool version + monkeypatch + separate build path yielded an image the v25 bootloader would **not** swap, even though it parsed as a valid MCUboot image. |
+
+### 16.3 The fix
+
+Both workflows that emit the client OTA artifact now build it with the **core's `security=sien` setting** instead of build‑plain‑then‑manually‑sign. This uses the core's own bundled `imgtool 1.8.0‑arduino.2` and the default MCUboot keychain the bootloader trusts — the exact format proven to swap on hardware.
+
+- [release-firmware-112025.yml](../.github/workflows/release-firmware-112025.yml): replaced *Install imgtool* + *Sign & Format MCUboot Image* with a *Build signed client firmware (MCUboot OTA slot image)* step that compiles `--fqbn arduino:mbed_opta:opta:security=sien --build-property build.version=<ver>+0` and copies the resulting `.ino.bin` to `TankAlarm-Client-secure-v<ver>.slot.bin`.
+- [arduino-ci-112025.yml](../.github/workflows/arduino-ci-112025.yml): same change for the committed `firmware/112025/client/…slot.bin`.
+- The `pip install imgtool`, the `header_size & 0xFFFF` monkeypatch, and the `mcuboot_keys/` references are removed from the signing path. (`mcuboot_keys/` stays in the repo for reference; it is content‑identical to the core defaults.)
+
+### 16.4 Why this is correct for both USB‑DFU and OTA
+
+The core `security=sien` `.ino.bin` is a raw signed+encrypted MCUboot image **without** a slot trailer. That is exactly what both consumers need:
+- **USB‑DFU** (`arduino-cli upload …:security=sien`): proven to validate + swap on this bench board.
+- **OTA** (`tankalarm_performMcubootUpdate`): the app pads the slot and writes the trailer via `MCUboot::applyUpdate(false)`, so the raw image is the right input.
+
+One artifact now serves both paths.
+
+### 16.5 Still to validate (hardware)
+
+The fix makes the *artifact* correct; it does not by itself prove a cellular OTA. Run §15 Stage D with a strictly‑newer signed slot image (e.g. tag `v1.9.28` so the fixed CI builds it, assign it on Notehub) and confirm the serial trail `FIRMWARE UPDATE AVAILABLE → MCUboot magic verified → STAGED · TRIGGERING SWAP → new version boots → sketch confirmed`.
+
+
