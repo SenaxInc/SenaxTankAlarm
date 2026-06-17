@@ -2098,8 +2098,15 @@ void loop() {
         ? (unsigned long)SOLAR_INBOUND_INTERVAL_MINUTES * 60000UL  // 1 hour (solar)
         : 600000UL;  // 10 minutes (grid)
     if (now - gLastDfuCheckMillis > dfuInterval) {
-      gLastDfuCheckMillis = now;
       if (!gDfuInProgress && gNotecardAvailable) {
+        gLastDfuCheckMillis = now;  // only advance the timer when a check actually runs
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+        mbedWatchdog.kick();  // QSPI blacklist mount + dfu.status query can be slow
+  #else
+        IWatchdog.reload();
+  #endif
+#endif
         checkForFirmwareUpdate();
         // Always apply a pushed OTA update from Notehub when one is available. The per-client
         // update policy was removed — the device unconditionally accepts firmware pushed to it.
@@ -2107,6 +2114,13 @@ void loop() {
           Serial.println(F("Auto-DFU: Applying available firmware update (MCUboot)..."));
           enableDfuMode();
         }
+      } else {
+        // Could not check this cycle (DFU busy or Notecard offline). Do NOT burn the
+        // full interval — a brief Notecard/I2C hiccup at the tick should not defer the
+        // OTA check by a whole hour. Retry in ~1 min. (now > dfuInterval in this branch
+        // because gLastDfuCheckMillis >= 0, so the subtraction cannot underflow.)
+        gLastDfuCheckMillis = now - dfuInterval + 60000UL;
+        Serial.println(F("DFU check deferred (DFU busy or Notecard offline) - retrying ~1 min"));
       }
     }
   }
@@ -3847,6 +3861,18 @@ static bool checkNotecardHealth() {
     Serial.print(F("card.wireless error: "));
     Serial.println(wirelessErr);
     notecard.deleteResponse(rsp);
+    // The Notecard answered over I2C, so the transport is healthy even though the
+    // cellular layer reported an error. Mark it available so OTA checks and note
+    // sends are not blocked by a wireless-only fault - otherwise a unit that
+    // briefly went offline could stay flagged offline indefinitely.
+    if (!gNotecardAvailable) {
+      Serial.println(F("Notecard responding (I2C OK, wireless error) - online mode restored"));
+      tankalarm_ensureNotecardBinding(notecard);
+      configureNotecardHubMode();
+    }
+    gNotecardAvailable = true;
+    gNotecardFailureCount = 0;
+    gLastSuccessfulNotecardComm = millis();
     return true;  // Notecard is responding (I2C OK), just wireless issue
   }
 
@@ -4009,10 +4035,38 @@ static void scheduleNextDailyReport() {
 static uint32_t gDfuFirmwareLength = 0;
 static TankAlarmDfuStatus gDfuStatus;
 
+// Stop a Notehub-pushed DFU we are deliberately refusing (downgrade/equal version
+// or a locally blacklisted version) so the Notecard stops advertising mode:"ready"
+// and the host does not re-evaluate the same image on every check. Deduped by
+// version so a given refused image is stopped/logged only once. Returns true if
+// this call actually issued the stop (i.e. the version was not already handled).
+static bool stopRefusedFirmware(const char *version, const char *reason) {
+  static char lastStopped[24] = {0};
+  if (version && strncmp(lastStopped, version, sizeof(lastStopped)) == 0) {
+    return false;  // already handled this version
+  }
+  J *req = notecard.newRequest("dfu.status");
+  if (req) {
+    JAddBoolToObject(req, "stop", true);
+    JAddStringToObject(req, "status", reason);
+    JAddStringToObject(req, "name", "user");
+    J *rsp = notecard.requestAndResponse(req);
+    if (rsp) notecard.deleteResponse(rsp);
+  }
+  if (version) strlcpy(lastStopped, version, sizeof(lastStopped));
+  return true;
+}
+
 static void checkForFirmwareUpdate() {
   TankAlarmDfuStatus dfuStatus;
   if (!tankalarm_checkDfuStatus(notecard, dfuStatus)) {
-    return;  // Notecard communication failure
+    // Notecard comm failure: clear any stale "update available" so a prior
+    // cycle's metadata cannot drive an apply with outdated length/version.
+    Serial.println(F("DFU check: dfu.status query failed (Notecard comm) - skipping"));
+    gDfuUpdateAvailable = false;
+    gDfuFirmwareLength = 0;
+    gDfuVersion[0] = '\0';
+    return;
   }
 
   // Track downloading state.
@@ -4035,6 +4089,11 @@ static void checkForFirmwareUpdate() {
   if (dfuStatus.error) {
     Serial.print(F("DFU error: "));
     Serial.println(dfuStatus.errorMsg);
+    // Clear stale state so the error path cannot leave a previous cycle's
+    // "available" flag set and trigger an apply with outdated metadata.
+    gDfuUpdateAvailable = false;
+    gDfuFirmwareLength = 0;
+    gDfuVersion[0] = '\0';
     return;
   }
 
@@ -4043,9 +4102,11 @@ static void checkForFirmwareUpdate() {
     // Check local blacklist before anything else
 #if defined(TANKALARM_DFU_MCUBOOT)
     if (tankalarm_isVersionBlacklisted(dfuStatus.version)) {
-      Serial.print(F("DFU: Version "));
-      Serial.print(dfuStatus.version);
-      Serial.println(F(" is locally blacklisted. Skipping check."));
+      if (stopRefusedFirmware(dfuStatus.version, "blacklisted (previous rollback)")) {
+        Serial.print(F("DFU: Version "));
+        Serial.print(dfuStatus.version);
+        Serial.println(F(" is locally blacklisted - stopped."));
+      }
       return;
     }
 
@@ -4054,11 +4115,13 @@ static void checkForFirmwareUpdate() {
     // (or an older .slot.bin) must never trigger a downgrade-then-rollback loop.
     // Sequence is major*100 + minor*10 + patch (matches FIRMWARE_BUILD_SEQ).
     if (tankalarm_versionToSeq(dfuStatus.version) <= (uint32_t)FIRMWARE_BUILD_SEQ) {
-      Serial.print(F("DFU: Offered v"));
-      Serial.print(dfuStatus.version);
-      Serial.print(F(" is not newer than running v"));
-      Serial.print(F(FIRMWARE_VERSION));
-      Serial.println(F(" - ignoring (no downgrade)."));
+      if (stopRefusedFirmware(dfuStatus.version, "not newer than running firmware")) {
+        Serial.print(F("DFU: Offered v"));
+        Serial.print(dfuStatus.version);
+        Serial.print(F(" is not newer than running v"));
+        Serial.print(F(FIRMWARE_VERSION));
+        Serial.println(F(" - ignoring (no downgrade), stopped."));
+      }
       gDfuUpdateAvailable = false;
       gDfuVersion[0] = '\0';
       gDfuFirmwareLength = 0;
@@ -4202,6 +4265,12 @@ static void enableDfuMode() {
     addSerialLog("MCUboot staging failed");
     // Tell the server the staging attempt failed (host never swapped) for dashboard visibility.
     sendOtaReportNote("ota-stage-failed", gDfuStatus.version, "MCUboot staging failed");
+    // Clear the pending-update flags so a failed staging attempt (preflight reject,
+    // role mismatch, transient error) does not retry the same image every check.
+    // A genuinely newer image is re-detected on the next successful check.
+    gDfuUpdateAvailable = false;
+    gDfuVersion[0] = '\0';
+    gDfuFirmwareLength = 0;
     if (gConfig.solarCharger.enabled) {
       gSolarManager.begin(gConfig.solarCharger);
     }

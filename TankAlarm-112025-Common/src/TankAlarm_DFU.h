@@ -793,11 +793,11 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
   char status[32];
   memset(status, 0, sizeof(status));
 
-  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}", 
+  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%31[^\"]\",\"status\":\"%31[^\"]\"}", 
                       &target_seq, target_v, status);
 
   if (parsed < 2) {
-    parsed = sscanf(buf, "{\x22target_seq\x22:%u,\x22target_v\x22:\x22%[^\x22]\x22,\x22status\x22:\x22%[^\x22]\x22}",
+    parsed = sscanf(buf, "{\x22target_seq\x22:%u,\x22target_v\x22:\x22%31[^\x22]\x22,\x22status\x22:\x22%31[^\x22]\x22}",
                     &target_seq, target_v, status);
   }
 
@@ -877,10 +877,10 @@ static inline bool tankalarm_isVersionBlacklisted(const char *version) {
   char status[32];
   memset(status, 0, sizeof(status));
 
-  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}", 
+  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%31[^\"]\",\"status\":\"%31[^\"]\"}", 
                       &target_seq, target_v, status);
   if (parsed < 2) {
-    parsed = sscanf(buf, "{\x22target_seq\x22:%u,\x22target_v\x22:\x22%[^\x22]\x22,\x22status\x22:\x22%[^\x22]\x22}",
+    parsed = sscanf(buf, "{\x22target_seq\x22:%u,\x22target_v\x22:\x22%31[^\x22]\x22,\x22status\x22:\x22%31[^\x22]\x22}",
                     &target_seq, target_v, status);
   }
 
@@ -922,7 +922,7 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
   unsigned int target_seq = 0;
   char target_v[32]; memset(target_v, 0, sizeof(target_v));
   char status[32]; memset(status, 0, sizeof(status));
-  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%[^\"]\",\"status\":\"%[^\"]\"}",
+  int parsed = sscanf(buf, "{\"target_seq\":%u,\"target_v\":\"%31[^\"]\",\"status\":\"%31[^\"]\"}",
                       &target_seq, target_v, status);
   if (parsed < 3) { tankalarm_otaFsUnmount(); return false; }
 
@@ -940,7 +940,7 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
     if (rn > 0) {
       char lastV[32]; memset(lastV, 0, sizeof(lastV));
       char lastS[16]; memset(lastS, 0, sizeof(lastS));
-      sscanf(rbuf, "{\"v\":\"%[^\"]\",\"s\":\"%[^\"]\"}", lastV, lastS);
+      sscanf(rbuf, "{\"v\":\"%31[^\"]\",\"s\":\"%15[^\"]\"}", lastV, lastS);
       if (strcmp(lastV, target_v) == 0 && strcmp(lastS, reportStatus) == 0) {
         tankalarm_otaFsUnmount();
         return false;
@@ -979,7 +979,9 @@ static bool tankalarm_performMcubootUpdate(
   if (firmwareLength == 0 || firmwareLength > TANKALARM_MCUBOOT_SLOT_SIZE) {
     Serial.print(F("MCUboot DFU: Invalid firmware length: "));
     Serial.println(firmwareLength);
-    return false;
+    // Route through cleanup so the Notecard DFU is stopped (clears the stale
+    // "ready" state) instead of looping on the same malformed image every check.
+    goto mcuboot_restore_hub;
   }
 
   // --- H2: Role/source check ---
@@ -989,7 +991,8 @@ static bool tankalarm_performMcubootUpdate(
     Serial.print(dfu.firmwareSource);
     Serial.print(F("\" does not match device role: "));
     Serial.println(tankalarm_roleToken(deviceRole));
-    return false;
+    // Wrong-role image: stop it on the Notecard so it is not re-detected forever.
+    goto mcuboot_restore_hub;
   }
 
   Serial.println(F("========================================"));
@@ -1005,7 +1008,7 @@ static bool tankalarm_performMcubootUpdate(
   Serial.println(F("MCUboot DFU: Entering Notecard DFU mode..."));
   {
     J *req = notecard.newRequest("hub.set");
-    if (!req) return false;
+    if (!req) goto mcuboot_restore_hub;
     JAddStringToObject(req, "mode", "dfu");
     if (kickWatchdog) kickWatchdog();
     J *rsp = notecard.requestAndResponse(req);
@@ -1013,7 +1016,10 @@ static bool tankalarm_performMcubootUpdate(
     if (rsp) {
       notecard.deleteResponse(rsp);
     } else {
-      return false;
+      // Lost response: the Notecard may have entered DFU mode (which suspends all
+      // cellular sync). Restore hub mode via cleanup instead of returning so the
+      // Notecard is not silently stranded offline until the 4h modem-stall timer.
+      goto mcuboot_restore_hub;
     }
   }
 
