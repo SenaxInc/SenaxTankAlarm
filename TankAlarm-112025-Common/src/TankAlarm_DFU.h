@@ -103,6 +103,29 @@ struct TankAlarmDfuStatus {
   char errorMsg[64];          // Error message (if any)
 };
 
+// Extract a semantic version (e.g. "1.9.33") from a firmware filename such as
+// "TankAlarm-Client-secure-v1.9.33.slot$20260617201834.bin". Returns true and fills
+// `out` on the first "<major>.<minor>.<patch>" run that is not preceded by a digit or
+// dot. Used to recover the OTA target version when the Notecard's dfu.status response
+// has no explicit "version" field (the host .slot.bin embeds no Blues metadata).
+static inline bool tankalarm_extractVersionFromFilename(const char *name, char *out, size_t outLen) {
+  if (!name || !out || outLen == 0) return false;
+  for (const char *p = name; *p != '\0'; ++p) {
+    if (*p < '0' || *p > '9') continue;
+    if (p != name) {
+      const char prev = *(p - 1);
+      if ((prev >= '0' && prev <= '9') || prev == '.') continue;  // middle of a number
+    }
+    int major = -1, minor = -1, patch = -1;
+    if (sscanf(p, "%d.%d.%d", &major, &minor, &patch) == 3 &&
+        major >= 0 && minor >= 0 && patch >= 0) {
+      snprintf(out, outLen, "%d.%d.%d", major, minor, patch);
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Poll Notecard for IAP DFU status.
  *
@@ -153,13 +176,27 @@ static inline bool tankalarm_checkDfuStatus(Notecard &notecard, TankAlarmDfuStat
     if (md5) {
       strlcpy(status.firmwareMd5, md5, sizeof(status.firmwareMd5));
     }
+    // Capture the update filename from whichever key the Notecard provides. Different
+    // Notecard firmware revisions expose it as "name", "file", or "source"; we need at
+    // least one to recover the version below when no explicit "version" is present.
     const char *name = JGetString(body, "name");
-    if (name) {
+    if (!name || name[0] == '\0') name = JGetString(body, "file");
+    if (!name || name[0] == '\0') name = JGetString(body, "source");
+    if (name && name[0] != '\0') {
       strlcpy(status.firmwareName, name, sizeof(status.firmwareName));
     }
     const char *source = JGetString(body, "source");
-    if (source) {
+    if (source && source[0] != '\0') {
       strlcpy(status.firmwareSource, source, sizeof(status.firmwareSource));
+    }
+  }
+
+  // Some Notecard firmware revisions place the update filename at the response root
+  // rather than inside "body"; capture it as a fallback for version recovery.
+  if (status.firmwareName[0] == '\0') {
+    const char *rootFile = JGetString(rsp, "file");
+    if (rootFile && rootFile[0] != '\0') {
+      strlcpy(status.firmwareName, rootFile, sizeof(status.firmwareName));
     }
   }
 
@@ -171,6 +208,18 @@ static inline bool tankalarm_checkDfuStatus(Notecard &notecard, TankAlarmDfuStat
       status.downloading = true;
     } else if (strcmp(mode, "error") == 0) {
       status.error = true;
+    }
+  }
+
+  // Recover the version when an update is READY but the Notecard reported no top-level
+  // "version" (our host .slot.bin embeds no Blues firmware metadata, so dfu.status
+  // returns an empty version). Derive it from the update filename so the host apply
+  // path — which requires a non-empty version — does not silently ignore a ready OTA.
+  if (status.updateAvailable && status.version[0] == '\0') {
+    if (tankalarm_extractVersionFromFilename(status.firmwareName, status.version, sizeof(status.version)) ||
+        tankalarm_extractVersionFromFilename(status.firmwareSource, status.version, sizeof(status.version))) {
+      Serial.print(F("DFU: recovered update version from filename: "));
+      Serial.println(status.version);
     }
   }
 
