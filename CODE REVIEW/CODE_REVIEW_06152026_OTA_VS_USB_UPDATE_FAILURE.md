@@ -539,4 +539,38 @@ One artifact now serves both paths.
 
 The fix makes the *artifact* correct; it does not by itself prove a cellular OTA. Run §15 Stage D with a strictly‑newer signed slot image (e.g. tag `v1.9.28` so the fixed CI builds it, assign it on Notehub) and confirm the serial trail `FIRMWARE UPDATE AVAILABLE → MCUboot magic verified → STAGED · TRIGGERING SWAP → new version boots → sketch confirmed`.
 
+---
+
+## 17. Hardware Validation — OTA Confirmed Working End‑to‑End (2026‑06‑16)
+
+**Status:** ✅ **PASS.** A real GitHub‑release → Notehub → cellular → device → MCUboot‑apply update succeeded on the bench client (`dev:860322068056545`).
+
+### 17.1 What was tested
+
+The fixed CI built `TankAlarm-Client-secure-v1.9.28.slot.bin` (tag `v1.9.28`). It was downloaded from the GitHub Release, uploaded to Notehub as Host Firmware, and assigned to the device (then on v1.9.27 / build 217).
+
+### 17.2 First observation — "stuck on 1.9.27" was **not** a firmware bug
+
+Notehub showed the 1.9.28 image reaching **"Ready — Successfully downloaded"** (the Notecard has the bytes), but **no host‑side `staged for MCUboot` / `firmware update failed` status followed**, and the device boot log showed **no staging attempt** (no `pending_ota.json`, no rollback). The host had simply never *run* its DFU check while the image was ready.
+
+**Root cause (benign):** the client's periodic DFU check is gated by a check interval (`SOLAR_INBOUND_INTERVAL_MINUTES = 60 min` for a solar unit) measured from `gLastDfuCheckMillis`, which **starts at 0 on every boot**. Every USB serial capture (the native‑USB port reset on open) and every bench power‑cycle **restarted that 1‑hour clock** before it could fire. A field unit runs uninterrupted and would apply on its next hourly check. This is a *bench‑artifact*, not a code defect.
+
+### 17.3 Decisive proof
+
+To validate the staging path in minutes instead of an unpredictable hour, a diagnostic v1.9.27 image was built with a build‑time‑only override (`-DTANKALARM_DFU_CHECK_INTERVAL_MS=60000`, inert unless defined; reverted after the test) and flashed over USB. Within ~2 minutes of boot the device pulled and applied the **production** 1.9.28 image over cellular. Serial captured:
+
+```
+Tank Alarm Client 112025 v1.9.28 (Jun 16 2026)
+MCUboot: sketch confirmed (early, unconditional)
+---- OTA readiness self-check ----  OTA partition: READY
+Firmware change detected (stored seq 217 -> running seq 218); will send immediate confirmation telemetry
+```
+
+The `stored seq 217 -> running seq 218` line is the device detecting **its own MCUboot swap** — only possible via a genuine OTA, not a USB flash. The image that booted is the real CI‑built 1.9.28 (the diagnostic firmware was only the 1.9.27 vehicle that staged it).
+
+### 17.4 Conclusion
+
+The §16 CI fix (build the slot image via core `security=sien`) is **validated end‑to‑end on hardware**. The remote GitHub → Notehub → cellular → MCUboot‑apply path now works; future client updates can be pushed without a USB visit. The earlier per‑version failures (1.9.7–1.9.24) were on the pre‑fix firmware/CI; this is the first success on the corrected stack.
+
+
 
