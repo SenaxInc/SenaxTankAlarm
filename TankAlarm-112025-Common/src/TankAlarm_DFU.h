@@ -757,9 +757,16 @@ static inline bool tankalarm_otaSelfCheck() {
 
 static inline uint32_t tankalarm_versionToSeq(const char *verStr) {
   if (!verStr || verStr[0] == '\0') return 0;
+  // Tolerate a leading 'v'/'V' (Git tag / Notehub version conventions like "v1.9.33")
+  // so a prefixed string is not silently parsed as 0 and rejected by the downgrade guard.
+  const char *p = verStr;
+  if (*p == 'v' || *p == 'V') p++;
   int major = 0, minor = 0, patch = 0;
-  sscanf(verStr, "%d.%d.%d", &major, &minor, &patch);
-  return major * 100 + minor * 10 + patch;
+  const int n = sscanf(p, "%d.%d.%d", &major, &minor, &patch);
+  // Require all three components and reject negatives; a malformed string returns 0
+  // (treated as "not newer" = safe refuse) instead of an undefined partial parse.
+  if (n != 3 || major < 0 || minor < 0 || patch < 0) return 0;
+  return (uint32_t)(major * 100 + minor * 10 + patch);
 }
 
 static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
@@ -827,6 +834,7 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
         J *req = notecard.newRequest("dfu.status");
         if (req) {
           JAddBoolToObject(req, "stop", true);
+          JAddStringToObject(req, "name", "user");  // target the host DFU channel explicitly (matches other stop calls)
           char err_buf[128];
           snprintf(err_buf, sizeof(err_buf), "rollback detected - trial crashed - reverted to %s", FIRMWARE_VERSION);
           JAddStringToObject(req, "status", err_buf);

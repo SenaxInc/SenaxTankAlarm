@@ -30,6 +30,8 @@
 
 #if defined(TANKALARM_DFU_MCUBOOT)
 #include <MCUboot.h>
+#else
+#warning "TANKALARM_DFU_MCUBOOT is NOT defined - MCUboot OTA updates are DISABLED in this build"
 #endif
 
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -1447,6 +1449,12 @@ void setup() {
   Serial.print(F(" ("));
   Serial.print(F(FIRMWARE_BUILD_DATE));
   Serial.println(F(")"));
+
+#if defined(TANKALARM_DFU_MCUBOOT)
+  Serial.println(F("  OTA: MCUboot ENABLED"));
+#else
+  Serial.println(F("  OTA: MCUboot DISABLED (no -DTANKALARM_DFU_MCUBOOT)"));
+#endif
 
 #if defined(TANKALARM_DFU_MCUBOOT)
   // Confirm this image unconditionally as early as possible so MCUboot does not
