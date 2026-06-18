@@ -719,6 +719,7 @@ iap_restore_hub:
 
 #if defined(TANKALARM_DFU_MCUBOOT)
 #include <MCUboot.h>
+#include "bootutil/bootutil_public.h"  // boot_set_pending() - call directly to observe the trailer-write return code
 #include "MBRBlockDevice.h"
 #include "FATFileSystem.h"
 #include "TankAlarm_MCUbootConfig.h"
@@ -780,6 +781,33 @@ static inline void tankalarm_otaFsUnmount() {
 // Safe no-op on a build without MCUboot. Call once from setup() after storage init.
 static inline bool tankalarm_otaSelfCheck() {
   Serial.println(F("---- OTA readiness self-check ----"));
+
+  // Bootloader identity + running-image signing state, so the "stock loader" (H-2)
+  // and "unsigned running image" (H-1) questions can be answered remotely without a
+  // USB visit. Offsets match STM32H747_getBootloaderInfo / KeyProvisioning:
+  // identifier = 15 chars @ 0x080002F0, version byte @ 0x08001F001.
+  {
+    const char *blId = (const char *)(0x080002F0UL);
+    uint8_t blVer = *((const volatile uint8_t *)(0x08001F001UL));
+    char idBuf[16];
+    memcpy(idBuf, blId, 15);
+    idBuf[15] = '\0';
+    for (int i = 0; i < 15; i++) { if (idBuf[i] < 32 || idBuf[i] > 126) idBuf[i] = '?'; }
+    bool blOk = (strncmp(blId, "MCUboot Arduino", 15) == 0) && (blVer > 24);
+    Serial.print(F("  Bootloader: \""));
+    Serial.print(idBuf);
+    Serial.print(F("\" v"));
+    Serial.print(blVer);
+    Serial.println(blOk ? F(" -> MCUboot OTA-capable")
+                        : F(" -> NOT MCUboot v25; OTA SWAP WILL NOT WORK (run STM32H747_manageBootloader)"));
+
+    uint32_t primaryMagic = *((const volatile uint32_t *)(0x08020000UL));
+    Serial.print(F("  Primary slot hdr @0x08020000: 0x"));
+    Serial.print(primaryMagic, HEX);
+    Serial.println(primaryMagic == 0x96f3b83d ? F(" -> signed MCUboot image")
+                                              : F(" -> NO MCUboot header (running image likely UNSIGNED / security=none)"));
+  }
+
   if (!tankalarm_otaFsMount()) {
     Serial.println(F("  QSPI p2 (fs_ota): MOUNT FAILED -> NOT provisioned. Run KeyProvisioning."));
     return false;
@@ -1313,17 +1341,43 @@ static bool tankalarm_performMcubootUpdate(
     }
   }
 
+  // Release our FAT mount of partition 2 BEFORE handing off to MCUboot. The core's
+  // boot_set_pending() opens the secondary slot via its own FATFileSystem("fs") +
+  // /fs/update.bin; if our "fs_ota" mount of the same partition is still active the
+  // trailer write can fail (the core ignores the mount error and the void
+  // MCUboot::applyUpdate wrapper discards boot_set_pending's return), leaving no swap
+  // trailer -> the bootloader boots the old image -> the app reports a false rollback.
+  tankalarm_otaFsUnmount();
+
   Serial.println(F("========================================"));
   Serial.println(F("MCUboot DFU: STAGED * TRIGGERING SWAP"));
   Serial.println(F("========================================"));
   Serial.flush();
   delay(500);
 
-  // Set the MCUboot trailer so the bootloader tests the firmware on next boot
-  MCUboot::applyUpdate(false);
+  // Set the MCUboot trailer and CHECK the result. Call boot_set_pending() directly
+  // (instead of the void MCUboot::applyUpdate wrapper, which discards the return
+  // code) so a failed trailer write is observable: on failure we clear the trial
+  // marker, abort the reset, and return false so the caller reports ota-stage-failed
+  // instead of rebooting into the old image and mislabeling it a rollback.
+  {
+    int swapRc = boot_set_pending(0);
+    if (swapRc != 0) {
+      Serial.print(F("MCUboot DFU: ERROR - boot_set_pending failed (rc="));
+      Serial.print(swapRc);
+      Serial.println(F("); swap NOT scheduled. Aborting reset to avoid a false rollback."));
+      // Remove the trial marker so a later reboot does not misread it as a rollback.
+      if (tankalarm_otaFsMount()) {
+        remove("/fs_ota/pending_ota.json");
+        tankalarm_otaFsUnmount();
+      }
+      goto mcuboot_restore_hub;
+    }
+    Serial.println(F("MCUboot DFU: swap trailer written (boot_set_pending OK)."));
+  }
   delay(500);
 
-  // Kick watchdog one last time before rebooting to maximize our ~30s window (13.6 option 1)
+  // Kick watchdog one last time before rebooting to maximize our ~30s window
   if (kickWatchdog) kickWatchdog();
 
   NVIC_SystemReset();
