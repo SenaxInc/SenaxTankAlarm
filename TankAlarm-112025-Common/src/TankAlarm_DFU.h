@@ -781,33 +781,10 @@ static inline void tankalarm_otaFsUnmount() {
 // Safe no-op on a build without MCUboot. Call once from setup() after storage init.
 static inline bool tankalarm_otaSelfCheck() {
   Serial.println(F("---- OTA readiness self-check ----"));
-
-  // Bootloader identity + running-image signing state, so the "stock loader" (H-2)
-  // and "unsigned running image" (H-1) questions can be answered remotely without a
-  // USB visit. Offsets match STM32H747_getBootloaderInfo / KeyProvisioning:
-  // identifier = 15 chars @ 0x080002F0, version byte @ 0x08001F001.
-  {
-    const char *blId = (const char *)(0x080002F0UL);
-    uint8_t blVer = *((const volatile uint8_t *)(0x08001F001UL));
-    char idBuf[16];
-    memcpy(idBuf, blId, 15);
-    idBuf[15] = '\0';
-    for (int i = 0; i < 15; i++) { if (idBuf[i] < 32 || idBuf[i] > 126) idBuf[i] = '?'; }
-    bool blOk = (strncmp(blId, "MCUboot Arduino", 15) == 0) && (blVer > 24);
-    Serial.print(F("  Bootloader: \""));
-    Serial.print(idBuf);
-    Serial.print(F("\" v"));
-    Serial.print(blVer);
-    Serial.println(blOk ? F(" -> MCUboot OTA-capable")
-                        : F(" -> NOT MCUboot v25; OTA SWAP WILL NOT WORK (run STM32H747_manageBootloader)"));
-
-    uint32_t primaryMagic = *((const volatile uint32_t *)(0x08020000UL));
-    Serial.print(F("  Primary slot hdr @0x08020000: 0x"));
-    Serial.print(primaryMagic, HEX);
-    Serial.println(primaryMagic == 0x96f3b83d ? F(" -> signed MCUboot image")
-                                              : F(" -> NO MCUboot header (running image likely UNSIGNED / security=none)"));
-  }
-
+  // NOTE: do NOT read raw internal-flash addresses here (e.g. the MCUboot primary
+  // slot header at 0x08020000). On the STM32H7, reading an erased/unprogrammed flash
+  // word raises a double-bit ECC fault -> HardFault. The bootloader identity is
+  // available safely via the STM32H747_getBootloaderInfo example sketch instead.
   if (!tankalarm_otaFsMount()) {
     Serial.println(F("  QSPI p2 (fs_ota): MOUNT FAILED -> NOT provisioned. Run KeyProvisioning."));
     return false;
