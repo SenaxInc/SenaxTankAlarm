@@ -725,51 +725,40 @@ iap_restore_hub:
 #include "TankAlarm_MCUbootConfig.h"
 
 // ----------------------------------------------------------------------------
-// Shared OTA filesystem access (single owner of the "fs_ota" prefix)
+// Shared OTA filesystem access  (use the MCUboot core's own "fs" mount)
 // ----------------------------------------------------------------------------
-// CRITICAL: every OTA helper below must mount partition 2 through THIS single
-// pair of static objects. Previous revisions declared a separate static
-// QSPIFBlockDevice + MBRBlockDevice + FATFileSystem("fs_ota") inside each
-// function. That was unsafe on Mbed OS for two reasons:
-//   1. A second QSPIFBlockDevice on the same physical pins fights the singleton
-//      the application already created via BlockDevice::get_default_instance()
-//      (which is mapped to partition 4 for the LittleFS config store). Two
-//      drivers asserting the same CS line corrupts driver state / faults the bus.
-//   2. Multiple function-local static FATFileSystem objects all try to register
-//      the same "fs_ota" mount prefix in Mbed's global filesystem table, which
-//      collides and makes later mount() calls fail (-EINVAL/-ENODEV).
-// Routing every helper through tankalarm_otaFsMount()/Unmount() guarantees a
-// single QSPI driver (the default instance) and a single "fs_ota" registration.
-static mbed::MBRBlockDevice *tankalarm_otaPart = nullptr;
-static mbed::FATFileSystem  *tankalarm_otaFs   = nullptr;
+// CRITICAL: the MCUboot core (libraries/MCUboot/src/flash_map_backend) mounts
+// QSPI MBR partition 2 as the Mbed volume "fs" at static-init time -- the global
+// initializer `mcuboot_secondary_bd = get_secondary_bd()` runs get_filesystem()
+// before setup() and keeps "fs" mounted for the entire life of the program.
+// boot_set_pending() and the bootloader both reach the secondary slot as the
+// file "/fs/update.bin" through THAT mount.
+//
+// The application MUST stage through the SAME "fs" mount. Earlier revisions
+// mounted partition 2 a SECOND time under a private "fs_ota" volume. Two
+// FATFileSystem objects over one physical partition keep independent FatFs
+// sector caches, so bytes the app wrote via "fs_ota" were not coherently visible
+// to the core's "fs" view: boot_set_pending() then opened a stale/short
+// "/fs/update.bin", flash_area_open()/the trailer write failed, and the host
+// reported "MCUboot staging failed" (observed v1.9.37->v1.9.38 OTA). Using the
+// core's single "fs" mount (one coherent cache) is the fix.
+//
+// get_filesystem() is the core accessor (secondary_bd.cpp) that performs/refreshes
+// the "fs" mount; it is idempotent (function-local statics) and returns nullptr
+// only when partition 2 cannot be initialised (i.e. the unit was never provisioned).
+mbed::FATFileSystem *get_filesystem(void);  // defined in the MCUboot core (secondary_bd.cpp)
 
-// Mount /fs_ota (partition 2) using the application's default QSPI block device.
-// Returns true on success. Safe to call repeatedly; the objects are created once.
+// Ensure the core's "fs" mount (partition 2) is available. Returns true on
+// success. Safe to call repeatedly. Never creates a second mount of the
+// partition and never unmounts -- the MCUboot core owns "/fs".
 static inline bool tankalarm_otaFsMount() {
-  mbed::BlockDevice *root = mbed::BlockDevice::get_default_instance();
-  if (!root) {
-    Serial.println(F("MCUboot: No default QSPI block device for OTA."));
-    return false;
-  }
-  if (!tankalarm_otaPart) {
-    tankalarm_otaPart = new mbed::MBRBlockDevice(root, 2);
-  }
-  if (!tankalarm_otaFs) {
-    tankalarm_otaFs = new mbed::FATFileSystem("fs_ota");
-  }
-  if (!tankalarm_otaPart || !tankalarm_otaFs) {
-    return false;
-  }
-  // Defensive: release any prior mount first so a re-entry (e.g. after a failed
-  // staging attempt that left the FS mounted) cannot fail with -EINVAL.
-  tankalarm_otaFs->unmount();
-  return (tankalarm_otaFs->mount(tankalarm_otaPart) == 0);
+  return (get_filesystem() != nullptr);
 }
 
+// Intentionally a no-op: "/fs" is owned by the MCUboot core and must stay mounted
+// (boot_set_pending() and the bootloader both use it). File data is flushed by
+// fclose(); there is nothing for the application to unmount.
 static inline void tankalarm_otaFsUnmount() {
-  if (tankalarm_otaFs) {
-    tankalarm_otaFs->unmount();
-  }
 }
 
 // Boot-time OTA readiness self-check. Prints, over Serial, whether the QSPI OTA
@@ -786,20 +775,20 @@ static inline bool tankalarm_otaSelfCheck() {
   // word raises a double-bit ECC fault -> HardFault. The bootloader identity is
   // available safely via the STM32H747_getBootloaderInfo example sketch instead.
   if (!tankalarm_otaFsMount()) {
-    Serial.println(F("  QSPI p2 (fs_ota): MOUNT FAILED -> NOT provisioned. Run KeyProvisioning."));
+    Serial.println(F("  QSPI p2 (/fs): MOUNT FAILED -> NOT provisioned. Run KeyProvisioning."));
     return false;
   }
   long upSize = -1, scSize = -1;
-  FILE *fu = fopen("/fs_ota/update.bin", "rb");
+  FILE *fu = fopen("/fs/update.bin", "rb");
   if (fu) { fseek(fu, 0, SEEK_END); upSize = ftell(fu); fclose(fu); }
-  FILE *fs = fopen("/fs_ota/scratch.bin", "rb");
+  FILE *fs = fopen("/fs/scratch.bin", "rb");
   if (fs) { fseek(fs, 0, SEEK_END); scSize = ftell(fs); fclose(fs); }
   tankalarm_otaFsUnmount();
 
   const long wantUp = (long)TANKALARM_MCUBOOT_SLOT_SIZE;     // 0x1E0000
   const long wantSc = (long)TANKALARM_MCUBOOT_SCRATCH_SIZE;  // 0x20000
   bool ok = (upSize == wantUp) && (scSize == wantSc);
-  Serial.println(F("  QSPI p2 (fs_ota): mounted OK"));
+  Serial.println(F("  QSPI p2 (/fs): mounted OK"));
   Serial.print(F("  update.bin:  "));  Serial.print(upSize);
   Serial.print(F(" (want "));          Serial.print(wantUp);  Serial.println(upSize == wantUp ? F(") OK") : F(") MISMATCH"));
   Serial.print(F("  scratch.bin: "));  Serial.print(scSize);
@@ -825,11 +814,11 @@ static inline uint32_t tankalarm_versionToSeq(const char *verStr) {
 
 static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
   if (!tankalarm_otaFsMount()) {
-    Serial.println(F("MCUboot: No QSPI fs_ota available for OTA checking."));
+    Serial.println(F("MCUboot: No QSPI /fs available for OTA checking."));
     return;
   }
 
-  FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
+  FILE *fp = fopen("/fs/pending_ota.json", "r");
   if (!fp) {
     tankalarm_otaFsUnmount();
     return;
@@ -842,7 +831,7 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
   fclose(fp);
 
   if (read_bytes == 0) {
-    remove("/fs_ota/pending_ota.json");
+    remove("/fs/pending_ota.json");
     tankalarm_otaFsUnmount();
     return;
   }
@@ -869,7 +858,7 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
         Serial.print(target_v);
         Serial.println(F(" succeeded! Health gate verification pending."));
         
-        FILE *f_write = fopen("/fs_ota/pending_ota.json", "w");
+        FILE *f_write = fopen("/fs/pending_ota.json", "w");
         if (f_write) {
           fprintf(f_write, "{\"target_seq\":%u,\"target_v\":\"%s\",\"status\":\"confirmed\"}\n", 
                   (unsigned int)target_seq, target_v);
@@ -897,7 +886,7 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
         }
 
         // Store version blacklist locally
-        FILE *f_write = fopen("/fs_ota/pending_ota.json", "w");
+        FILE *f_write = fopen("/fs/pending_ota.json", "w");
         if (f_write) {
           fprintf(f_write, "{\"target_seq\":%u,\"target_v\":\"%s\",\"status\":\"failed_rollback\"}\n", 
                   (unsigned int)target_seq, target_v);
@@ -919,7 +908,7 @@ static inline bool tankalarm_isVersionBlacklisted(const char *version) {
 
   if (!tankalarm_otaFsMount()) return false;
 
-  FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
+  FILE *fp = fopen("/fs/pending_ota.json", "r");
   if (!fp) {
     tankalarm_otaFsUnmount();
     return false;
@@ -974,7 +963,7 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
 
   if (!tankalarm_otaFsMount()) return false;
 
-  FILE *fp = fopen("/fs_ota/pending_ota.json", "r");
+  FILE *fp = fopen("/fs/pending_ota.json", "r");
   if (!fp) { tankalarm_otaFsUnmount(); return false; }
   char buf[256]; memset(buf, 0, sizeof(buf));
   size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
@@ -994,7 +983,7 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
   if (!reportStatus) { tankalarm_otaFsUnmount(); return false; }
 
   // Dedupe against the last reported outcome.
-  FILE *rf = fopen("/fs_ota/ota_reported.json", "r");
+  FILE *rf = fopen("/fs/ota_reported.json", "r");
   if (rf) {
     char rbuf[64]; memset(rbuf, 0, sizeof(rbuf));
     size_t rn = fread(rbuf, 1, sizeof(rbuf) - 1, rf);
@@ -1020,7 +1009,7 @@ static inline bool tankalarm_peekOtaReport(TankAlarmOtaReport &out) {
 static inline void tankalarm_markOtaReported(const char *targetV, const char *status) {
   if (!targetV || !status) return;
   if (!tankalarm_otaFsMount()) return;
-  FILE *wf = fopen("/fs_ota/ota_reported.json", "w");
+  FILE *wf = fopen("/fs/ota_reported.json", "w");
   if (wf) {
     fprintf(wf, "{\"v\":\"%s\",\"s\":\"%s\"}\n", targetV, status);
     fclose(wf);
@@ -1124,13 +1113,13 @@ static bool tankalarm_performMcubootUpdate(
     }
     
     // --- 11.6: Fail-closed opening behaviour ---
-    fp = fopen("/fs_ota/update.bin", "r+b");
+    fp = fopen("/fs/update.bin", "r+b");
     if (!fp) {
 #if defined(TANKALARM_MCUBOOT_ALLOW_RECREATE_UPDATE_FILE)
       Serial.println(F("[WARNING] QSPI file allocation missing! Re-creating space, fragment risks alert. Run KeyProvisioning to restore contiguous sectors."));
-      fp = fopen("/fs_ota/update.bin", "wb");
+      fp = fopen("/fs/update.bin", "wb");
 #else
-      Serial.println(F("MCUboot DFU: ERROR - /fs_ota/update.bin missing or failed to open in r+b mode (QSPI partition not provisioned; run KeyProvisioning). Aborting."));
+      Serial.println(F("MCUboot DFU: ERROR - /fs/update.bin missing or failed to open in r+b mode (QSPI partition not provisioned; run KeyProvisioning). Aborting."));
       goto mcuboot_restore_hub;
 #endif
     }
@@ -1284,7 +1273,7 @@ static bool tankalarm_performMcubootUpdate(
 
   // --- Step 4d: Persistent Trial state file pending_ota.json ---
   {
-    FILE *f_pending = fopen("/fs_ota/pending_ota.json", "w");
+    FILE *f_pending = fopen("/fs/pending_ota.json", "w");
     if (f_pending) {
       uint32_t target_seq = tankalarm_versionToSeq(dfu.version);
       fprintf(f_pending, "{\"target_seq\":%u,\"target_v\":\"%s\",\"status\":\"trial\"}\n", 
@@ -1318,12 +1307,11 @@ static bool tankalarm_performMcubootUpdate(
     }
   }
 
-  // Release our FAT mount of partition 2 BEFORE handing off to MCUboot. The core's
-  // boot_set_pending() opens the secondary slot via its own FATFileSystem("fs") +
-  // /fs/update.bin; if our "fs_ota" mount of the same partition is still active the
-  // trailer write can fail (the core ignores the mount error and the void
-  // MCUboot::applyUpdate wrapper discards boot_set_pending's return), leaving no swap
-  // trailer -> the bootloader boots the old image -> the app reports a false rollback.
+  // update.bin was written and fclose()d above THROUGH THE CORE'S "fs" mount, so
+  // boot_set_pending() below sees a coherent, fully-flushed /fs/update.bin (the
+  // core opens the secondary slot via its own FATFileSystem("fs") + /fs/update.bin).
+  // We deliberately do NOT unmount "/fs": the MCUboot core owns it and the trailer
+  // write needs it. (tankalarm_otaFsUnmount() is a no-op, retained for symmetry.)
   tankalarm_otaFsUnmount();
 
   Serial.println(F("========================================"));
@@ -1345,7 +1333,7 @@ static bool tankalarm_performMcubootUpdate(
       Serial.println(F("); swap NOT scheduled. Aborting reset to avoid a false rollback."));
       // Remove the trial marker so a later reboot does not misread it as a rollback.
       if (tankalarm_otaFsMount()) {
-        remove("/fs_ota/pending_ota.json");
+        remove("/fs/pending_ota.json");
         tankalarm_otaFsUnmount();
       }
       goto mcuboot_restore_hub;
