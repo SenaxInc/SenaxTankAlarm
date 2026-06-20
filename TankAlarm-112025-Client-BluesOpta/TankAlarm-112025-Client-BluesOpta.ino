@@ -73,15 +73,19 @@ enum FluidType : uint8_t;
   // OTA partition (p2) and break firmware updates.
   #define TANKALARM_APP_DATA_PARTITION 4
 
-  // Mbed OS filesystem instance - mounted at "/fs" for POSIX path compatibility
+  // Mbed OS filesystem instance - mounted at "/cfg" (NOT "/fs": the MCUboot core
+  // reserves "/fs" for the OTA secondary slot on partition 2; sharing that mount
+  // name shadowed the core's OTA mount and silently broke firmware staging).
   static LittleFileSystem *mbedFS = nullptr;
   static BlockDevice *mbedBD = nullptr;
   static mbed::MBRBlockDevice *mbedAppPart = nullptr;
   static MbedWatchdogHelper mbedWatchdog;
   static bool gStorageAvailable = false;
   
-  // POSIX-compatible file path prefix for Mbed OS VFS
-  #define POSIX_FS_PREFIX "/fs"
+  // POSIX-compatible file path prefix for Mbed OS VFS (app config store, partition 4).
+  // Must NOT be "/fs" -- that mount name is reserved by the MCUboot core for the OTA
+  // secondary slot on partition 2; a shared name shadows the core's OTA mount.
+  #define POSIX_FS_PREFIX "/cfg"
   #define FILESYSTEM_AVAILABLE
   #define POSIX_FILE_IO_AVAILABLE
 #elif defined(ARDUINO_ARCH_STM32)
@@ -165,7 +169,7 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 // Compared on boot to FIRMWARE_BUILD_SEQ to detect a just-installed firmware (OTA or USB)
 // and trigger an immediate confirmation telemetry sync. Lives on the app data partition.
 #ifndef FIRMWARE_MARKER_FILE
-#define FIRMWARE_MARKER_FILE "/fs/fw_marker.json"
+#define FIRMWARE_MARKER_FILE "/cfg/fw_marker.json"
 #endif
 
 // ============================================================================
@@ -2367,8 +2371,8 @@ static float getEffectiveSpecificGravity(const MonitorConfig &cfg) {
 #ifdef POSIX_FILE_IO_AVAILABLE
 static void recoverOrphanedTmpFiles() {
   static const char * const criticalFiles[] = {
-    "/fs/client_config.json",
-    "/fs/pending_notes.log",
+    "/cfg/client_config.json",
+    "/cfg/pending_notes.log",
     nullptr
   };
 
@@ -2430,7 +2434,7 @@ static void initializeStorage() {
       return;
     }
 
-    mbedFS = new LittleFileSystem("fs");
+    mbedFS = new LittleFileSystem("cfg");
     int err = mbedFS->mount(mbedAppPart);
     if (err) {
       // Format ONLY partition 4 (never the whole device).
@@ -3019,7 +3023,7 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
     // Mbed OS file operations
     if (!mbedFS) return false;
     
-    FILE *file = fopen("/fs/client_config.json", "r");
+    FILE *file = fopen("/cfg/client_config.json", "r");
     if (!file) {
       return false;
     }
@@ -3504,7 +3508,7 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
       Serial.println(F("Failed to serialize config"));
       return false;
     }
-    if (!tankalarm_posix_write_file_atomic("/fs/client_config.json",
+    if (!tankalarm_posix_write_file_atomic("/cfg/client_config.json",
                                             jsonBuf, len)) {
       Serial.println(F("Failed to write config"));
       return false;
@@ -8008,7 +8012,7 @@ static void bufferNoteForRetry(const char *fileName, const char *payload, bool s
       Serial.println(F("Warning: Filesystem not available; note dropped"));
       return;
     }
-    FILE *file = fopen("/fs/pending_notes.log", "a");
+    FILE *file = fopen("/cfg/pending_notes.log", "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
       return;
@@ -8051,12 +8055,12 @@ static void flushBufferedNotes() {
       return;
     }
     
-    FILE *src = fopen("/fs/pending_notes.log", "r");
+    FILE *src = fopen("/cfg/pending_notes.log", "r");
     if (!src) {
       return;
     }
     
-    FILE *tmp = fopen("/fs/pending_notes.tmp", "w");
+    FILE *tmp = fopen("/cfg/pending_notes.tmp", "w");
     if (!tmp) {
       fclose(src);
       return;
@@ -8156,14 +8160,14 @@ static void flushBufferedNotes() {
     
     if (wroteFailures) {
       // Atomic rename — LittleFS handles overwrite; do NOT remove() first
-      if (rename("/fs/pending_notes.tmp", "/fs/pending_notes.log") != 0) {
+      if (rename("/cfg/pending_notes.tmp", "/cfg/pending_notes.log") != 0) {
         Serial.println(F("WARNING: note buffer rename failed"));
         // tmp file preserved for recovery; original .log may still exist
       }
     } else {
       // All notes sent successfully — remove both files
-      remove("/fs/pending_notes.log");
-      remove("/fs/pending_notes.tmp");
+      remove("/cfg/pending_notes.log");
+      remove("/cfg/pending_notes.tmp");
     }
   #else
     if (!LittleFS.exists(NOTE_BUFFER_PATH)) {
@@ -8288,7 +8292,7 @@ static void pruneNoteBufferIfNeeded() {
       return;
     }
     
-    FILE *file = fopen("/fs/pending_notes.log", "r");
+    FILE *file = fopen("/cfg/pending_notes.log", "r");
     if (!file) {
       return;
     }
@@ -8310,7 +8314,7 @@ static void pruneNoteBufferIfNeeded() {
 
     if (fseek(file, startOffset, SEEK_SET) != 0) {
       fclose(file);
-      remove("/fs/pending_notes.log");
+      remove("/cfg/pending_notes.log");
       return;
     }
 
@@ -8322,7 +8326,7 @@ static void pruneNoteBufferIfNeeded() {
       }
     }
 
-    FILE *tmp = fopen("/fs/pending_notes.tmp", "w");
+    FILE *tmp = fopen("/cfg/pending_notes.tmp", "w");
     if (!tmp) {
       fclose(file);
       return;
@@ -8343,12 +8347,12 @@ static void pruneNoteBufferIfNeeded() {
     fclose(tmp);
     
     if (writeError) {
-      remove("/fs/pending_notes.tmp");
+      remove("/cfg/pending_notes.tmp");
       Serial.println(F("Failed to copy note buffer"));
       return;
     }
     // Atomic rename — LittleFS handles overwrite; do NOT remove() first
-    if (rename("/fs/pending_notes.tmp", "/fs/pending_notes.log") != 0) {
+    if (rename("/cfg/pending_notes.tmp", "/cfg/pending_notes.log") != 0) {
       Serial.println(F("WARNING: note prune rename failed"));
       // tmp preserved for recovery; original was not removed
     } else {
