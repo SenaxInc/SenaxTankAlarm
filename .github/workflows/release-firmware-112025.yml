@@ -141,37 +141,46 @@ jobs:
           test -n "$BIN_SOURCE"
           cp "$BIN_SOURCE" "TankAlarm-Viewer-v${{ steps.version.outputs.version }}.bin"
 
-      - name: Build signed client firmware (MCUboot OTA slot image)
+      - name: Install imgtool
+        run: |
+          pip install imgtool
+          python -c "import imgtool.image; f=imgtool.image.__file__; s=open(f).read().replace('self.header_size,', 'self.header_size & 0xFFFF,'); open(f, 'w').write(s)"
+
+      - name: Sign & Format MCUboot Image (Client only)
         shell: bash
         run: |
-          # Only the Client supports MCUboot OTA. The signed/encrypted slot image
-          # is produced by compiling with the Arduino core's "security=sien"
-          # (Signature + Encryption) setting. This runs the core's OWN bundled
-          # imgtool (1.8.0-arduino.2) with the canonical flags and the default
-          # MCUboot keychain that the Opta bootloader actually trusts -- the SAME
-          # format proven to validate and swap on hardware. This replaces the
-          # previous "build plain + pip install imgtool + header_size monkeypatch
-          # + custom-key sign" approach, which used a different (latest) imgtool
-          # and produced a subtly divergent image the bootloader would not swap.
-          # Server and Viewer are updated locally over USB with their raw .bin,
-          # so they are not signed here.
-          mkdir -p build/client-secure
-          arduino-cli compile --fqbn arduino:mbed_opta:opta:security=sien \
-            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
-            --build-property "build.version=${{ steps.version.outputs.version }}+0" \
-            --libraries "$LIB_ROOT" \
-            --output-dir build/client-secure \
-            TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
+          # Only the Client supports MCUboot OTA. Server and Viewer are updated
+          # locally over USB with their raw .bin, so they are not signed here.
+          imgtool sign \
+            --key mcuboot_keys/ecdsa-p256-signing-priv-key.pem \
+            --encrypt mcuboot_keys/ecdsa-p256-encrypt-pub-key.pem \
+            --align 32 \
+            --max-align 32 \
+            --version "${{ steps.version.outputs.version }}+0" \
+            --header-size 0x20000 \
+            --pad-header \
+            --slot-size 0x1E0000 \
+            "TankAlarm-Client-v${{ steps.version.outputs.version }}.bin" \
+            "TankAlarm-Client-secure-v${{ steps.version.outputs.version }}.slot.bin"
 
-          SLOT_SOURCE=$(find build/client-secure -maxdepth 1 -name '*.bin' ! -name '*.with_bootloader.bin' ! -name '*.bootloader.bin' | head -n1)
-          test -n "$SLOT_SOURCE"
-          cp "$SLOT_SOURCE" "TankAlarm-Client-secure-v${{ steps.version.outputs.version }}.slot.bin"
+      - name: Prepare release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        id: notes
+        shell: bash
+        run: |
+          NOTES="release-notes/v${{ steps.version.outputs.version }}.md"
+          if [ ! -f "$NOTES" ]; then
+            mkdir -p release-notes
+            printf '# TankAlarm v%s\n\nSee the changelog below for the changes in this release.\n' "${{ steps.version.outputs.version }}" > "$NOTES"
+          fi
+          echo "path=$NOTES" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           name: TankAlarm Beta v${{ steps.version.outputs.version }}
+          body_path: ${{ steps.notes.outputs.path }}
           files: |
             TankAlarm-Client-v${{ steps.version.outputs.version }}.bin
             TankAlarm-Server-v${{ steps.version.outputs.version }}.bin
