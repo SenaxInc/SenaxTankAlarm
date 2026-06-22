@@ -10004,9 +10004,17 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       
       // Add VIN voltage from client metadata if available
       ClientMetadata *meta = findClientMetadata(rec.clientUid);
-      if (meta && meta->vinVoltage > 0.0f) {
-        clientObj["v"] = meta->vinVoltage;
-        clientObj["ve"] = meta->vinVoltageEpoch;
+      // Fix 6/12/14: only expose a battery voltage that is both plausible (>= 6.0V, so the
+      // Notecard ~5V rail is never shown as a battery) and recent (<= 48h old). This ages out a
+      // stale value the client has stopped sending and stops one implausible reading from
+      // pinning the dashboard VIN forever.
+      if (meta && meta->vinVoltage >= 6.0f && meta->vinVoltageEpoch > 0.0) {
+        double vNow = currentEpoch();
+        double vAge = (vNow > 0.0) ? (vNow - meta->vinVoltageEpoch) : 0.0;
+        if (vAge >= 0.0 && vAge < 172800.0) {  // 48 hours
+          clientObj["v"] = meta->vinVoltage;
+          clientObj["ve"] = meta->vinVoltageEpoch;
+        }
       }
       // Add firmware version from client metadata
       if (meta && meta->firmwareVersion[0] != '\0') {
@@ -11158,9 +11166,7 @@ static ConfigDispatchStatus dispatchClientConfig(const char *clientUid, JsonVari
   JsonArrayConst sensors = cfgObj["sensors"].as<JsonArrayConst>();
   if (!sensors.isNull()) {
     for (JsonObjectConst t : sensors) {
-      // Client default is opt-in/off, so an omitted field also counts as disabled
-      bool isStuckDisabled = !t["stuckDetection"].is<bool>() || !t["stuckDetection"].as<bool>();
-      if (isStuckDisabled) {
+      if (t["stuckDetection"].is<bool>() && !t["stuckDetection"].as<bool>()) {
         uint8_t sensorIdx = t["number"] | (uint8_t)0;
         if (sensorIdx == 0) continue;
         SensorRecord *rec = findSensorByHash(clientUid, sensorIdx);
@@ -11644,7 +11650,12 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // revert to daily-only voltage reporting on the client.
   {
     float telemetryVin = doc["v"] | 0.0f;
-    if (telemetryVin > 0.0f) {
+    // Fix 6/7: only accept a battery voltage that is either tagged with a real measurement
+    // source (vs = "mppt" | "vin-divider") or is plausibly a battery (>= 6.0V). This rejects the
+    // Notecard ~5V regulator rail that older/misbuilt clients could otherwise store as "v".
+    const char *vsrc = doc["vs"] | "";
+    bool vTagged = (strcmp(vsrc, "mppt") == 0 || strcmp(vsrc, "vin-divider") == 0);
+    if (telemetryVin > 0.0f && (vTagged || telemetryVin >= 6.0f)) {
       ClientMetadata *vmeta = findOrCreateClientMetadata(clientUid);
       if (vmeta) {
         vmeta->vinVoltage = telemetryVin;
@@ -11906,42 +11917,6 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   if (!rec) {
     return;
   }
-
-  // If an incoming alarm is "sensor-stuck", check if the current configuration has it disabled.
-  // If disabled, treat as an invalid/stale alarm and auto-clear/ignore it rather than letting
-  // it latch in the database (e.g. if the client is running old firmware or has not applied its config yet).
-  if (strcmp(type, "sensor-stuck") == 0) {
-    bool stuckDisabledInConfig = false;
-    const ClientConfigSnapshot *stuckSnap = findClientConfigSnapshot(clientUid);
-    if (stuckSnap && stuckSnap->payload[0] != '\0') {
-      JsonDocument stuckCfg;
-      if (deserializeJson(stuckCfg, stuckSnap->payload) == DeserializationError::Ok) {
-        JsonArrayConst cfgSensors = stuckCfg["sensors"].as<JsonArrayConst>();
-        if (!cfgSensors.isNull()) {
-          for (JsonObjectConst ct : cfgSensors) {
-            uint8_t ctn = ct["number"] | 0;
-            if (ctn == sensorIndex) {
-              // Client default is opt-in/off, so a missing field also counts as disabled.
-              stuckDisabledInConfig = !(ct["stuckDetection"] | false);
-              break;
-            }
-          }
-        }
-      }
-    }
-    if (stuckDisabledInConfig) {
-      rec->alarmActive = false;
-      strlcpy(rec->alarmType, "clear", sizeof(rec->alarmType));
-      clearAlarmEvent(clientUid, sensorIndex);
-      gSensorRegistryDirty = true;
-      Serial.print(F("Auto-cleared incoming sensor-stuck alarm (stuck detection disabled) for "));
-      Serial.print(clientUid);
-      Serial.print(F(" sensor "));
-      Serial.println(sensorIndex);
-      addServerSerialLog("Stale sensor-stuck alarm auto-cleared on arrival", "info", "alarm");
-      return; 
-    }
-  }
   
   // Store optional user-assigned display number (0 = unset)
   if (doc.containsKey("un")) {
@@ -12169,14 +12144,21 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   // ~5V supply rail rather than the actual battery, which misrepresents the system voltage on
   // the dashboard. The solar charger reports the true pack voltage in solar.bv.
   float vinVoltage = doc["v"].as<float>();
+  // Fix 6/7: the top-level "v" is trusted only when the client tags its source
+  // (vs = "mppt" | "vin-divider"); the MPPT pack voltage (solar.bv) is always the real battery.
+  const char *vsrc = doc["vs"] | "";
+  bool vTrusted = (strcmp(vsrc, "mppt") == 0 || strcmp(vsrc, "vin-divider") == 0);
   JsonObject dailySolar = doc["solar"];
   if (!dailySolar.isNull()) {
     float solarBv = dailySolar["bv"] | 0.0f;
     if (solarBv > 0.0f) {
       vinVoltage = solarBv;
+      vTrusted = true;
     }
   }
-  if (isFirstPart && vinVoltage > 0.0f) {
+  // Reject an untagged, implausible reading (e.g. the Notecard ~5V rail) so it cannot poison the
+  // dashboard; a tagged or MPPT reading is accepted at any plausible battery level.
+  if (isFirstPart && vinVoltage > 0.0f && (vTrusted || vinVoltage >= 6.0f)) {
     ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
     if (meta) {
       meta->vinVoltage = vinVoltage;
@@ -12274,10 +12256,15 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     for (uint8_t ri = 0; ri < gSensorRecordCount; ++ri) {
       if (strcmp(gSensorRecords[ri].clientUid, clientUid) != 0) continue;
       if (!gSensorRecords[ri].alarmActive) continue;
-      // Skip system alarm types — those aren't in the daily alarms array
+      // Skip system + diagnostic alarm types. The daily "alarms" array only represents high/low
+      // level alarms, so it must NOT be used to clear solar/battery/power system alarms or sensor
+      // diagnostic faults (Fix 9: sensor-fault/sensor-stuck were being wrongly cleared by a daily
+      // report that was never designed to represent them).
       if (strcmp(gSensorRecords[ri].alarmType, "solar") == 0 ||
           strcmp(gSensorRecords[ri].alarmType, "battery") == 0 ||
-          strcmp(gSensorRecords[ri].alarmType, "power") == 0) continue;
+          strcmp(gSensorRecords[ri].alarmType, "power") == 0 ||
+          strcmp(gSensorRecords[ri].alarmType, "sensor-fault") == 0 ||
+          strcmp(gSensorRecords[ri].alarmType, "sensor-stuck") == 0) continue;
       // Check if this sensorIndex has an active alarm in the daily report
       bool foundInDaily = false;
       for (JsonObject a : dailyAlarms) {
@@ -12369,6 +12356,10 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     } else if (t["sensorMa"]) {
       mA = t["sensorMa"].as<float>();
       rec->sensorMa = (mA >= 4.0f) ? mA : 0.0f;
+    } else if (strcmp(rec->sensorType, "currentLoop") == 0) {
+      // Fix 13: a current-loop daily with NO raw mA means the last acquisition had no valid
+      // reading — clear any stored mA so a stale value (e.g. a pegged 18.02) cannot linger.
+      rec->sensorMa = 0.0f;
     }
     if (t["vt"]) {
       voltage = t["vt"].as<float>();
@@ -12393,13 +12384,21 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       rec->previousLevelEpoch = rec->lastUpdateEpoch;
     }
     
-    rec->levelInches = newLevel;
+    // Fix 8: a current-loop daily "lvl" that the client flagged faulted (sf) or reused (ru) with
+    // no valid raw mA is stale/fabricated (e.g. a reused lvl:0 after an I2C read failure). Do not
+    // let it overwrite the last good level (or record a snapshot) on the dashboard.
+    bool dailyFaulted = ((t["sf"] | 0) != 0) || ((t["ru"] | 0) != 0);
+    bool isCurrentLoopSensor = (strcmp(rec->sensorType, "currentLoop") == 0);
+    bool trustLevel = !(isCurrentLoopSensor && dailyFaulted && mA < 4.0f);
+    if (trustLevel) {
+      rec->levelInches = newLevel;
+    }
     rec->lastUpdateEpoch = now;
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
     // even when change-based telemetry is disabled (levelChangeThreshold = 0)
-    if (newLevel > 0.0f) {
+    if (trustLevel && newLevel > 0.0f) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;

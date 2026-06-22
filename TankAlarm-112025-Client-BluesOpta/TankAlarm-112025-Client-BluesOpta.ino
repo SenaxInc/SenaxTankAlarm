@@ -838,6 +838,7 @@ static bool isSolarOnlyActive() {
 static PowerState gPowerState = POWER_STATE_NORMAL;
 static PowerState gPreviousPowerState = POWER_STATE_NORMAL;
 static float gEffectiveBatteryVoltage = 0.0f;  // Best voltage from either source
+static const char *gEffectiveVoltageSource = nullptr;  // Fix 7: source of the last effective voltage ("mppt" | "vin-divider"); nullptr when none
 static uint8_t gPowerStateDebounce = 0;        // Consecutive readings at proposed new state
 static unsigned long gPowerStateChangeMillis = 0; // When the current power state was entered
 static unsigned long gLastPowerStateLogMillis = 0; // Rate-limit power state log messages
@@ -5295,6 +5296,14 @@ static float readAnalogSensor(const MonitorConfig &cfg, uint8_t idx) {
   // Store raw voltage reading for telemetry
   gMonitorState[idx].currentSensorVoltage = voltage;
 
+  // Live-zero fault guard (Fix 2): a sensor with an elevated minimum output voltage
+  // (e.g. a 1-5V transducer) reading far below that minimum is unpowered or disconnected.
+  // Return NAN so validateSensorReading() escalates a sensor-fault instead of letting
+  // linearMap() produce a negative value that is then silently clamped to a fabricated 0.0.
+  if (cfg.analogVoltageMin >= 0.5f && voltage < cfg.analogVoltageMin * 0.2f) {
+    return NAN;
+  }
+
   // Map voltage to sensor's native pressure units
   float pressure = linearMap(voltage, cfg.analogVoltageMin, cfg.analogVoltageMax,
                              cfg.sensorRangeMin, cfg.sensorRangeMax);
@@ -5904,6 +5913,11 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
   if (cfg.hasLearnedCalibration) {
     o["cv"] = cfg.calVersion;
   }
+
+  // Data-quality flags (Fix 8): mark when lvl is NOT a fresh valid acquisition so the server
+  // and dashboard do not treat a reused or faulted reading as an authoritative measurement.
+  if (state.sensorFailed) o["sf"] = 1;   // sensor currently in a failed/fault state
+  if (state.sampleReused) o["ru"] = 1;   // this value was reused from a previous cycle
 }
 
 static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
@@ -5935,6 +5949,9 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   float telemetryVoltage = getEffectiveBatteryVoltage();
   if (telemetryVoltage > 0.0f) {
     doc["v"] = roundTo(telemetryVoltage, 2);
+    // Fix 7: tag the measurement source so the server only displays voltage that came from
+    // the MPPT charge controller or the analog Vin divider (never a Notecard ~5V rail).
+    if (gEffectiveVoltageSource) doc["vs"] = gEffectiveVoltageSource;
   }
 
   publishNote(TELEMETRY_FILE, doc, syncNow);
@@ -7328,18 +7345,22 @@ static void checkSolarOnlySunsetProtocol(unsigned long now) {
 /**
  * Determine the best available battery voltage from all monitoring sources.
  * Returns the lower of available sources (conservative approach — protect the battery).
- * A source is only considered if it has valid recent data.
+ * A source is only considered if it has valid recent data. Records the winning source in
+ * gEffectiveVoltageSource (Fix 7) so telemetry/daily can tag it.
  *
  * Sources (in priority order):
  *   1. SunSaver MPPT via Modbus RS-485 (most accurate, directly from charge controller)
- *   2. Notecard card.voltage (non-Opta only; on the Wireless-for-Opta carrier the Notecard V+
- *      is regulated to ~5V and cannot read the 12V battery, so pollBatteryVoltage() is a no-op
- *      there and this source is inert)
- *   3. Analog Vin voltage divider (direct ADC reading of battery via resistor divider)
+ *   2. Analog Vin voltage divider (direct ADC reading of battery via resistor divider)
+ *
+ * NOTE (Fix 1): the Notecard card.voltage is NOT a battery source on the Blues
+ * "Wireless for Opta" carrier — the Notecard V+ is the ~5V regulated DC-DC rail and cannot
+ * read the 12V battery. That source is compile-gated out on Opta/mbed below so no future code
+ * path can resurrect the ~5V rail as a battery reading.
  */
 static float getEffectiveBatteryVoltage() {
   float voltage = 0.0f;
   bool hasVoltage = false;
+  const char *source = nullptr;
   
   // Source 1: SunSaver MPPT via Modbus RS-485
   if (gSolarManager.isEnabled() && gSolarManager.isCommunicationOk()) {
@@ -7347,34 +7368,40 @@ static float getEffectiveBatteryVoltage() {
     if (solar.batteryVoltage > 0.0f) {
       voltage = solar.batteryVoltage;
       hasVoltage = true;
+      source = "mppt";
     }
   }
   
-  // Source 2: Notecard card.voltage — only valid where the Notecard is wired directly to the
-  // battery (non-Opta builds). On the Blues "Wireless for Opta" carrier the Notecard V+ is
-  // regulated to ~5V by a DC-DC converter and physically cannot read the 12V battery, so
-  // pollBatteryVoltage() is a no-op there and gBatteryData.valid stays false — this source is
-  // skipped and can never drive the power-state machine on that hardware.
+#if !defined(ARDUINO_OPTA) && !defined(ARDUINO_ARCH_MBED)
+  // Source 2 (non-Opta ONLY): Notecard card.voltage, valid only where the Notecard is wired
+  // directly to the battery. Compile-gated out on the Opta carrier (Fix 1), where the Notecard
+  // V+ is the regulated ~5V rail and must never be treated as a battery reading.
   if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f) {
     if (!hasVoltage) {
       voltage = gBatteryData.voltage;
       hasVoltage = true;
-    } else {
-      // Use the LOWER of the two readings (conservative — protect battery)
-      voltage = min(voltage, gBatteryData.voltage);
+      source = "notecard";
+    } else if (gBatteryData.voltage < voltage) {
+      // Use the LOWER of the readings (conservative — protect battery)
+      voltage = gBatteryData.voltage;
+      source = "notecard";
     }
   }
+#endif
   
   // Source 3: Analog Vin voltage divider
   if (gConfig.vinMonitor.enabled && gVinVoltage > 0.5f) {
     if (!hasVoltage) {
       voltage = gVinVoltage;
       hasVoltage = true;
-    } else {
-      voltage = min(voltage, gVinVoltage);
+      source = "vin-divider";
+    } else if (gVinVoltage < voltage) {
+      voltage = gVinVoltage;
+      source = "vin-divider";
     }
   }
   
+  gEffectiveVoltageSource = hasVoltage ? source : nullptr;
   return hasVoltage ? voltage : 0.0f;
 }
 
@@ -7616,6 +7643,8 @@ static void sendDailyReport() {
     // Include VIN voltage in the first part of the daily report
     if (part == 0 && vinVoltage > 0.0f) {
       doc["v"] = vinVoltage;
+      // Fix 7: tag the voltage source (MPPT or Vin divider) so the server can trust it.
+      if (gEffectiveVoltageSource) doc["vs"] = gEffectiveVoltageSource;
     }
     
     // Include solar charger data in the first part of the daily report
