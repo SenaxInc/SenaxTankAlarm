@@ -809,7 +809,11 @@ static inline uint32_t tankalarm_versionToSeq(const char *verStr) {
   // Require all three components and reject negatives; a malformed string returns 0
   // (treated as "not newer" = safe refuse) instead of an undefined partial parse.
   if (n != 3 || major < 0 || minor < 0 || patch < 0) return 0;
-  return (uint32_t)(major * 100 + minor * 10 + patch);
+  // Monotonic semantic-version ordering. Weighting each component by 1000 so minor/patch up to
+  // 999 never overflow into the next field. The previous major*100+minor*10+patch was NON-monotonic
+  // once patch exceeded 9: e.g. 1.9.42 -> 232 but 2.0.0 -> 200, which made the downgrade guard
+  // wrongly read 2.0.0 as OLDER than 1.9.42 ("not newer than running firmware").
+  return (uint32_t)((uint32_t)major * 1000000UL + (uint32_t)minor * 1000UL + (uint32_t)patch);
 }
 
 static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
@@ -853,7 +857,11 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
 
   if (parsed >= 2) {
     if (strcmp(status, "trial") == 0) {
-      if (FIRMWARE_BUILD_SEQ == target_seq) {
+      // Compare by VERSION (target_v), not the stored target_seq: a pending_ota.json staged by an
+      // older firmware holds target_seq in THAT firmware's versionToSeq scale, so comparing seq
+      // numbers across a formula change would false-trigger a rollback. Comparing the running
+      // version vs the staged target version via versionToSeq() is scale-consistent (both now).
+      if (tankalarm_versionToSeq(FIRMWARE_VERSION) == tankalarm_versionToSeq(target_v)) {
         Serial.print(F("MCUboot: Trial boot of version "));
         Serial.print(target_v);
         Serial.println(F(" succeeded! Health gate verification pending."));
@@ -866,12 +874,10 @@ static inline void tankalarm_resolvePendingOta(Notecard &notecard) {
         }
       } else {
         // Rollback Detected!
-        Serial.print(F("MCUboot: ROLLBACK DETECTED! Expected target build seq: "));
-        Serial.print(target_seq);
-        Serial.print(F(" ("));
+        Serial.print(F("MCUboot: ROLLBACK DETECTED! Expected target version "));
         Serial.print(target_v);
-        Serial.print(F("), but currently running: "));
-        Serial.println(FIRMWARE_BUILD_SEQ);
+        Serial.print(F(", but currently running "));
+        Serial.println(F(FIRMWARE_VERSION));
 
         // Send rollback & stop failure status to Notehub, evicting the bad image from Notecard cache
         J *req = notecard.newRequest("dfu.status");

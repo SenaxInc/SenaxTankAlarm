@@ -4126,8 +4126,10 @@ static void checkForFirmwareUpdate() {
     // Downgrade guard: only auto-apply a STRICTLY NEWER image. Notehub is
     // expected to assign the intended target, but a stale/incorrect assignment
     // (or an older .slot.bin) must never trigger a downgrade-then-rollback loop.
-    // Sequence is major*100 + minor*10 + patch (matches FIRMWARE_BUILD_SEQ).
-    if (tankalarm_versionToSeq(dfuStatus.version) <= (uint32_t)FIRMWARE_BUILD_SEQ) {
+    // Compare offered vs running by monotonic semantic-version sequence (versionToSeq).
+    // Must compare against the running FIRMWARE_VERSION's sequence, NOT FIRMWARE_BUILD_SEQ
+    // (a separate monotonic build counter that only coincided with versionToSeq through 1.9.x).
+    if (tankalarm_versionToSeq(dfuStatus.version) <= tankalarm_versionToSeq(FIRMWARE_VERSION)) {
       if (stopRefusedFirmware(dfuStatus.version, "not newer than running firmware")) {
         Serial.print(F("DFU: Offered v"));
         Serial.print(dfuStatus.version);
