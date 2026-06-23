@@ -3016,6 +3016,11 @@ static void sanitizeSolarConfig(SolarConfig &sc) {
   }
   // modbusTimeoutMs floor of 500 ms (clamped in begin() but keep here for consistency)
   if (sc.modbusTimeoutMs < 500) sc.modbusTimeoutMs = 500;
+  // ...and a ceiling of 4000 ms. A single realtime read tries both Modbus function codes
+  // (up to 2 x timeout), and v2.0.43 wraps it in SOLAR_REALTIME_MAX_ATTEMPTS retries; capping
+  // the timeout keeps the whole solar poll well under WATCHDOG_TIMEOUT_SECONDS (30 s) even on a
+  // dead bus. A legitimate SunSaver/MRC-1 reply is sub-second, so 4 s is a generous ceiling.
+  if (sc.modbusTimeoutMs > 4000) sc.modbusTimeoutMs = 4000;
 }
 
 static bool loadConfigFromFlash(ClientConfig &cfg) {
