@@ -97,6 +97,30 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
   return false;
 }
 
+// Read 'count' contiguous registers ONE AT A TIME (count=1 per Modbus transaction). The SunSaver
+// MPPT via the Morningstar MRC-1 MeterBus->RS-485 bridge was bench-verified (2026-04-22) ONLY with
+// single-register reads -- firmware/sunsaver-modbus-test and firmware/sunsaver-rs485-raw both poll
+// one register per request. A multi-register block read is a DIFFERENT Modbus transaction the
+// MeterBus bridge does not reliably answer; in the field that presents as "config applied + poller
+// running but every poll fails" (scOk:0) while the single-register startup probe in begin() succeeds.
+// Returns true only if EVERY register reads OK, and SHORT-CIRCUITS on the first failure so a dead
+// bus costs one read, not 'count' reads. The watchdog is kicked before each read because a
+// slow-but-responding bus can take up to one Modbus timeout per register.
+static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, uint8_t count,
+                                      uint16_t *buffer, uint8_t &cachedFC) {
+  for (uint8_t i = 0; i < count; ++i) {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+#elif defined(ARDUINO_ARCH_STM32)
+    IWatchdog.reload();
+#endif
+    if (!readRegistersWithFallback(slaveId, (uint16_t)(startAddress + i), 1, &buffer[i], cachedFC)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 SolarManager::SolarManager() 
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0) {
   memset(&_data, 0, sizeof(SolarData));
@@ -263,7 +287,9 @@ bool SolarManager::readRegisters() {
     if (attempt > 0) {
       delay(SOLAR_RETRY_DELAY_MS);  // brief settle before re-attempting (short, WDT-safe)
     }
-    if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs, _cachedHoldingFC)) {
+    // Single-register reads (count=1 each) -- the bench-verified transaction the MRC-1/SunSaver
+    // answers; a 5-register block read is not reliably bridged. See readRegistersIndividually().
+    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs, _cachedHoldingFC)) {
       realtimeOk = true;
       break;
     }
@@ -308,7 +334,8 @@ bool SolarManager::readRegisters() {
   // overall poll as failed.
   if (success && !nextData.setpointsValid) {
     uint16_t setpointRegs[4];  // V_reg, (gap), V_float, V_eq
-    if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_REG, 4, setpointRegs, _cachedHoldingFC)) {
+    // Single-register reads (see readRegistersIndividually) -- same MRC-1 bridge constraint.
+    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_V_REG, 4, setpointRegs, _cachedHoldingFC)) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
 #elif defined(ARDUINO_ARCH_STM32)
