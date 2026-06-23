@@ -5956,6 +5956,14 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
     if (gEffectiveVoltageSource) doc["vs"] = gEffectiveVoltageSource;
   }
 
+  // MPPT/RS-485 observability: when the SunSaver charger is configured, report whether the
+  // Modbus link is currently healthy (scOk=1) or failing (scOk=0). Without this an
+  // enabled-but-not-communicating charger is indistinguishable from a disabled one -- it sends
+  // no voltage, and the comm-failure alarm defaults off, so the failure is otherwise silent.
+  if (gSolarManager.isEnabled()) {
+    doc["scOk"] = gSolarManager.isCommunicationOk() ? 1 : 0;
+  }
+
   publishNote(TELEMETRY_FILE, doc, syncNow);
 }
 
@@ -6544,12 +6552,18 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
   
   const SolarData &data = gSolarManager.getData();
   
-  // Only include fresh solar data when communication is currently healthy.
+  // When the Modbus link is down, surface a minimal failure status instead of silently
+  // omitting the solar block -- otherwise an enabled-but-not-communicating MPPT looks
+  // identical to a disabled one on the dashboard / event log.
   if (!data.communicationOk) {
-    return false;
+    JsonObject solarFail = doc["solar"].to<JsonObject>();
+    solarFail["commOk"] = 0;
+    solarFail["errs"] = data.consecutiveErrors;
+    return true;
   }
   
   JsonObject solar = doc["solar"].to<JsonObject>();
+  solar["commOk"] = 1;
   
   // Current readings
   solar["bv"] = roundTo(data.batteryVoltage, 2);       // Battery voltage
