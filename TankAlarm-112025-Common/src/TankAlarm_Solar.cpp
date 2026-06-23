@@ -246,13 +246,30 @@ bool SolarManager::readRegisters() {
   // Real-time block: 5 contiguous filtered ADC registers starting at adc_vb_f
   //   0x0008 batt V, 0x0009 array V, 0x000A load V, 0x000B charge I, 0x000C load I.
   uint16_t realtimeRegs[5];
+  // Bounded retry around the VERIFIED realtime block only (0x0008..0x000C). A single transient
+  // RS-485 disturbance (a corrupted byte or a locally-generated TX->RX turnaround artifact)
+  // otherwise fails the entire poll, and after SOLAR_COMM_FAILURE_THRESHOLD such polls the
+  // client would raise a false comm-failure alarm. The setpoint read and the (compiled-out)
+  // status/fault/daily blocks are deliberately NOT retried so worst-case Modbus blocking stays
+  // bounded. The watchdog is kicked before EVERY attempt (each attempt can cost up to one full
+  // Modbus timeout on a dead bus), so the retry loop can never starve it.
+  bool realtimeOk = false;
+  for (uint8_t attempt = 0; attempt < SOLAR_REALTIME_MAX_ATTEMPTS; ++attempt) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
 #elif defined(ARDUINO_ARCH_STM32)
-  IWatchdog.reload();
+    IWatchdog.reload();
 #endif
+    if (attempt > 0) {
+      delay(SOLAR_RETRY_DELAY_MS);  // brief settle before re-attempting (short, WDT-safe)
+    }
+    if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs, _cachedHoldingFC)) {
+      realtimeOk = true;
+      break;
+    }
+  }
 
-  if (readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs, _cachedHoldingFC)) {
+  if (realtimeOk) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
 #elif defined(ARDUINO_ARCH_STM32)

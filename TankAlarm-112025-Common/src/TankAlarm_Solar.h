@@ -239,6 +239,20 @@ struct SolarConfig {
 #define SOLAR_DEFAULT_POLL_INTERVAL_SEC 60
 #define SOLAR_COMM_FAILURE_THRESHOLD    5
 
+// Bounded retry for the VERIFIED realtime register block (0x0008..0x000C) only, for RS-485
+// noise immunity. Total Modbus attempts per poll = SOLAR_REALTIME_MAX_ATTEMPTS (1 initial +
+// retries). Worst-case added blocking on a dead bus is roughly (attempts-1) * (2 * timeout)
+// because each attempt may try both function codes; the watchdog is kicked before each attempt.
+// The setpoint and status/fault/daily blocks are intentionally NOT retried. Note the interaction
+// with SOLAR_COMM_FAILURE_THRESHOLD: up to (attempts * threshold) low-level reads can occur
+// before a comm failure is declared, which is the intended trade for transient-noise tolerance.
+#ifndef SOLAR_REALTIME_MAX_ATTEMPTS
+#define SOLAR_REALTIME_MAX_ATTEMPTS     3
+#endif
+#ifndef SOLAR_RETRY_DELAY_MS
+#define SOLAR_RETRY_DELAY_MS            100
+#endif
+
 // ============================================================================
 // SolarManager Class Interface
 // ============================================================================

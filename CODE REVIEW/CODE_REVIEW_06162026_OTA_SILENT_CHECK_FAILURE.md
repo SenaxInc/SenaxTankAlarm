@@ -645,33 +645,3 @@ The CRC-32 check at the end (Step 4c) would catch this only if the Notecard prov
 7. **Verify `dfu.get` response offset** when available, as defense-in-depth against silent data misplacement (Finding 21).
 
 > Findings 15–17 are the highest priority: they represent silent failure modes where the device either loses connectivity or enters infinite retry loops with no diagnostic output. Findings 18–19 are reliability hardening. Findings 20–21 are defense-in-depth improvements to the OTA safety model.
-
----
-
-## 9. Implementation Status (06/16/2026)
-
-After verifying every finding against the current source, the following were **implemented** in `v1.9.30` (client `.ino` + `TankAlarm_DFU.h`). Each was checked to be a real issue in the code, not a duplicate, and a low‑risk fail‑safe change.
-
-| Finding | Status | Change |
-|---|---|---|
-| F1 (observability) | ✅ Implemented | Logs added for skip/comm‑fail/error reasons in `checkForFirmwareUpdate()` and the periodic block. |
-| F2 (timer reset before guard) | ✅ Implemented | `gLastDfuCheckMillis = now` moved inside the `!gDfuInProgress && gNotecardAvailable` guard; on skip, the timer is set to retry in ~1 min instead of a full interval. |
-| F8 (refused update never stopped) | ✅ Implemented | New `stopRefusedFirmware()` sends `dfu.status {stop,status}` once per refused version (downgrade/equal/blacklist), deduped to avoid churn. |
-| F10 (`card.wireless` err keeps offline) | ✅ Implemented | A `card.wireless` response with a cellular‑layer error now marks the Notecard available (I²C is proven healthy), restoring OTA checks/note sends. |
-| F13 (preflight reject leaves ready) | ✅ Implemented | `performMcubootUpdate()` length/role preflight rejects now `goto mcuboot_restore_hub` (sends `dfu.status stop`). |
-| F15 (`hub.set mode=dfu` lost response strands Notecard) | ✅ Implemented | The `!req` and lost‑response paths in Step 1 now route through `mcuboot_restore_hub` (restores hub mode), preventing a ~4 h offline strand. |
-| F16 (stale flag drives apply) | ✅ Implemented | `gDfuUpdateAvailable`/length/version cleared on comm‑fail and error returns. |
-| F17 (retry loop on staging failure) | ✅ Implemented | `enableDfuMode()` clears the pending‑update flags when staging fails. |
-| F18 (`sscanf` overflow) | ✅ Implemented | All `pending_ota.json`/`ota_reported.json` parses now use bounded `%31[^"]` / `%15[^"]`. |
-| F19 (no watchdog kick) | ✅ Implemented | Watchdog kicked before the normal‑path `checkForFirmwareUpdate()`, mirroring the daily path. |
-| F9, F11 | ✅ Covered | Duplicates of F2 / F16 respectively; addressed by those fixes. |
-
-**Deferred (with rationale — each needs dedicated hardware validation, not a batch change):**
-
-- **F12 (`versionToSeq` not semver‑safe):** the function is *load‑bearing*. `performMcubootUpdate()` writes `target_seq = versionToSeq(version)` into `pending_ota.json`, and `resolvePendingOta()` later checks `FIRMWARE_BUILD_SEQ == target_seq` for an **exact** rollback match. Changing the weighting (`major*100+minor*10+patch`) would break that coupling. It is currently correct for the active `1.9.x` line (`190+patch == FIRMWARE_BUILD_SEQ`). Fixing it properly requires decoupling the downgrade guard from `FIRMWARE_BUILD_SEQ` (compare against `FIRMWARE_VERSION` as a tuple) and re‑validating an OTA + a deliberate rollback. **Address at the next minor bump (`1.10.0`)**, which is also the first version where the current scheme misorders.
-- **F14 (low‑power daily sync race):** only affects `LOW_POWER`/`CRITICAL_HIBERNATE`. Adding a short post‑sync retry trades energy for latency on a weak battery — needs real battery‑state testing to tune.
-- **F20 (defer `confirmSketch()` for OTA images):** a genuine safety gap, but enabling MCUboot hardware rollback risks **false‑rollback** of a good image on a flaky‑Notecard unit, which is worse than the current "always confirm" behavior. Requires a dedicated test: deliberately flash a broken OTA image and confirm it rolls back, *and* confirm a good image on a disconnected‑Notecard unit does **not** roll back. Must not be bundled with the fixes above.
-- **F21 (`dfu.get` offset echo):** defense‑in‑depth; depends on whether the Notecard echoes the requested offset (unverified). MCUboot's own header/signature check is the backstop. Low value relative to risk.
-
-*Implemented changes compiled clean (`security=sien`, MCUboot macro on) and are fail‑safe: every new path either restores normal operation or clears state so the device keeps running its current firmware. The deferred items are tracked here for a focused follow‑up with bench validation.*
-

@@ -2579,7 +2579,7 @@ static void createDefaultConfig(ClientConfig &cfg) {
   cfg.solarCharger.enabled = false;                          // Disabled by default
   cfg.solarCharger.modbusSlaveId = SOLAR_DEFAULT_SLAVE_ID;   // Default: 1
   cfg.solarCharger.modbusBaudRate = SOLAR_DEFAULT_BAUD_RATE; // Default: 9600
-  cfg.solarCharger.modbusTimeoutMs = SOLAR_DEFAULT_TIMEOUT_MS; // Default: 200ms
+  cfg.solarCharger.modbusTimeoutMs = SOLAR_DEFAULT_TIMEOUT_MS; // Default: 1000ms (begin() floors to 500ms min)
   cfg.solarCharger.pollIntervalSec = SOLAR_DEFAULT_POLL_INTERVAL_SEC; // Default: 60s
   cfg.solarCharger.batteryLowVoltage = BATTERY_VOLTAGE_LOW;  // Default: 11.8V
   cfg.solarCharger.batteryCriticalVoltage = BATTERY_VOLTAGE_CRITICAL; // Default: 11.5V
