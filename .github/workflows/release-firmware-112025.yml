@@ -169,6 +169,27 @@ jobs:
           test -n "$SLOT_SOURCE"
           cp "$SLOT_SOURCE" "TankAlarm-Client-secure-v${{ steps.version.outputs.version }}.slot.bin"
 
+      - name: Validate client OTA slot image (MCUboot magic)
+        shell: bash
+        run: |
+          # Guard against shipping a non-bootable OTA image. A correctly built security=sien slot
+          # image begins with the MCUboot IMAGE_MAGIC 0x96f3b83d (little-endian bytes: 3d b8 f3 96).
+          # A plain security=none build starts with the STM32 vector table instead. If the build
+          # step is ever reverted to a plain build (as happened in 2926b11, causing the v2.0.40 OTA
+          # to revert on the device), this check fails the release BEFORE a bad image is published.
+          SLOT="TankAlarm-Client-secure-v${{ steps.version.outputs.version }}.slot.bin"
+          test -s "$SLOT" || { echo "ERROR: $SLOT is missing or empty."; exit 1; }
+          MAGIC=$(head -c 4 "$SLOT" | od -An -tx1 | tr -d ' \n')
+          if [ "$MAGIC" != "3db8f396" ]; then
+            echo "ERROR: $SLOT does not start with the MCUboot image magic."
+            echo "  expected: 3db8f396 (security=sien signed slot image)"
+            echo "  actual:   $MAGIC"
+            echo "The client OTA slot image was NOT built with security=sien (likely a plain build);"
+            echo "the device's bootloader would reject/revert it. Refusing to publish."
+            exit 1
+          fi
+          echo "OTA slot image validated: MCUboot magic OK ($MAGIC), size $(wc -c < "$SLOT") bytes."
+
       - name: Prepare release notes
         if: startsWith(github.ref, 'refs/tags/')
         id: notes
