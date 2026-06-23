@@ -5403,16 +5403,61 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
+  // A0602 Blueprint transactions get a wider bus timeout than the 25ms Notecard default; the
+  // ADC channel-config + framed reads can take longer than a Notecard ping. RESTORED before
+  // every return below so it never leaks to Notecard operations on the shared bus.
+  Wire.setTimeout(100);
+
   // Configure the A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol
-  // BEFORE reading (v1.9.23). The legacy bare read never configured the channel and returned a
-  // stale register (the constant ~18mA / 43.8psi symptom). In the power-gated model the channel
-  // loses its config when P1 is switched off, so we (re)configure here on every powered read,
-  // after the warmup so the rail is up. A failed config is non-fatal: the framed read below
-  // CRC-validates the answer and faults (NAN) rather than trusting a bad frame.
-  bool adcConfigOk = tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr);
+  // BEFORE reading (v1.9.23). In the power-gated model the channel loses its config when P1 is
+  // switched off, so we (re)configure here on every powered read, after the warmup so the rail
+  // is up. v2.0.45: the SET ACK only means "queued"; CONFIRM the channel actually entered
+  // current-ADC mode via GET_CHANNEL_FUNCTION (0x40) before trusting a reading. Retry config 3x.
+  // GRACEFUL gate: hard-fault (NAN) only if the SET is NACKed every attempt OR the expansion
+  // POSITIVELY reports a non-current-ADC function. If the A0602 firmware never answers 0x40,
+  // fall through to the read (the framed GET ADC has its own CRC/channel guard) so we never
+  // brick a sensor whose expansion firmware predates GET_CHANNEL_FUNCTION.
+  bool adcConfigOk = false;
+  bool funcReadable = false;
+  bool funcVerified = false;
+  for (uint8_t attempt = 0; attempt < 3 && !funcVerified; ++attempt) {
+    if (attempt > 0) delay(10);
+    if (!tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr)) {
+      continue;  // SET NACK -- retry
+    }
+    adcConfigOk = true;
+    unsigned long fstart = millis();
+    while ((millis() - fstart) < 100) {
+      uint8_t fun = 0xFF;
+      if (tankalarm_getAnalogChannelFunction((uint8_t)channel, i2cAddr, fun)) {
+        funcReadable = true;
+        if (fun == TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER) { funcVerified = true; break; }
+      }
+      delay(5);
+    }
+  }
   if (!adcConfigOk) {
-    Serial.print(F("WARNING: A0602 current-ADC channel config NACK on ch "));
+    Serial.print(F("ERROR: A0602 current-ADC channel config NACK on ch "));
     Serial.println(channel);
+    gCurrentLoopI2cErrors++;
+    gMonitorState[idx].currentSensorMa = 0.0f;
+    gMonitorState[idx].sampleReused = true;
+    if (cfg.pwmGatingEnabled) { (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr); }
+    Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+    return NAN;
+  }
+  if (funcReadable && !funcVerified) {
+    // We positively read the channel function and it is NOT current-ADC: a real
+    // misconfiguration. Do not trust the reading.
+    Serial.print(F("ERROR: A0602 ch "));
+    Serial.print(channel);
+    Serial.println(F(" not in current-ADC mode after config; rejecting read"));
+    gCurrentLoopI2cErrors++;
+    gMonitorState[idx].currentSensorMa = 0.0f;
+    gMonitorState[idx].sampleReused = true;
+    if (cfg.pwmGatingEnabled) { (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr); }
+    Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+    return NAN;
   }
   delay(2);
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
@@ -5475,15 +5520,26 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // Turn off sensor power gating once readings complete to achieve low-power gating (transistor OFF)
+  // Turn off sensor power gating once readings complete to achieve low-power gating (transistor OFF).
+  // v2.0.45: retry OFF (mirrors the ON retry) so a transient bus NACK can't leave the transmitter
+  // powered, which would distort the solar power budget and future observations.
   if (cfg.pwmGatingEnabled) {
-    bool pwmOffSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+    bool pwmOffSuccess = false;
+    for (uint8_t attempt = 0; attempt < 3 && !pwmOffSuccess; ++attempt) {
+      if (attempt > 0) delay(5);
+      pwmOffSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+    }
     if (!pwmOffSuccess) {
       Serial.print(F("WARNING: Failed to disable sensor power gating on P"));
       Serial.print(cfg.pwmGatingChannel + 1);
       Serial.println(F(" via I2C"));
+      gCurrentLoopI2cErrors++;
     }
   }
+
+  // Restore the default Wire timeout now that all A0602 transactions are done, so the wider
+  // 100ms window never leaks to subsequent Notecard operations on the shared bus.
+  Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
 
   float milliamps;
   if (validSamples == 0) {
@@ -5491,7 +5547,9 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     // would mask a disconnected/unpowered transmitter as healthy data. Clear the raw mA so
     // no stale value is transmitted, and return NAN so validateSensorReading() escalates a
     // sensor-fault after the failure threshold (sampleMonitors() still reuses the last level
-    // for display continuity).
+    // for display continuity). v2.0.45: count framed-path total failures into the fleet
+    // diagnostic so a silently-failing A0602 is visible in i2c_cl_err / i2c-error-rate.
+    gCurrentLoopI2cErrors++;
     gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
     return NAN;
@@ -5615,15 +5673,37 @@ static float readMonitorSensor(uint8_t idx) {
   }
 }
 
+// True if any configured monitor uses the 4-20mA current-loop interface (A0602). Used to
+// decide whether to defer Notecard outbox trimming until AFTER sampling, so the heavy Notecard
+// I2C traffic in trimTelemetryOutbox() does not share the bus with the timing-sensitive A0602
+// transactions (the Blueprint protocol assumes a sole bus master).
+static bool hasCurrentLoopMonitor() {
+  for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    if (gConfig.monitors[i].sensorInterface == SENSOR_CURRENT_LOOP) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void sampleMonitors() {
   // Solar-only sensor voltage gating: skip sampling if power is insufficient
   if (isSolarOnlyActive() && !isSensorVoltageGateOpen()) {
     return;  // Voltage too low for reliable sensor readings
   }
 
-  // Trim the telemetry outbox once per sampling pass (before any sendTelemetry calls)
-  // so repeated monitors do not each issue a note.changes query on the I2C bus.
-  trimTelemetryOutbox();
+  // Trim the telemetry outbox once per sampling pass so repeated monitors do not each issue a
+  // note.changes query on the I2C bus. v2.0.45: on current-loop devices DEFER this until AFTER
+  // sampling -- trimTelemetryOutbox() does multiple blocking Notecard transactions on the shared
+  // Wire bus, and running them immediately before the A0602 reads risks corrupting them.
+  const bool deferTrim = hasCurrentLoopMonitor();
+  if (!deferTrim) {
+    trimTelemetryOutbox();
+  } else {
+    // Drain any stale bytes a prior Notecard transaction may have left in the Wire RX buffer
+    // so they cannot be misread as the first bytes of an A0602 answer frame.
+    while (Wire.available()) { (void)Wire.read(); }
+  }
 
   for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
     const double sampleEpoch = currentEpoch();
@@ -5658,6 +5738,12 @@ static void sampleMonitors() {
         gMonitorState[i].lastReportedValue = inches;
       }
     }
+  }
+
+  // Deferred outbox trim for current-loop devices: now that all A0602 reads are done, trim the
+  // outbox once (it also covers any notes queued by sendTelemetry above).
+  if (deferTrim) {
+    trimTelemetryOutbox();
   }
 }
 
@@ -5967,6 +6053,12 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   // no voltage, and the comm-failure alarm defaults off, so the failure is otherwise silent.
   if (gSolarManager.isEnabled()) {
     doc["scOk"] = gSolarManager.isCommunicationOk() ? 1 : 0;
+    // v2.0.45: when the link READS but the values are rejected by the plausibility clamp
+    // (scOk:0 yet a CRC-valid Modbus read happened), flag scImpl:1 so the dashboard can tell
+    // "no link" (timeout) apart from "values rejected" (data). Omitted on a healthy link.
+    if (!gSolarManager.isCommunicationOk() && gSolarManager.wasLastReadImplausible()) {
+      doc["scImpl"] = 1;
+    }
   }
 
   publishNote(TELEMETRY_FILE, doc, syncNow);
@@ -6564,6 +6656,15 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
     JsonObject solarFail = doc["solar"].to<JsonObject>();
     solarFail["commOk"] = 0;
     solarFail["errs"] = data.consecutiveErrors;
+    // v2.0.45 taxonomy: surface WHY the link failed so a field scOk:0 can be classified
+    // remotely (timeout = physical; illegal data address = register/slave; invalid CRC = noise),
+    // and tell a transport failure apart from a CRC-valid-but-rejected read (scImpl).
+    solarFail["merr"]  = gSolarManager.getModbusErrorCount();
+    solarFail["maddr"] = gSolarManager.getLastModbusFailAddress();
+    solarFail["mms"]   = gSolarManager.getLastModbusResponseMs();
+    if (gSolarManager.wasLastReadImplausible()) solarFail["scImpl"] = 1;
+    const char *lastErr = gSolarManager.getLastModbusError();
+    if (lastErr && lastErr[0]) solarFail["merrTxt"] = lastErr;
     return true;
   }
   

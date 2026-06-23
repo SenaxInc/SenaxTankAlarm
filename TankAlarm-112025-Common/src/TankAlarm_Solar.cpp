@@ -20,43 +20,93 @@
 static char _faultDescBuffer[128];
 static char _alarmDescBuffer[128];
 
+// --- Modbus diagnostics (field troubleshooting of scOk:0) ---
+// File-local because ModbusRTUClient lives in this translation unit. Exposed via the
+// SolarManager accessor methods defined below. These distinguish a transport failure
+// (timeout / CRC / illegal address) from a CRC-valid read rejected by the plausibility
+// clamp. The failure COUNT is incremented once per logical read (in
+// readRegistersWithFallback) so a normal FC03->FC04 fallback probe is not double-counted.
+static uint32_t sSolarModbusErrorCount = 0;
+static char     sSolarLastModbusError[40] = {0};
+static uint16_t sSolarLastFailAddress = 0;
+static uint16_t sSolarLastResponseMs = 0;
+static bool     sSolarLastReadImplausible = false;
+
+// Drain any stale bytes left in the RS-485 UART RX buffer before a new Modbus
+// transaction. ArduinoModbus enables MODBUS_ERROR_RECOVERY_PROTOCOL (flush on CRC/FC
+// error) but NOT _LINK (no flush on timeout), so a late/garbage reply can linger and
+// corrupt the next request. Cheap belt-and-suspenders.
+static void drainRS485Rx() {
+  while (RS485.available()) {
+    (void)RS485.read();
+  }
+}
+
+// Capture the reason for a low-level Modbus read failure (does NOT increment the failure
+// count -- that happens once per logical read in readRegistersWithFallback).
+static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
+  sSolarLastFailAddress = address;
+  sSolarLastResponseMs = elapsedMs;
+  const char *e = ModbusRTUClient.lastError();
+  if (!e || !e[0]) {
+    e = "unknown";
+  }
+  size_t i = 0;
+  for (; e[i] && i < sizeof(sSolarLastModbusError) - 1; ++i) {
+    sSolarLastModbusError[i] = e[i];
+  }
+  sSolarLastModbusError[i] = '\0';
+}
+
 static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
+  drainRS485Rx();
+  unsigned long _t0 = millis();
   if (!ModbusRTUClient.requestFrom(slaveId, HOLDING_REGISTERS, startAddress, count)) {
+    captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
 
   if (ModbusRTUClient.available() < count) {
+    captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
 
   for (uint8_t index = 0; index < count; ++index) {
     int val = ModbusRTUClient.read();
     if (val < 0) {
+      captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
       return false;
     }
     buffer[index] = (uint16_t)val;
   }
 
+  sSolarLastResponseMs = (uint16_t)(millis() - _t0);
   return true;
 }
 
 static bool readInputRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
+  drainRS485Rx();
+  unsigned long _t0 = millis();
   if (!ModbusRTUClient.requestFrom(slaveId, INPUT_REGISTERS, startAddress, count)) {
+    captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
 
   if (ModbusRTUClient.available() < count) {
+    captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
 
   for (uint8_t index = 0; index < count; ++index) {
     int val = ModbusRTUClient.read();
     if (val < 0) {
+      captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
       return false;
     }
     buffer[index] = (uint16_t)val;
   }
 
+  sSolarLastResponseMs = (uint16_t)(millis() - _t0);
   return true;
 }
 
@@ -65,23 +115,25 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
     if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
       return true;
     }
-    // Failed: cached FC is wrong. Clear cache, bypass holding, go straight to input fallback on this call (R-4)
-    cachedFC = 0;
+    // Primary FC failed. Try the alternate WITHOUT discarding the cache first: a single
+    // transient timeout on a known-good FC03 device must not force permanent FC04
+    // re-probing on every subsequent poll (R-4 hardening, v2.0.45). Only switch the cache
+    // if the alternate FC genuinely answers.
     if (readInputRegisters(slaveId, startAddress, count, buffer)) {
       cachedFC = 4;
       return true;
     }
+    ++sSolarModbusErrorCount;
     return false;
   } else if (cachedFC == 4) {
     if (readInputRegisters(slaveId, startAddress, count, buffer)) {
       return true;
     }
-    // Failed: cached FC is wrong. Clear cache, bypass input, go straight to holding fallback on this call (R-4)
-    cachedFC = 0;
     if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
       cachedFC = 3;
       return true;
     }
+    ++sSolarModbusErrorCount;
     return false;
   }
 
@@ -94,6 +146,7 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
     cachedFC = 4;
     return true;
   }
+  ++sSolarModbusErrorCount;
   return false;
 }
 
@@ -267,16 +320,18 @@ bool SolarManager::readRegisters() {
   // To re-enable for bench experimentation, define SOLAR_ENABLE_UNVERIFIED_REGISTERS.
   // ==========================================================================
 
-  // Real-time block: 5 contiguous filtered ADC registers starting at adc_vb_f
-  //   0x0008 batt V, 0x0009 array V, 0x000A load V, 0x000B charge I, 0x000C load I.
-  uint16_t realtimeRegs[5];
-  // Bounded retry around the VERIFIED realtime block only (0x0008..0x000C). A single transient
-  // RS-485 disturbance (a corrupted byte or a locally-generated TX->RX turnaround artifact)
-  // otherwise fails the entire poll, and after SOLAR_COMM_FAILURE_THRESHOLD such polls the
-  // client would raise a false comm-failure alarm. The setpoint read and the (compiled-out)
-  // status/fault/daily blocks are deliberately NOT retried so worst-case Modbus blocking stays
-  // bounded. The watchdog is kicked before EVERY attempt (each attempt can cost up to one full
-  // Modbus timeout on a dead bus), so the retry loop can never starve it.
+  // Real-time block. Read EXACTLY the four registers the bench-proven
+  // firmware/sunsaver-modbus-test.ino reads: 0x0008 batt V, 0x0009 array V,
+  // 0x000B charge I, 0x000C load I. 0x000A (filtered load voltage) is intentionally
+  // SKIPPED -- it was read into a 5th slot but never consumed, and a NACK on that one
+  // register would short-circuit readRegistersIndividually() and fail the whole poll.
+  // realtimeRegs index map: [0]=battV [1]=arrV [2]=chargeI [3]=loadI.
+  uint16_t realtimeRegs[4];
+  // Bounded retry around the VERIFIED realtime registers only. A single transient
+  // RS-485 disturbance otherwise fails the entire poll, and after
+  // SOLAR_COMM_FAILURE_THRESHOLD such polls the client would raise a false comm-failure
+  // alarm. The watchdog is kicked before EVERY attempt and (via readRegistersIndividually)
+  // before each register, so the retry loop can never starve it.
   bool realtimeOk = false;
   for (uint8_t attempt = 0; attempt < SOLAR_REALTIME_MAX_ATTEMPTS; ++attempt) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -287,9 +342,11 @@ bool SolarManager::readRegisters() {
     if (attempt > 0) {
       delay(SOLAR_RETRY_DELAY_MS);  // brief settle before re-attempting (short, WDT-safe)
     }
-    // Single-register reads (count=1 each) -- the bench-verified transaction the MRC-1/SunSaver
-    // answers; a 5-register block read is not reliably bridged. See readRegistersIndividually().
-    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 5, realtimeRegs, _cachedHoldingFC)) {
+    // Two contiguous single-register reads, skipping the unused 0x000A in between.
+    // readRegistersIndividually() reads count=1 per Modbus transaction (the bench-verified
+    // transaction the MRC-1/SunSaver answers) and kicks the WDT per register.
+    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 2, &realtimeRegs[0], _cachedHoldingFC) &&
+        readRegistersIndividually(_config.modbusSlaveId, SS_REG_CHARGE_CURRENT, 2, &realtimeRegs[2], _cachedHoldingFC)) {
       realtimeOk = true;
       break;
     }
@@ -303,26 +360,38 @@ bool SolarManager::readRegisters() {
 #endif
     float battV = scaleVoltage(realtimeRegs[0]);
     float arrV  = scaleVoltage(realtimeRegs[1]);
-    float chgI  = scaleCurrent(realtimeRegs[3]);
-    float lodI  = scaleCurrent(realtimeRegs[4]);
+    float chgI  = scaleCurrent(realtimeRegs[2]);  // signed (see scaleCurrent)
+    float lodI  = scaleCurrent(realtimeRegs[3]);  // signed
 
-    // Plausibility Clamps (R-3 / SR-1) - Reject glitches/unreasonable reads
-    if (battV >= 5.0f && battV <= 40.0f && arrV >= 0.0f && arrV <= 80.0f && chgI >= 0.0f && chgI <= 100.0f) {
+    // Saturate small negative readings (normal no-charge / night offsets) to zero so
+    // they cannot be misread as out-of-range.
+    if (arrV < 0.0f) arrV = 0.0f;
+    if (chgI < 0.0f) chgI = 0.0f;
+    if (lodI < 0.0f) lodI = 0.0f;
+
+    // TRANSPORT-HEALTH GATE (v2.0.45): only the battery voltage decides scOk. A
+    // CRC-valid Modbus read must never be discarded as a comm failure because a
+    // data-quality field looks odd -- treating the current registers as unsigned
+    // previously turned a healthy night-time read (small negative charge current ->
+    // ~158 A) into scOk:0. Array V and currents are now clamped as data quality only.
+    if (battV >= 5.0f && battV <= 40.0f) {
       nextData.batteryVoltage = battV;
-      nextData.arrayVoltage   = arrV;
-      nextData.chargeCurrent  = chgI;
-      nextData.loadCurrent    = lodI;
+      nextData.arrayVoltage   = (arrV <= 80.0f)  ? arrV : nextData.arrayVoltage;
+      nextData.chargeCurrent  = (chgI <= 100.0f) ? chgI : nextData.chargeCurrent;
+      nextData.loadCurrent    = (lodI <= 100.0f) ? lodI : nextData.loadCurrent;
+      sSolarLastReadImplausible = false;
     } else {
-      Serial.print(F("WARNING: Solar read registered implausible values, rejecting poll (bv="));
+      // CRC-valid read but the battery voltage itself is implausible: a DATA problem,
+      // distinct from a transport failure. Flag it (scImpl) so the dashboard can tell
+      // "no link" apart from "values rejected."
+      sSolarLastReadImplausible = true;
+      Serial.print(F("WARNING: Solar battery voltage implausible, rejecting poll (bv="));
       Serial.print(battV, 2);
-      Serial.print(F(" av="));
-      Serial.print(arrV, 2);
-      Serial.print(F(" ic="));
-      Serial.print(chgI, 2);
       Serial.println(F(")"));
       success = false;
     }
   } else {
+    sSolarLastReadImplausible = false;  // genuine transport failure, not a value rejection
     success = false;
   }
 
@@ -333,17 +402,22 @@ bool SolarManager::readRegisters() {
   // change at boot or DIP-switch change. Best-effort: failure does not mark the
   // overall poll as failed.
   if (success && !nextData.setpointsValid) {
-    uint16_t setpointRegs[4];  // V_reg, (gap), V_float, V_eq
-    // Single-register reads (see readRegistersIndividually) -- same MRC-1 bridge constraint.
-    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_V_REG, 4, setpointRegs, _cachedHoldingFC)) {
+    // Read the three setpoints we actually use at their exact addresses, SKIPPING the
+    // gap register 0x0034 (AH_DAILY) that sits between V_reg and V_float. A NACK on the
+    // gap must not abort the (best-effort) setpoint read nor perturb the FC cache.
+    uint16_t vRegRaw = 0, vFloatRaw = 0, vEqRaw = 0;
+    bool setpointOk = readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_REG, 1, &vRegRaw, _cachedHoldingFC);
+    if (setpointOk) setpointOk = readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_FLOAT, 1, &vFloatRaw, _cachedHoldingFC);
+    if (setpointOk) setpointOk = readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_EQ, 1, &vEqRaw, _cachedHoldingFC);
+    if (setpointOk) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
 #elif defined(ARDUINO_ARCH_STM32)
       IWatchdog.reload();
 #endif
-      float vReg   = scaleVoltage(setpointRegs[0]);
-      float vFloat = scaleVoltage(setpointRegs[2]);
-      float vEq    = scaleVoltage(setpointRegs[3]);
+      float vReg   = scaleVoltage(vRegRaw);
+      float vFloat = scaleVoltage(vFloatRaw);
+      float vEq    = scaleVoltage(vEqRaw);
       // Sanity: setpoints must look like plausible battery voltages.
       // Accept anything in 8..32V (covers 12V and 24V chargers, allows L16/equalize).
       if (vReg >= 8.0f && vReg <= 32.0f && vFloat >= 8.0f && vFloat <= 32.0f) {
@@ -480,8 +554,27 @@ float SolarManager::scaleVoltage(uint16_t raw) const {
 }
 
 float SolarManager::scaleCurrent(uint16_t raw) const {
-  // Formula: Current = (Raw * 79.16) / 32768 for 12V system
-  return (raw * SS_SCALE_CURRENT_12V) / SS_SCALE_DIVISOR;
+  // Formula: Current = (Raw * 79.16) / 32768 for 12V system.
+  // The SunSaver filtered current registers (adc_ic_f 0x000B, adc_il_f 0x000C) are SIGNED
+  // (two's complement). Cast through int16_t FIRST so a small negative current near zero
+  // (no-charge / night) scales to a small negative value, NOT a huge positive one. Reading
+  // it as unsigned wrapped -16 counts to ~158 A, which tripped the plausibility clamp and
+  // silently turned a healthy Modbus read into scOk:0 (fixed v2.0.45).
+  return ((float)(int16_t)raw * SS_SCALE_CURRENT_12V) / SS_SCALE_DIVISOR;
+}
+
+// --- Modbus diagnostics accessors (file-local state defined near the top) ---
+uint32_t SolarManager::getModbusErrorCount() const { return sSolarModbusErrorCount; }
+const char* SolarManager::getLastModbusError() const { return sSolarLastModbusError; }
+uint16_t SolarManager::getLastModbusFailAddress() const { return sSolarLastFailAddress; }
+uint16_t SolarManager::getLastModbusResponseMs() const { return sSolarLastResponseMs; }
+bool SolarManager::wasLastReadImplausible() const { return sSolarLastReadImplausible; }
+void SolarManager::resetModbusErrorStats() {
+  sSolarModbusErrorCount = 0;
+  sSolarLastModbusError[0] = '\0';
+  sSolarLastFailAddress = 0;
+  sSolarLastResponseMs = 0;
+  sSolarLastReadImplausible = false;
 }
 
 void SolarManager::updateHealthStatus() {
@@ -864,6 +957,12 @@ bool SolarManager::readRegisters() { return false; }
 float SolarManager::scaleVoltage(uint16_t raw) const { (void)raw; return 0.0f; }
 float SolarManager::scaleCurrent(uint16_t raw) const { (void)raw; return 0.0f; }
 void SolarManager::updateHealthStatus() {}
+uint32_t SolarManager::getModbusErrorCount() const { return 0; }
+const char* SolarManager::getLastModbusError() const { return ""; }
+uint16_t SolarManager::getLastModbusFailAddress() const { return 0; }
+uint16_t SolarManager::getLastModbusResponseMs() const { return 0; }
+bool SolarManager::wasLastReadImplausible() const { return false; }
+void SolarManager::resetModbusErrorStats() {}
 SolarManager::ChemistryCheck SolarManager::verifyChemistry(uint8_t expectedType,
                                                             uint8_t nominalVoltage,
                                                             char* outDescription,

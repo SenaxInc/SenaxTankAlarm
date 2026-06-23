@@ -491,4 +491,82 @@ static inline float tankalarm_readCurrentAdcFramed(uint8_t channel, uint8_t i2cA
   return 25.0f * (float)raw / 65535.0f; // A0602 current-ADC full scale (matches pinCurrent)
 }
 
+// Blueprint channel-function value for a 4-20mA current ADC with external loop power.
+// Verified against the installed Arduino_Opta_Blueprint library (AnalogCommonCfg.h CfgFun_t):
+// CH_FUNC_CURRENT_INPUT_EXT_POWER = 4. COUPLING: the expansion reports this function for our
+// configure frame ONLY because tankalarm_configureCurrentAdcChannel() sends
+// ADDING_ADC = OA_DISABLE. If that byte ever becomes OA_ENABLE the channel reports
+// CH_FUNC_CURRENT_INPUT_LOOP_POWER (5) and THIS constant must change with it.
+#ifndef TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER
+#define TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER 0x04
+#endif
+
+/**
+ * Query the ACTUAL configured function of an A0602 channel via the framed Blueprint
+ * GET_CHANNEL_FUNCTION (0x40) protocol. The SET CH_ADC ACK only means "command queued" --
+ * the expansion applies the channel reconfiguration later in its own main loop. This read
+ * confirms the AD74412R is genuinely in current-ADC mode before we trust a reading.
+ * Frame verified against OptaAnalogProtocol.h: request [0x02][0x40][0x01][ch][CRC];
+ * answer [0x03][0x40][0x02][ch][fun][CRC].
+ * Returns true + funOut on a fully-validated answer; false on ANY I2C/framing/CRC failure
+ * (false means "could not read the function", NOT "wrong function" -- the caller must
+ * distinguish the two so an A0602 firmware that doesn't implement 0x40 is not hard-failed).
+ */
+static inline bool tankalarm_getAnalogChannelFunction(uint8_t channel, uint8_t i2cAddr, uint8_t &funOut) {
+  if (channel >= 8) {
+    return false;
+  }
+  uint8_t req[5];
+  req[0] = 0x02;        // BP_CMD_GET
+  req[1] = 0x40;        // ARG_GET_CHANNEL_FUNCTION
+  req[2] = 0x01;        // LEN_GET_CHANNEL_FUNCTION
+  req[3] = channel;     // GET_CHANNEL_FUNCTION_CH_POS
+  req[4] = tankalarm_optaCrc8(req, 4);
+
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(req, 5);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  delay(1); // allow the expansion to stage its answer buffer
+  // Answer = [BP_ANS_GET=0x03][ARG=0x40][LEN=0x02][channel][function][CRC] = 6 bytes
+  const uint8_t ANS_LEN = 6;
+  uint8_t a[6];
+  uint8_t n = 0;
+  uint8_t got = Wire.requestFrom(i2cAddr, ANS_LEN);
+  while (Wire.available() && n < ANS_LEN) { a[n++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (got != ANS_LEN || n != ANS_LEN) {
+    return false;
+  }
+  if (a[0] != 0x03 || a[1] != 0x40 || a[2] != 0x02 || a[3] != channel) {
+    return false;
+  }
+  if (tankalarm_optaCrc8(a, 5) != a[5]) {
+    return false;
+  }
+  funOut = a[4];
+  return true;
+}
+
+/**
+ * Poll tankalarm_getAnalogChannelFunction() until the channel reports current-ADC mode
+ * (CH_FUNC_CURRENT_INPUT_EXT_POWER) or timeoutMs elapses. Convenience wrapper; callers that
+ * need to distinguish "unreadable" from "wrong function" should call the getter directly.
+ */
+static inline bool tankalarm_waitCurrentAdcFunction(uint8_t channel, uint8_t i2cAddr, uint16_t timeoutMs = 100) {
+  const unsigned long start = millis();
+  for (;;) {
+    uint8_t fun = 0xFF;
+    if (tankalarm_getAnalogChannelFunction(channel, i2cAddr, fun) &&
+        fun == TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER) {
+      return true;
+    }
+    if ((millis() - start) >= timeoutMs) {
+      return false;
+    }
+    delay(5);
+  }
+}
+
 #endif // TANKALARM_I2C_H

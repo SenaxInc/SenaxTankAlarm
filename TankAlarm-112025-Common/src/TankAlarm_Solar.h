@@ -289,7 +289,17 @@ public:
   bool isCommunicationOk() const { return _data.communicationOk; }
   bool isBatteryHealthy() const { return _data.batteryHealthy; }
   bool isSolarHealthy() const { return _data.solarHealthy; }
-  
+
+  // Modbus diagnostics for field troubleshooting of scOk:0. These let the operator
+  // distinguish a transport failure (timeout/CRC/illegal address -> getLastModbusError())
+  // from a CRC-valid read rejected by the plausibility clamp (wasLastReadImplausible()).
+  uint32_t getModbusErrorCount() const;
+  const char* getLastModbusError() const;
+  uint16_t getLastModbusFailAddress() const;
+  uint16_t getLastModbusResponseMs() const;
+  bool wasLastReadImplausible() const;
+  void resetModbusErrorStats();
+
   // Reset daily statistics (call at midnight or report time)
   void resetDailyStats();
 

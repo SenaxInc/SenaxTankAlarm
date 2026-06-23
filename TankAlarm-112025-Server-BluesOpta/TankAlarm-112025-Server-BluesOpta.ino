@@ -11823,6 +11823,28 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
       addServerSerialLog("Stale sensor-stuck alarm auto-cleared on telemetry", "info", "alarm");
     }
   }
+
+  // Self-clear a stale latched "sensor-fault" alarm (v2.0.45). sensor-fault is latched by
+  // handleAlarm and is normally cleared only by a client recovery note or a manual clear. Once
+  // the A0602 read is restored the client resumes sending FRESH readings (ru:0, no sf). A fresh,
+  // non-reused, non-failed reading for this sensor is definitive proof the sensor recovered, so
+  // any lingering sensor-fault is stale and is cleared. Gated strictly on ru:0 && !sf so a
+  // genuinely failing sensor (which reuses its value: ru:1, or never uploads while failed) is
+  // never masked.
+  if (rec->alarmActive && strcmp(rec->alarmType, "sensor-fault") == 0) {
+    bool sampleReused = (doc["ru"] | 0) != 0;
+    bool sensorFailedFlag = (doc["sf"] | 0) != 0;
+    if (!sampleReused && !sensorFailedFlag) {
+      rec->alarmActive = false;
+      strlcpy(rec->alarmType, "clear", sizeof(rec->alarmType));
+      clearAlarmEvent(clientUid, sensorIndex);
+      Serial.print(F("Cleared stale sensor-fault alarm (fresh reading) for "));
+      Serial.print(clientUid);
+      Serial.print(F(" sensor "));
+      Serial.println(sensorIndex);
+      addServerSerialLog("Stale sensor-fault alarm auto-cleared on fresh telemetry", "info", "alarm");
+    }
+  }
   
   // Record telemetry snapshot for historical charting
   // Get site name and tank height for history record
