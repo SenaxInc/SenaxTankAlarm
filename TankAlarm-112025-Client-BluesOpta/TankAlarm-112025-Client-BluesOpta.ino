@@ -280,6 +280,33 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define CURRENT_LOOP_GATED_SETTLE_MS 300
 #endif
 
+#ifndef CURRENT_LOOP_OVER_RANGE_MA
+// Above this current a 4-20mA loop reading is rejected as a fault. A healthy transmitter cannot
+// legitimately exceed 20mA full scale; a value above ~21mA (e.g. a raw 0xFFFF read that scales
+// to 25mA, or a near-full-scale garbage frame) is an I2C/loop fault, not a real reading. Without
+// this guard linearMap(mA,4,20,...) extrapolates the bad value into a fabricated level/pressure.
+#define CURRENT_LOOP_OVER_RANGE_MA 21.0f
+#endif
+
+#ifndef A0602_WIRE_TIMEOUT_MS
+// Scoped Wire byte-timeout (ms) for A0602 current-loop transactions. The A0602 does NOT clock-
+// stretch, so it needs only a short timeout; failing fast lets the loop() bus recovery engage
+// sooner instead of blocking. The Notecard (which DOES clock-stretch) keeps I2C_WIRE_TIMEOUT_MS.
+#define A0602_WIRE_TIMEOUT_MS 25
+#endif
+
+#ifndef A0602_PEROP_I2C_CLOCK_HZ
+// Per-operation I2C clock for A0602 framed transactions. Raised ONLY around the A0602 frames
+// (then restored to I2C_NORMAL_CLOCK_HZ before any Notecard op) to shrink the A0602's bus-
+// occupancy window ~4x WITHOUT ever running the clock-sensitive Notecard at 400kHz.
+#define A0602_PEROP_I2C_CLOCK_HZ 400000
+#endif
+
+#ifndef I2C_NORMAL_CLOCK_HZ
+// Shared-bus default clock (Notecard-safe). Restored after every A0602 per-op window.
+#define I2C_NORMAL_CLOCK_HZ 100000
+#endif
+
 #ifndef MAX_ALARMS_PER_HOUR
 #define MAX_ALARMS_PER_HOUR 10  // Maximum alarms per monitor per hour
 #endif
@@ -900,6 +927,22 @@ static char gSignalRat[8] = {0};    // Radio access technology (e.g., "lte", "ca
 // Non-static: extern-linked via TankAlarm_I2C.h shared functions
 uint32_t gCurrentLoopI2cErrors = 0;
 uint32_t gI2cBusRecoveryCount = 0;
+
+// v2.0.46: A0602 current-loop diagnostics (daily-windowed; reset with gCurrentLoopI2cErrors).
+// Make the shared-bus health observable in Notehub so a field A0602 fault is measurable, and
+// so the per-op 400kHz window's effect on read latency (gLastClBurstMicros) can be confirmed.
+enum ClFaultReason : uint8_t {
+  CL_FAULT_NONE = 0,        // last A0602 read OK
+  CL_FAULT_PWM_NACK = 1,    // P1 power-gate enable NACKed (loop unpowered)
+  CL_FAULT_CONFIG_NACK = 2, // ADC channel config NACKed
+  CL_FAULT_FUNC_WRONG = 3,  // channel not in current-ADC mode
+  CL_FAULT_READ_FAIL = 4,   // every framed sample failed
+  CL_FAULT_OVER_RANGE = 5   // reading rejected as >21mA / 0xFFFF garbage
+};
+uint32_t gCurrentLoopReadsOk = 0;            // valid A0602 reads this window
+uint32_t gCurrentLoopOverRange = 0;          // reads rejected as over-range/garbage this window
+uint8_t  gLastClFaultReason = CL_FAULT_NONE; // last A0602 fault code (see ClFaultReason)
+uint32_t gLastClBurstMicros = 0;             // duration (us) of the last A0602 read burst
 
 // Startup I2C scan results — persisted for first health telemetry report
 static bool gStartupNotecardFound = false;
@@ -1907,6 +1950,9 @@ void loop() {
             Serial.print(sensorRecoveryBackoff);
             Serial.println(F(")"));
             recoverI2CBus();
+            // v2.0.46: recoverI2CBus() does Wire.end()/begin(); re-bind the Notecard so its
+            // I2C session survives the bus cycle (mirrors the dual-failure recovery path).
+            tankalarm_ensureNotecardBinding(notecard);
             logI2CRecoveryEvent(I2C_RECOVERY_SENSOR_ONLY);
             sensorRecoveryTotalAttempts++;
             // Reset sensor failure counters to give them a fresh chance
@@ -5054,6 +5100,9 @@ static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger) {
   doc["trigger"] = (uint8_t)trigger;
   doc["count"] = gI2cBusRecoveryCount;
   doc["i2c_errs"] = gCurrentLoopI2cErrors;
+  doc["cl_ok"] = gCurrentLoopReadsOk;
+  doc["cl_fault"] = gLastClFaultReason;
+  doc["cl_dur_us"] = gLastClBurstMicros;
   double epoch = currentEpoch();
   if (epoch > 0) {
     doc["t"] = epoch;
@@ -5398,15 +5447,20 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       gMonitorState[idx].lastPwmEnableOk = false;
       gMonitorState[idx].currentSensorMa = 0.0f;
       gMonitorState[idx].sampleReused = true;
+      gLastClFaultReason = CL_FAULT_PWM_NACK;
       (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
       return NAN;
     }
   }
 
-  // A0602 Blueprint transactions get a wider bus timeout than the 25ms Notecard default; the
-  // ADC channel-config + framed reads can take longer than a Notecard ping. RESTORED before
-  // every return below so it never leaks to Notecard operations on the shared bus.
-  Wire.setTimeout(100);
+  // A0602 Blueprint transactions run in an OWNED, scoped window on the shared bus (v2.0.46):
+  //  - a SHORT byte-timeout (the A0602 doesn't clock-stretch, so fail fast into loop() recovery);
+  //  - the per-op 400kHz clock to shrink the A0602's bus occupancy ~4x.
+  // BOTH are RESTORED (timeout -> I2C_WIRE_TIMEOUT_MS, clock -> I2C_NORMAL_CLOCK_HZ) before every
+  // return below so neither ever leaks to a Notecard operation on the shared bus.
+  const uint32_t clBurstStartUs = micros();
+  Wire.setTimeout(A0602_WIRE_TIMEOUT_MS);
+  Wire.setClock(A0602_PEROP_I2C_CLOCK_HZ);
 
   // Configure the A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol
   // BEFORE reading (v1.9.23). In the power-gated model the channel loses its config when P1 is
@@ -5440,9 +5494,11 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     Serial.print(F("ERROR: A0602 current-ADC channel config NACK on ch "));
     Serial.println(channel);
     gCurrentLoopI2cErrors++;
+    gLastClFaultReason = CL_FAULT_CONFIG_NACK;
     gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
     if (cfg.pwmGatingEnabled) { (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr); }
+    Wire.setClock(I2C_NORMAL_CLOCK_HZ);
     Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
     return NAN;
   }
@@ -5453,9 +5509,11 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     Serial.print(channel);
     Serial.println(F(" not in current-ADC mode after config; rejecting read"));
     gCurrentLoopI2cErrors++;
+    gLastClFaultReason = CL_FAULT_FUNC_WRONG;
     gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
     if (cfg.pwmGatingEnabled) { (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr); }
+    Wire.setClock(I2C_NORMAL_CLOCK_HZ);
     Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
     return NAN;
   }
@@ -5537,9 +5595,12 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // Restore the default Wire timeout now that all A0602 transactions are done, so the wider
-  // 100ms window never leaks to subsequent Notecard operations on the shared bus.
+  // Restore the default Wire clock + timeout now that all A0602 transactions are done, so the
+  // per-op 400kHz / short-timeout window never leaks to subsequent Notecard operations on the
+  // shared bus. Record the burst duration (us) for Notehub profiling of the clock-window effect.
+  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
   Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+  gLastClBurstMicros = micros() - clBurstStartUs;
 
   float milliamps;
   if (validSamples == 0) {
@@ -5550,6 +5611,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     // for display continuity). v2.0.45: count framed-path total failures into the fleet
     // diagnostic so a silently-failing A0602 is visible in i2c_cl_err / i2c-error-rate.
     gCurrentLoopI2cErrors++;
+    gLastClFaultReason = CL_FAULT_READ_FAIL;
     gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
     return NAN;
@@ -5558,6 +5620,22 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
 
   // Store raw mA reading for telemetry
   gMonitorState[idx].currentSensorMa = milliamps;
+
+  // Over-range fault (v2.0.46): a 4-20mA transmitter cannot legitimately exceed 20mA full scale.
+  // A value above CURRENT_LOOP_OVER_RANGE_MA (e.g. a raw 0xFFFF read scaling to 25mA, or a near-
+  // full-scale garbage frame that passed CRC) is an I2C/loop fault. Reject it rather than let
+  // linearMap() extrapolate a fabricated level/pressure. Clear the raw mA so it isn't transmitted.
+  if (milliamps > CURRENT_LOOP_OVER_RANGE_MA) {
+    Serial.print(F("ERROR: A0602 over-range read "));
+    Serial.print(milliamps, 2);
+    Serial.println(F("mA (>full-scale) — rejecting as fault"));
+    gCurrentLoopI2cErrors++;
+    gCurrentLoopOverRange++;
+    gLastClFaultReason = CL_FAULT_OVER_RANGE;
+    gMonitorState[idx].currentSensorMa = 0.0f;
+    gMonitorState[idx].sampleReused = true;
+    return NAN;
+  }
 
   // Live-zero fault: a 4-20mA loop reading below ~3.6mA means the loop is open/broken or the
   // transmitter is unpowered. Return NAN so validateSensorReading() escalates a sensor-fault
@@ -5572,6 +5650,10 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   if (milliamps < CURRENT_LOOP_FAULT_MA) {
     return NAN;
   }
+
+  // Valid in-range A0602 reading (v2.0.46 observability): count success + clear the fault code.
+  gCurrentLoopReadsOk++;
+  gLastClFaultReason = CL_FAULT_NONE;
 
   // Server-pushed learned calibration overrides the theoretical conversion so the client's
   // level (and alarm thresholds) match the server's calibrated display. Skips gas, which
@@ -5692,12 +5774,15 @@ static void sampleMonitors() {
     return;  // Voltage too low for reliable sensor readings
   }
 
-  // Trim the telemetry outbox once per sampling pass so repeated monitors do not each issue a
-  // note.changes query on the I2C bus. v2.0.45: on current-loop devices DEFER this until AFTER
-  // sampling -- trimTelemetryOutbox() does multiple blocking Notecard transactions on the shared
-  // Wire bus, and running them immediately before the A0602 reads risks corrupting them.
-  const bool deferTrim = hasCurrentLoopMonitor();
-  if (!deferTrim) {
+  // v2.0.46: TWO-PHASE sampling pass to guarantee single-owner bus access for the timing-
+  // sensitive A0602 (current-loop) reads. The Notecard is an I2C slave, but every
+  // publishNote()/trim is a HOST-initiated transaction that can hold the shared Wire bus for up
+  // to ~30s; running one between two A0602 frames corrupts the framed read. So on current-loop
+  // devices we (A) acquire + validate ALL sensors with NO Notecard I/O, then (B) evaluate
+  // alarms/unloads and publish telemetry AFTER every A0602 read is complete. Devices with no
+  // current-loop monitor keep the original interleaved behaviour (no isolation needed).
+  const bool deferPublishes = hasCurrentLoopMonitor();
+  if (!deferPublishes) {
     trimTelemetryOutbox();
   } else {
     // Drain any stale bytes a prior Notecard transaction may have left in the Wire RX buffer
@@ -5705,10 +5790,11 @@ static void sampleMonitors() {
     while (Wire.available()) { (void)Wire.read(); }
   }
 
+  // ---- Phase A: acquire + validate every sensor (NO Notecard publishes when deferring) ----
   for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
     const double sampleEpoch = currentEpoch();
     float inches = readMonitorSensor(i);
-    
+
     // Validate sensor reading
     if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
@@ -5720,9 +5806,39 @@ static void sampleMonitors() {
         gMonitorState[i].lastReadingEpoch = sampleEpoch;
       }
     }
-    
+
+    if (!deferPublishes) {
+      // No current-loop monitor present: keep the original interleaved evaluate + publish.
+      evaluateAlarms(i);
+      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed) {
+        evaluateUnload(i);
+      }
+      if (gConfig.monitors[i].enableServerUpload && !gMonitorState[i].sensorFailed) {
+        const float threshold = gConfig.monitors[i].reportThreshold;
+        const bool needBaseline = (gMonitorState[i].lastReportedValue < 0.0f);
+        const bool thresholdEnabled = (threshold > 0.0f);
+        const bool changeExceeded = thresholdEnabled && (fabs(inches - gMonitorState[i].lastReportedValue) >= threshold);
+        if (needBaseline || changeExceeded) {
+          sendTelemetry(i, "sample", false);
+          gMonitorState[i].lastReportedValue = inches;
+        }
+      }
+    }
+  }
+
+  // Non-current-loop devices are fully handled in Phase A above.
+  if (!deferPublishes) {
+    return;
+  }
+
+  // ---- Between phases: all A0602 reads are done. Drain any RX residue before Notecard I/O. ----
+  while (Wire.available()) { (void)Wire.read(); }
+
+  // ---- Phase B: evaluate alarms/unloads and publish telemetry (the deferred Notecard I/O) ----
+  for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    const float inches = gMonitorState[i].currentInches;
     evaluateAlarms(i);
-    
+
     // Evaluate tank unload if tracking is enabled for this tank
     if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed) {
       evaluateUnload(i);
@@ -5740,11 +5856,9 @@ static void sampleMonitors() {
     }
   }
 
-  // Deferred outbox trim for current-loop devices: now that all A0602 reads are done, trim the
-  // outbox once (it also covers any notes queued by sendTelemetry above).
-  if (deferTrim) {
-    trimTelemetryOutbox();
-  }
+  // Deferred outbox trim for current-loop devices: now that all A0602 reads AND the Phase-B
+  // publishes are done, trim the outbox once.
+  trimTelemetryOutbox();
 }
 
 static bool restorePersistentRelayAfterBoot(uint8_t idx, bool highAlarmActive, bool lowAlarmActive, unsigned long sampleNow) {
@@ -7877,6 +7991,8 @@ static void sendDailyReport() {
     doc["y"] = "i2c-error-rate";
     doc["errs"] = gCurrentLoopI2cErrors;
     doc["recs"] = gI2cBusRecoveryCount;
+    doc["ok"] = gCurrentLoopReadsOk;
+    doc["or"] = gCurrentLoopOverRange;
     doc["t"] = currentEpoch();
     publishNote(ALARM_FILE, doc, true);
   }
@@ -7885,6 +8001,8 @@ static void sendDailyReport() {
   // the recent 24-hour window rather than lifetime totals.
   gCurrentLoopI2cErrors = 0;
   gI2cBusRecoveryCount = 0;
+  gCurrentLoopReadsOk = 0;
+  gCurrentLoopOverRange = 0;
 }
 
 static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t monitorIndex, size_t payloadLimit) {
@@ -9766,6 +9884,13 @@ static void sendHealthTelemetry() {
   // I2C bus health counters
   doc["i2c_cl_err"] = gCurrentLoopI2cErrors;
   doc["i2c_bus_recover"] = gI2cBusRecoveryCount;
+  // v2.0.46 A0602 current-loop diagnostics (daily window): valid-read count, over-range/garbage
+  // rejections, last fault code (see ClFaultReason), and last read-burst duration (us) so the
+  // shared-bus health and the per-op 400kHz window's effect are observable in Notehub.
+  doc["cl_ok"] = gCurrentLoopReadsOk;
+  doc["cl_or"] = gCurrentLoopOverRange;
+  doc["cl_fault"] = gLastClFaultReason;
+  doc["cl_dur_us"] = gLastClBurstMicros;
 
   // Include solar data if available
   if (gSolarManager.isEnabled()) {

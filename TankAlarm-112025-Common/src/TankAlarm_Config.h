@@ -142,8 +142,11 @@
 // Wire library timeout (ms) for I2C transactions.
 // Prevents indefinite blocking if SDA/SCL lines are physically disconnected
 // mid-transaction.  Applied via Wire.setTimeout() after every Wire.begin().
+// v2.0.46: raised 25->50ms. This is the NOTECARD/global timeout; the Notecard clock-stretches
+// SCL up to ~25ms during sync (FUTURE_3.3.3), so 25ms was marginal. The A0602 (which does NOT
+// clock-stretch) uses its own shorter A0602_WIRE_TIMEOUT_MS scoped around its transactions.
 #ifndef I2C_WIRE_TIMEOUT_MS
-#define I2C_WIRE_TIMEOUT_MS 25
+#define I2C_WIRE_TIMEOUT_MS 50
 #endif
 
 // 24-hour I2C error count threshold that triggers an alarm note

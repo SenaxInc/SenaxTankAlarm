@@ -85,7 +85,8 @@ static inline void tankalarm_recoverI2CBus(
   Wire.end();
 
   // Toggle SCL manually to unstick any slave.
-  // On Arduino Opta: SCL = PIN_WIRE_SCL (PB_8), SDA = PIN_WIRE_SDA (PB_9)
+  // On Arduino Opta: Wire = I2C3, so SCL = PIN_WIRE_SCL (PH_7) and SDA = PIN_WIRE_SDA (PH_8).
+  // (The PIN_WIRE_* macros already resolve to the correct pins; the prior PB_8/PB_9 comment was wrong.)
 #if defined(ARDUINO_OPTA)
   const int I2C_SCL_PIN = PIN_WIRE_SCL;
   const int I2C_SDA_PIN = PIN_WIRE_SDA;
@@ -488,6 +489,13 @@ static inline float tankalarm_readCurrentAdcFramed(uint8_t channel, uint8_t i2cA
     return -1.0f;
   }
   uint16_t raw = (uint16_t)a[4] | ((uint16_t)a[5] << 8); // little-endian
+  // v2.0.46: an all-ones raw sample is the I2C "bus pulled high"/garbage signature. It scales to
+  // 25mA — above a 4-20mA loop's full scale and indistinguishable-by-value from a real reading
+  // once converted to float. Reject it here, while the raw word is still in hand, so a failed
+  // frame can never masquerade as a ~25mA reading downstream.
+  if (raw == 0xFFFF) {
+    return -1.0f;
+  }
   return 25.0f * (float)raw / 65535.0f; // A0602 current-ADC full scale (matches pinCurrent)
 }
 
