@@ -1984,6 +1984,37 @@ void loop() {
         recoverI2CBus();
         logI2CRecoveryEvent(I2C_RECOVERY_DUAL_FAILURE);
         tankalarm_ensureNotecardBinding(notecard);
+        // Fix C1 (v2.0.50): the A0602's Blueprint-assigned address lives in its own MCU's
+        // RAM and normally survives a tankalarm_recoverI2CBus() SCL-toggle cycle. BUT if
+        // the module was externally power-cycled (brownout, loop-power loss, hardware reset)
+        // it lost its 0x0B assignment and is now listening at the OPTA_DEFAULT_SLAVE_I2C_ADDRESS
+        // (0x0A == CURRENT_LOOP_I2C_ALT_ADDRESS_1). A lightweight re-probe finds it and
+        // steers gConfig.currentLoopI2cAddress at runtime (not persisted). We deliberately do
+        // NOT call bootstrapA0602Managed() here — see the comment block at its definition for
+        // why (OPTA_CONTROLLER_RESET is broadcast + expensive). See review document
+        // CODE_REVIEW_06252026_CURRENT_LOOP_SENSORS.md §10 for full rationale.
+        if (!gDfuInProgress) {
+          delay(50);  // brief peripheral settle after Wire.end()/begin() (§7.1)
+          uint8_t prev = gConfig.currentLoopI2cAddress;
+          uint8_t resolved = resolveCurrentLoopI2cAddress(prev);
+          if (resolved != prev) {
+            gConfig.currentLoopI2cAddress = resolved;  // runtime steering only
+            Serial.print(F("A0602: post-recovery re-probe address change 0x"));
+            if (prev < 0x10) Serial.print('0');
+            Serial.print(prev, HEX);
+            Serial.print(F(" -> 0x"));
+            if (resolved < 0x10) Serial.print('0');
+            Serial.println(resolved, HEX);
+          }
+          if (resolved == 0x0A) {
+            // §9.3: distinguish "address found" from "sensor working." A re-probe to 0x0A
+            // means the A0602 is at its UNMANAGED default; raw framed reads MAY or MAY NOT
+            // be serviced by an unmanaged module. Operator should treat this as a hint that
+            // a maintenance-window re-management may be needed.
+            Serial.println(F("WARNING: A0602 at unmanaged default 0x0A after recovery; "
+                             "framed reads may still fail until module is re-managed"));
+          }
+        }
       } else if (consecutiveTotalI2cFailLoops >= I2C_DUAL_FAIL_RESET_LOOPS) {
         // Prolonged dual failure — force watchdog reset
         Serial.println(F("FATAL: Prolonged I2C failure on all buses. Forcing reset."));
@@ -2036,6 +2067,27 @@ void loop() {
             // v2.0.46: recoverI2CBus() does Wire.end()/begin(); re-bind the Notecard so its
             // I2C session survives the bus cycle (mirrors the dual-failure recovery path).
             tankalarm_ensureNotecardBinding(notecard);
+            // Fix C1 (v2.0.50): same as the dual-failure site — lightweight re-probe to catch
+            // an externally power-cycled A0602 that dropped to its 0x0A unmanaged default.
+            // See CODE_REVIEW_06252026_CURRENT_LOOP_SENSORS.md §10 for rationale.
+            if (!gDfuInProgress) {
+              delay(50);  // brief peripheral settle (§7.1)
+              uint8_t prev = gConfig.currentLoopI2cAddress;
+              uint8_t resolved = resolveCurrentLoopI2cAddress(prev);
+              if (resolved != prev) {
+                gConfig.currentLoopI2cAddress = resolved;  // runtime steering only
+                Serial.print(F("A0602: post-recovery re-probe address change 0x"));
+                if (prev < 0x10) Serial.print('0');
+                Serial.print(prev, HEX);
+                Serial.print(F(" -> 0x"));
+                if (resolved < 0x10) Serial.print('0');
+                Serial.println(resolved, HEX);
+              }
+              if (resolved == 0x0A) {
+                Serial.println(F("WARNING: A0602 at unmanaged default 0x0A after recovery; "
+                                 "framed reads may still fail until module is re-managed"));
+              }
+            }
             logI2CRecoveryEvent(I2C_RECOVERY_SENSOR_ONLY);
             sensorRecoveryTotalAttempts++;
             // Reset sensor failure counters to give them a fresh chance
@@ -5492,7 +5544,10 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     i2cAddr = CURRENT_LOOP_I2C_ADDRESS;
   }
 
-  // Enable solid-state power gating by pulling physical terminal HIGH (transistor ON)
+  // Enable solid-state power gating by pulling physical terminal HIGH (transistor ON).
+  // Fix C2 (v2.0.50): PWM enable runs at the normal 100 kHz bus speed BEFORE the A0602
+  // burst window opens. This keeps high-speed transactions tightly scoped around the
+  // actual A0602 framed reads (§7.3, §8.2.1).
   if (cfg.pwmGatingEnabled) {
     // The I2C ACK only confirms the command was received, not that the rail came up.
     // Retry the enable a couple of times so a transient bus NACK doesn't leave the
@@ -5504,23 +5559,6 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
     if (pwmOnSuccess) {
       gMonitorState[idx].lastPwmEnableOk = true;
-      // Feed the watchdog across the (multi-second) warmup so several current-loop
-      // monitors read sequentially in one loop() pass can't starve the watchdog.
-      // Chunk the stabilization delay and kick between chunks.
-      uint32_t remaining = cfg.pwmGatingWarmup;
-      const uint32_t chunk = 1000; // 1s slices keep us well inside the WDT window
-      while (remaining > 0) {
-        uint32_t slice = (remaining > chunk) ? chunk : remaining;
-        delay(slice);
-        remaining -= slice;
-#ifdef TANKALARM_WATCHDOG_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-        mbedWatchdog.kick();
-  #else
-        IWatchdog.reload();
-  #endif
-#endif
-      }
     } else {
       Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
       Serial.print(cfg.pwmGatingChannel + 1);
@@ -5539,19 +5577,33 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // A0602 Blueprint transactions run in an OWNED, scoped window on the shared bus (v2.0.46):
+  // A0602 Blueprint transactions run in OWNED, scoped windows on the shared bus (v2.0.46):
   //  - a SHORT byte-timeout (the A0602 doesn't clock-stretch, so fail fast into loop() recovery);
-  //  - the per-op 400kHz clock to shrink the A0602's bus occupancy ~4x.
-  // BOTH are RESTORED (timeout -> I2C_WIRE_TIMEOUT_MS, clock -> I2C_NORMAL_CLOCK_HZ) before every
-  // return below so neither ever leaks to a Notecard operation on the shared bus.
-  const uint32_t clBurstStartUs = micros();
+  //  - the per-op 400 kHz clock to shrink the A0602's bus occupancy ~4x.
+  // BOTH are RESTORED before every early return and around the warmup gap, so neither ever
+  // leaks to a Notecard operation on the shared bus.
+  //
+  // Fix C2 (v2.0.50): the burst window is now SPLIT into two phases (§7.3 / §10.4):
+  //   1. CONFIGURE burst: open -> configure ADC channel + verify -> close (back to 100 kHz)
+  //   2. (warmup delay, no I/O activity, normal bus clock)
+  //   3. SAMPLE burst:    open -> priming read + N samples -> close (back to 100 kHz)
+  //   4. PWM disable runs at normal 100 kHz bus speed.
+  // gLastClBurstMicros accumulates active burst time only (§9-2): configWindowUs + sampleWindowUs.
+
+  // ---- CONFIGURE burst window ----
+  const uint32_t configStartUs = micros();
   Wire.setTimeout(A0602_WIRE_TIMEOUT_MS);
   Wire.setClock(A0602_PEROP_I2C_CLOCK_HZ);
 
   // Configure the A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol
-  // BEFORE reading (v1.9.23). In the power-gated model the channel loses its config when P1 is
-  // switched off, so we (re)configure here on every powered read, after the warmup so the rail
-  // is up. v2.0.45: the SET ACK only means "queued"; CONFIRM the channel actually entered
+  // BEFORE the warmup (Fix C2, v2.0.50). In the power-gated model the channel loses its
+  // config when P1 is switched off, so we (re)configure here on every powered read. Putting
+  // the configure BEFORE the warmup means the AD74412R sense node is connected to the I/O
+  // pin during the entire stabilization window, so the transmitter's loop current can settle
+  // electrically while the rail is being brought up. Without this, the channel sits in
+  // high-impedance during warmup and the first priming read captures a freshly-configured
+  // sense node that hasn't completed its electrical settling.
+  // v2.0.45: the SET ACK only means "queued"; CONFIRM the channel actually entered
   // current-ADC mode via GET_CHANNEL_FUNCTION (0x40) before trusting a reading. Retry config 3x.
   // GRACEFUL gate: hard-fault (NAN) only if the SET is NACKed every attempt OR the expansion
   // POSITIVELY reports a non-current-ADC function. If the A0602 firmware never answers 0x40,
@@ -5576,6 +5628,18 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       delay(5);
     }
   }
+
+  // ---- Close CONFIGURE burst window (Fix C2: restore normal bus settings BEFORE any
+  //      cleanup commands or warmup, so PWM-off in the early-return paths runs at 100 kHz
+  //      and the warmup delay doesn't sit inside the high-speed window). §8.2.2 / §9-1.
+  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
+  Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+  const uint32_t configWindowUs = micros() - configStartUs;
+
+  // Early-return paths (Fix C2, §9-1): preserve the FULL existing side-effect set
+  // (counter, fault reason, raw mA clear, sampleReused, PWM-off) so fleet telemetry
+  // (cl_fault / i2c_cl_err) and the dual/sensor-only recovery escalation logic continue
+  // to see the same signal as before C2.
   if (!adcConfigOk) {
     Serial.print(F("ERROR: A0602 current-ADC channel config NACK on ch "));
     Serial.println(channel);
@@ -5583,9 +5647,15 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     gLastClFaultReason = CL_FAULT_CONFIG_NACK;
     gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
-    if (cfg.pwmGatingEnabled) { (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr); }
-    Wire.setClock(I2C_NORMAL_CLOCK_HZ);
-    Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+    if (cfg.pwmGatingEnabled) {
+      // PWM-off at normal 100 kHz bus speed (burst window already closed above).
+      bool pwmOffOk = false;
+      for (uint8_t a = 0; a < 3 && !pwmOffOk; ++a) {
+        if (a > 0) delay(5);
+        pwmOffOk = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      }
+    }
+    gLastClBurstMicros = configWindowUs;  // §9-2: only the active CONFIGURE window
     return NAN;
   }
   if (funcReadable && !funcVerified) {
@@ -5598,12 +5668,48 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     gLastClFaultReason = CL_FAULT_FUNC_WRONG;
     gMonitorState[idx].currentSensorMa = 0.0f;
     gMonitorState[idx].sampleReused = true;
-    if (cfg.pwmGatingEnabled) { (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr); }
-    Wire.setClock(I2C_NORMAL_CLOCK_HZ);
-    Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+    if (cfg.pwmGatingEnabled) {
+      bool pwmOffOk = false;
+      for (uint8_t a = 0; a < 3 && !pwmOffOk; ++a) {
+        if (a > 0) delay(5);
+        pwmOffOk = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      }
+    }
+    gLastClBurstMicros = configWindowUs;  // §9-2
     return NAN;
   }
-  delay(2);
+
+  // ---- Warmup delay (Fix C2: now AFTER configure, so the AD74412R sense node is connected
+  //      and the transmitter can drive loop current into a real sense resistor during the
+  //      entire stabilization window). No I/O activity here; bus is at normal 100 kHz so any
+  //      hypothetical interleaved transaction would be Notecard-safe — though the loop is
+  //      synchronous and nothing else can interleave anyway. §6.4 / §10.4.
+  if (cfg.pwmGatingEnabled) {
+    // Feed the watchdog across the (multi-second) warmup so several current-loop
+    // monitors read sequentially in one loop() pass can't starve the watchdog.
+    // Chunk the stabilization delay and kick between chunks.
+    uint32_t remaining = cfg.pwmGatingWarmup;
+    const uint32_t chunk = 1000; // 1s slices keep us well inside the WDT window
+    while (remaining > 0) {
+      uint32_t slice = (remaining > chunk) ? chunk : remaining;
+      delay(slice);
+      remaining -= slice;
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+      mbedWatchdog.kick();
+  #else
+      IWatchdog.reload();
+  #endif
+#endif
+    }
+  }
+
+  // ---- SAMPLE burst window (Fix C2): re-open the 400 kHz / short-timeout window for the
+  //      priming read and the N sample reads. PWM disable runs AFTER the window closes.
+  const uint32_t sampleStartUs = micros();
+  Wire.setTimeout(A0602_WIRE_TIMEOUT_MS);
+  Wire.setClock(A0602_PEROP_I2C_CLOCK_HZ);
+
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     mbedWatchdog.kick();
@@ -5664,9 +5770,16 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
+  // ---- Close SAMPLE burst window (Fix C2: restore normal bus settings BEFORE the PWM-off
+  //      command so the high-speed / short-timeout window is tightly scoped). §8.2.1.
+  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
+  Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
+  const uint32_t sampleWindowUs = micros() - sampleStartUs;
+
   // Turn off sensor power gating once readings complete to achieve low-power gating (transistor OFF).
   // v2.0.45: retry OFF (mirrors the ON retry) so a transient bus NACK can't leave the transmitter
   // powered, which would distort the solar power budget and future observations.
+  // Fix C2 (v2.0.50): PWM-off now runs at normal 100 kHz bus speed (burst window closed above).
   if (cfg.pwmGatingEnabled) {
     bool pwmOffSuccess = false;
     for (uint8_t attempt = 0; attempt < 3 && !pwmOffSuccess; ++attempt) {
@@ -5681,12 +5794,9 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // Restore the default Wire clock + timeout now that all A0602 transactions are done, so the
-  // per-op 400kHz / short-timeout window never leaks to subsequent Notecard operations on the
-  // shared bus. Record the burst duration (us) for Notehub profiling of the clock-window effect.
-  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
-  Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
-  gLastClBurstMicros = micros() - clBurstStartUs;
+  // Fix C2 (§9-2): record the active A0602 burst time (CONFIGURE + SAMPLE windows only);
+  // the warmup gap between them is EXCLUDED so historical cl_dur_us comparisons stay meaningful.
+  gLastClBurstMicros = configWindowUs + sampleWindowUs;
 
   float milliamps;
   if (validSamples == 0) {

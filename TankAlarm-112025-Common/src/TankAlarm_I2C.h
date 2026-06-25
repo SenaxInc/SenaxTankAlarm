@@ -397,9 +397,11 @@ static inline uint8_t tankalarm_optaCrc8(const uint8_t *data, size_t len) {
 
 /**
  * Configure an A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol.
- * Must be called AFTER loop power is applied (e.g. after the P1 gate warmup) and BEFORE
- * tankalarm_readCurrentAdcFramed(); in the power-gated low-power model the channel config
- * is re-applied on every power-on cycle.
+ * Must be called AFTER the power gate is enabled, BEFORE the warmup delay and sampling burst
+ * (Fix C2, v2.0.50): the channel is intentionally configured into current-input mode during
+ * warmup so the AD74412R sense node is connected to the I/O pin and loop current can
+ * stabilize while the rail is being brought up. In the power-gated low-power model the
+ * channel config is re-applied on every power-on cycle.
  *
  * @return true if the config frame was written (endTransmission ACK), false on I2C NACK.
  */
