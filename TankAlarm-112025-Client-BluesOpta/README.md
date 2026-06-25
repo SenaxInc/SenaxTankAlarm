@@ -512,6 +512,43 @@ Action: Check solar panel connections and battery
 | No data in daily | Verify `includeInDaily` is true |
 | No alerts | Check `alertOnLow` and `alertOnFault` settings |
 
+#### Known gaps in fault detection
+
+The SunSaver MPPT status / fault / alarm registers at `0x002B`, `0x002C`, `0x002E` were not
+reliably decodable on the bench-tested firmware revision (returned `faults=0x4235` on a
+physically healthy unit, 2026-04-22). They are intentionally bypassed in production builds
+until the addresses can be re-verified — see the bench-verification TODO in
+[TankAlarm-112025-Common/src/TankAlarm_Solar.cpp](../TankAlarm-112025-Common/src/TankAlarm_Solar.cpp).
+
+The alerts that **ARE** still produced from verified electrical readings:
+
+| Alert | Trigger | Source |
+|---|---|---|
+| `SOLAR_ALERT_BATTERY_CRITICAL` | `batteryVoltage < criticalVoltage` | live ADC block |
+| `SOLAR_ALERT_BATTERY_LOW` | `batteryVoltage < lowVoltage` | live ADC block |
+| `SOLAR_ALERT_BATTERY_HIGH` | `batteryVoltage > highVoltage` | live ADC block |
+| `SOLAR_ALERT_NO_CHARGE` | daylight detected + zero charge current for 3 consecutive polls | live ADC block |
+| `SOLAR_ALERT_COMM_FAILURE` | Modbus link dead | transport |
+
+Failure modes that are **NOT** currently surfaced (would require status / fault / alarm
+register verification first):
+
+- DIP-switch tampering (`SS_FAULT_DIP_SW_FAULT`)
+- EEPROM corruption (`SS_FAULT_RESET_FAULT`, `SS_ALARM_EEPROM`)
+- Battery temperature sensor (RTS) wiring faults (`SS_FAULT_RTS_DISCONN/SHORT`,
+  `SS_ALARM_RTS_*`, `SS_ALARM_RTS_MISWIRE`)
+- Battery sense lead wiring (`SS_ALARM_BATT_SENSE`, `SS_ALARM_BATT_SENSE_DISC`)
+- Controller uncalibrated (`SS_ALARM_UNCALIBRATED`)
+- Internal heatsink overtemp limit (`SS_FAULT_HEATSINK_LIMIT`,
+  `SS_ALARM_HEATSINK_LIMIT`) — the heatsink temperature register is also among the
+  unverified set.
+
+For most field deployments the electrical-derived alerts cover the conditions that matter
+operationally; the unverified registers add wiring/hardware-integrity diagnostics that are
+rare in the field. See review document
+[CODE REVIEW/CODE_REVIEW_06252026_RS485_SUNSAVER_COMMUNICATION.md](../CODE%20REVIEW/CODE_REVIEW_06252026_RS485_SUNSAVER_COMMUNICATION.md)
+§2 Inconsistency E for full rationale.
+
 ### Battery Voltage Monitoring
 
 The system tracks battery voltage from one of two physical sources, auto-selected by the firmware with strict priority MPPT > Vin divider (Fix 9):

@@ -8028,6 +8028,10 @@ static void sendDailyReport() {
   gI2cBusRecoveryCount = 0;
   gCurrentLoopReadsOk = 0;
   gCurrentLoopOverRange = 0;
+  // Fix S2 (v2.0.49): reset Modbus error counters too so "merr" in the next solar
+  // block is a windowed 24-hour total instead of lifetime-since-boot. Matches the
+  // adjacent I2C error reset pattern.
+  gSolarManager.resetModbusErrorStats();
 }
 
 static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t monitorIndex, size_t payloadLimit) {

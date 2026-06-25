@@ -110,7 +110,7 @@ static bool readInputRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t c
   return true;
 }
 
-static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer, uint8_t &cachedFC) {
+static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer, uint8_t &cachedFC, bool fastFail = false) {
   if (cachedFC == 3) {
     if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
       return true;
@@ -119,7 +119,13 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
     // transient timeout on a known-good FC03 device must not force permanent FC04
     // re-probing on every subsequent poll (R-4 hardening, v2.0.45). Only switch the cache
     // if the alternate FC genuinely answers.
-    if (readInputRegisters(slaveId, startAddress, count, buffer)) {
+    //
+    // Fix S3 (Part A, v2.0.49): when the caller passes fastFail=true (the bus has already
+    // produced one or more consecutive failures and is most likely dead), SKIP the
+    // alternate-FC probe. We do not discard the cache — R-4 is preserved — we just stop
+    // wasting ~1 s per failed read on a known-dead bus. The cooperative pulse sampler can
+    // then continue running between polls instead of being starved for up to 6 s.
+    if (!fastFail && readInputRegisters(slaveId, startAddress, count, buffer)) {
       cachedFC = 4;
       return true;
     }
@@ -129,7 +135,7 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
     if (readInputRegisters(slaveId, startAddress, count, buffer)) {
       return true;
     }
-    if (readHoldingRegisters(slaveId, startAddress, count, buffer)) {
+    if (!fastFail && readHoldingRegisters(slaveId, startAddress, count, buffer)) {
       cachedFC = 3;
       return true;
     }
@@ -160,14 +166,14 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
 // bus costs one read, not 'count' reads. The watchdog is kicked before each read because a
 // slow-but-responding bus can take up to one Modbus timeout per register.
 static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, uint8_t count,
-                                      uint16_t *buffer, uint8_t &cachedFC) {
+                                      uint16_t *buffer, uint8_t &cachedFC, bool fastFail = false) {
   for (uint8_t i = 0; i < count; ++i) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
 #elif defined(ARDUINO_ARCH_STM32)
     IWatchdog.reload();
 #endif
-    if (!readRegistersWithFallback(slaveId, (uint16_t)(startAddress + i), 1, &buffer[i], cachedFC)) {
+    if (!readRegistersWithFallback(slaveId, (uint16_t)(startAddress + i), 1, &buffer[i], cachedFC, fastFail)) {
       return false;
     }
   }
@@ -230,9 +236,18 @@ bool SolarManager::begin(const SolarConfig& config) {
   // The Opta needs a post-TX delay of one full character time before DE drops,
   // otherwise the last byte of the Modbus query is corrupted on the wire and
   // the slave silently rejects it. setDelays(pre, post) is in microseconds.
-  // Use 1200 us as a safe upper bound (covers 9600 8N1=1042 us, 9600 8N2=1146 us).
-  // The previous (50, 50) value was 50 us post-delay -- ~20x too short.
-  RS485.setDelays(0, 1200);
+  //
+  // Fix S1 (v2.0.49): the post-delay must SCALE WITH BAUD RATE. The previous
+  // hardcoded 1200 us was safe at 9600 baud (1 char time = 1146 us) but at the higher
+  // baud rates the sanitizer also permits (19200..115200) it held DE active past the
+  // Modbus 3.5-char inter-frame gap and caused bus contention with a fast slave's
+  // response. One 11-bit character time (8N2) = 11,000,000 / baud microseconds, clamped
+  // to a safe floor (150 us protects 115200 from underrunning the DE FET) and ceiling
+  // (1500 us is more than enough for the slowest supported baud).
+  uint32_t postDelayUs = 11000000UL / _config.modbusBaudRate;
+  if (postDelayUs < 150)  postDelayUs = 150;
+  if (postDelayUs > 1500) postDelayUs = 1500;
+  RS485.setDelays(0, postDelayUs);
   
   Serial.print(F("Solar: Modbus RTU initialized at "));
   Serial.print(_config.modbusBaudRate);
@@ -240,7 +255,9 @@ bool SolarManager::begin(const SolarConfig& config) {
   Serial.print(_config.modbusSlaveId);
   Serial.print(F(", timeout "));
   Serial.print(_config.modbusTimeoutMs);
-  Serial.println(F(" ms"));
+  Serial.print(F(" ms, postDelay "));
+  Serial.print(postDelayUs);
+  Serial.println(F(" us"));
   
   _initialized = true;
   _data.communicationOk = false;
@@ -318,6 +335,20 @@ bool SolarManager::readRegisters() {
   // datasheet for this exact firmware, we skip those reads entirely.
   //
   // To re-enable for bench experimentation, define SOLAR_ENABLE_UNVERIFIED_REGISTERS.
+  //
+  // BENCH-VERIFICATION TODO (per /memories/repo/sunsaver-production-fix-2026-04-22.md):
+  //   1. Probe register addresses 0x0021, 0x0023, 0x002F, 0x0032 alongside the currently
+  //      coded 0x002B/0x002C/0x002E and look for sane values matching the SunSaver PDU
+  //      charge_state enum (range 0..8) and the documented fault/alarm bitfield widths.
+  //   2. Capture `faults` and `alarms` while inducing known conditions on the bench:
+  //      flip a DIP switch (expect SS_FAULT_DIP_SW_FAULT), disconnect the RTS sensor
+  //      (expect SS_FAULT_RTS_DISCONN / SS_ALARM_RTS_DISCONN), short the array briefly
+  //      (expect SS_FAULT_OVERCURRENT). Watch the bit positions actually change.
+  //   3. Once at least chargeState + faults + alarms verify against known conditions,
+  //      gate by SOLAR_ENABLE_UNVERIFIED_REGISTERS for a beta cohort first, observe a
+  //      fleet-wide passive capture (collect bits but suppress SMS) before baking into
+  //      production. See review CODE_REVIEW_06252026_RS485_SUNSAVER_COMMUNICATION.md
+  //      §2 Inconsistency E for the rationale.
   // ==========================================================================
 
   // Real-time block. Read EXACTLY the four registers the bench-proven
@@ -332,8 +363,18 @@ bool SolarManager::readRegisters() {
   // SOLAR_COMM_FAILURE_THRESHOLD such polls the client would raise a false comm-failure
   // alarm. The watchdog is kicked before EVERY attempt and (via readRegistersIndividually)
   // before each register, so the retry loop can never starve it.
+  //
+  // Fix S3 (Part B, v2.0.49): once we have ANY consecutive failure already on record
+  // the bus is most likely dead. Cap the retry loop to 1 attempt and propagate
+  // fastFail down so each register read also skips its alternate-FC probe. Worst-case
+  // dead-bus blocking drops from ~6.2 s to ~1 s per poll, which keeps the cooperative
+  // pulse sampler running between polls. Once a poll succeeds, _data.consecutiveErrors
+  // resets to 0 and full retry/dual-FC behavior is restored (so R-4 hardening still
+  // absorbs the first transient).
+  const bool fastFail = (_data.consecutiveErrors >= 1);
+  const uint8_t maxAttempts = fastFail ? 1 : SOLAR_REALTIME_MAX_ATTEMPTS;
   bool realtimeOk = false;
-  for (uint8_t attempt = 0; attempt < SOLAR_REALTIME_MAX_ATTEMPTS; ++attempt) {
+  for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
 #elif defined(ARDUINO_ARCH_STM32)
@@ -345,8 +386,8 @@ bool SolarManager::readRegisters() {
     // Two contiguous single-register reads, skipping the unused 0x000A in between.
     // readRegistersIndividually() reads count=1 per Modbus transaction (the bench-verified
     // transaction the MRC-1/SunSaver answers) and kicks the WDT per register.
-    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 2, &realtimeRegs[0], _cachedHoldingFC) &&
-        readRegistersIndividually(_config.modbusSlaveId, SS_REG_CHARGE_CURRENT, 2, &realtimeRegs[2], _cachedHoldingFC)) {
+    if (readRegistersIndividually(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 2, &realtimeRegs[0], _cachedHoldingFC, fastFail) &&
+        readRegistersIndividually(_config.modbusSlaveId, SS_REG_CHARGE_CURRENT, 2, &realtimeRegs[2], _cachedHoldingFC, fastFail)) {
       realtimeOk = true;
       break;
     }
@@ -592,6 +633,28 @@ void SolarManager::updateHealthStatus() {
   // Software-derived charge state indicators (Task 2.1)
   _data.isCharging = (_data.chargeCurrent >= 0.1f);
   _data.isFullyCharged = (!_data.isCharging && _data.batteryVoltage >= BATTERY_VOLTAGE_FLOAT);
+
+  // Fix S4 (v2.0.49): derive a sensible chargeState from the verified electrical values
+  // so getChargeStateDescription() no longer permanently reports "Starting" in production.
+  // The placeholder set in readRegisters() (#else branch -> CHARGE_STATE_START) is
+  // overwritten here every poll. Without verified status-register addresses we can only
+  // distinguish four useful states from the live ADC block:
+  //   FLOAT       = fully charged + not charging (battery at float voltage, no current in)
+  //   BULK        = actively charging (any current flowing into the battery)
+  //   NIGHT       = no panel input (array voltage at or below battery voltage)
+  //   DISCONNECT  = panel present but no charging (likely fault / disconnect / regulating)
+  // ABSORPTION and EQUALIZE require status-register verification to distinguish; they
+  // both fall under BULK here. See SOLAR_ENABLE_UNVERIFIED_REGISTERS bench-verification
+  // TODO in readRegisters() for the path to richer state reporting.
+  if (_data.isFullyCharged) {
+    _data.chargeState = CHARGE_STATE_FLOAT;
+  } else if (_data.isCharging) {
+    _data.chargeState = CHARGE_STATE_BULK;
+  } else if (_data.arrayVoltage < (_data.batteryVoltage + 1.0f)) {
+    _data.chargeState = CHARGE_STATE_NIGHT;
+  } else {
+    _data.chargeState = CHARGE_STATE_DISCONNECT;
+  }
 #endif
   
   // Battery health assessment
