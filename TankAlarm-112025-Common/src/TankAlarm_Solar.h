@@ -181,9 +181,13 @@ struct SolarData {
   bool dailyStatsSeeded;      // True when software daily tracking has been seeded
   
   // Communication status
-  bool communicationOk;       // Last Modbus read successful
-  uint32_t lastReadMillis;    // Timestamp of last successful read
+  bool communicationOk;       // Last Modbus read successful (5-poll smoothed via SOLAR_COMM_FAILURE_THRESHOLD)
+  uint32_t lastReadMillis;    // Timestamp of last successful read (millis() since boot; 0 = never)
   uint8_t consecutiveErrors;  // Count of consecutive read errors
+
+  // R2 / R6 (v2.0.53): per-poll observability for ambiguous-failure disambiguation.
+  bool lastPollOk;            // R6: most recent poll succeeded (NO smoothing); for realtime indicator
+  uint32_t firstReadMillis;   // R2: millis() of the FIRST successful read since boot (0 = never)
 
   // Charge setpoints read from controller (reflects DIP-switch chemistry).
   // setpointsValid is false until we successfully read them at least once.
@@ -290,6 +294,11 @@ public:
   bool isBatteryHealthy() const { return _data.batteryHealthy; }
   bool isSolarHealthy() const { return _data.solarHealthy; }
 
+  // R3 (v2.0.53): expose the Modbus library init state separately from the OR'd
+  // isEnabled(). Lets the client emit "configured but library failed to init" in
+  // telemetry instead of going silent (which looks identical to "user disabled solar").
+  bool isInitialized() const { return _initialized; }
+
   // Modbus diagnostics for field troubleshooting of scOk:0. These let the operator
   // distinguish a transport failure (timeout/CRC/illegal address -> getLastModbusError())
   // from a CRC-valid read rejected by the plausibility clamp (wasLastReadImplausible()).
@@ -299,6 +308,17 @@ public:
   uint16_t getLastModbusResponseMs() const;
   bool wasLastReadImplausible() const;
   void resetModbusErrorStats();
+
+  // R1 / R5 (v2.0.53): per-error-type classification. getLastModbusErrorTag() returns one
+  // of "to" (Timeout), "crc" (CRC error), "ida" (Illegal data address), "ifu" (Illegal
+  // function), "?" (other). Per-bucket lifetime counts mirror sSolarModbusErrorCount; the
+  // sum of the five buckets equals getModbusErrorCount() in steady state.
+  const char* getLastModbusErrorTag() const;
+  uint32_t getModbusErrTimeout()      const;
+  uint32_t getModbusErrCrc()          const;
+  uint32_t getModbusErrIllegalAddr()  const;
+  uint32_t getModbusErrIllegalFunc()  const;
+  uint32_t getModbusErrOther()        const;
 
   // Reset daily statistics (call at midnight or report time)
   void resetDailyStats();

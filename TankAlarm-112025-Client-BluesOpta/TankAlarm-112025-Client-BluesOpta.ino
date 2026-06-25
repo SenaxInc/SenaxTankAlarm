@@ -6392,13 +6392,42 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   // Modbus link is currently healthy (scOk=1) or failing (scOk=0). Without this an
   // enabled-but-not-communicating charger is indistinguishable from a disabled one -- it sends
   // no voltage, and the comm-failure alarm defaults off, so the failure is otherwise silent.
-  if (gSolarManager.isEnabled()) {
-    doc["scOk"] = gSolarManager.isCommunicationOk() ? 1 : 0;
-    // v2.0.45: when the link READS but the values are rejected by the plausibility clamp
-    // (scOk:0 yet a CRC-valid Modbus read happened), flag scImpl:1 so the dashboard can tell
-    // "no link" (timeout) apart from "values rejected" (data). Omitted on a healthy link.
-    if (!gSolarManager.isCommunicationOk() && gSolarManager.wasLastReadImplausible()) {
-      doc["scImpl"] = 1;
+  //
+  // Fix R1-R6 (v2.0.53): expanded telemetry surface to disambiguate the six possible meanings
+  // of scOk:0. R3 specifically drops the _initialized AND from the emit guard so a client with
+  // solarCharger.enabled=true but ModbusRTUClient.begin() failure still emits a solar block
+  // (scInit:0) instead of going silent and looking like "solar disabled in config".
+  if (gConfig.solarCharger.enabled) {
+    const bool initOk = gSolarManager.isInitialized();
+    doc["scInit"] = initOk ? 1 : 0;  // R3: library initialized state
+    if (initOk) {
+      const SolarData &sd = gSolarManager.getData();
+      doc["scOk"]     = sd.communicationOk ? 1 : 0;  // 5-poll smoothed (drives SMS escalation)
+      doc["scLast"]   = sd.lastPollOk ? 1 : 0;       // R6: single-poll truth (no smoothing)
+      doc["scSpv"]    = sd.setpointsValid ? 1 : 0;   // R4: setpoint registers ever read OK
+      doc["scOkEver"] = (sd.firstReadMillis > 0) ? 1 : 0;  // R2: link has succeeded since boot
+      if (!sd.communicationOk) {
+        // v2.0.45: when the link READS but the values are rejected by the plausibility clamp
+        // (scOk:0 yet a CRC-valid Modbus read happened), flag scImpl:1 so the dashboard can
+        // tell "no link" (timeout) apart from "values rejected" (data). Omitted on a healthy link.
+        if (gSolarManager.wasLastReadImplausible()) {
+          doc["scImpl"] = 1;
+        }
+        // R1: classified short tag of the last library error ("to"/"crc"/"ida"/"ifu"/"?"),
+        // last response ms, and last failing register address. ~30 B in the failed path.
+        const char *errTag = gSolarManager.getLastModbusErrorTag();
+        if (errTag && errTag[0]) doc["scErr"] = errTag;
+        uint16_t resMs = gSolarManager.getLastModbusResponseMs();
+        if (resMs > 0) doc["scResMs"] = resMs;
+        uint16_t maddr = gSolarManager.getLastModbusFailAddress();
+        if (maddr > 0) doc["scMaddr"] = maddr;
+        // R2: seconds since the last successful read (omitted if never succeeded). Lets
+        // the dashboard show "RS-485 down 47 s" vs just "RS-485 down".
+        if (sd.lastReadMillis > 0) {
+          uint32_t agoMs = (uint32_t)millis() - sd.lastReadMillis;
+          doc["scLastOkS"] = agoMs / 1000U;
+        }
+      }
     }
   }
 
@@ -6984,8 +7013,20 @@ static void sendSolarAlarm(SolarAlertType alertType) {
 
 // Append solar charger data to daily report (called from sendDailyReport)
 static bool appendSolarDataToDaily(JsonDocument &doc) {
-  if (!gSolarManager.isEnabled() || !gConfig.solarCharger.includeInDailyReport) {
+  // Fix R3 (v2.0.53): predicate on the CONFIG flag, not the OR'd isEnabled(). When the
+  // operator has solar configured but ModbusRTUClient.begin() failed, we still want a
+  // daily solar block (scInit:0) so the dashboard reflects "configured but library failed"
+  // instead of going silent and looking identical to "user disabled solar".
+  if (!gConfig.solarCharger.enabled || !gConfig.solarCharger.includeInDailyReport) {
     return false;
+  }
+
+  // R3: emit a degraded block when the library never came up.
+  if (!gSolarManager.isInitialized()) {
+    JsonObject solarFail = doc["solar"].to<JsonObject>();
+    solarFail["commOk"] = 0;
+    solarFail["scInit"] = 0;
+    return true;
   }
   
   const SolarData &data = gSolarManager.getData();
@@ -6996,6 +7037,7 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
   if (!data.communicationOk) {
     JsonObject solarFail = doc["solar"].to<JsonObject>();
     solarFail["commOk"] = 0;
+    solarFail["scInit"] = 1;  // R3: distinguish library-init failure from runtime failure
     solarFail["errs"] = data.consecutiveErrors;
     // v2.0.45 taxonomy: surface WHY the link failed so a field scOk:0 can be classified
     // remotely (timeout = physical; illegal data address = register/slave; invalid CRC = noise),
@@ -7006,11 +7048,37 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
     if (gSolarManager.wasLastReadImplausible()) solarFail["scImpl"] = 1;
     const char *lastErr = gSolarManager.getLastModbusError();
     if (lastErr && lastErr[0]) solarFail["merrTxt"] = lastErr;
+    // R5 (v2.0.53): per-error-type buckets. Sums to merr in steady state. Lets the
+    // dashboard separate "all timeouts" (wire/power) from "all illegal address" (register
+    // map / firmware revision) from a mix. ~50 B daily-only overhead.
+    solarFail["merrTo"]  = gSolarManager.getModbusErrTimeout();
+    solarFail["merrCrc"] = gSolarManager.getModbusErrCrc();
+    solarFail["merrIda"] = gSolarManager.getModbusErrIllegalAddr();
+    solarFail["merrIfu"] = gSolarManager.getModbusErrIllegalFunc();
+    solarFail["merrOth"] = gSolarManager.getModbusErrOther();
+    // R2 (v2.0.53): has the link ever succeeded since boot? Lets the dashboard
+    // distinguish "never worked since reboot" (likely wiring/baud/slave problem) from
+    // "was working then degraded".
+    solarFail["scOkEver"] = (data.firstReadMillis > 0) ? 1 : 0;
     return true;
   }
   
   JsonObject solar = doc["solar"].to<JsonObject>();
   solar["commOk"] = 1;
+  solar["scInit"] = 1;
+  // R5 (v2.0.53): per-error-type buckets also emitted on the healthy path so the daily
+  // captures residual errors that recovered (e.g. 3 timeouts at sunrise that self-cleared).
+  // Only emit non-zero buckets to keep the happy-path payload tight.
+  uint32_t merrTotal = gSolarManager.getModbusErrorCount();
+  if (merrTotal > 0) {
+    solar["merr"] = merrTotal;
+    uint32_t b;
+    if ((b = gSolarManager.getModbusErrTimeout())     > 0) solar["merrTo"]  = b;
+    if ((b = gSolarManager.getModbusErrCrc())         > 0) solar["merrCrc"] = b;
+    if ((b = gSolarManager.getModbusErrIllegalAddr()) > 0) solar["merrIda"] = b;
+    if ((b = gSolarManager.getModbusErrIllegalFunc()) > 0) solar["merrIfu"] = b;
+    if ((b = gSolarManager.getModbusErrOther())       > 0) solar["merrOth"] = b;
+  }
   
   // Current readings
   solar["bv"] = roundTo(data.batteryVoltage, 2);       // Battery voltage

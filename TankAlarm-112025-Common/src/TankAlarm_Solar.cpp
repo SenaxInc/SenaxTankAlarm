@@ -32,6 +32,51 @@ static uint16_t sSolarLastFailAddress = 0;
 static uint16_t sSolarLastResponseMs = 0;
 static bool     sSolarLastReadImplausible = false;
 
+// R1 / R5 (v2.0.53): per-error-type buckets and the most recent classified tag. The tag is
+// set by classifyModbusErrorTag() inside captureSolarModbusError(); the buckets are
+// incremented exactly once per LOGICAL failure inside readRegistersWithFallback() so a
+// fallback FC probe is not double-counted. In steady state the five buckets sum to
+// sSolarModbusErrorCount. Reset together by resetModbusErrorStats().
+static uint32_t sSolarErrTimeout      = 0;  // "Timeout"
+static uint32_t sSolarErrCrc          = 0;  // "CRC error" / "CRC mismatch"
+static uint32_t sSolarErrIllegalAddr  = 0;  // "Illegal data address"
+static uint32_t sSolarErrIllegalFunc  = 0;  // "Illegal function"
+static uint32_t sSolarErrOther        = 0;  // catch-all (unknown / library-init failure)
+static char     sSolarLastErrorTag[8]  = {0};  // short tag: "to"|"crc"|"ida"|"ifu"|"?"
+
+// Classify the last ModbusRTUClient.lastError() string into one of five short tags.
+// Uses substring match because the library returns prose like "Illegal data address"
+// not enum codes. Tag set here is read by readRegistersWithFallback() to pick the
+// bucket to increment.
+static void classifyModbusErrorTag(const char *errText) {
+  if (!errText || !errText[0]) {
+    strlcpy(sSolarLastErrorTag, "?", sizeof(sSolarLastErrorTag));
+    return;
+  }
+  if (strstr(errText, "Timeout") || strstr(errText, "timeout")) {
+    strlcpy(sSolarLastErrorTag, "to", sizeof(sSolarLastErrorTag));
+  } else if (strstr(errText, "CRC") || strstr(errText, "crc")) {
+    strlcpy(sSolarLastErrorTag, "crc", sizeof(sSolarLastErrorTag));
+  } else if (strstr(errText, "Illegal data address") || strstr(errText, "data address")) {
+    strlcpy(sSolarLastErrorTag, "ida", sizeof(sSolarLastErrorTag));
+  } else if (strstr(errText, "Illegal function") || strstr(errText, "function")) {
+    strlcpy(sSolarLastErrorTag, "ifu", sizeof(sSolarLastErrorTag));
+  } else {
+    strlcpy(sSolarLastErrorTag, "?", sizeof(sSolarLastErrorTag));
+  }
+}
+
+// Increment the per-bucket lifetime counter that matches sSolarLastErrorTag. Called
+// once per logical failure where sSolarModbusErrorCount is also incremented, so the
+// per-bucket totals sum to the lifetime total.
+static void incrementSolarErrorBucket() {
+  if      (!strcmp(sSolarLastErrorTag, "to"))  ++sSolarErrTimeout;
+  else if (!strcmp(sSolarLastErrorTag, "crc")) ++sSolarErrCrc;
+  else if (!strcmp(sSolarLastErrorTag, "ida")) ++sSolarErrIllegalAddr;
+  else if (!strcmp(sSolarLastErrorTag, "ifu")) ++sSolarErrIllegalFunc;
+  else                                          ++sSolarErrOther;
+}
+
 // Drain any stale bytes left in the RS-485 UART RX buffer before a new Modbus
 // transaction. ArduinoModbus enables MODBUS_ERROR_RECOVERY_PROTOCOL (flush on CRC/FC
 // error) but NOT _LINK (no flush on timeout), so a late/garbage reply can linger and
@@ -56,6 +101,10 @@ static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
     sSolarLastModbusError[i] = e[i];
   }
   sSolarLastModbusError[i] = '\0';
+  // R1/R5: classify the error text into a short tag so the per-bucket counter
+  // (incremented once per logical failure in readRegistersWithFallback) picks the
+  // right bucket, and so the client can emit "scErr" without re-running the classifier.
+  classifyModbusErrorTag(sSolarLastModbusError);
 }
 
 static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
@@ -130,6 +179,7 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
       return true;
     }
     ++sSolarModbusErrorCount;
+    incrementSolarErrorBucket();  // R5
     return false;
   } else if (cachedFC == 4) {
     if (readInputRegisters(slaveId, startAddress, count, buffer)) {
@@ -140,6 +190,7 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
       return true;
     }
     ++sSolarModbusErrorCount;
+    incrementSolarErrorBucket();  // R5
     return false;
   }
 
@@ -153,6 +204,7 @@ static bool readRegistersWithFallback(uint8_t slaveId, uint16_t startAddress, ui
     return true;
   }
   ++sSolarModbusErrorCount;
+  incrementSolarErrorBucket();  // R5
   return false;
 }
 
@@ -573,7 +625,16 @@ bool SolarManager::readRegisters() {
     _data.communicationOk = true;
     _data.lastReadMillis = millis();
     _data.consecutiveErrors = 0;
+    // R2/R6 (v2.0.53): mark this poll as successful (no smoothing) and stamp
+    // the FIRST successful read since boot. firstReadMillis stays at the first
+    // success value for the lifetime of the boot, so the dashboard can tell
+    // "link has succeeded at some point" apart from "never succeeded."
+    _data.lastPollOk = true;
+    if (_data.firstReadMillis == 0) {
+      _data.firstReadMillis = _data.lastReadMillis;
+    }
   } else {
+    _data.lastPollOk = false;  // R6
     _data.consecutiveErrors++;
     if (_data.consecutiveErrors >= SOLAR_COMM_FAILURE_THRESHOLD) {
       _data.communicationOk = false;
@@ -610,12 +671,28 @@ const char* SolarManager::getLastModbusError() const { return sSolarLastModbusEr
 uint16_t SolarManager::getLastModbusFailAddress() const { return sSolarLastFailAddress; }
 uint16_t SolarManager::getLastModbusResponseMs() const { return sSolarLastResponseMs; }
 bool SolarManager::wasLastReadImplausible() const { return sSolarLastReadImplausible; }
+
+// R1/R5 (v2.0.53): per-error-type accessors.
+const char* SolarManager::getLastModbusErrorTag() const { return sSolarLastErrorTag; }
+uint32_t SolarManager::getModbusErrTimeout()     const { return sSolarErrTimeout; }
+uint32_t SolarManager::getModbusErrCrc()         const { return sSolarErrCrc; }
+uint32_t SolarManager::getModbusErrIllegalAddr() const { return sSolarErrIllegalAddr; }
+uint32_t SolarManager::getModbusErrIllegalFunc() const { return sSolarErrIllegalFunc; }
+uint32_t SolarManager::getModbusErrOther()       const { return sSolarErrOther; }
 void SolarManager::resetModbusErrorStats() {
   sSolarModbusErrorCount = 0;
   sSolarLastModbusError[0] = '\0';
   sSolarLastFailAddress = 0;
   sSolarLastResponseMs = 0;
   sSolarLastReadImplausible = false;
+  // R1/R5: also clear the classified tag and the five per-bucket counters so the
+  // daily window starts fresh in lockstep with the lifetime total.
+  sSolarLastErrorTag[0] = '\0';
+  sSolarErrTimeout = 0;
+  sSolarErrCrc = 0;
+  sSolarErrIllegalAddr = 0;
+  sSolarErrIllegalFunc = 0;
+  sSolarErrOther = 0;
 }
 
 void SolarManager::updateHealthStatus() {
@@ -1026,6 +1103,13 @@ uint16_t SolarManager::getLastModbusFailAddress() const { return 0; }
 uint16_t SolarManager::getLastModbusResponseMs() const { return 0; }
 bool SolarManager::wasLastReadImplausible() const { return false; }
 void SolarManager::resetModbusErrorStats() {}
+// R1/R5 (v2.0.53) no-op stubs for the non-Opta build branch.
+const char* SolarManager::getLastModbusErrorTag() const { return ""; }
+uint32_t SolarManager::getModbusErrTimeout()      const { return 0; }
+uint32_t SolarManager::getModbusErrCrc()          const { return 0; }
+uint32_t SolarManager::getModbusErrIllegalAddr()  const { return 0; }
+uint32_t SolarManager::getModbusErrIllegalFunc()  const { return 0; }
+uint32_t SolarManager::getModbusErrOther()        const { return 0; }
 SolarManager::ChemistryCheck SolarManager::verifyChemistry(uint8_t expectedType,
                                                             uint8_t nominalVoltage,
                                                             char* outDescription,
