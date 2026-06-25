@@ -66,6 +66,7 @@ jobs:
           arduino-cli lib install "Blues Wireless Notecard"
           arduino-cli lib install "ArduinoRS485"
           arduino-cli lib install "ArduinoModbus"
+          arduino-cli lib install "Arduino_Opta_Blueprint"
 
       - name: Generate config headers from secret
         run: |

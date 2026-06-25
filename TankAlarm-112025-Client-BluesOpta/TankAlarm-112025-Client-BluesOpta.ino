@@ -28,6 +28,16 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+// Arduino_Opta_Blueprint: official A0602 expansion driver. Used ONLY at boot to run the
+// Blueprint reset/address-assignment handshake so the A0602 ends up at a real assigned
+// I2C address (OPTA_CONTROLLER_FIRST_AVAILABLE_ADDRESS = 0x0B+) instead of the legacy
+// 0x64/0x0A probe defaults that the field A0602 was never at. Once the address is
+// captured, the existing v2.0.46 raw Blueprint-frame read path (configureCurrentAdcChannel
+// + getAnalogChannelFunction + readCurrentAdcFramed) talks to that discovered address and
+// remains in charge of every per-sample transaction -- OptaController::update() is NOT
+// called in the hot loop, so it never races the raw frames on the shared I2C bus.
+#include "OptaBlue.h"
+
 #if defined(TANKALARM_DFU_MCUBOOT)
 #include <MCUboot.h>
 #else
@@ -928,6 +938,18 @@ static char gSignalRat[8] = {0};    // Radio access technology (e.g., "lte", "ca
 uint32_t gCurrentLoopI2cErrors = 0;
 uint32_t gI2cBusRecoveryCount = 0;
 
+// v2.0.47: A0602 managed-addressing state. Blueprint expansions are assigned a dynamic I2C
+// address (from OPTA_CONTROLLER_FIRST_AVAILABLE_ADDRESS = 0x0B upward) when the controller
+// runs its bootstrap; the legacy 0x64/0x0A probe missed those entirely. bootstrapA0602Managed()
+// in setup() runs OptaController.begin()+update() ONCE to discover the real assigned address
+// (and turn the A0602 status LED GREEN). gConfig.currentLoopI2cAddress is then steered at that
+// address so the existing v2.0.46 framed-protocol read path talks to the right place. The
+// controller is NOT polled after bootstrap (no OptaController.update() in the hot loop), so it
+// never competes with the raw Blueprint frames for the shared I2C bus.
+static int     gA0602DeviceIndex    = -1;     // -1 => bootstrap failed / no expansion
+static uint8_t gA0602ManagedAddress = 0x00;   // assigned address (0x0B..) captured at boot
+static bool    gOptaControllerReady = false;
+
 // v2.0.46: A0602 current-loop diagnostics (daily-windowed; reset with gCurrentLoopI2cErrors).
 // Make the shared-bus health observable in Notehub so a field A0602 fault is measurable, and
 // so the per-op 400kHz window's effect on read latency (gLastClBurstMicros) can be confirmed.
@@ -1485,6 +1507,45 @@ static uint8_t resolveCurrentLoopI2cAddress(uint8_t preferredAddress) {
   return fallbackAddress;
 }
 
+// v2.0.47: Run the official Arduino_Opta_Blueprint controller bootstrap ONCE to discover
+// the A0602's assigned I2C address (Blueprint assigns from OPTA_CONTROLLER_FIRST_AVAILABLE_ADDRESS
+// = 0x0B upward). This replaces blind probing of the legacy 0x64 / 0x0A defaults that the field
+// A0602 was never at -- the root cause of the "stuck ~18 mA" symptom: every Blueprint frame
+// was silently NACKed at the wrong address so the read path returned stale/garbage bytes.
+//
+// Side effects of OptaController::begin():
+//  - Calls Wire.begin() (idempotent) and Wire.setClock(400000). We restore 100 kHz before
+//    returning so the next Notecard transaction sees the documented-stable bus speed.
+//  - Emits OPTA_CONTROLLER_RESET to every expansion and re-runs address assignment. This is
+//    expensive; MUST NOT be called outside setup(). After bootstrap we do NOT call
+//    OptaController.update() in the hot loop, so the controller never races the v2.0.46
+//    raw framed read path for the shared bus.
+//
+// Returns true if an EXPANSION_OPTA_ANALOG was discovered (LED turns GREEN on the module).
+// On false the caller should fall back to legacy probing -- callable raw frames at the legacy
+// addresses still work if the module was previously addressed.
+static bool bootstrapA0602Managed() {
+  OptaController.begin();
+  OptaController.update();
+  delay(20);
+  OptaController.update();
+
+  int n = OptaController.getExpansionNum();
+  for (int i = 0; i < n; ++i) {
+    if (OptaController.getExpansionType(i) == EXPANSION_OPTA_ANALOG) {
+      gA0602DeviceIndex    = i;
+      gA0602ManagedAddress = OptaController.getExpansionI2Caddress(i);
+      break;
+    }
+  }
+  gOptaControllerReady = (gA0602DeviceIndex >= 0);
+
+  // Restore the Notecard-safe I2C clock (OptaController forced 400 kHz). Mirrors the
+  // v2.0.46 per-op clock-window discipline used inside the raw read path.
+  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
+  return gOptaControllerReady;
+}
+
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 2000) {
@@ -1537,6 +1598,25 @@ void setup() {
 
   Wire.begin();
   Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);  // Guard against indefinite blocking on bus hang
+
+  // v2.0.47: A0602 managed bootstrap -- one-shot Blueprint controller handshake to discover
+  // the real assigned I2C address (0x0B+) and turn the A0602 status LED GREEN. Restores the
+  // 100 kHz Notecard-safe clock before returning. Must run after Wire.begin() and BEFORE the
+  // bus scan + Notecard init below so the rest of setup() addresses the A0602 correctly.
+  bool a0602Managed = bootstrapA0602Managed();
+  if (a0602Managed) {
+    Serial.print(F("A0602: managed at 0x"));
+    if (gA0602ManagedAddress < 0x10) Serial.print('0');
+    Serial.print(gA0602ManagedAddress, HEX);
+    Serial.print(F(" (device index "));
+    Serial.print(gA0602DeviceIndex);
+    Serial.println(F(")"));
+    // Steer the v2.0.46 raw framed read path at the actually-assigned address rather than
+    // the legacy 0x64 / 0x0A defaults the field A0602 was never at.
+    gConfig.currentLoopI2cAddress = gA0602ManagedAddress;
+  } else {
+    Serial.println(F("A0602: managed bootstrap FAILED -- falling back to legacy address probe"));
+  }
 
   uint8_t configuredCurrentLoopAddr = gConfig.currentLoopI2cAddress;
   if (configuredCurrentLoopAddr < 0x08 || configuredCurrentLoopAddr > 0x77 || configuredCurrentLoopAddr == NOTECARD_I2C_ADDRESS) {
