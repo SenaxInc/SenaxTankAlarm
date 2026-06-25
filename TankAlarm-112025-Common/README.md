@@ -92,24 +92,32 @@ SunSaver MPPT solar charger monitoring via Modbus RTU over RS-485:
 - SunSaver MPPT solar charge controller
 
 ### TankAlarm_Battery.h
-Battery voltage monitoring via Notecard card.voltage API (no additional hardware):
+Battery voltage monitoring sourced from the SunSaver MPPT (Modbus RS-485) or an external analog Vin voltage divider — auto-selected by the client's `getEffectiveBatteryVoltage()` with strict MPPT > Vin-divider priority. The Notecard `card.voltage` API is **not** used on the Blues "Wireless for Opta" carrier (the Notecard V+ is the regulated ~5V DC-DC rail, not the battery).
+
 - `BatteryType` - Enum (LEAD_ACID_12V, LIFEPO4_12V, LIPO, CUSTOM)
 - `BatteryAlertType` - Alert levels (NONE, LOW, CRITICAL, HIGH, DECLINING, USB_LOST, RECOVERED)
-- `BatteryData` - Voltage, trends (daily/weekly/monthly), mode, SOC, health status
-- `BatteryConfig` - Thresholds, poll interval, alert enable, analysis window
+- `BatteryData` - Voltage from the active source, source identifier (`mode` = "mppt" | "vin-divider"), running min/max stats, validity flag
+- `BatteryConfig` - Thresholds, poll interval, alert enable
 - `initBatteryConfig()` - Initialize config with defaults for battery type
 - `getBatteryStateDescription()` - User-friendly battery state description
 
 **Features:**
-- Trend analysis with configurable window (default 7 days)
-- Declining battery detection via weekly trends
-- Low/critical voltage alerts with SMS escalation
-- State of charge estimation from voltage curves
+- Per-boot running min/max voltage included in the daily report
+- Low / critical / high / recovery alerts (suppressed when MPPT is the active source so the
+  alert path does not duplicate `solarCharger.alertOnLowBattery`)
+- Daily-report battery section tagged with the active source (`battery.src`)
+
+**Not currently implemented in firmware:**
+- Trend analysis (daily/weekly/monthly voltage changes — the Notecard-provided trend window
+  was removed with Fix 11; struct fields remain reserved but always read 0)
+- State-of-charge estimation
 - USB power fallback detection
 
-**Hardware Required:**
-- Notecard wired directly to 12V battery (3.8V-17V VIN range)
-- No additional hardware needed - uses Notecard's built-in voltage monitoring
+**Hardware Required (at least one of):**
+- SunSaver MPPT solar charge controller wired through a Morningstar MRC-1 (MeterBus to EIA-485 Adapter) for the RS-485 source
+- External voltage divider (R1 high-side, R2 low-side) on an Opta analog input for the Vin divider source
+
+With neither source enabled, battery voltage is unknown and battery alerts / daily-report battery section are skipped.
 
 ## Example
 

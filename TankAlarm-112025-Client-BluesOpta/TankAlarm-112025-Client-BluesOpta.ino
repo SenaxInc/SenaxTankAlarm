@@ -372,7 +372,8 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 // Power Conservation State Machine
 // Progressive duty-cycle reduction based on battery voltage.
 // Uses hysteresis thresholds to prevent oscillation during charge/discharge.
-// Voltage source: best of SunSaver MPPT (Modbus) and Notecard card.voltage.
+// Voltage source: getEffectiveBatteryVoltage() — SunSaver MPPT (Modbus) preferred,
+// analog Vin divider as fallback. Notecard card.voltage is never used (Fix 9/11).
 // ============================================================================
 enum PowerState : uint8_t {
   POWER_STATE_NORMAL            = 0,  // Full operation
@@ -1410,7 +1411,6 @@ static void setRelayState(uint8_t relayNum, bool state);
 static void initializeRelays();
 static void triggerRemoteRelays(const char *targetClient, uint8_t relayMask, bool activate);
 static int getRelayPin(uint8_t relayIndex);
-static float readNotecardVinVoltage();
 static float readVinDividerVoltage();
 static void checkRelayMomentaryTimeout(unsigned long now);
 static bool fetchNotecardLocation(float &latitude, float &longitude);
@@ -1436,12 +1436,12 @@ static void logSolarPollSnapshot(unsigned long now, SolarAlertType alertType);
 static bool appendSolarDataToDaily(JsonDocument &doc);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
-// Battery voltage monitoring via Notecard (when wired directly to battery)
+// Battery voltage monitoring (sourced from SunSaver MPPT or Vin divider via
+// getEffectiveBatteryVoltage(); Fix 11: Notecard card.voltage is never used).
 static bool pollBatteryVoltage(BatteryData &data, const BatteryConfig &cfg);
 static void checkBatteryAlerts(const BatteryData &data, const BatteryConfig &cfg);
 static void sendBatteryAlarm(BatteryAlertType alertType, float voltage);
 static bool appendBatteryDataToDaily(JsonDocument &doc);
-static void configureBatteryMonitoring(const BatteryConfig &cfg);
 // Power conservation
 static void updatePowerState();
 static void sendPowerStateChange(PowerState oldState, PowerState newState, float voltage);
@@ -1771,10 +1771,13 @@ void setup() {
     }
   }
 
-  // Initialize battery voltage monitoring (Notecard direct to battery)
+  // Initialize battery voltage monitoring
+  // Fix 11: source is auto-picked by getEffectiveBatteryVoltage() (SunSaver MPPT preferred,
+  // analog Vin divider as fallback, or nothing). No Notecard I/O and no platform compile
+  // guard required — the previous Fix 10 Opta gate is no longer needed here because
+  // pollBatteryVoltage() never touches the Notecard.
   if (gConfig.batteryMonitor.enabled) {
-    configureBatteryMonitoring(gConfig.batteryMonitor);
-    Serial.println(F("Battery voltage monitoring enabled"));
+    Serial.println(F("Battery voltage monitoring enabled (source: MPPT/Vin auto-select)"));
     addSerialLog("Battery voltage monitoring initialized");
     // Initialize battery data structure
     memset(&gBatteryData, 0, sizeof(BatteryData));
@@ -2194,9 +2197,12 @@ void loop() {
     }
   }
   
-  // Poll battery voltage via Notecard (when wired directly to battery)
+  // Poll battery voltage (sourced from MPPT/Vin divider — never the Notecard)
   // Always poll even in CRITICAL — needed to detect battery recovery.
-  if (gConfig.batteryMonitor.enabled && gNotecardAvailable) {
+  // Fix 11: pollBatteryVoltage no longer issues Notecard I/O, so the previous Fix 10 Opta
+  // compile guard and the `gNotecardAvailable` gate are no longer required for the poll
+  // itself. sendBatteryAlarm() is still internally gated on gNotecardAvailable.
+  if (gConfig.batteryMonitor.enabled) {
     unsigned long batteryPollInterval = (unsigned long)gConfig.batteryMonitor.pollIntervalSec * 1000UL;
     // In reduced power states, poll less often (but still poll for recovery detection)
     if (gPowerState >= POWER_STATE_LOW_POWER) {
@@ -6903,151 +6909,85 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
 }
 
 // ============================================================================
-// Battery Voltage Monitoring Functions (Notecard direct to battery)
+// Battery Voltage Monitoring Functions
+// Source-agnostic: reads voltage from getEffectiveBatteryVoltage() (SunSaver MPPT preferred,
+// analog Vin divider as fallback). Notecard card.voltage is never used (Fix 11).
 // ============================================================================
 
 /**
- * Configure Notecard card.voltage with appropriate battery thresholds.
- * Must be called once during setup when battery monitoring is enabled.
- */
-static void configureBatteryMonitoring(const BatteryConfig &cfg) {
-  // Configure battery voltage monitoring thresholds
-  // Note: "calibration" and "set" are not documented card.voltage parameters
-  // and will be silently ignored by the Notecard. Diode drop compensation
-  // should be applied in firmware when reading the voltage instead.
-  J *req = notecard.newRequest("card.voltage");
-  if (!req) return;
-  
-  // Create custom mode string for voltage thresholds
-  char modeStr[80];
-  snprintf(modeStr, sizeof(modeStr), 
-           "usb:%.1f;high:%.1f;normal:%.1f;low:%.1f;dead:0",
-           cfg.highVoltage + 0.5f,
-           cfg.highVoltage,
-           cfg.normalVoltage,
-           cfg.criticalVoltage);
-  JAddStringToObject(req, "mode", modeStr);
-  
-  // Enable voltage trend tracking
-  JAddBoolToObject(req, "on", true);
-  
-  J *rsp = notecard.requestAndResponse(req);
-  if (rsp) {
-    const char *err = JGetString(rsp, "err");
-    if (err && strlen(err) > 0) {
-      Serial.print(F("Battery config error: "));
-      Serial.println(err);
-    } else {
-      Serial.print(F("Battery thresholds configured: "));
-      Serial.println(modeStr);
-    }
-    notecard.deleteResponse(rsp);
-  }
-}
-
-/**
- * Poll battery voltage and trend data from Notecard.
- * Returns true if data was successfully retrieved.
+ * Poll battery voltage from the active source (MPPT or Vin divider) and update BatteryData.
+ * Returns true if a valid voltage was sampled, false otherwise.
+ *
+ * Fix 11: previously read Notecard card.voltage; on the Blues "Wireless for Opta" carrier
+ * card.voltage is the regulated ~5V DC-DC rail (not the 12V battery) and so was unusable.
+ * This function now reads getEffectiveBatteryVoltage(), which honors strict priority
+ * MPPT > Vin divider (Fix 9). Trend statistics (weekly/monthly/SOC) that the Notecard used
+ * to provide are not reconstructed in firmware; running min/max are tracked across this boot.
  */
 static bool pollBatteryVoltage(BatteryData &data, const BatteryConfig &cfg) {
-#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  // HARDWARE LIMITATION (Blues "Wireless for Opta"): the Notecard's V+ is supplied through the
-  // carrier's DC-DC converter, which regulates it to ~5V. card.voltage therefore reads that
-  // regulated rail and physically cannot exceed ~5V — it can NEVER represent the 12V battery.
-  // Using it would misreport the battery and (via the conservative min() in
-  // getEffectiveBatteryVoltage) trip a bogus CRITICAL_HIBERNATE that halts telemetry and blocks
-  // OTA recovery. On this hardware the battery voltage comes only from the SunSaver MPPT
-  // (RS-485 Modbus) and/or the analog Vin voltage divider, so the Notecard is never used as a
-  // battery source. This single chokepoint also disables Notecard battery alerts and the daily
-  // battery section, which both gate on a successful poll / gBatteryData.valid.
-  (void)cfg;
-  data.valid = false;
-  return false;
-#else
-  J *req = notecard.newRequest("card.voltage");
-  if (!req) {
+  float v = getEffectiveBatteryVoltage();
+  const char *src = gEffectiveVoltageSource;
+
+  if (v <= 0.0f || src == nullptr) {
     data.valid = false;
     return false;
   }
-  
-  // Request trend analysis data
-  JAddNumberToObject(req, "hours", cfg.trendAnalysisHours);
-  
-  J *rsp = notecard.requestAndResponse(req);
-  if (!rsp) {
-    data.valid = false;
-    Serial.println(F("No response from card.voltage"));
-    return false;
+
+  data.voltage = v;
+
+  // Repurposed: data.mode now holds the source identifier ("mppt" | "vin-divider"), not the
+  // Notecard's voltage-mode classification. Used by checkBatteryAlerts() to defer to
+  // solarCharger's own alert pipeline when MPPT is the active source.
+  strlcpy(data.mode, src, sizeof(data.mode));
+
+  // Notecard-specific fields are not applicable to MPPT/Vin sources
+  data.usbPowered = false;
+  data.uptimeMinutes = (uint32_t)(millis() / 60000UL);
+
+  // Running min/max across this boot. voltageMin starts at 0 (memset) which would otherwise
+  // permanently win the min comparison — seed it on first valid sample.
+  if (data.voltageMin <= 0.0f || data.voltage < data.voltageMin) {
+    data.voltageMin = data.voltage;
   }
-  
-  const char *err = JGetString(rsp, "err");
-  if (err && strlen(err) > 0) {
-    Serial.print(F("card.voltage error: "));
-    Serial.println(err);
-    notecard.deleteResponse(rsp);
-    data.valid = false;
-    return false;
+  if (data.voltage > data.voltageMax) {
+    data.voltageMax = data.voltage;
   }
-  
-  // Parse response
-  data.voltage = (float)JGetNumber(rsp, "value");
-  
-  // Apply calibration offset (e.g., diode voltage drop compensation).
-  // This was previously sent as a "calibration" field to card.voltage, but
-  // that parameter is not supported by the Notecard API — apply in firmware.
-  if (cfg.calibrationOffset != 0.0f) {
-    data.voltage += cfg.calibrationOffset;
-  }
-  
-  // BugFix 02282026: Copy mode string into fixed buffer before deleteResponse()
-  // frees the JSON memory. Was: data.mode = JGetString(rsp, "mode");
-  const char *modeStr = JGetString(rsp, "mode");
-  strlcpy(data.mode, (modeStr && modeStr[0] != '\0') ? modeStr : "unknown", sizeof(data.mode));
-  data.usbPowered = JGetBool(rsp, "usb");
-  data.uptimeMinutes = (uint32_t)JGetNumber(rsp, "minutes");
-  
-  // Trend analysis data
-  data.voltageMin = (float)JGetNumber(rsp, "vmin");
-  data.voltageMax = (float)JGetNumber(rsp, "vmax");
-  data.voltageAvg = (float)JGetNumber(rsp, "vavg");
-  data.analysisHours = (uint16_t)JGetNumber(rsp, "hours");
-  data.dailyChange = (float)JGetNumber(rsp, "daily");
-  data.weeklyChange = (float)JGetNumber(rsp, "weekly");
-  data.monthlyChange = (float)JGetNumber(rsp, "monthly");
-  
-  notecard.deleteResponse(rsp);
-  
-  // Derive status flags
+  // No firmware-side trend tracking yet — leave dailyChange/weeklyChange/monthlyChange at 0,
+  // which the alarm/daily emitters already skip via `if (... != 0.0f)` gates.
+
   data.isHealthy = (data.voltage >= cfg.normalVoltage && data.voltage <= cfg.highVoltage);
-  data.isCharging = (data.dailyChange > 0.0f);
-  data.isDeclining = (data.weeklyChange < -cfg.declineAlertThreshold);
-  
+  data.isCharging = false;
+  data.isDeclining = false;
   data.valid = true;
   data.lastReadMillis = millis();
-  
+
   // Log voltage reading
   Serial.print(F("Battery: "));
   Serial.print(data.voltage, 2);
-  Serial.print(F("V ("));
+  Serial.print(F("V ["));
+  Serial.print(src);
+  Serial.print(F("] ("));
   Serial.print(getBatteryStateDescription(data.voltage, &cfg));
-  Serial.print(F(")"));
-  if (data.weeklyChange != 0.0f) {
-    Serial.print(F(" 7d: "));
-    Serial.print(data.weeklyChange > 0 ? "+" : "");
-    Serial.print(data.weeklyChange, 2);
-    Serial.print(F("V"));
-  }
-  Serial.println();
-  
+  Serial.println(F(")"));
+
   return true;
-#endif
 }
 
 /**
  * Check battery data against thresholds and trigger alerts if needed.
+ *
+ * Fix 11: when the active source is "mppt", suppress alerting from this pipeline because
+ * gSolarManager already publishes its own low/critical/high alerts via
+ * solarCharger.alertOnLowBattery (avoids double-alerting on the same MPPT reading). When the
+ * active source is "vin-divider" (or anything else), this pipeline owns the alerts.
  */
 static void checkBatteryAlerts(const BatteryData &data, const BatteryConfig &cfg) {
   if (!data.valid) return;
+
+  // Fix 11: defer to solarCharger when MPPT is the active source.
+  if (data.mode[0] != '\0' && strcmp(data.mode, "mppt") == 0) {
+    return;
+  }
   
   unsigned long now = millis();
   BatteryAlertType alert = BATTERY_ALERT_NONE;
@@ -7183,6 +7123,12 @@ static bool appendBatteryDataToDaily(JsonDocument &doc) {
   
   // Current voltage (state/healthy derivable from voltage + config thresholds on server)
   battery["v"] = roundTo(gBatteryData.voltage, 2);
+
+  // Fix 11: tag the active source ("mppt" | "vin-divider") so the server can distinguish
+  // batteryMonitor readings from the legacy Notecard card.voltage readings in historical data.
+  if (gBatteryData.mode[0] != '\0') {
+    battery["src"] = (const char *)gBatteryData.mode;
+  }
   
   // Stats over analysis period
   if (gBatteryData.voltageMin > 0.0f) {
@@ -7205,8 +7151,8 @@ static bool appendBatteryDataToDaily(JsonDocument &doc) {
 // ============================================================================
 // Power Conservation State Machine
 // Progressive duty-cycle reduction with hysteresis-based recovery.
-// Merges voltage data from both SunSaver MPPT and Notecard card.voltage 
-// to drive a single power-state decision.
+// Driven by getEffectiveBatteryVoltage() (SunSaver MPPT > Vin divider; Fix 9/11) — the
+// Notecard card.voltage rail is never considered.
 // ============================================================================
 
 /**
@@ -7660,62 +7606,58 @@ static void checkSolarOnlySunsetProtocol(unsigned long now) {
 
 /**
  * Determine the best available battery voltage from all monitoring sources.
- * Returns the lower of available sources (conservative approach — protect the battery).
- * A source is only considered if it has valid recent data. Records the winning source in
+ * Uses STRICT PRIORITY (Fix 9): the highest-priority source that has valid recent data
+ * wins; lower-priority sources are NEVER allowed to override it, even if they read lower.
+ * The previous "lower of" logic let a noisy ADC divider drag a clean MPPT reading down
+ * and trip a bogus CRITICAL_HIBERNATE. Records the winning source in
  * gEffectiveVoltageSource (Fix 7) so telemetry/daily can tag it.
  *
- * Sources (in priority order):
- *   1. SunSaver MPPT via Modbus RS-485 (most accurate, directly from charge controller)
- *   2. Analog Vin voltage divider (direct ADC reading of battery via resistor divider)
+ * Sources (in strict priority order):
+ *   1. SunSaver MPPT via Modbus RS-485 (most accurate, digital charge-controller reading)
+ *   2. Analog Vin voltage divider (direct ADC of battery via resistor divider, less accurate)
  *
- * NOTE (Fix 1): the Notecard card.voltage is NOT a battery source on the Blues
- * "Wireless for Opta" carrier — the Notecard V+ is the ~5V regulated DC-DC rail and cannot
- * read the 12V battery. That source is compile-gated out on Opta/mbed below so no future code
- * path can resurrect the ~5V rail as a battery reading.
+ * NOTE (Fix 9 update): the Notecard card.voltage is NEVER used as a battery source on ANY
+ * platform. On the Blues "Wireless for Opta" carrier the Notecard V+ is the regulated ~5V
+ * DC-DC rail and physically cannot read the 12V battery (would misreport and trip a bogus
+ * CRITICAL_HIBERNATE). Even on hypothetical hardware where the Notecard V+ would be the
+ * battery, the SunSaver MPPT and the analog Vin divider are the only sanctioned battery
+ * sources — the Notecard path is deliberately removed from this function so no future
+ * configuration or wiring change can resurrect it as a power-state input.
  */
 static float getEffectiveBatteryVoltage() {
   float voltage = 0.0f;
   bool hasVoltage = false;
   const char *source = nullptr;
   
-  // Source 1: SunSaver MPPT via Modbus RS-485
+  // Source 1 (HIGHEST PRIORITY): SunSaver MPPT via Modbus RS-485.
+  // The MPPT is an industrial digital charge controller that measures the battery terminal
+  // directly and reports over RS-485. It is the most accurate source available, so when it is
+  // present and healthy NOTHING is allowed to override it (Fix 9). The previous "use the
+  // lower of" logic let a noisy/uncalibrated Vin divider drag a clean 12.3V MPPT reading
+  // down to e.g. 11.9V and trip a bogus CRITICAL_HIBERNATE.
   if (gSolarManager.isEnabled() && gSolarManager.isCommunicationOk()) {
     const SolarData &solar = gSolarManager.getData();
-    if (solar.batteryVoltage > 0.0f) {
+    if (solar.batteryVoltage > 0.1f) {
       voltage = solar.batteryVoltage;
       hasVoltage = true;
       source = "mppt";
     }
   }
   
-#if !defined(ARDUINO_OPTA) && !defined(ARDUINO_ARCH_MBED)
-  // Source 2 (non-Opta ONLY): Notecard card.voltage, valid only where the Notecard is wired
-  // directly to the battery. Compile-gated out on the Opta carrier (Fix 1), where the Notecard
-  // V+ is the regulated ~5V rail and must never be treated as a battery reading.
-  if (gConfig.batteryMonitor.enabled && gBatteryData.valid && gBatteryData.voltage > 0.0f) {
-    if (!hasVoltage) {
-      voltage = gBatteryData.voltage;
-      hasVoltage = true;
-      source = "notecard";
-    } else if (gBatteryData.voltage < voltage) {
-      // Use the LOWER of the readings (conservative — protect battery)
-      voltage = gBatteryData.voltage;
-      source = "notecard";
-    }
+  // Source 2 (FALLBACK): analog Vin voltage divider.
+  // Only consulted when MPPT did not provide a valid reading. ADC dividers are subject to
+  // component tolerance, supply noise, and temperature drift, so they are a fallback — never
+  // an override (Fix 9).
+  if (!hasVoltage && gConfig.vinMonitor.enabled && gVinVoltage > 0.5f) {
+    voltage = gVinVoltage;
+    hasVoltage = true;
+    source = "vin-divider";
   }
-#endif
   
-  // Source 3: Analog Vin voltage divider
-  if (gConfig.vinMonitor.enabled && gVinVoltage > 0.5f) {
-    if (!hasVoltage) {
-      voltage = gVinVoltage;
-      hasVoltage = true;
-      source = "vin-divider";
-    } else if (gVinVoltage < voltage) {
-      voltage = gVinVoltage;
-      source = "vin-divider";
-    }
-  }
+  // Notecard card.voltage is intentionally NOT considered here on any platform (Fix 9
+  // update). The Notecard battery monitor (pollBatteryVoltage / gBatteryData) now sources
+  // from this same function via Fix 11, so all voltage paths agree on which physical sensor
+  // is the truth — there is no longer a separate Notecard-derived reading anywhere.
   
   gEffectiveVoltageSource = hasVoltage ? source : nullptr;
   return hasVoltage ? voltage : 0.0f;
@@ -7966,7 +7908,10 @@ static void sendDailyReport() {
     // Include solar charger data in the first part of the daily report
     if (part == 0) {
       appendSolarDataToDaily(doc);
-      appendBatteryDataToDaily(doc);  // Notecard battery voltage monitoring
+      // Fix 11: appendBatteryDataToDaily now sources from MPPT/Vin via
+      // getEffectiveBatteryVoltage() and never touches the Notecard, so it is safe to run
+      // on all platforms (the previous Fix 10 Opta compile guard is no longer needed).
+      appendBatteryDataToDaily(doc);
       // Include power conservation state in daily report
       if (gPowerState != POWER_STATE_NORMAL) {
         JsonObject powerObj = doc["power"].to<JsonObject>();
@@ -9723,44 +9668,6 @@ static void pollForSyncRequests() {
     J *delRsp = notecard.requestAndResponse(delReq);
     if (delRsp) notecard.deleteResponse(delRsp);
   }
-}
-
-// ============================================================================
-// Notecard VIN Voltage Reading
-// ============================================================================
-
-static float readNotecardVinVoltage() {
-  J *req = notecard.newRequest("card.voltage");
-  if (!req) {
-    Serial.println(F("Failed to create card.voltage request"));
-    return -1.0f;
-  }
-
-  J *rsp = notecard.requestAndResponse(req);
-  if (!rsp) {
-    Serial.println(F("No response from card.voltage"));
-    return -1.0f;
-  }
-
-  // Check for error response
-  const char *err = JGetString(rsp, "err");
-  if (err && strlen(err) > 0) {
-    Serial.print(F("card.voltage error: "));
-    Serial.println(err);
-    notecard.deleteResponse(rsp);
-    return -1.0f;
-  }
-
-  double voltage = JGetNumber(rsp, "value");
-  notecard.deleteResponse(rsp);
-
-  if (voltage > 0.0) {
-    Serial.print(F("Notecard VIN voltage: "));
-    Serial.print(voltage);
-    Serial.println(F(" V"));
-  }
-
-  return (float)voltage;
 }
 
 // ============================================================================

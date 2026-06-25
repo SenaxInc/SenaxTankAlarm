@@ -16,11 +16,11 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "2.0.47"
+#define FIRMWARE_VERSION "2.0.48"
 #endif
 
 #ifndef FIRMWARE_BUILD_SEQ
-#define FIRMWARE_BUILD_SEQ 241   // monotonic; bump every release (v2.0.47 = 241)
+#define FIRMWARE_BUILD_SEQ 242   // monotonic; bump every release (v2.0.48 = 242)
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.

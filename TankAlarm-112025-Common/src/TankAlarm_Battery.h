@@ -1,26 +1,30 @@
 /**
  * TankAlarm_Battery.h
  * 
- * Battery Voltage Monitoring via Blues Notecard
+ * Battery Voltage Monitoring (SunSaver MPPT or Vin Divider)
  * 
- * Uses the Notecard's card.voltage API to monitor battery health when
- * the Notecard is wired directly to the battery (3.8V - 17V VIN range).
- * 
+ * Battery voltage is sampled from one of two physical sources, auto-selected by
+ * getEffectiveBatteryVoltage() in the client firmware:
+ *   1. SunSaver MPPT solar charge controller via Modbus RTU over RS-485 (preferred)
+ *   2. External analog Vin voltage divider on an Opta analog input (fallback)
+ *
+ * The Notecard's `card.voltage` API is intentionally NOT used as a battery source on the
+ * Blues "Wireless for Opta" carrier: the Notecard V+ is supplied through the carrier's
+ * regulated ~5V DC-DC converter and physically cannot represent the 12V battery (Fix 9/11).
+ *
  * Features:
- * - Real-time voltage monitoring
- * - Configurable thresholds for 12V lead-acid, LiFePO4, or custom batteries
- * - Trend analysis (daily, weekly, monthly voltage changes)
- * - Low voltage alerts
- * - Integration with daily reports
- * 
+ * - Real-time voltage monitoring from the active source
+ * - Configurable thresholds per battery chemistry (lead-acid / LiFePO4 / Li-ion / custom)
+ *   with 12V/24V pack scaling
+ * - Low / critical / high / recovery alerts (gated to non-MPPT sources so the alert path
+ *   does not duplicate solarCharger.alertOnLowBattery)
+ * - Per-boot running min/max voltage stats included in the daily report
+ *
  * Hardware Requirements:
- * - Blues Notecard wired directly to battery (not through 5V regulator)
- * - Optional: Schottky diode for reverse polarity protection
- * 
- * Note: The Notecard's card.voltage calibration offset (default 0.35V) 
- * accounts for forward voltage drop of protection diodes. Adjust if using
- * different diode or no diode.
- * 
+ * - SunSaver MPPT + Morningstar MRC-1 (MeterBus to EIA-485 Adapter) for the RS-485 source, OR
+ * - External voltage divider (R1 high-side, R2 low-side) on an Opta analog input for the
+ *   Vin divider source. Both are optional; with neither enabled, battery voltage is unknown.
+ *
  * Copyright (c) 2025-2026 Senax Inc. All rights reserved.
  */
 
@@ -121,32 +125,37 @@ enum BatteryAlertType : uint8_t {
 };
 
 // ============================================================================
-// Battery Data Structure (data from card.voltage)
+// Battery Data Structure (data from MPPT or Vin divider via getEffectiveBatteryVoltage)
 // ============================================================================
 struct BatteryData {
   // Current measurements
   float voltage;              // Current battery voltage (V)
-  char mode[16];              // Voltage mode state (usb/high/normal/low/dead)
-                              // BugFix 02282026: Was const char* pointing into freed Notecard
-                              // JSON response memory — now a fixed buffer copied via strlcpy.
-  bool usbPowered;            // True if USB power connected
-  uint32_t uptimeMinutes;     // Device uptime in minutes
+  char mode[16];              // Source identifier ("mppt" | "vin-divider" | empty if unknown)
+                              // BugFix 02282026: was const char* into freed Notecard JSON —
+                              // now a fixed buffer copied via strlcpy.
+                              // Fix 11: repurposed from the old Notecard voltage-mode string
+                              // ("usb"/"high"/"normal"/"low"/"dead") to the source name.
+  bool usbPowered;            // Legacy Notecard field — always false on MPPT/Vin sources.
+  uint32_t uptimeMinutes;     // Device uptime in minutes (firmware-computed since Fix 11)
   
-  // Historical data (from trend analysis)
-  float voltageMin;           // Minimum voltage in analysis period
-  float voltageMax;           // Maximum voltage in analysis period
-  float voltageAvg;           // Average voltage in analysis period
-  uint16_t analysisHours;     // Hours of data analyzed
+  // Historical data: running min/max across the current boot session (no firmware-side
+  // multi-day persistence yet; voltageAvg/analysisHours are reserved and not populated).
+  float voltageMin;           // Minimum voltage observed this boot
+  float voltageMax;           // Maximum voltage observed this boot
+  float voltageAvg;           // Reserved — not populated by the current firmware
+  uint16_t analysisHours;     // Reserved — not populated by the current firmware
   
-  // Trend data (voltage change rates)
-  float dailyChange;          // Voltage change in last 24 hours
-  float weeklyChange;         // Voltage change in last 7 days
-  float monthlyChange;        // Voltage change in last 30 days
+  // Trend data (reserved — not populated by the current firmware; emitters skip when 0).
+  // Were filled from Notecard card.voltage trend analysis pre-Fix-11; removing the Notecard
+  // source left no firmware-side multi-day history, so these always read 0.
+  float dailyChange;          // Reserved — voltage change in last 24 hours (always 0)
+  float weeklyChange;         // Reserved — voltage change in last 7 days (always 0)
+  float monthlyChange;        // Reserved — voltage change in last 30 days (always 0)
   
   // Derived status
   bool isHealthy;             // Battery within normal range
-  bool isCharging;            // Voltage trending up (likely charging)
-  bool isDeclining;           // Significant voltage decline detected
+  bool isCharging;            // Reserved — derived from trend data, currently always false
+  bool isDeclining;           // Reserved — derived from trend data, currently always false
   
   // Data validity
   bool valid;                 // True if data was successfully read
@@ -168,16 +177,20 @@ struct BatteryConfig {
   float criticalVoltage;      // Critical low voltage (immediate alert)
   
   // Calibration
-  float calibrationOffset;    // Diode voltage drop compensation (default: 0.35V)
+  float calibrationOffset;    // Reserved — Schottky diode voltage drop compensation
+                              // (was applied to Notecard card.voltage readings; unused after
+                              // Fix 11 since MPPT/Vin divider readings are already calibrated).
   
   // Monitoring parameters
   uint16_t pollIntervalSec;   // How often to poll voltage (default: 300s = 5 min)
-  uint16_t trendAnalysisHours;// Hours of data for trend analysis (default: 168 = 7 days)
+  uint16_t trendAnalysisHours;// Reserved — was the Notecard trend window; firmware no longer
+                              // computes multi-day trends (Fix 11).
   
   // Alert configuration
   bool alertOnLow;            // Send alert when voltage goes low
   bool alertOnCritical;       // Send alert when voltage is critical
-  bool alertOnDeclining;      // Send alert on significant decline trend
+  bool alertOnDeclining;      // Reserved — was triggered by the Notecard weekly trend;
+                              // firmware no longer computes trends, so this never fires.
   bool alertOnRecovery;       // Send alert when voltage recovers to normal
   
   // Trend alert threshold

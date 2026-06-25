@@ -473,7 +473,8 @@ Use this path when the charge controller does not expose RS-485/Modbus data
 What remains supported in firmware:
 
 - Power-state control via `solarPowered`
-- Battery health from Notecard direct voltage (`batteryMonitor`)
+- Battery health via `batteryMonitor` (sources from SunSaver MPPT or Vin divider; never the
+  Notecard on Opta — see "Battery Voltage Monitoring" below)
 - Optional analog divider voltage monitoring (`vinMonitor`)
 - Daily reporting and alarm logic based on available battery sources
 
@@ -511,124 +512,77 @@ Action: Check solar panel connections and battery
 | No data in daily | Verify `includeInDaily` is true |
 | No alerts | Check `alertOnLow` and `alertOnFault` settings |
 
-### Battery Voltage Monitoring (Notecard Direct)
+### Battery Voltage Monitoring
 
-The system supports battery voltage monitoring using the Notecard's built-in voltage measurement when wired directly to a 12V battery. This is the **simplest option** as it requires no additional hardware beyond what's already installed. It provides:
+The system tracks battery voltage from one of two physical sources, auto-selected by the firmware with strict priority MPPT > Vin divider (Fix 9):
 
-- **Real-time voltage monitoring** - Track battery state throughout the day
-- **Trend analysis** - Daily, weekly, and monthly voltage trends to detect declining batteries
-- **Low voltage alerts** - SMS/email warnings when voltage drops below thresholds
-- **State of charge estimation** - Approximate SOC percentage from voltage curves
-- **USB power detection** - Alert if system falls back to USB power
+1. **SunSaver MPPT via Modbus RS-485** (preferred) — the most accurate reading, comes from the charge controller's own measurement of the battery terminal.
+2. **Analog Vin voltage divider** (fallback) — a pair of external resistors on an Opta analog input.
 
-**Hardware Required:**
+The Notecard's `card.voltage` API is **not** used as a battery source on the Blues "Wireless for Opta" carrier (the Notecard V+ is the carrier's regulated ~5V DC-DC rail and physically cannot represent the 12V battery; see Fix 9/11). With neither source enabled the battery monitor is silent — `pollBatteryVoltage()` returns `false` and the battery alert path / daily-report battery section are skipped.
 
-Wire the Notecard's VIN/GND directly to your 12V battery (3.8V-17V VIN range is supported). No additional sensors or adapters needed.
+The server's Client Configuration page exposes a single **Voltage Monitor** dropdown with three options — *None*, *Voltage Divider*, *RS485 (SunSaver Modbus)* — that drives `solarCharger.enabled` and `vinMonitor.enabled` in the emitted config.
 
-> **Note:** If you also have a SunSaver MPPT solar charger, you can enable both systems. The MPPT provides more detailed charging data while the Notecard voltage monitoring is always available as a backup.
+**What `batteryMonitor` provides:**
+
+- Real-time voltage tracking from the active source
+- Low / critical / high / recovery alerts (suppressed when the active source is MPPT, so the alert path does not duplicate `solarCharger.alertOnLowBattery`)
+- Per-boot running min/max voltage in the daily report
+- Source identifier (`mppt` / `vin-divider`) emitted on telemetry (`vs`) and the daily-report `battery.src`
+
+**What `batteryMonitor` no longer provides** (was previously sourced from the Notecard's trend window; removed with Fix 11):
+
+- Daily / weekly / monthly voltage trend statistics
+- State-of-charge estimation from voltage curves
+- USB power fallback detection
 
 **Configuration Parameters:**
 
 ```json
 {
+  "batteryConfig": {
+    "enabled": true,
+    "batteryType": 1,
+    "batteryTypeName": "agm",
+    "nominalVoltage": 12
+  },
   "batteryMonitor": {
     "enabled": true,
-    "batteryType": "leadAcid12V",
-    "pollIntervalSec": 900,
+    "pollIntervalSec": 300,
     "alertOnLow": true,
-    "voltageHighV": 14.4,
-    "voltageLowV": 12.0,
-    "voltageCriticalV": 11.8,
-    "trendAnalysisHours": 168,
-    "includeInDaily": true,
-    "alertIntervalMinutes": 60
+    "alertOnCritical": true,
+    "includeInDailyReport": true
   }
 }
 ```
 
-**Configuration Fields:**
+Threshold voltages (`lowVoltage` / `criticalVoltage` / `highVoltage`) are derived automatically from `batteryConfig.batteryType` + `nominalVoltage` via `initBatteryConfig()`; the 12V baseline scales 2x for 24V packs.
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `enabled` | `false` | Enable Notecard battery monitoring |
-| `batteryType` | `"leadAcid12V"` | Battery type: "leadAcid12V", "lifepo4_12V", "lipo", or "custom" |
-| `pollIntervalSec` | `900` | How often to poll voltage (seconds, min 60) |
-| `alertOnLow` | `true` | Send alerts for low/critical voltage |
-| `voltageHighV` | `14.4` | High voltage threshold (for overcharge detection) |
-| `voltageLowV` | `12.0` | Low voltage warning threshold |
-| `voltageCriticalV` | `11.8` | Critical voltage (alarm immediately) |
-| `trendAnalysisHours` | `168` | Hours of data for trend analysis (7 days default) |
-| `includeInDaily` | `true` | Include battery data in daily report |
-| `alertIntervalMinutes` | `60` | Minimum minutes between repeated alerts |
-
-**Battery Type Defaults:**
+**Battery Type Defaults (12V baseline; scaled 2x for 24V):**
 
 | Battery Type | Low V | Critical V | High V | Notes |
 |--------------|-------|------------|--------|-------|
-| Lead-Acid 12V | 12.0 | 11.8 | 14.4 | AGM, flooded, gel batteries |
+| AGM / SLA / Gel | 12.0 | 11.8 | 14.4 | Sealed lead-acid family |
+| Flooded | 12.0 | 11.8 | 15.0 | Higher equalization ceiling |
 | LiFePO4 12V | 12.8 | 12.0 | 14.6 | 4S LiFePO4 pack |
-| LiPo | 3.5 | 3.2 | 4.2 | Single cell or pack average |
+| Li-ion (NMC) | 11.4 | 10.5 | 12.6 | 3S NMC pack |
+| LiPo (single cell) | 3.5 | 3.2 | 4.2 | Pack voltage scaling not applied |
 | Custom | User | User | User | Set all thresholds manually |
 
-**State of Charge Estimation:**
+**Data Included in Daily Report (`battery` sub-object):**
 
-The system estimates state of charge (SOC) from voltage using lookup tables. Note that voltage-based SOC is approximate and varies with load, temperature, and battery age.
+When `includeInDailyReport` is enabled and a valid voltage was sampled:
 
-| Lead-Acid 12V | LiFePO4 12V |
-|---------------|-------------|
-| 12.7V+ = 100% | 13.3V+ = 100% |
-| 12.5V = 75% | 13.2V = 75% |
-| 12.3V = 50% | 13.1V = 50% |
-| 12.1V = 25% | 13.0V = 25% |
-| 11.9V = 0% | 12.8V = 0% |
-
-**Trend Analysis:**
-
-The Notecard provides trend data showing voltage changes over time:
-- **Daily trend** - Voltage change in last 24 hours
-- **Weekly trend** - Voltage change in last 7 days
-- **Monthly trend** - Voltage change in last 30 days
-
-A negative weekly trend with declining voltage can indicate:
-- Battery aging and capacity loss
-- Insufficient solar charging
-- Increased load on the system
-
-**Data Included in Daily Report:**
-
-When `includeInDaily` is enabled:
-- Current battery voltage
-- Voltage mode (USB, high, normal, low, critical)
-- Min/max/average voltage over analysis period
-- Daily/weekly voltage trends
-- Estimated state of charge
-- Battery health status
+- `v` — current battery voltage
+- `src` — active source identifier (`"mppt"` | `"vin-divider"`)
+- `vMin`, `vMax` — running min/max across the current boot session
 
 **Example Alert Message:**
 
 ```
-Battery: Voltage LOW (11.95V)
+Battery: low (11.95V)
 Site: North Tank Farm
-SOC: ~20%
-Weekly Trend: -0.35V
-Action: Check charging system and loads
 ```
-
-**Choosing Between Solar Monitoring and Notecard Battery Monitoring:**
-
-| Feature | Notecard Battery | SunSaver MPPT |
-|---------|------------------|---------------|
-| Hardware needed | None extra | MRC-1 + RS485 |
-| Battery voltage | ✓ | ✓ |
-| Solar voltage | ✗ | ✓ |
-| Charge current | ✗ | ✓ |
-| Charge state | Via voltage only | Direct reading |
-| Trend analysis | ✓ (7-day) | ✓ (daily min/max) |
-| Fault detection | ✗ | ✓ |
-| Amp-hours | ✗ | ✓ |
-| Best for | Simple monitoring | Full solar diagnostics |
-
-**Both can be enabled simultaneously** - the MPPT provides detailed charging data while Notecard monitoring provides backup voltage tracking.
 
 ## Operation
 
