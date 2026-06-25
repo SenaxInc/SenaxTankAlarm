@@ -962,6 +962,22 @@ enum ClFaultReason : uint8_t {
   CL_FAULT_READ_FAIL = 4,   // every framed sample failed
   CL_FAULT_OVER_RANGE = 5   // reading rejected as >21mA / 0xFFFF garbage
 };
+
+// Fix 12 (v2.0.51): stable short strings for the current-loop fault enum, emitted in
+// telemetry/daily/alarm payloads when a current-loop read fails. Server-side dashboards
+// can show these directly (or map them to human-readable text), so a failed read can never
+// be confused for a successful 0.0 PSI / 0.0 in reading.
+static inline const char *clFaultReasonString(uint8_t reason) {
+  switch (reason) {
+    case CL_FAULT_NONE:        return "ok";
+    case CL_FAULT_PWM_NACK:    return "pwm_nack";
+    case CL_FAULT_CONFIG_NACK: return "config_nack";
+    case CL_FAULT_FUNC_WRONG:  return "func_wrong";
+    case CL_FAULT_READ_FAIL:   return "read_fail";
+    case CL_FAULT_OVER_RANGE:  return "over_range";
+    default:                   return "unknown";
+  }
+}
 uint32_t gCurrentLoopReadsOk = 0;            // valid A0602 reads this window
 uint32_t gCurrentLoopOverRange = 0;          // reads rejected as over-range/garbage this window
 uint8_t  gLastClFaultReason = CL_FAULT_NONE; // last A0602 fault code (see ClFaultReason)
@@ -6293,11 +6309,20 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
       o["fl"] = roundTo(state.currentInches, 1);  // 1.0 or 0.0 (float switch state)
       break;
     case SENSOR_CURRENT_LOOP:
+      // Fix 12 (v2.0.51): current-loop sensors are RAW-mA-only on the wire. The server
+      // converts mA -> engineering units using the sensor config it gave us; the client
+      // deliberately does NOT emit a computed `lvl`/`cap` for current-loop so a failed
+      // read or stale-reused value cannot silently masquerade as a real measurement.
+      //   - Successful read  -> emit `ma` (always, even at live-zero ~4 mA).
+      //   - Failed read (ru) -> emit `fault: "<short_string>"` and DO NOT emit `ma`.
+      // `pg` (PWM gate enable result) is kept for diagnostics on either path.
       o["st"] = "currentLoop";
-      if (state.currentSensorMa >= 4.0f) o["ma"] = roundTo(state.currentSensorMa, 2);
-      // v1.9.22: surface the power-gate enable result so a floating/stale read vs a real
-      // reading is distinguishable remotely (Notehub/dashboard) without a serial cable.
       if (cfg.pwmGatingEnabled) o["pg"] = state.lastPwmEnableOk ? 1 : 0;
+      if (state.sampleReused) {
+        o["fault"] = clFaultReasonString(gLastClFaultReason);
+      } else {
+        o["ma"] = roundTo(state.currentSensorMa, 2);
+      }
       break;
     case SENSOR_ANALOG:
       o["st"] = "analog";
@@ -6311,8 +6336,14 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
   }
 
   // Self-describing level + capacity so every note decodes with zero registry state.
-  o["lvl"] = roundTo(state.currentInches, 1);
-  o["cap"] = roundTo(getMonitorHeight(cfg), 1);
+  // Fix 12 (v2.0.51): current-loop sensors are excluded — the raw `ma` (or `fault` string)
+  // emitted above is authoritative; emitting `lvl`/`cap` here would create the ambiguous
+  // "lvl:0 could be a real 0 PSI or a faulted/reused default" condition that motivated
+  // this change. Other sensor types still emit lvl + cap so existing dashboards keep working.
+  if (cfg.sensorInterface != SENSOR_CURRENT_LOOP) {
+    o["lvl"] = roundTo(state.currentInches, 1);
+    o["cap"] = roundTo(getMonitorHeight(cfg), 1);
+  }
   if (cfg.hasLearnedCalibration) {
     o["cv"] = cfg.calVersion;
   }
