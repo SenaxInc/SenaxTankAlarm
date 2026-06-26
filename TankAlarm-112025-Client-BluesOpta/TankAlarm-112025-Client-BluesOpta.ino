@@ -5548,10 +5548,11 @@ static float readAnalogSensor(const MonitorConfig &cfg, uint8_t idx) {
 static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   // Use explicit bounds check for current loop channel
   int16_t channel = (cfg.currentLoopChannel >= 0 && cfg.currentLoopChannel < 8) ? cfg.currentLoopChannel : 0;
+  
   // Validate that we have a valid sensor range configured
   if (cfg.sensorRangeMax <= cfg.sensorRangeMin) {
     gMonitorState[idx].currentSensorMa = 0.0f;
-    return NAN; // Invalid configuration — fault rather than report a plausible-but-fake 0
+    return NAN; // Invalid configuration — fault
   }
 
   // Resolve current-loop expansion module address
@@ -5560,30 +5561,17 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     i2cAddr = CURRENT_LOOP_I2C_ADDRESS;
   }
 
-  // Enable solid-state power gating by pulling physical terminal HIGH (transistor ON).
-  // Fix C2 (v2.0.50): PWM enable runs at the normal 100 kHz bus speed BEFORE the A0602
-  // burst window opens. This keeps high-speed transactions tightly scoped around the
-  // actual A0602 framed reads (§7.3, §8.2.1).
+  // Enable solid-state power gating if configured
   if (cfg.pwmGatingEnabled) {
-    // The I2C ACK only confirms the command was received, not that the rail came up.
-    // Retry the enable a couple of times so a transient bus NACK doesn't leave the
-    // transmitter unpowered (which would read as an under-range / sensor fault).
     bool pwmOnSuccess = false;
     for (uint8_t attempt = 0; attempt < 3 && !pwmOnSuccess; ++attempt) {
       if (attempt > 0) delay(5);
       pwmOnSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 10000, 9999, i2cAddr);
     }
-    if (pwmOnSuccess) {
-      gMonitorState[idx].lastPwmEnableOk = true;
-    } else {
+    if (!pwmOnSuccess) {
       Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
       Serial.print(cfg.pwmGatingChannel + 1);
       Serial.println(F(" via I2C"));
-      // Safety (v1.9.22): when the P1 high-side switch fails to enable, the transmitter is
-      // UNPOWERED, so reading the channel now would capture a floating/stale value (a
-      // plausible-but-false reading such as ~18mA / 43.8psi). Do NOT sample. Record the failed
-      // enable, drive P1 off defensively, and return a sensor fault so validateSensorReading()
-      // escalates instead of publishing a fabricated pressure.
       gMonitorState[idx].lastPwmEnableOk = false;
       gMonitorState[idx].currentSensorMa = 0.0f;
       gMonitorState[idx].sampleReused = true;
@@ -5591,211 +5579,37 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
       return NAN;
     }
+    gMonitorState[idx].lastPwmEnableOk = true;
+    
+    // Stabilization delay
+    delay(3000);
   }
 
-  // A0602 Blueprint transactions run in OWNED, scoped windows on the shared bus (v2.0.46):
-  //  - a SHORT byte-timeout (the A0602 doesn't clock-stretch, so fail fast into loop() recovery);
-  //  - the per-op 400 kHz clock to shrink the A0602's bus occupancy ~4x.
-  // BOTH are RESTORED before every early return and around the warmup gap, so neither ever
-  // leaks to a Notecard operation on the shared bus.
-  //
-  // Fix C2 (v2.0.50): the burst window is now SPLIT into two phases (§7.3 / §10.4):
-  //   1. CONFIGURE burst: open -> configure ADC channel + verify -> close (back to 100 kHz)
-  //   2. (warmup delay, no I/O activity, normal bus clock)
-  //   3. SAMPLE burst:    open -> priming read + N samples -> close (back to 100 kHz)
-  //   4. PWM disable runs at normal 100 kHz bus speed.
-  // gLastClBurstMicros accumulates active burst time only (§9-2): configWindowUs + sampleWindowUs.
-
-  // ---- CONFIGURE burst window ----
-  const uint32_t configStartUs = micros();
-  Wire.setTimeout(A0602_WIRE_TIMEOUT_MS);
-  Wire.setClock(A0602_PEROP_I2C_CLOCK_HZ);
-
-  // Configure the A0602 channel as a 4-20mA current ADC via the framed Blueprint protocol
-  // BEFORE the warmup (Fix C2, v2.0.50). In the power-gated model the channel loses its
-  // config when P1 is switched off, so we (re)configure here on every powered read. Putting
-  // the configure BEFORE the warmup means the AD74412R sense node is connected to the I/O
-  // pin during the entire stabilization window, so the transmitter's loop current can settle
-  // electrically while the rail is being brought up. Without this, the channel sits in
-  // high-impedance during warmup and the first priming read captures a freshly-configured
-  // sense node that hasn't completed its electrical settling.
-  // v2.0.45: the SET ACK only means "queued"; CONFIRM the channel actually entered
-  // current-ADC mode via GET_CHANNEL_FUNCTION (0x40) before trusting a reading. Retry config 3x.
-  // GRACEFUL gate: hard-fault (NAN) only if the SET is NACKed every attempt OR the expansion
-  // POSITIVELY reports a non-current-ADC function. If the A0602 firmware never answers 0x40,
-  // fall through to the read (the framed GET ADC has its own CRC/channel guard) so we never
-  // brick a sensor whose expansion firmware predates GET_CHANNEL_FUNCTION.
-  bool adcConfigOk = false;
-  bool funcReadable = false;
-  bool funcVerified = false;
-  for (uint8_t attempt = 0; attempt < 3 && !funcVerified; ++attempt) {
-    if (attempt > 0) delay(10);
-    if (!tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr)) {
-      continue;  // SET NACK -- retry
-    }
-    adcConfigOk = true;
-    unsigned long fstart = millis();
-    while ((millis() - fstart) < 100) {
-      uint8_t fun = 0xFF;
-      if (tankalarm_getAnalogChannelFunction((uint8_t)channel, i2cAddr, fun)) {
-        funcReadable = true;
-        if (fun == TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER) { funcVerified = true; break; }
-      }
-      delay(5);
-    }
-  }
-
-  // ---- Close CONFIGURE burst window (Fix C2: restore normal bus settings BEFORE any
-  //      cleanup commands or warmup, so PWM-off in the early-return paths runs at 100 kHz
-  //      and the warmup delay doesn't sit inside the high-speed window). §8.2.2 / §9-1.
-  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
-  Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
-  const uint32_t configWindowUs = micros() - configStartUs;
-
-  // Early-return paths (Fix C2, §9-1): preserve the FULL existing side-effect set
-  // (counter, fault reason, raw mA clear, sampleReused, PWM-off) so fleet telemetry
-  // (cl_fault / i2c_cl_err) and the dual/sensor-only recovery escalation logic continue
-  // to see the same signal as before C2.
-  if (!adcConfigOk) {
-    Serial.print(F("ERROR: A0602 current-ADC channel config NACK on ch "));
-    Serial.println(channel);
-    gCurrentLoopI2cErrors++;
-    gLastClFaultReason = CL_FAULT_CONFIG_NACK;
-    gMonitorState[idx].currentSensorMa = 0.0f;
-    gMonitorState[idx].sampleReused = true;
-    if (cfg.pwmGatingEnabled) {
-      // PWM-off at normal 100 kHz bus speed (burst window already closed above).
-      bool pwmOffOk = false;
-      for (uint8_t a = 0; a < 3 && !pwmOffOk; ++a) {
-        if (a > 0) delay(5);
-        pwmOffOk = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
-      }
-    }
-    gLastClBurstMicros = configWindowUs;  // §9-2: only the active CONFIGURE window
-    return NAN;
-  }
-  if (funcReadable && !funcVerified) {
-    // We positively read the channel function and it is NOT current-ADC: a real
-    // misconfiguration. Do not trust the reading.
-    Serial.print(F("ERROR: A0602 ch "));
-    Serial.print(channel);
-    Serial.println(F(" not in current-ADC mode after config; rejecting read"));
-    gCurrentLoopI2cErrors++;
-    gLastClFaultReason = CL_FAULT_FUNC_WRONG;
-    gMonitorState[idx].currentSensorMa = 0.0f;
-    gMonitorState[idx].sampleReused = true;
-    if (cfg.pwmGatingEnabled) {
-      bool pwmOffOk = false;
-      for (uint8_t a = 0; a < 3 && !pwmOffOk; ++a) {
-        if (a > 0) delay(5);
-        pwmOffOk = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
-      }
-    }
-    gLastClBurstMicros = configWindowUs;  // §9-2
-    return NAN;
-  }
-
-  // ---- Warmup delay (Fix C2: now AFTER configure, so the AD74412R sense node is connected
-  //      and the transmitter can drive loop current into a real sense resistor during the
-  //      entire stabilization window). No I/O activity here; bus is at normal 100 kHz so any
-  //      hypothetical interleaved transaction would be Notecard-safe — though the loop is
-  //      synchronous and nothing else can interleave anyway. §6.4 / §10.4.
-  if (cfg.pwmGatingEnabled) {
-    // Feed the watchdog across the (multi-second) warmup so several current-loop
-    // monitors read sequentially in one loop() pass can't starve the watchdog.
-    // Chunk the stabilization delay and kick between chunks.
-    uint32_t remaining = cfg.pwmGatingWarmup;
-    const uint32_t chunk = 1000; // 1s slices keep us well inside the WDT window
-    while (remaining > 0) {
-      uint32_t slice = (remaining > chunk) ? chunk : remaining;
-      delay(slice);
-      remaining -= slice;
-#ifdef TANKALARM_WATCHDOG_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-      mbedWatchdog.kick();
-  #else
-      IWatchdog.reload();
-  #endif
-#endif
-    }
-  }
-
-  // ---- SAMPLE burst window (Fix C2): re-open the 400 kHz / short-timeout window for the
-  //      priming read and the N sample reads. PWM disable runs AFTER the window closes.
-  const uint32_t sampleStartUs = micros();
-  Wire.setTimeout(A0602_WIRE_TIMEOUT_MS);
-  Wire.setClock(A0602_PEROP_I2C_CLOCK_HZ);
-
-#ifdef TANKALARM_WATCHDOG_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    mbedWatchdog.kick();
-  #else
-    IWatchdog.reload();
-  #endif
-#endif
-
-  // Inter-sample settle. The A0602 current-loop ADC needs time to deliver a fresh conversion
-  // after the channel is selected. The validated standalone gating test (P1_Transistor_Gating_Test)
-  // sampled at 300ms spacing and read the transmitter correctly; the small production default
-  // (e.g. 5ms) is too aggressive and can return a stale, constant high value that looks like a
-  // pegged reading. When gating is enabled, floor the settle to the proven cadence regardless of
-  // the configured pwmGatingSampleDelay.
-  const uint32_t sampleSettleMs = cfg.pwmGatingEnabled
-      ? (((uint32_t)cfg.pwmGatingSampleDelay > (uint32_t)CURRENT_LOOP_GATED_SETTLE_MS)
-            ? (uint32_t)cfg.pwmGatingSampleDelay : (uint32_t)CURRENT_LOOP_GATED_SETTLE_MS)
-      : 5UL;
-
-  // Priming read (gated sensors only): take one framed conversion and discard it, then settle,
-  // so the averaged samples below reflect the freshly-powered+configured transmitter rather than
-  // a stale pre-warmup ADC value. This mirrors the proven P1_Transistor_Gating_Test sequence.
-  if (cfg.pwmGatingEnabled) {
-    (void)tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
-    delay(sampleSettleMs);
-#ifdef TANKALARM_WATCHDOG_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    mbedWatchdog.kick();
-  #else
-    IWatchdog.reload();
-  #endif
-#endif
-  }
-
-  // BugFix v1.6.2 (M-1): Multi-sample averaging for current-loop sensors.
-  // I2C reads are slower than ADC, so we use 4 samples (vs 8 for analog).
-  const uint8_t numSamples = 4;
+  const uint8_t numSamples = 5;
   float total = 0.0f;
   uint8_t validSamples = 0;
+  
   for (uint8_t s = 0; s < numSamples; ++s) {
-    float sample = tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
+    float sample = readCurrentLoopMilliamps(channel);
     if (sample >= 0.0f) {
       total += sample;
       validSamples++;
     }
     if (s < numSamples - 1) {
-      delay(sampleSettleMs);
+      delay(300);
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
-      // Settle can total ~1s across samples when gating is on; kick the WDT.
       if (cfg.pwmGatingEnabled) {
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
         mbedWatchdog.kick();
-  #else
+#else
         IWatchdog.reload();
-  #endif
+#endif
       }
 #endif
     }
   }
 
-  // ---- Close SAMPLE burst window (Fix C2: restore normal bus settings BEFORE the PWM-off
-  //      command so the high-speed / short-timeout window is tightly scoped). §8.2.1.
-  Wire.setClock(I2C_NORMAL_CLOCK_HZ);
-  Wire.setTimeout(I2C_WIRE_TIMEOUT_MS);
-  const uint32_t sampleWindowUs = micros() - sampleStartUs;
-
-  // Turn off sensor power gating once readings complete to achieve low-power gating (transistor OFF).
-  // v2.0.45: retry OFF (mirrors the ON retry) so a transient bus NACK can't leave the transmitter
-  // powered, which would distort the solar power budget and future observations.
-  // Fix C2 (v2.0.50): PWM-off now runs at normal 100 kHz bus speed (burst window closed above).
+  // Disable PWM power gating once readings complete
   if (cfg.pwmGatingEnabled) {
     bool pwmOffSuccess = false;
     for (uint8_t attempt = 0; attempt < 3 && !pwmOffSuccess; ++attempt) {
@@ -5810,18 +5624,9 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // Fix C2 (§9-2): record the active A0602 burst time (CONFIGURE + SAMPLE windows only);
-  // the warmup gap between them is EXCLUDED so historical cl_dur_us comparisons stay meaningful.
-  gLastClBurstMicros = configWindowUs + sampleWindowUs;
-
+  // Validate we got at least one good reading
   float milliamps;
   if (validSamples == 0) {
-    // Total acquisition failure (every I2C sample failed). Returning the previous level here
-    // would mask a disconnected/unpowered transmitter as healthy data. Clear the raw mA so
-    // no stale value is transmitted, and return NAN so validateSensorReading() escalates a
-    // sensor-fault after the failure threshold (sampleMonitors() still reuses the last level
-    // for display continuity). v2.0.45: count framed-path total failures into the fleet
-    // diagnostic so a silently-failing A0602 is visible in i2c_cl_err / i2c-error-rate.
     gCurrentLoopI2cErrors++;
     gLastClFaultReason = CL_FAULT_READ_FAIL;
     gMonitorState[idx].currentSensorMa = 0.0f;
@@ -5830,17 +5635,10 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   }
   milliamps = total / validSamples;
 
-  // Store raw mA reading for telemetry
   gMonitorState[idx].currentSensorMa = milliamps;
 
-  // Over-range fault (v2.0.46): a 4-20mA transmitter cannot legitimately exceed 20mA full scale.
-  // A value above CURRENT_LOOP_OVER_RANGE_MA (e.g. a raw 0xFFFF read scaling to 25mA, or a near-
-  // full-scale garbage frame that passed CRC) is an I2C/loop fault. Reject it rather than let
-  // linearMap() extrapolate a fabricated level/pressure. Clear the raw mA so it isn't transmitted.
+  // Over-range and Fault guards
   if (milliamps > CURRENT_LOOP_OVER_RANGE_MA) {
-    Serial.print(F("ERROR: A0602 over-range read "));
-    Serial.print(milliamps, 2);
-    Serial.println(F("mA (>full-scale) — rejecting as fault"));
     gCurrentLoopI2cErrors++;
     gCurrentLoopOverRange++;
     gLastClFaultReason = CL_FAULT_OVER_RANGE;
@@ -5849,27 +5647,13 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     return NAN;
   }
 
-  // Live-zero fault: a 4-20mA loop reading below ~3.6mA means the loop is open/broken or the
-  // transmitter is unpowered. Return NAN so validateSensorReading() escalates a sensor-fault
-  // instead of reporting a plausible-but-wrong level. This guard sits BEFORE the calibration
-  // branch so it protects both the learned-calibration and theoretical paths (a learned fit
-  // would otherwise resolve 0mA to calOffset, a healthy-looking static depth).
-  //
-  // This applies to gas pressure monitors too: a healthy 4-20mA transmitter sitting at true
-  // zero pressure still sources 4mA (the live zero), so an under-range reading is ALWAYS a
-  // loop fault, never a legitimate 0 PSI. Without this gate an unpowered/open gas loop would
-  // read ~0mA and be reported as a real 0.0 reading instead of a sensor fault.
   if (milliamps < CURRENT_LOOP_FAULT_MA) {
     return NAN;
   }
 
-  // Valid in-range A0602 reading (v2.0.46 observability): count success + clear the fault code.
   gCurrentLoopReadsOk++;
   gLastClFaultReason = CL_FAULT_NONE;
 
-  // Server-pushed learned calibration overrides the theoretical conversion so the client's
-  // level (and alarm thresholds) match the server's calibrated display. Skips gas, which
-  // reports raw pressure rather than a fluid level.
   if (cfg.hasLearnedCalibration && cfg.objectType != OBJECT_GAS) {
     float level = cfg.calSlope * milliamps + cfg.calOffset;
     if (cfg.calTempCoef != 0.0f) {
@@ -5879,42 +5663,23 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     return level;
   }
 
-  // Handle different 4-20mA sensor types using native sensor range
   float levelInches;
   if (cfg.currentLoopType == CURRENT_LOOP_ULTRASONIC) {
-    // Ultrasonic sensor mounted on TOP of tank (e.g., Siemens Sitrans LU240)
-    // 4mA = minimum distance (sensorRangeMin), 20mA = maximum distance (sensorRangeMax)
-    // sensorMountHeight = distance from sensor to tank bottom when empty
-
     float distanceNative = linearMap(milliamps, 4.0f, 20.0f,
                                      cfg.sensorRangeMin, cfg.sensorRangeMax);
     float distanceInches = distanceNative * getDistanceConversionFactorByName(cfg.sensorRangeUnit);
-
-    // Calculate liquid level: tank height - distance from sensor to surface
     levelInches = cfg.sensorMountHeight - distanceInches;
     if (levelInches < 0.0f) levelInches = 0.0f;
   } else {
-    // Pressure sensor mounted near BOTTOM of tank (e.g., Dwyer 626-06-CB-P1-E5-S1)
-    // 4mA = sensorRangeMin (e.g., 0 PSI), 20mA = sensorRangeMax (e.g., 5 PSI)
-    // sensorMountHeight = height of sensor above tank bottom (usually 0-2 inches)
-
     float pressure = linearMap(milliamps, 4.0f, 20.0f,
                                cfg.sensorRangeMin, cfg.sensorRangeMax);
-
-    // Gas pressure monitors: report the raw pressure in its native unit. No PSI->inches
-    // conversion, no mount-height add — gas pressure isn't a fluid column.
     if (cfg.objectType == OBJECT_GAS) {
       if (pressure < 0.0f) pressure = 0.0f;
       return pressure;
     }
-
-    // Liquid level: divide by fluid specific gravity so we don't assume water.
-    // inches_of_fluid = (pressure_PSI * 27.68 in_H2O/PSI) / SG
     float conversionFactor = getPressureConversionFactorByName(cfg.sensorRangeUnit);
     float sg = getEffectiveSpecificGravity(cfg);
     float liquidAboveSensor = (pressure * conversionFactor) / sg;
-
-    // Total height from tank bottom = liquid above sensor + sensor mount height
     levelInches = liquidAboveSensor + cfg.sensorMountHeight;
     if (levelInches < 0.0f) levelInches = 0.0f;
   }
