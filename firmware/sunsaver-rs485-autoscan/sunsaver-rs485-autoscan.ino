@@ -35,22 +35,22 @@ struct QueryProfile {
 
 static const SerialProfile kSerialProfiles[] = {
   { 9600,  SERIAL_8N2, "9600 8N2" },
-  { 9600,  SERIAL_8N1, "9600 8N1" },
-  { 9600,  SERIAL_8E1, "9600 8E1" },
-  { 19200, SERIAL_8N2, "19200 8N2" }
+  { 9600,  SERIAL_8N1, "9600 8N1" }
 };
 
 static const DelayProfile kDelayProfiles[] = {
-  { 0, 0, "dly0/0" },
-  { 50, 50, "dly50/50" }
+  { 0,    1200, "pre0/post1200" },
+  { 1000, 1200, "pre1000/post1200" },
+  { 2000, 1200, "pre2000/post1200" },
+  { 3500, 1200, "pre3500/post1200" },
+  { 4000, 1200, "pre4000/post1200" }
 };
 
-static const uint8_t kSlaveIds[] = { 1, 2 };
+static const uint8_t kSlaveIds[] = { 1 };
 
 static const QueryProfile kQueryProfiles[] = {
-  { 0x04, 0x0008, 1, "FC04 reg0008 (filtered batt V)" },
-  { 0x03, 0x0012, 1, "FC03 reg0012 (batt V)" },
-  { 0x03, 0x0025, 1, "FC03 reg0025 (DIP bitfield)" }
+  { 0x03, 0x0008, 1, "FC03 reg0008 (filtered batt V)" },
+  { 0x04, 0x0008, 1, "FC04 reg0008 (filtered batt V)" }
 };
 
 struct ScanStats {

@@ -43,6 +43,8 @@ static const uint32_t BAUD_RATE = 9600;
 static const uint16_t MODBUS_TIMEOUT_MS = 500;
 static const uint32_t POLL_INTERVAL_MS  = 3000;
 
+static RS485Class gOptaRS485(Serial2, PB_10, PB_14, PB_13);
+
 static bool gModbusReady = false;
 static uint32_t gPollCount = 0;
 static uint32_t gOkCount = 0;
@@ -158,7 +160,7 @@ void setup() {
   // SunSaver MPPT uses 9600 8N2 (2 stop bits) per Morningstar spec.
   // ArduinoModbus default is SERIAL_8N1 which causes silent framing errors.
   Serial.println(F("Calling ModbusRTUClient.begin(9600, SERIAL_8N2)..."));
-  if (!ModbusRTUClient.begin(BAUD_RATE, SERIAL_8N2)) {
+  if (!ModbusRTUClient.begin(gOptaRS485, BAUD_RATE, SERIAL_8N2)) {
     Serial.println(F("FATAL: ModbusRTUClient.begin() failed"));
     gModbusReady = false;
   } else {
@@ -168,7 +170,7 @@ void setup() {
     // SunSaver silently rejects it. See Arduino forum thread #1421875 post #18.
     // 1042 us = 10/9600 * 1e6 (8N1); 1146 us = 11/9600 * 1e6 (8N2).
     // Use 1200 us as a safe upper bound covering both framings.
-    RS485.setDelays(0, 1200);
+    gOptaRS485.setDelays(0, 1200);
     Serial.println(F("ModbusRTUClient.begin() OK (8N2, postDelay=1200us)"));
     gModbusReady = true;
   }

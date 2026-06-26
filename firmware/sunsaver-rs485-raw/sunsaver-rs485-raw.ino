@@ -167,10 +167,6 @@ void setup() {
   Serial.println(F("==============================================="));
 }
 
-static const uint8_t  kSlaveIds[]   = { 1, 2 };
-static const uint8_t  kSlaveCount   = sizeof(kSlaveIds) / sizeof(kSlaveIds[0]);
-static const uint8_t  kFnCodes[]    = { 0x03, 0x04 };  // Read Holding / Read Input
-static const uint8_t  kFnCount      = sizeof(kFnCodes) / sizeof(kFnCodes[0]);
 static const uint16_t kSerialCfgs[] = { SERIAL_8N2, SERIAL_8N1 };
 static const char *   kSerialNames[]= { "8N2",       "8N1"       };
 static const uint8_t  kCfgCount     = sizeof(kSerialCfgs) / sizeof(kSerialCfgs[0]);

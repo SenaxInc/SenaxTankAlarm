@@ -202,3 +202,65 @@ Sleeping 10 seconds before next measurement...
 The baseline mA reading was verified at **4.2578 mA** (representing approx. 4mA), proving that the sensor, the A0602 module, and the Opta's gating transistors are working perfectly.
 
 We then successfully integrated this simplified gating-and-sampling routine into the production master client code.
+
+---
+
+## 5. SunSaver RS-485 Modbus RTU Isolation Testing
+
+To diagnose and isolate reports of SunSaver communication errors on the EIA-485 segment, we carried out raw and protocol-level diagnostic isolation tests.
+
+### 5.1. Verified Diagnostic Settings & Polarity Cross-over
+Morningstar utilizes an older terminal logic convention compared to modern adapters:
+* **Terminal A:** Inverting/Negative line (`DATA-`, MARK=low)
+* **Terminal B:** Non-Inverting/Positive line (`DATA+`, MARK=high)
+
+On the Arduino Opta RS-485 physical port, the A/B terminals map to modern conventions where Opta A is `DATA+` and Opta B is `DATA-`. Therefore, the physical link wires **must be crossed A $\longleftrightarrow$ B**:
+* **Opta A (DATA+)** $\longleftrightarrow$ **MRC-1 Terminal B (DATA+)**
+* **Opta B (DATA-)** $\longleftrightarrow$ **MRC-1 Terminal A (DATA-)**
+* **Opta GND** $\longleftrightarrow$ **MRC-1 Terminal G**
+
+### 5.2. Morningstar MRC-1 LED Diagnostics
+* **LED Turned OFF:** No 12V MeterBus power is reaching the adapter. Check the RJ-11 MeterBus cable connection.
+* **Steady Green:** Power is OK, but the bus is completely idle. No data frames are reaching the transceiver.
+* **Steady Amber/Orange:** A/B line polarity is physically reversed. Swap wires between Opta A and B terminals.
+* **Flickering Green and Red (Amber Flicker):** Bidirectional communication is fully functional.
+
+### 5.3. Historical Modbus RTU Settings and Register Map
+Historical bring-up notes from 2026-04-22 record one working path for this Opta + MRC-1 + SunSaver setup:
+* Baud/framing: `9600`, `SERIAL_8N2` (8N1 also responded historically, but 8N2 matches the SunSaver spec).
+* Slave ID: `1`.
+* Function code: FC04 (`Read Input Registers`).
+* Turnaround: `RS485.setDelays(0, 1200)` plus the forum TX bracket `noReceive()` -> `beginTransmission()` -> `write()` -> `flush()` -> `delay(1)` -> `endTransmission()` -> `receive()`.
+* Live filtered registers: `0x0008` battery voltage, `0x0009` array voltage, `0x000A` load voltage, `0x000B` charge current, `0x000C` load current.
+* Scaling: voltage raw value * `96.667 / 32768`, current raw value * `79.16 / 32768`.
+
+The historical production capture was `SolarPoll comm=OK err=0 bv=12.23 av=0.00 ic=0.03 lc=0.00`. The historical raw diagnostic also captured `0x0008 = 0x1072`, which scales to approximately `12.4V`. Those values are historical evidence only; the 2026-06-26 rerun has not reproduced a live SunSaver voltage reading yet.
+
+### 5.4. 2026-06-26 Rerun Status
+The 2026-06-26 current-loop validation succeeded, but SunSaver RS-485 validation remains unresolved. Tests performed during this session:
+
+* Rebuilt and reran the historical-style `firmware/sunsaver-modbus-test/sunsaver-modbus-test.ino` using `9600`, `SERIAL_8N2`, slave `1`, holding-register reads, and `RS485.setDelays(0, 1200)`. Result: `Connection timed out`, no battery voltage.
+* Rebuilt and reran production Client firmware with forced solar polling and structured `SolarPoll` serial output enabled. Result: repeated `comm=FAIL`, incrementing error counters, `bv=0.00`.
+* Added explicit Opta RS-485 binding in `TankAlarm_Solar.cpp` using `Serial2`, `PB_10`, `PB_14`, and `PB_13`. Result: compiled and uploaded, but production still reported `comm=FAIL`.
+* Corrected the focused autoscan to include the actual forum delay fix (`postDelay=1200`) and T3.5-scale pre-delay candidates. One complete 20-step cycle produced `valid_response=0`, `valid_exception=0`, `artifact_00=0`, `no_valid_frame=20`; every captured tuple returned `0 bytes`.
+* Restored the raw diagnostic loop to match the historical `977ca70` behavior: slave `1`, FC04 only, full probe table, alternating `8N2`/`8N1`, and the forum TX bracket. The signed upload completed. After COM4 re-enumerated, the raw byte dump showed `0 bytes` for the live register block `0x0008` through `0x000C` under both `8N1` and `8N2`.
+* Added and signed-uploaded `firmware/sunsaver-rs485-direct-serial2/sunsaver-rs485-direct-serial2.ino`, which bypasses ArduinoRS485/ArduinoModbus and drives `Serial2` plus Opta `PB_14`/`PB_13` direction pins directly. Serial capture is pending because the Opta USB serial device had not re-enumerated immediately after DFU at the time this note was updated.
+* Captured current Arduino environment versions for comparison: `arduino:mbed_opta` core `4.5.0`, `ArduinoRS485` library `1.1.1`, and `ArduinoModbus` library `1.0.9`.
+
+### 5.5. Current Conclusion
+No 2026-06-26 test has verified a live SunSaver voltage reading. The previously documented `SolarPoll ... comm=OK ... bv=13.25` sample was not produced in this session and should not be treated as evidence.
+
+The remaining investigation is software/history focused, not a hardware-blame conclusion:
+* Compare the installed ArduinoRS485/ArduinoModbus/core versions and generated transmit behavior against the 2026-04-22 working environment before changing production logic further.
+* Re-check whether the currently installed user libraries are shadowing bundled libraries or changed behavior since the historical capture.
+* Capture the direct Serial2 diagnostic after COM4 re-enumerates. If it receives bytes, the fault is in the ArduinoRS485 object/sequencing path; if it also receives `0 bytes`, the silence is below ArduinoRS485/ArduinoModbus.
+* If an older ArduinoRS485/ArduinoModbus/core combination reproduces the historical FC04 response, pin that environment or port only the necessary sequencing behavior into `TankAlarm_Solar.cpp`.
+
+The production Client currently has the solar test overrides enabled for troubleshooting:
+
+```cpp
+#define SOLAR_HW_TEST_SERIAL
+#define SOLAR_HW_TEST_FORCE_SOLAR_CONFIG
+```
+
+These should be commented out before the final production flash unless the next validation run intentionally needs forced SunSaver polling.

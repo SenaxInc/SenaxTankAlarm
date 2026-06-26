@@ -16,6 +16,13 @@
 #include <ArduinoRS485.h>
 #include <ArduinoModbus.h>
 
+#if defined(ARDUINO_OPTA)
+static RS485Class sSolarRS485(Serial2, PB_10, PB_14, PB_13);
+#define TANKALARM_SOLAR_RS485 sSolarRS485
+#else
+#define TANKALARM_SOLAR_RS485 RS485
+#endif
+
 // Static message buffers for descriptions (avoid dynamic allocation)
 static char _faultDescBuffer[128];
 static char _alarmDescBuffer[128];
@@ -53,7 +60,7 @@ static void classifyModbusErrorTag(const char *errText) {
     strlcpy(sSolarLastErrorTag, "?", sizeof(sSolarLastErrorTag));
     return;
   }
-  if (strstr(errText, "Timeout") || strstr(errText, "timeout")) {
+  if (strstr(errText, "Timeout") || strstr(errText, "timeout") || strstr(errText, "timed") || strstr(errText, "timed out")) {
     strlcpy(sSolarLastErrorTag, "to", sizeof(sSolarLastErrorTag));
   } else if (strstr(errText, "CRC") || strstr(errText, "crc")) {
     strlcpy(sSolarLastErrorTag, "crc", sizeof(sSolarLastErrorTag));
@@ -82,8 +89,8 @@ static void incrementSolarErrorBucket() {
 // error) but NOT _LINK (no flush on timeout), so a late/garbage reply can linger and
 // corrupt the next request. Cheap belt-and-suspenders.
 static void drainRS485Rx() {
-  while (RS485.available()) {
-    (void)RS485.read();
+  while (TANKALARM_SOLAR_RS485.available()) {
+    (void)TANKALARM_SOLAR_RS485.read();
   }
 }
 
@@ -269,7 +276,7 @@ bool SolarManager::begin(const SolarConfig& config) {
   // Modbus RTU spec requires 8N2 when no parity is used; SunSaver MPPT
   // (and Morningstar MRC-1 adapter) expect 8N2. ArduinoModbus default is
   // 8N1, which often appears to work but produces intermittent CRC errors.
-  if (!ModbusRTUClient.begin(_config.modbusBaudRate, SERIAL_8N2)) {
+  if (!ModbusRTUClient.begin(TANKALARM_SOLAR_RS485, _config.modbusBaudRate, SERIAL_8N2)) {
     Serial.println(F("Solar: Failed to initialize Modbus RTU Client"));
     _initialized = false;
     return false;
@@ -296,10 +303,15 @@ bool SolarManager::begin(const SolarConfig& config) {
   // response. One 11-bit character time (8N2) = 11,000,000 / baud microseconds, clamped
   // to a safe floor (150 us protects 115200 from underrunning the DE FET) and ceiling
   // (1500 us is more than enough for the slowest supported baud).
-  uint32_t postDelayUs = 11000000UL / _config.modbusBaudRate;
+  //
+  // Note on truncation margin: we add 50 microseconds of safety margin to the raw quotient
+  // (11,000,000 / 9600 = 1145 us) to ensure integer truncation doesn't drop the DE pin
+  // 0.83 microseconds BEFORE the stop bits have fully completed transmitting. This scales
+  // 9600 to 1195 us (matching the stable 1200 us baseline).
+  uint32_t postDelayUs = (11000000UL / _config.modbusBaudRate) + 50UL;
   if (postDelayUs < 150)  postDelayUs = 150;
   if (postDelayUs > 1500) postDelayUs = 1500;
-  RS485.setDelays(0, postDelayUs);
+  TANKALARM_SOLAR_RS485.setDelays(0, postDelayUs);
   
   Serial.print(F("Solar: Modbus RTU initialized at "));
   Serial.print(_config.modbusBaudRate);
