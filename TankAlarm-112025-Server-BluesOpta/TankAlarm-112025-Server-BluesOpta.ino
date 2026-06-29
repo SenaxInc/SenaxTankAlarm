@@ -11129,6 +11129,13 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
   gBackupInProgress = true;
   setFtpBackupStage("test-start");
   ftpsTraceReset();
+  // Kick the watchdog up front — the FTP test can block for many seconds at
+  // each network step (connect/login/TLS handshake/STOR/RETR), and without
+  // periodic kicks the hardware watchdog (WATCHDOG_TIMEOUT_SECONDS=30) will
+  // reset the device mid-test. A reset would regenerate the session token and
+  // bounce the browser to /login with no feedback. Mirrors the kick cadence
+  // used by performFtpBackupDetailed / performFtpRestoreDetailed.
+  serviceTransferWatchdog();
   // Free LWIP LISTEN PCB so FTPS data sockets have headroom (Opta pool=4).
   // Mirrors what /api/ftp-backup does for the same reason.
   gWebServer.end();
@@ -11152,12 +11159,14 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
 
   // ---- Step 1: connect + login ----
   setFtpBackupStage("test-connect");
+  serviceTransferWatchdog();
   FtpSession session;
   memset(&session, 0, sizeof(session));
   unsigned long t = millis();
   bool connected = useFtps
       ? ftpsConnectAndLogin(errBuf, sizeof(errBuf))
       : ftpConnectAndLogin(session, errBuf, sizeof(errBuf));
+  serviceTransferWatchdog();
   {
     JsonObject st = steps.add<JsonObject>();
     st["step"] = useFtps ? "ftps-connect" : "ftp-connect";
@@ -11170,11 +11179,13 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
   bool stored = false;
   if (connected) {
     setFtpBackupStage("test-upload");
+    serviceTransferWatchdog();
     errBuf[0] = '\0';
     t = millis();
     stored = useFtps
         ? ftpsStoreBuffer(remotePath, (const uint8_t *)payload, (size_t)payloadLen, errBuf, sizeof(errBuf))
         : ftpStoreBuffer(session, remotePath, (const uint8_t *)payload, (size_t)payloadLen, errBuf, sizeof(errBuf));
+    serviceTransferWatchdog();
     JsonObject st = steps.add<JsonObject>();
     st["step"] = "upload";
     st["ok"] = stored;
@@ -11189,11 +11200,13 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
   size_t readBackLen = 0;
   if (stored) {
     setFtpBackupStage("test-download");
+    serviceTransferWatchdog();
     errBuf[0] = '\0';
     t = millis();
     retrieved = useFtps
         ? ftpsRetrieveBuffer(remotePath, readBack, sizeof(readBack), readBackLen, errBuf, sizeof(errBuf))
         : ftpRetrieveBuffer(session, remotePath, readBack, sizeof(readBack), readBackLen, errBuf, sizeof(errBuf));
+    serviceTransferWatchdog();
     JsonObject st = steps.add<JsonObject>();
     st["step"] = "download";
     st["ok"] = retrieved;
@@ -11219,11 +11232,13 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
   }
 
   // ---- Always close the session ----
+  serviceTransferWatchdog();
   if (useFtps) {
     ftpsQuit();
   } else if (connected) {
     ftpQuit(session);
   }
+  serviceTransferWatchdog();
 
   gWebServer.begin();
   gBackupInProgress = false;
