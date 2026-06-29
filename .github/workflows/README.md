@@ -11,6 +11,7 @@ This directory contains automated CI/CD workflows for the SenaxTankAlarm project
 | Workflow | File | Trigger | What it does |
 |----------|------|---------|--------------|
 | Arduino CI & Firmware Build (112025) | `arduino-ci-112025.yml` | Push/PR on 112025 sketch paths; manual | Compile-checks the Opta sketches (opens an issue on failure); on push, builds `.bin` files and commits them to `firmware/112025/` |
+| Auto-tag on FIRMWARE_VERSION bump | `auto-tag-on-version-bump.yml` | Push to master/main touching `TankAlarm_Common.h`; manual | If the new `FIRMWARE_VERSION` is not yet tagged, creates `v<version>` annotated tag and dispatches the release workflow on that ref |
 | Release Firmware (112025) | `release-firmware-112025.yml` | `v*` tag; manual | Builds Client + Server + Viewer `.bin` and publishes a GitHub Release |
 | Update Website Screenshots | `update-screenshots.yml` | Weekly schedule; push on Server/Viewer `.ino`; manual | Renders the embedded web UI and commits PNG screenshots |
 | Package Common Library | `package-tankalarm-common.yml` | Push on `TankAlarm-112025-Common/` | Zips the Common library and commits the archive |
