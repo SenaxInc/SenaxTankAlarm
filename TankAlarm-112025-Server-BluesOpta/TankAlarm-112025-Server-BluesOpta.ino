@@ -842,7 +842,7 @@ static FtpArchiveCache gFtpArchiveCache = {0, 0, false, {}, 0};
 // Forward declarations for history functions
 static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh);
 static void clearAlarmEvent(const char *clientUid, uint8_t sensorIndex);
-static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage);
+static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch);
 // Daily summary warm tier functions
 static void rollupDailySummaries();
 static bool saveDailySummaryFile(uint16_t year, uint8_t month);
@@ -7296,8 +7296,22 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
   return nullptr;
 }
 
-// Record a telemetry snapshot (called hourly or on significant change)
-static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage) {
+// Record a telemetry snapshot for the per-sensor history ring buffer.
+//
+// `eventEpoch` is the caller's best estimate of when the *sensor reading was
+// actually acquired* (NOT when the note was received). For telemetry/alarm
+// notes this is the client's top-level `t`; for daily notes it is the per-sensor
+// nested `t["t"]` added in v2.0.56. Using sensor time as the chart X-axis keeps
+// trends accurate when Notecard queues drain after a network gap, when daily
+// reports package a reading taken 30+ minutes earlier, or when a stuck/reused
+// sample causes the same value to be republished — those points correctly
+// cluster at the original acquisition time instead of marching forward with
+// every retransmission.
+//
+// Fallback chain: sane `eventEpoch` -> server's `currentEpoch()` -> drop note
+// (refuse to record with timestamp=0, which the chart's time-window cutoff
+// would silently filter out anyway).
+static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch) {
   SensorHourlyHistory *hist = findOrCreateSensorHistory(clientUid, sensorIndex);
   if (!hist) {
     static unsigned long lastHistFullWarn = 0;
@@ -7319,25 +7333,43 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
   }
   hist->heightInches = heightInches;
   
-  // Get current time. If server clock has not synced yet (typically the first few
-  // minutes after boot, before Notecard time arrives) we cannot store a meaningful
-  // timestamp — recording snapshots with timestamp=0 would later get filtered out
-  // by the chart's time-window cutoff once the clock IS synced, silently dropping
-  // those early data points. Refuse to record until time is available.
-  double now = currentEpoch();
-  if (now <= 0.0) {
+  // Resolve the snapshot timestamp. Prefer the caller-supplied sensor acquisition
+  // epoch when it is in a sane window (2020-01-01 .. server-now + 24h); otherwise
+  // fall back to server-now; otherwise refuse to record.
+  const double MIN_VALID_EPOCH = 1577836800.0;  // 2020-01-01 UTC
+  double serverNow = currentEpoch();
+  double maxAllowed = (serverNow > 0.0) ? (serverNow + 86400.0) : 0.0;  // tolerate up to 24h client clock skew
+  double snapEpoch = 0.0;
+  if (eventEpoch >= MIN_VALID_EPOCH && (maxAllowed <= 0.0 || eventEpoch <= maxAllowed)) {
+    snapEpoch = eventEpoch;
+  } else if (serverNow > 0.0) {
+    snapEpoch = serverNow;
+  }
+  if (snapEpoch <= 0.0) {
     static unsigned long lastNoTimeWarn = 0;
     if (millis() - lastNoTimeWarn > 300000UL) {
       lastNoTimeWarn = millis();
-      Serial.println(F("WARNING: Snapshot dropped — server clock not synced yet"));
-      addServerSerialLog("Snapshot dropped — server clock not synced", "warn", "history");
+      Serial.println(F("WARNING: Snapshot dropped — no valid timestamp (clock unsynced and no event epoch)"));
+      addServerSerialLog("Snapshot dropped — no valid timestamp", "warn", "history");
     }
     return;
   }
   
+  // Deduplicate: if the most recent snapshot for this sensor has the same
+  // timestamp AND the same level, the client is republishing a stuck/reused
+  // reading. Skip — adding it would waste ring-buffer slots and stack points
+  // at the same chart X coordinate without conveying any new information.
+  if (hist->snapshotCount > 0) {
+    uint16_t lastIdx = (hist->writeIndex - 1 + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
+    const TelemetrySnapshot &last = hist->snapshots[lastIdx];
+    if (last.timestamp == snapEpoch && fabsf(last.level - level) < 0.01f) {
+      return;
+    }
+  }
+  
   // Add snapshot to ring buffer
   TelemetrySnapshot &snap = hist->snapshots[hist->writeIndex];
-  snap.timestamp = now;
+  snap.timestamp = snapEpoch;
   snap.level = level;
   snap.voltage = voltage;
   
@@ -11990,7 +12022,12 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
     vinVoltage = meta->vinVoltage;
   }
   
-  recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, vinVoltage);
+  // Record telemetry snapshot for historical charting. Use the client's
+  // acquisition epoch (top-level `t`) so the chart X-axis reflects when the
+  // reading was actually taken, not when the server happened to receive the note.
+  double telemetryEpoch = doc["t"] | 0.0;
+  if (telemetryEpoch <= 0.0) telemetryEpoch = epoch;
+  recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, vinVoltage, telemetryEpoch);
 }
 
 static void handleAlarm(JsonDocument &doc, double epoch) {
@@ -12174,8 +12211,12 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     // current level. Falls back to 48 in only if the note predates self-describing payloads.
     float alarmCap = doc["cap"] | 0.0f;
     if (alarmCap <= 0.0f) alarmCap = 48.0f;
+    // Acquisition time from the alarm note's top-level `t`, falling back to the
+    // processNotefile epoch if the note predates the acquisition-time fix.
+    double alarmEventEpoch = doc["t"] | 0.0;
+    if (alarmEventEpoch <= 0.0) alarmEventEpoch = epoch;
     recordTelemetrySnapshot(clientUid, alarmSiteName, sensorIndex,
-                            alarmCap, level, alarmVin);
+                            alarmCap, level, alarmVin, alarmEventEpoch);
   }
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   gSensorRegistryDirty = true;
@@ -12574,8 +12615,13 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;
+      // Per-sensor acquisition epoch (v2.0.56+). Falls back to the daily report's
+      // top-level epoch (transmission time) and then to server-now in the
+      // recordTelemetrySnapshot fallback chain.
+      double dailySensorEpoch = t["t"] | 0.0;
+      if (dailySensorEpoch <= 0.0) dailySensorEpoch = epoch;
       recordTelemetrySnapshot(clientUid, siteName, sensorIndex,
-                              dailyCap, newLevel, vinVoltage);
+                              dailyCap, newLevel, vinVoltage, dailySensorEpoch);
     }
   }
 
