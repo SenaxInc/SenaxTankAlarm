@@ -871,6 +871,7 @@ struct FtpResult;
 static bool ftpSendCommand(FtpSession &session, const char *command, int &code, char *message, size_t maxLen);
 static bool ftpConnectAndLogin(FtpSession &session, char *error, size_t errorSize);
 static bool ftpEnterPassive(FtpSession &session, IPAddress &dataHost, uint16_t &dataPort, char *error, size_t errorSize);
+static bool ftpMakeDir(FtpSession &session, const char *dir, char *error, size_t errorSize);
 static bool ftpStoreBuffer(FtpSession &session, const char *remoteFile, const uint8_t *data, size_t len, char *error, size_t errorSize);
 static bool ftpRetrieveBuffer(FtpSession &session, const char *remoteFile, char *out, size_t outMax, size_t &outLen, char *error, size_t errorSize);
 static void ftpQuit(FtpSession &session);
@@ -5743,6 +5744,27 @@ static void buildRemotePath(char *out, size_t outLen, const char *fileName) {
   snprintf(out, outLen, "%s/%s", baseDir, fileName);
 }
 
+// Plain-FTP MKD. Returns true on 257 (created). 550 typically means
+// "directory already exists" — caller should treat that as a soft failure
+// and continue, matching the FTPS path's gFtpsClient.mkd() semantics.
+static bool ftpMakeDir(FtpSession &session, const char *dir, char *error, size_t errorSize) {
+  if (!dir || dir[0] == '\0') {
+    snprintf(error, errorSize, "MKD: empty dir");
+    return false;
+  }
+  char cmd[160];
+  snprintf(cmd, sizeof(cmd), "MKD %s", dir);
+  int code = 0;
+  char msg[128];
+  if (!ftpSendCommand(session, cmd, code, msg, sizeof(msg))) {
+    snprintf(error, errorSize, "MKD no response");
+    return false;
+  }
+  if (code == 257) return true;
+  snprintf(error, errorSize, "MKD %d %.80s", code, msg);
+  return false;
+}
+
 static bool ftpStoreBuffer(FtpSession &session, const char *remoteFile, const uint8_t *data, size_t len, char *error, size_t errorSize) {
   if (!data || len == 0) {
     snprintf(error, errorSize, "No data to upload");
@@ -6823,10 +6845,18 @@ static FtpResult performFtpBackupDetailed() {
 
     // Create the per-server directory if it does not already exist.
     // Best-effort: a failure here is logged but does not abort the backup.
+    // For plain FTP we issue MKD on the control socket; for FTPS we delegate
+    // to the FTPS client. In both cases 550 (already exists) is treated as
+    // a soft warning by the caller, so subsequent STORs into the dir succeed.
+    char remoteBaseDir[128];
+    buildRemoteBaseDir(remoteBaseDir, sizeof(remoteBaseDir));
     if (useFtps) {
-      char remoteBaseDir[128];
-      buildRemoteBaseDir(remoteBaseDir, sizeof(remoteBaseDir));
       if (!gFtpsClient.mkd(remoteBaseDir, err, sizeof(err))) {
+        Serial.print(F("FTP backup: MKD warning (non-fatal): "));
+        Serial.println(err);
+      }
+    } else {
+      if (!ftpMakeDir(session, remoteBaseDir, err, sizeof(err))) {
         Serial.print(F("FTP backup: MKD warning (non-fatal): "));
         Serial.println(err);
       }
@@ -11126,16 +11156,10 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
   Serial.println(F("/api/ftp-test: start"));
   const unsigned long testT0 = millis();
   gFtpBackupCriticalPathActive = true;
-  gBackupInProgress = true;
   setFtpBackupStage("test-start");
   ftpsTraceReset();
-  // Kick the watchdog up front — the FTP test can block for many seconds at
-  // each network step (connect/login/TLS handshake/STOR/RETR), and without
-  // periodic kicks the hardware watchdog (WATCHDOG_TIMEOUT_SECONDS=30) will
-  // reset the device mid-test. A reset would regenerate the session token and
-  // bounce the browser to /login with no feedback. Mirrors the kick cadence
-  // used by performFtpBackupDetailed / performFtpRestoreDetailed.
-  serviceTransferWatchdog();
+  setFtpBackupStage("test-running");
+  gBackupInProgress = true;
   // Free LWIP LISTEN PCB so FTPS data sockets have headroom (Opta pool=4).
   // Mirrors what /api/ftp-backup does for the same reason.
   gWebServer.end();
@@ -11160,8 +11184,12 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
   // ---- Step 1: connect + login ----
   setFtpBackupStage("test-connect");
   serviceTransferWatchdog();
+  // NOTE: do NOT memset(&session, 0, sizeof(session)) — FtpSession::ctrl is
+  // an EthernetClient whose AClient base holds a std::shared_ptr<MbedClient>.
+  // memsetting a shared_ptr is undefined behavior and corrupts its control
+  // block, which crashes connect() and resets the device. The default
+  // constructor already leaves the shared_ptr in the correct empty state.
   FtpSession session;
-  memset(&session, 0, sizeof(session));
   unsigned long t = millis();
   bool connected = useFtps
       ? ftpsConnectAndLogin(errBuf, sizeof(errBuf))
@@ -11173,6 +11201,33 @@ static void handleFtpTestPost(EthernetClient &client, const String &body) {
     st["ok"] = connected;
     st["elapsedMs"] = (uint32_t)(millis() - t);
     if (!connected && errBuf[0]) st["error"] = errBuf;
+  }
+
+  // ---- Step 1b: ensure the per-server directory exists (best-effort) ----
+  // Mirrors what /api/ftp-backup does so the test does not fail STOR just
+  // because the directory was not pre-created. 550 (already exists) is the
+  // expected outcome after the first successful test and is reported as a
+  // non-fatal warning so the test continues to upload/download/verify.
+  if (connected) {
+    setFtpBackupStage("test-mkdir");
+    serviceTransferWatchdog();
+    char remoteBaseDir[128];
+    buildRemoteBaseDir(remoteBaseDir, sizeof(remoteBaseDir));
+    char mkdErrBuf[160];
+    mkdErrBuf[0] = '\0';
+    t = millis();
+    bool mkdOk = useFtps
+        ? gFtpsClient.mkd(remoteBaseDir, mkdErrBuf, sizeof(mkdErrBuf))
+        : ftpMakeDir(session, remoteBaseDir, mkdErrBuf, sizeof(mkdErrBuf));
+    serviceTransferWatchdog();
+    JsonObject st = steps.add<JsonObject>();
+    st["step"] = "mkdir";
+    st["ok"] = mkdOk;
+    st["dir"] = remoteBaseDir;
+    st["elapsedMs"] = (uint32_t)(millis() - t);
+    if (!mkdOk && mkdErrBuf[0]) {
+      st["warning"] = mkdErrBuf;  // expected when the dir already exists
+    }
   }
 
   // ---- Step 2: upload (STOR) ----
