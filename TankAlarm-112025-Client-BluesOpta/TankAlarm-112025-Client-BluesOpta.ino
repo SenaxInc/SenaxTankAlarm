@@ -783,7 +783,9 @@ struct ClientConfig {
 };
 
 struct MonitorRuntime {
-  float currentInches;
+  float currentValue;           // Latest reading in the monitor's own measurement unit:
+                                // inches for level, psi for pressure, rpm for engines,
+                                // gpm for flow, 1.0/0.0 for digital float switches.
   float currentSensorMa;        // Raw sensor reading in milliamps (for 4-20mA sensors)
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
@@ -1445,7 +1447,7 @@ static void pollForSyncRequests();
 static void sendSerialLogs();
 static void sendSerialAck(const char *status);
 static void evaluateUnload(uint8_t idx);
-static void sendUnloadEvent(uint8_t idx, float peakInches, float currentInches, double peakEpoch);
+static void sendUnloadEvent(uint8_t idx, float peakInches, float currentValue, double peakEpoch);
 static void sendSolarAlarm(SolarAlertType alertType);
 static void logSolarHardwareTestHeartbeat(unsigned long now);
 static void logSolarPollSnapshot(unsigned long now, SolarAlertType alertType);
@@ -1719,7 +1721,7 @@ void setup() {
   }
 
   for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
-    gMonitorState[i].currentInches = 0.0f;
+    gMonitorState[i].currentValue = 0.0f;
     gMonitorState[i].currentSensorMa = 0.0f;
     gMonitorState[i].currentSensorVoltage = 0.0f;
     gMonitorState[i].lastReadingEpoch = 0.0;
@@ -5072,7 +5074,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           gMonitorState[i].highClearDebounceCount = 0;
           gMonitorState[i].lowClearDebounceCount = 0;
           // Send explicit clear so server clears its alarmActive flag
-          sendAlarm(i, "clear", gMonitorState[i].currentInches);
+          sendAlarm(i, "clear", gMonitorState[i].currentValue);
           // Deactivate any local alarm (relay/buzzer)
           activateLocalAlarm(i, false);
         }
@@ -5775,10 +5777,10 @@ static void sampleMonitors() {
     // Validate sensor reading
     if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
-      inches = gMonitorState[i].currentInches;
+      inches = gMonitorState[i].currentValue;
       gMonitorState[i].sampleReused = true;
     } else {
-      gMonitorState[i].currentInches = inches;
+      gMonitorState[i].currentValue = inches;
       if (!gMonitorState[i].sampleReused) {
         gMonitorState[i].lastReadingEpoch = sampleEpoch;
       }
@@ -5813,7 +5815,7 @@ static void sampleMonitors() {
 
   // ---- Phase B: evaluate alarms/unloads and publish telemetry (the deferred Notecard I/O) ----
   for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
-    const float inches = gMonitorState[i].currentInches;
+    const float inches = gMonitorState[i].currentValue;
     evaluateAlarms(i);
 
     // Evaluate tank unload if tracking is enabled for this tank
@@ -5889,8 +5891,8 @@ static void evaluateAlarms(uint8_t idx) {
 
   // Handle digital sensors (float switches) differently
   if (cfg.sensorInterface == SENSOR_DIGITAL) {
-    // For digital sensors, currentInches is either DIGITAL_SENSOR_ACTIVATED_VALUE (1.0) or DIGITAL_SENSOR_NOT_ACTIVATED_VALUE (0.0)
-    bool isActivated = (state.currentInches > DIGITAL_SWITCH_THRESHOLD);
+    // For digital sensors, currentValue is either DIGITAL_SENSOR_ACTIVATED_VALUE (1.0) or DIGITAL_SENSOR_NOT_ACTIVATED_VALUE (0.0)
+    bool isActivated = (state.currentValue > DIGITAL_SWITCH_THRESHOLD);
     bool shouldAlarm = false;
     bool triggerOnActivated = true;  // Track what condition triggers the alarm
     
@@ -5937,7 +5939,7 @@ static void evaluateAlarms(uint8_t idx) {
         state.highAlarmDebounceCount = 0;
         // Send alarm with descriptive type based on configured trigger condition
         const char *alarmType = triggerOnActivated ? "triggered" : "not_triggered";
-        sendAlarm(idx, alarmType, state.currentInches);
+        sendAlarm(idx, alarmType, state.currentValue);
       }
     } else if (!shouldAlarm && state.highAlarmLatched) {
       state.highClearDebounceCount++;
@@ -5945,7 +5947,7 @@ static void evaluateAlarms(uint8_t idx) {
       if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
         state.highAlarmLatched = false;
         state.highClearDebounceCount = 0;
-        sendAlarm(idx, "clear", state.currentInches);
+        sendAlarm(idx, "clear", state.currentValue);
       }
     } else if (!shouldAlarm) {
       state.highAlarmDebounceCount = 0;
@@ -5963,16 +5965,16 @@ static void evaluateAlarms(uint8_t idx) {
   float lowTrigger = cfg.lowAlarmThreshold;
   float lowClear = cfg.lowAlarmThreshold + hyst;
 
-  bool highCondition = state.currentInches >= highTrigger;
-  bool lowCondition = state.currentInches <= lowTrigger;
+  bool highCondition = state.currentValue >= highTrigger;
+  bool lowCondition = state.currentValue <= lowTrigger;
   // Decoupled clear conditions: the high alarm clears once the level falls below the high
   // threshold minus hysteresis; the low alarm clears once the level rises above the low
   // threshold plus hysteresis. Previously both alarms shared a single mid-band clearCondition
   // ((x < highClear) && (x > lowClear)); when (highThreshold - lowThreshold) <= 2*hysteresis
   // that band was empty/inverted and a latched alarm could NEVER clear, and high-alarm
   // clearing was incorrectly coupled to the (possibly unused) low threshold.
-  bool highClearCondition = state.currentInches < highClear;
-  bool lowClearCondition = state.currentInches > lowClear;
+  bool highClearCondition = state.currentValue < highClear;
+  bool lowClearCondition = state.currentValue > lowClear;
 
   if (firstAlarmSample && restorePersistentRelayAfterBoot(idx, highCondition, !highCondition && lowCondition, sampleNow)) {
     return;
@@ -5987,7 +5989,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.highAlarmLatched = true;
       state.lowAlarmLatched = false;
       state.highAlarmDebounceCount = 0;
-      sendAlarm(idx, "high", state.currentInches);
+      sendAlarm(idx, "high", state.currentValue);
     }
   } else if (state.highAlarmLatched && highClearCondition) {
     state.highClearDebounceCount++;
@@ -5995,7 +5997,7 @@ static void evaluateAlarms(uint8_t idx) {
     if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
       state.highAlarmLatched = false;
       state.highClearDebounceCount = 0;
-      sendAlarm(idx, "clear", state.currentInches);
+      sendAlarm(idx, "clear", state.currentValue);
     }
   } else if (!highCondition && !highClearCondition) {
     state.highAlarmDebounceCount = 0;
@@ -6013,7 +6015,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.lowAlarmLatched = true;
       state.highAlarmLatched = false;
       state.lowAlarmDebounceCount = 0;
-      sendAlarm(idx, "low", state.currentInches);
+      sendAlarm(idx, "low", state.currentValue);
     }
   } else if (state.lowAlarmLatched && lowClearCondition) {
     state.lowClearDebounceCount++;
@@ -6021,7 +6023,7 @@ static void evaluateAlarms(uint8_t idx) {
     if (state.lowClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
       state.lowAlarmLatched = false;
       state.lowClearDebounceCount = 0;
-      sendAlarm(idx, "clear", state.currentInches);
+      sendAlarm(idx, "clear", state.currentValue);
     }
   } else if (!lowCondition && !lowClearCondition) {
     state.lowAlarmDebounceCount = 0;
@@ -6071,7 +6073,7 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
   switch (cfg.sensorInterface) {
     case SENSOR_DIGITAL:
       o["st"] = "digital";
-      o["fl"] = roundTo(state.currentInches, 1);  // 1.0 or 0.0 (float switch state)
+      o["fl"] = roundTo(state.currentValue, 1);  // 1.0 or 0.0 (float switch state)
       break;
     case SENSOR_CURRENT_LOOP:
       // Fix 12 (v2.0.51): current-loop sensors are RAW-mA-only on the wire. The server
@@ -6096,7 +6098,7 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
     case SENSOR_PULSE:
     default:
       o["st"] = "pulse";
-      o["rm"] = roundTo(state.currentInches, 1);
+      o["rm"] = roundTo(state.currentValue, 1);
       break;
   }
 
@@ -6106,7 +6108,7 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
   // "lvl:0 could be a real 0 PSI or a faulted/reused default" condition that motivated
   // this change. Other sensor types still emit lvl + cap so existing dashboards keep working.
   if (cfg.sensorInterface != SENSOR_CURRENT_LOOP) {
-    o["lvl"] = roundTo(state.currentInches, 1);
+    o["lvl"] = roundTo(state.currentValue, 1);
     o["cap"] = roundTo(getMonitorHeight(cfg), 1);
   }
   if (cfg.hasLearnedCalibration) {
@@ -6494,7 +6496,7 @@ static void evaluateUnload(uint8_t idx) {
     return;
   }
 
-  float currentInches = state.currentInches;
+  float currentValue = state.currentValue;
   
   // Determine the unload threshold (use percentage or absolute, whichever is configured)
   float dropPercent = (cfg.unloadDropPercent > 0.0f) ? cfg.unloadDropPercent : UNLOAD_DEFAULT_DROP_PERCENT;
@@ -6502,24 +6504,24 @@ static void evaluateUnload(uint8_t idx) {
   
   // If we haven't started tracking yet, wait for tank to reach minimum peak
   if (!state.unloadTracking) {
-    if (currentInches >= minPeakHeight) {
+    if (currentValue >= minPeakHeight) {
       // Start tracking - tank has reached minimum fill level
       state.unloadTracking = true;
-      state.unloadPeakInches = currentInches;
+      state.unloadPeakInches = currentValue;
       state.unloadPeakSensorMa = state.currentSensorMa;
       state.unloadPeakEpoch = currentEpoch();
       Serial.print(F("Unload tracking started for "));
       Serial.print(cfg.name);
       Serial.print(F(" at "));
-      Serial.print(currentInches);
+      Serial.print(currentValue);
       Serial.println(F(" inches"));
     }
     return;
   }
 
   // Update peak if current level is higher
-  if (currentInches > state.unloadPeakInches) {
-    state.unloadPeakInches = currentInches;
+  if (currentValue > state.unloadPeakInches) {
+    state.unloadPeakInches = currentValue;
     state.unloadPeakSensorMa = state.currentSensorMa;
     state.unloadPeakEpoch = currentEpoch();
     gUnloadDebounceCount[idx] = 0;  // Reset debounce on new peak
@@ -6539,16 +6541,16 @@ static void evaluateUnload(uint8_t idx) {
   }
   
   // Check if level has dropped enough to be considered an unload
-  if (currentInches <= unloadTriggerLevel) {
+  if (currentValue <= unloadTriggerLevel) {
     // Debounce: require consecutive low readings
     gUnloadDebounceCount[idx]++;
     
     if (gUnloadDebounceCount[idx] >= UNLOAD_DEBOUNCE_COUNT) {
       // Determine the "empty" level to report
-      float emptyHeight = currentInches;
+      float emptyHeight = currentValue;
       
       // If level is at or below sensor mount height, use default empty height
-      if (currentInches <= cfg.sensorMountHeight) {
+      if (currentValue <= cfg.sensorMountHeight) {
         emptyHeight = (cfg.unloadEmptyHeight > 0.0f) ? cfg.unloadEmptyHeight : UNLOAD_DEFAULT_EMPTY_HEIGHT;
       }
       
@@ -6565,7 +6567,7 @@ static void evaluateUnload(uint8_t idx) {
   }
 }
 
-static void sendUnloadEvent(uint8_t idx, float peakInches, float currentInches, double peakEpoch) {
+static void sendUnloadEvent(uint8_t idx, float peakInches, float currentValue, double peakEpoch) {
   if (idx >= gConfig.monitorCount) {
     return;
   }
@@ -6578,13 +6580,13 @@ static void sendUnloadEvent(uint8_t idx, float peakInches, float currentInches, 
   Serial.print(F(" peak="));
   Serial.print(peakInches);
   Serial.print(F("in, current="));
-  Serial.print(currentInches);
+  Serial.print(currentValue);
   Serial.println(F("in"));
 
   // Log to serial
   char logMsg[128];
   snprintf(logMsg, sizeof(logMsg), "Unload: %s peak=%.1fin, empty=%.1fin", 
-           cfg.name, peakInches, currentInches);
+           cfg.name, peakInches, currentValue);
   addSerialLog(logMsg);
 
   // Send unload event via Notecard if network available
@@ -6595,7 +6597,7 @@ static void sendUnloadEvent(uint8_t idx, float peakInches, float currentInches, 
     doc["k"] = cfg.sensorIndex;
     // Note: "type" = "unload" omitted — routing is by file (unload.qi)
     doc["pk"] = roundTo(peakInches, 1);      // Peak height
-    doc["em"] = roundTo(currentInches, 1);   // Empty/low height
+    doc["em"] = roundTo(currentValue, 1);   // Empty/low height
     doc["pt"] = peakEpoch;                    // Peak timestamp
     doc["t"] = currentEpoch();               // Event timestamp
     
@@ -8026,6 +8028,14 @@ static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t moni
   // zero registry state after a restart.
   buildSensorObject(t, monitorIndex);
 
+  // Per-sensor acquisition epoch. Mirrors telemetry.qo's top-level `t` so the
+  // server can distinguish report transmission time from the time the reading
+  // was actually acquired — critical when `ru`/`sf` indicate the daily is
+  // republishing a stale cached value (orphaned-epoch fix).
+  if (state.lastReadingEpoch > 0.0) {
+    t["t"] = (uint32_t)state.lastReadingEpoch;
+  }
+
   if (measureJson(doc) > payloadLimit) {
     size_t currentSize = array.size();
     if (currentSize > 0) {
@@ -8034,7 +8044,7 @@ static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t moni
     return false;
   }
 
-  state.lastDailySentValue = state.currentInches;
+  state.lastDailySentValue = state.currentValue;
   return true;
 }
 
@@ -9074,7 +9084,7 @@ static void checkRelayMomentaryTimeout(unsigned long now) {
       // Send timeout notification through alarm pipeline for safety timeouts
       // (only when we have an owning monitor to route the alarm through)
       if (hasOwner && strcmp(reason, "safety max-on timeout") == 0) {
-        sendAlarm(monIdx, "relay_timeout", gMonitorState[monIdx].currentInches);
+        sendAlarm(monIdx, "relay_timeout", gMonitorState[monIdx].currentValue);
       }
     }
   }

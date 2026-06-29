@@ -32,8 +32,14 @@
 #define DEFAULT_SAMPLE_INTERVAL_SEC 1800
 #endif
 
-// Minimum level change threshold in inches (0 = send all readings)
-// Used when no JSON config specifies a threshold
+// Minimum change threshold (in each monitor's own measurement unit) required
+// before a non-baseline telemetry.qo note is published. Applies universally to
+// every sensor interface and object type — inches for liquid level, psi for
+// pressure, rpm for engines, gpm for flow, etc.
+//
+// 0 = change-based telemetry DISABLED for that monitor. The client publishes
+// only the boot baseline note and then the scheduled daily.qo report; alarms
+// still publish to alarm.qo unconditionally.
 #ifndef DEFAULT_LEVEL_CHANGE_THRESHOLD
 #define DEFAULT_LEVEL_CHANGE_THRESHOLD 0.0f
 #endif

@@ -145,7 +145,8 @@ struct SensorRecord {
   char label[24];
   uint8_t sensorIndex;
   uint8_t userNumber;           // Optional user-assigned display number (0 = unset)
-  float levelInches;
+  float currentValue;           // Latest reading in the sensor's own measurement unit
+                                // (inches for level, psi for pressure, rpm for engines, etc.).
   bool alarmActive;
   char alarmType[24];
   double lastUpdateEpoch;
@@ -887,7 +888,7 @@ static void sendSensorJson(EthernetClient &client) {
     if (gSensorRecords[i].userNumber > 0) {
       obj["un"] = gSensorRecords[i].userNumber;
     }
-    obj["l"] = gSensorRecords[i].levelInches;
+    obj["l"] = gSensorRecords[i].currentValue;
     obj["a"] = gSensorRecords[i].alarmActive;
     obj["at"] = gSensorRecords[i].alarmType;
     obj["u"] = gSensorRecords[i].lastUpdateEpoch;
@@ -1079,7 +1080,7 @@ static void handleViewerSummary(JsonDocument &doc, double epoch) {
       strlcpy(rec.label, item["n"] | "Tank", sizeof(rec.label));
       rec.sensorIndex = item["k"].is<uint8_t>() ? item["k"].as<uint8_t>() : gSensorRecordCount;
       rec.userNumber = item["un"].is<uint8_t>() ? item["un"].as<uint8_t>() : 0;
-      rec.levelInches = item["l"].as<float>();
+      rec.currentValue = item["l"].as<float>();
       rec.alarmActive = item["a"].as<bool>();
       strlcpy(rec.alarmType, item["at"] | (rec.alarmActive ? "alarm" : "clear"), sizeof(rec.alarmType));
       rec.lastUpdateEpoch = item["u"].as<double>();
@@ -1500,9 +1501,9 @@ static bool sendDailyPrintJob() {
       printer.println();
 
       // Level in feet and inches
-      if (rec.levelInches >= 0.0f && isfinite(rec.levelInches)) {
-        int feet = (int)(rec.levelInches / 12.0f);
-        float remIn = rec.levelInches - (float)(feet * 12);
+      if (rec.currentValue >= 0.0f && isfinite(rec.currentValue)) {
+        int feet = (int)(rec.currentValue / 12.0f);
+        float remIn = rec.currentValue - (float)(feet * 12);
         char levelBuf[16];
         snprintf(levelBuf, sizeof(levelBuf), "%d' %.1f\"", feet, remIn);
         printer.print(F("   Level:  "));
