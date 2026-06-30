@@ -40,8 +40,21 @@
 
 #if defined(TANKALARM_DFU_MCUBOOT)
 #include <MCUboot.h>
+#elif defined(TANKALARM_ALLOW_NON_MCUBOOT_BUILD)
+// Opt-out hatch for deliberate non-OTA test builds. Once flashed, the resulting
+// binary CANNOT accept any over-the-air firmware update — Notehub will keep
+// re-queuing the same image and every attempt will fail with
+// "MCUboot DFU not supported in this build" in _health.qo. Recover only by
+// USB-flashing a build that has TANKALARM_DFU_MCUBOOT defined.
+#warning "TANKALARM_ALLOW_NON_MCUBOOT_BUILD is set — the resulting client binary CANNOT receive OTA updates. Only use for local USB-only testing."
 #else
-#warning "TANKALARM_DFU_MCUBOOT is NOT defined - MCUboot OTA updates are DISABLED in this build"
+// Hard-fail the build if MCUboot DFU support is missing. Without this guard the
+// developer would get a silently-broken binary: USB-flashing it ships a client
+// that downloads every Notehub OTA payload but rejects the apply step (see
+// _health.qo "MCUboot DFU not supported in this build"), wasting cellular data
+// and triggering an "ota-stage-failed" SMS on every retry. The only recovery
+// is another USB flash. Recipe: see CODE REVIEW/CODE_REVIEW_06292026_*.
+#error "TANKALARM_DFU_MCUBOOT is required for the Client build. Rebuild with: arduino-cli compile --fqbn arduino:mbed_opta:opta --library TankAlarm-112025-Common --build-property \"build.extra_flags=-DTANKALARM_DFU_MCUBOOT\" TankAlarm-112025-Client-BluesOpta. To intentionally produce a non-OTA-capable test binary, also pass -DTANKALARM_ALLOW_NON_MCUBOOT_BUILD."
 #endif
 
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
