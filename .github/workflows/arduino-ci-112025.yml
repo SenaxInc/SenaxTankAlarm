@@ -37,25 +37,6 @@ jobs:
           repository: dorkmo/FTPSclientOPTA
           path: arduino-opta-ftps
 
-      # Temporary bridge: overlay our local 0.3.0 patch on top of the
-      # upstream FTPSclientOPTA checkout until dorkmo/FTPSclientOPTA
-      # publishes 0.3.0. See:
-      #   CODE REVIEW/FTPSCLIENTOPTA_UPSTREAM_CHANGES_06292026.md
-      # Remove this step (and the vendor/FTPSclientOPTA-overlay
-      # directory) once the public library has
-      # FtpsClient::discoverFingerprint(...).
-      - name: Overlay local FTPSclientOPTA 0.3.0 patch
-        shell: bash
-        run: |
-          if [ -d vendor/FTPSclientOPTA-overlay ]; then
-            cp -fv vendor/FTPSclientOPTA-overlay/library.properties arduino-opta-ftps/library.properties
-            cp -fv vendor/FTPSclientOPTA-overlay/src/FtpsClient.h   arduino-opta-ftps/src/FtpsClient.h
-            cp -fv vendor/FTPSclientOPTA-overlay/src/FtpsClient.cpp arduino-opta-ftps/src/FtpsClient.cpp
-            echo "FTPSclientOPTA overlay applied (vendor/FTPSclientOPTA-overlay)"
-          else
-            echo "::warning::vendor/FTPSclientOPTA-overlay/ missing; using upstream FTPSclientOPTA as-is"
-          fi
-
       - name: Install Arduino CLI
         shell: bash
         run: |
@@ -297,25 +278,6 @@ jobs:
         with:
           repository: dorkmo/FTPSclientOPTA
           path: arduino-opta-ftps
-
-      # Temporary bridge: overlay our local 0.3.0 patch on top of the
-      # upstream FTPSclientOPTA checkout until dorkmo/FTPSclientOPTA
-      # publishes 0.3.0. See:
-      #   CODE REVIEW/FTPSCLIENTOPTA_UPSTREAM_CHANGES_06292026.md
-      # Remove this step (and the vendor/FTPSclientOPTA-overlay
-      # directory) once the public library has
-      # FtpsClient::discoverFingerprint(...).
-      - name: Overlay local FTPSclientOPTA 0.3.0 patch
-        shell: bash
-        run: |
-          if [ -d vendor/FTPSclientOPTA-overlay ]; then
-            cp -fv vendor/FTPSclientOPTA-overlay/library.properties arduino-opta-ftps/library.properties
-            cp -fv vendor/FTPSclientOPTA-overlay/src/FtpsClient.h   arduino-opta-ftps/src/FtpsClient.h
-            cp -fv vendor/FTPSclientOPTA-overlay/src/FtpsClient.cpp arduino-opta-ftps/src/FtpsClient.cpp
-            echo "FTPSclientOPTA overlay applied (vendor/FTPSclientOPTA-overlay)"
-          else
-            echo "::warning::vendor/FTPSclientOPTA-overlay/ missing; using upstream FTPSclientOPTA as-is"
-          fi
 
       - name: Install Arduino CLI
         shell: bash

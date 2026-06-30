@@ -6,6 +6,31 @@
 
 This document captures the exact diff that was applied locally so the same change can be committed upstream.
 
+> **Status (2026-06-29):** All three changes below have been applied to the
+> local working copy of `ArduinoOPTA-FTPS` (`library.properties` → 0.3.0,
+> `src/FtpsClient.h` declaration, `src/FtpsClient.cpp` implementation) and a
+> matching `CHANGELOG.md` entry was added. The local tree compiles clean.
+>
+> The temporary local CI bridge (`vendor/FTPSclientOPTA-overlay/` plus the
+> "Overlay local FTPSclientOPTA 0.3.0 patch" step in both
+> `arduino-ci-112025.yml` and `release-firmware-112025.yml`) has now been
+> **removed** from this working tree in anticipation of the upstream
+> release. This means SenaxTankAlarm CI now depends on
+> `dorkmo/FTPSclientOPTA` `main` actually containing
+> `FtpsClient::discoverFingerprint(...)`.
+>
+> **Push order matters:**
+> 1. Commit + push `dorkmo/FTPSclientOPTA` `main` (the four files in the
+>    Suggested release steps below) and push the `v0.3.0` tag. Wait for
+>    the [Release Library ZIP][rel-zip] workflow to publish the asset.
+> 2. Only then commit + push the SenaxTankAlarm cleanup (the overlay
+>    deletion + workflow edits + this doc update).
+>
+> If the two pushes are reversed the next SenaxTankAlarm CI run will fail
+> to compile because upstream `main` will still be 0.2.4.
+>
+> [rel-zip]: https://github.com/dorkmo/FTPSclientOPTA/actions/workflows/release.yml
+
 ---
 
 ## TL;DR
@@ -76,7 +101,8 @@ Insert immediately **after** the existing `void quit();` declaration and **befor
   ///
   /// Requires begin() to have been called first. `tlsServerName` is
   /// optional — if null/empty, falls back to `host`. On success, writes
-  /// a NUL-terminated lowercase hex string to `fingerprintOut` (no colons).
+  /// a NUL-terminated uppercase hex string to `fingerprintOut` (no
+  /// colons); `fingerprintOutSize` must be at least 65.
   bool discoverFingerprint(const char *host,
                            uint16_t port,
                            const char *tlsServerName,
@@ -230,7 +256,7 @@ The implementation reuses the same anonymous-namespace helpers (`clearError`, `h
 ## Manual verification before publishing
 
 1. Open `examples/FtpsSpikeTest/FtpsSpikeTest.ino` (or any other example) and confirm it still compiles. The new method is additive so existing code is unaffected.
-2. Compile a sketch that calls `discoverFingerprint` against a known FTPS server (e.g. vsftpd configured with a self-signed cert) and confirm the returned hex matches what `openssl s_client -starttls ftp -connect host:21` reports. Example consumer code:
+2. Compile a sketch that calls `discoverFingerprint` against a known FTPS server (e.g. vsftpd configured with a self-signed cert) and confirm the returned hex matches what `openssl s_client -starttls ftp -connect host:21` reports (note: the transport emits **uppercase** hex; compare case-insensitively or upper-case the openssl output). Example consumer code:
 
    ```cpp
    FtpsClient ftps;
