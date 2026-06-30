@@ -5609,17 +5609,60 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       return NAN;
     }
     gMonitorState[idx].lastPwmEnableOk = true;
-    
+
+    // Re-apply A0602 current-ADC channel configuration on every power-on cycle.
+    // The AD74412R powers up in an unconfigured state every time the rail is gated;
+    // without this SET CH_ADC frame, framed reads return a stale default register value
+    // that looks plausible (constant 4-20mA) but never responds to the sensor.
+    // Fix C2 ordering (CODE_REVIEW_06302026): configure BEFORE the warmup so the sense
+    // node is connected to the I/O pin while loop current stabilizes.
+    bool configOk = false;
+    for (uint8_t attempt = 0; attempt < 3 && !configOk; ++attempt) {
+      if (attempt > 0) delay(5);
+      configOk = tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr);
+    }
+    if (!configOk) {
+      Serial.print(F("WARNING: A0602 channel "));
+      Serial.print(channel);
+      Serial.println(F(" SET CH_ADC NACKed"));
+      gMonitorState[idx].currentSensorMa = 0.0f;
+      gMonitorState[idx].sampleReused = true;
+      gLastClFaultReason = CL_FAULT_CONFIG_NACK;
+      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      return NAN;
+    }
+
     // Stabilization delay
     delay(3000);
+
+    // Verify the A0602 actually applied the channel function before we trust any sample.
+    // The SET ACK only means "command queued" — the expansion applies the channel
+    // reconfiguration in its own main loop. If the GET fails entirely (e.g. an A0602
+    // firmware that doesn't implement opcode 0x40) we proceed and rely on the framed-read
+    // CRC for validation. If it returns the WRONG function, that's a hard fault.
+    uint8_t funActual = 0xFF;
+    if (tankalarm_getAnalogChannelFunction((uint8_t)channel, i2cAddr, funActual) &&
+        funActual != TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER) {
+      Serial.print(F("WARNING: A0602 channel "));
+      Serial.print(channel);
+      Serial.print(F(" reports function 0x"));
+      Serial.println(funActual, HEX);
+      gMonitorState[idx].currentSensorMa = 0.0f;
+      gMonitorState[idx].sampleReused = true;
+      gLastClFaultReason = CL_FAULT_FUNC_WRONG;
+      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      return NAN;
+    }
   }
 
   const uint8_t numSamples = 5;
   float total = 0.0f;
   uint8_t validSamples = 0;
-  
+
   for (uint8_t s = 0; s < numSamples; ++s) {
-    float sample = readCurrentLoopMilliamps(channel);
+    // Framed Blueprint GET protocol with CRC + channel-echo validation. Rejects
+    // corrupted / cross-talked frames instead of accepting them as plausible 4-20mA.
+    float sample = tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
     if (sample >= 0.0f) {
       total += sample;
       validSamples++;
