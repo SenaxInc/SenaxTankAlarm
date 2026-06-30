@@ -16,11 +16,11 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "2.0.73"
+#define FIRMWARE_VERSION "2.0.74"
 #endif
 
 #ifndef FIRMWARE_BUILD_SEQ
-#define FIRMWARE_BUILD_SEQ 267   // monotonic; bump every release (v2.0.73 = 267)
+#define FIRMWARE_BUILD_SEQ 268   // monotonic; bump every release (v2.0.74 = 268)
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.
@@ -285,6 +285,15 @@ struct RelayRuntime {
 // Route #2 delivers to client's sync_request.qi
 #ifndef SYNC_REQUEST_FILE
 #define SYNC_REQUEST_FILE "sync_request.qi"     // Client receives sync request from server
+#endif
+
+// --- Telemetry request (server-to-client on-demand sensor read + publish) ---
+// Server sends via command.qo with _type:"telemetry_request"; client takes a
+// fresh sensor reading, publishes a telemetry note, then forces hub.sync so the
+// fresh reading reaches Notehub immediately (instead of waiting for the next
+// scheduled outbound window — up to 6 hours away on solar/periodic clients).
+#ifndef TELEMETRY_REQUEST_FILE
+#define TELEMETRY_REQUEST_FILE "telemetry_request.qi"  // Client receives telemetry request
 #endif
 
 // ============================================================================

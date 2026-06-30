@@ -1124,6 +1124,8 @@ struct ClientSerialLog {
 static ClientSerialLog gSerialLog;
 static unsigned long gLastSerialRequestCheckMillis = 0;
 static unsigned long gLastLocationRequestCheckMillis = 0;
+static unsigned long gLastTelemetryRequestCheckMillis = 0;
+static unsigned long gLastTelemetryRequestHandledMillis = 0;  // throttle: ignore duplicate requests within cooldown
 
 // Forward declarations
 static PulseSamplingRecommendation getRecommendedPulseSampling(float expectedRate);
@@ -1457,6 +1459,7 @@ static void addSerialLog(const char *message);
 static void pollForSerialRequests();
 static void pollForLocationRequests();
 static void pollForSyncRequests();
+static void pollForTelemetryRequests();
 static void sendSerialLogs();
 static void sendSerialAck(const char *status);
 static void evaluateUnload(uint8_t idx);
@@ -2218,6 +2221,17 @@ void loop() {
     if (now - gLastConfigCheckMillis < 2000UL) {
       // Poll sync_request.qi right after config check (same cadence, minimal overhead)
       pollForSyncRequests();
+    }
+
+    // Check for server-requested fresh telemetry (dashboard "Update" button).
+    // Piggybacks on the same inbound cadence so we only open one Notecard
+    // session per cycle. When triggered, takes a fresh sensor reading,
+    // force-publishes each enabled monitor, then forces hub.sync so the new
+    // reading reaches Notehub immediately instead of waiting for the next
+    // outbound window (up to 6 hours on solar/periodic clients).
+    if (now - gLastTelemetryRequestCheckMillis >= inboundInterval) {
+      gLastTelemetryRequestCheckMillis = now;
+      pollForTelemetryRequests();
     }
   }
 
@@ -9665,6 +9679,86 @@ static void pollForSyncRequests() {
   J *delReq = notecard.newRequest("note.get");
   if (delReq) {
     JAddStringToObject(delReq, "file", SYNC_REQUEST_FILE);
+    JAddBoolToObject(delReq, "delete", true);
+    J *delRsp = notecard.requestAndResponse(delReq);
+    if (delRsp) notecard.deleteResponse(delRsp);
+  }
+}
+
+// ============================================================================
+// Server-Requested Telemetry Update (dashboard "Update" button)
+// ============================================================================
+// The server can send a "telemetry" command via command.qo → telemetry_request.qi
+// to ask this client for a fresh sensor reading right now. The client takes a
+// new reading via sampleMonitors(), force-publishes each enabled monitor (so the
+// note is sent even if the value has not crossed the change threshold), then
+// forces hub.sync so the fresh reading reaches Notehub immediately instead of
+// waiting for the next outbound sync window (up to 6 hours on solar/periodic).
+#define TELEMETRY_REQUEST_COOLDOWN_MS 30000UL  // ignore duplicate requests within 30s
+
+static void pollForTelemetryRequests() {
+  J *req = notecard.newRequest("note.get");
+  if (!req) return;
+
+  JAddStringToObject(req, "file", TELEMETRY_REQUEST_FILE);
+  // Peek without deleting — delete only after the request has been honored.
+
+  J *rsp = notecard.requestAndResponse(req);
+  if (!rsp) return;
+
+  J *body = JGetObject(rsp, "body");
+  if (!body) {
+    notecard.deleteResponse(rsp);
+    return;
+  }
+
+  const char *request = JGetString(body, "request");
+  bool handled = (request && strcmp(request, "telemetry") == 0);
+  notecard.deleteResponse(rsp);
+
+  if (handled) {
+    unsigned long now = millis();
+    if (gLastTelemetryRequestHandledMillis != 0 &&
+        (now - gLastTelemetryRequestHandledMillis) < TELEMETRY_REQUEST_COOLDOWN_MS) {
+      Serial.println(F("Telemetry request received but within cooldown — skipping fresh read"));
+      addSerialLog("Telemetry request throttled by cooldown");
+    } else {
+      gLastTelemetryRequestHandledMillis = now;
+      Serial.println(F("Telemetry request received from server — taking fresh reading"));
+      addSerialLog("Server-requested telemetry update initiated");
+
+      // Phase 1: take fresh sensor readings (also publishes any change-driven notes).
+      sampleMonitors();
+
+      // Phase 2: force-publish each enabled monitor regardless of change threshold so
+      // the dashboard always sees current values within seconds. The last call passes
+      // syncNow=true to trigger an immediate hub.sync via publishNote().
+      uint8_t lastIdx = 0xFF;
+      for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+        if (gConfig.monitors[i].enableServerUpload && !gMonitorState[i].sensorFailed) {
+          lastIdx = i;
+        }
+      }
+      if (lastIdx != 0xFF) {
+        for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+          if (!gConfig.monitors[i].enableServerUpload || gMonitorState[i].sensorFailed) continue;
+          sendTelemetry(i, "ondemand", (i == lastIdx));
+          // Update lastReportedValue so the next change-driven publish doesn't
+          // fire immediately for the same value.
+          gMonitorState[i].lastReportedValue = gMonitorState[i].currentValue;
+        }
+      } else {
+        // No enabled monitors — still force a hub.sync so the request log goes out.
+        J *syncReq = notecard.newRequest("hub.sync");
+        if (syncReq) notecard.sendRequest(syncReq);
+      }
+    }
+  }
+
+  // Consume the note now that the request has been honored (or was unrecognized).
+  J *delReq = notecard.newRequest("note.get");
+  if (delReq) {
+    JAddStringToObject(delReq, "file", TELEMETRY_REQUEST_FILE);
     JAddBoolToObject(delReq, "delete", true);
     J *delRsp = notecard.requestAndResponse(delReq);
     if (delRsp) notecard.deleteResponse(delRsp);

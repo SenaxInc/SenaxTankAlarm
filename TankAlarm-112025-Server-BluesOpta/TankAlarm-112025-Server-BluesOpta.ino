@@ -533,6 +533,12 @@ struct ClientMetadata {
   bool dailyComplete;         // True when final part (m=false) received
   uint8_t dailyExpectedParts; // Part number of final part + 1
 
+  // On-demand telemetry update tracking (dashboard "Update" button).
+  // Set to currentEpoch() when the operator presses Update; the dashboard treats
+  // the request as fulfilled once a fresher telemetry note arrives
+  // (sensor lastUpdate > updateRequestedEpoch). RAM-only; not persisted.
+  double updateRequestedEpoch;
+
   // Fix 14 (v2.0.53): Solar/RS-485 telemetry state mirror.
   // ALL fields are RAM-only and NOT persisted — they reflect the client's last
   // telemetry note and are refreshed every poll cycle. After a server reboot they
@@ -2248,12 +2254,12 @@ state.sparkData=map;state.sparkLoaded=true;state.sparkError=false;renderSparklin
 function renderSparklines(){
 document.querySelectorAll('.dc-sparkline[data-spark-key]').forEach(el=>{
 const key=el.dataset.sparkKey;const readings=state.sparkData[key];if(readings&&readings.length>=2){el.innerHTML='';drawSparkline(el,readings,el.dataset.sparkColor);}else if(state.sparkLoaded){const n=readings?readings.length:0;const msg=state.sparkError?'Trend unavailable':(n===0?'No trend data yet':(n===1?'1 reading recorded':'Need more readings'));el.innerHTML='<span class="spark-label">'+msg+'</span>';}});}
-function buildSiteModel(rawClients){const sites={};rawClients.forEach(c=>{const uid=c.c||'';const site=c.s||'Unknown Site';if(!sites[site])sites[site]={name:site,clients:{}};if(!sites[site].clients[uid])sites[site].clients[uid]={uid:uid,alarm:!!c.a,lastUpdate:c.u||0,vinVoltage:c.v,vinVoltageEpoch:c.ve,otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sol:c.sol||null,sensors:[]};const cl=sites[site].clients[uid];if(c.a)cl.alarm=true;if(c.u>cl.lastUpdate)cl.lastUpdate=c.u;const sensors=Array.isArray(c.ts)?c.ts:[];if(sensors.length){sensors.forEach((t,idx)=>{cl.sensors.push({label:t.n||c.n||'Sensor',sensorIndex:t.k||'',userNumber:t.un||0,currentValue:t.l,sensorMa:t.ma,sensorType:t.st||'',objectType:t.ot||'tank',measurementUnit:t.mu||'',contents:t.ct||'',alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,change24h:t.d,sensorIdx:idx,fault:t.flt||'',_clientUid:uid});});}else if(c.u){cl.sensors.push({label:c.n||'Sensor',sensorIndex:c.k||'',userNumber:c.un||0,currentValue:c.l,sensorMa:c.ma,sensorType:'',objectType:'tank',measurementUnit:'',contents:'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,change24h:undefined,sensorIdx:0,fault:c.flt||'',_clientUid:uid});}});return sites;}
+function buildSiteModel(rawClients){const sites={};rawClients.forEach(c=>{const uid=c.c||'';const site=c.s||'Unknown Site';if(!sites[site])sites[site]={name:site,clients:{}};if(!sites[site].clients[uid])sites[site].clients[uid]={uid:uid,alarm:!!c.a,lastUpdate:c.u||0,vinVoltage:c.v,vinVoltageEpoch:c.ve,otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sol:c.sol||null,updateRequestedEpoch:c.ureq||0,sensors:[]};const cl=sites[site].clients[uid];if(c.a)cl.alarm=true;if(c.u>cl.lastUpdate)cl.lastUpdate=c.u;if(c.ureq&&c.ureq>cl.updateRequestedEpoch)cl.updateRequestedEpoch=c.ureq;const sensors=Array.isArray(c.ts)?c.ts:[];if(sensors.length){sensors.forEach((t,idx)=>{cl.sensors.push({label:t.n||c.n||'Sensor',sensorIndex:t.k||'',userNumber:t.un||0,currentValue:t.l,sensorMa:t.ma,sensorType:t.st||'',objectType:t.ot||'tank',measurementUnit:t.mu||'',contents:t.ct||'',alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,change24h:t.d,sensorIdx:idx,fault:t.flt||'',_clientUid:uid});});}else if(c.u){cl.sensors.push({label:c.n||'Sensor',sensorIndex:c.k||'',userNumber:c.un||0,currentValue:c.l,sensorMa:c.ma,sensorType:'',objectType:'tank',measurementUnit:'',contents:'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,change24h:undefined,sensorIdx:0,fault:c.flt||'',_clientUid:uid});}});return sites;}
 )HTML" R"HTML(
 function clientStatusColor(cl){if(cl.alarm)return'red';if(!cl.lastUpdate||isStale(cl.lastUpdate))return'yellow';return'green';}
 function solarHealthHtml(cl){if(!cl||!cl.sol)return'<span style="color:var(--muted);">--</span>';var s=cl.sol;var color,label,info='';if(!s.init){color='#dc2626';label='init FAIL';}else if(s.ok&&s.last){color='#10b981';label='OK';if(s.spv)info=' (setpoints verified)';}else if(s.ok&&!s.last){color='#f59e0b';label='last poll FAIL';if(s.err)info=' err='+s.err;}else{color='#dc2626';if(!s.ever){label='NEVER OK';}else{label='DOWN';if(s.lastOkS)label+=' '+s.lastOkS+'s';}if(s.err)info+=' err='+s.err;if(s.resMs)info+=' '+s.resMs+'ms';if(s.maddr)info+=' reg=0x'+s.maddr.toString(16);if(s.impl)info+=' [impl]';}return '<span style="color:'+color+';font-weight:500;" title="'+escapeHtml('RS-485 / SunSaver Modbus: '+label+info)+'">'+escapeHtml(label)+'</span>'+(info?'<span style="color:var(--muted);font-size:0.75rem;"> '+escapeHtml(info)+'</span>':'');}
 function renderSites(){const container=els.siteContainer;container.innerHTML='';const siteNames=Object.keys(state.sites).sort();if(!siteNames.length){container.innerHTML='<div class="no-data">No telemetry available yet.</div>';return;}
-siteNames.forEach(siteName=>{const site=state.sites[siteName];const section=document.createElement('div');section.className='site-section';const clientList=Object.values(site.clients);const hasAlarm=clientList.some(c=>c.alarm);const head=document.createElement('div');head.className='site-head';if(hasAlarm)head.style.borderLeft='4px solid var(--danger)';const left=document.createElement('div');left.innerHTML=`<div class="site-name">${escapeHtml(siteName)}</div>`;const right=document.createElement('div');right.className='site-actions';const dots=document.createElement('div');dots.className='client-dots';dots.title='Client status indicators - click to expand';clientList.forEach(cl=>{const dot=document.createElement('span');dot.className='cdot '+clientStatusColor(cl);dot.title=cl.uid;dot.dataset.uid=cl.uid;dot.dataset.site=siteName;dot.addEventListener('click',()=>toggleDotInfo(section,cl,siteName));dots.appendChild(dot);});right.appendChild(dots);const manageBtn=document.createElement('a');manageBtn.className='pill secondary';manageBtn.style.cssText='font-size:0.75rem;padding:3px 10px;';manageBtn.href='/site-config?site='+encodeURIComponent(siteName);manageBtn.textContent='Manage';right.appendChild(manageBtn);head.appendChild(left);head.appendChild(right);section.appendChild(head);const infoSlot=document.createElement('div');infoSlot.className='cdot-info-slot';section.appendChild(infoSlot);const grid=document.createElement('div');grid.className='data-grid';const allSensors=[];clientList.forEach(cl=>{cl.sensors.forEach(t=>{t._clientUid=cl.uid;t._vinVoltage=cl.vinVoltage;allSensors.push(t);});if(!cl.sensors.length){allSensors.push({label:'Configured Client',sensorIndex:'',objectType:'pending',lastUpdate:0,_clientUid:cl.uid,_vinVoltage:cl.vinVoltage,alarm:false});}});const grouped={};allSensors.forEach(t=>{const ot=t.objectType||'tank';if(!grouped[ot])grouped[ot]=[];grouped[ot].push(t);});const typeOrder=['tank','gas','rpm','flow','engine','pump','pending'];typeOrder.forEach(ot=>{if(!grouped[ot])return;grouped[ot].forEach(t=>{grid.appendChild(renderDataCard(t,siteName));});});Object.keys(grouped).filter(ot=>!typeOrder.includes(ot)).forEach(ot=>{grouped[ot].forEach(t=>{grid.appendChild(renderDataCard(t,siteName));});});section.appendChild(grid);container.appendChild(section);});}
+siteNames.forEach(siteName=>{const site=state.sites[siteName];const section=document.createElement('div');section.className='site-section';const clientList=Object.values(site.clients);const hasAlarm=clientList.some(c=>c.alarm);const head=document.createElement('div');head.className='site-head';if(hasAlarm)head.style.borderLeft='4px solid var(--danger)';const left=document.createElement('div');left.innerHTML=`<div class="site-name">${escapeHtml(siteName)}</div>`;const right=document.createElement('div');right.className='site-actions';const dots=document.createElement('div');dots.className='client-dots';dots.title='Client status indicators - click to expand';clientList.forEach(cl=>{const dot=document.createElement('span');dot.className='cdot '+clientStatusColor(cl);dot.title=cl.uid;dot.dataset.uid=cl.uid;dot.dataset.site=siteName;dot.addEventListener('click',()=>toggleDotInfo(section,cl,siteName));dots.appendChild(dot);});right.appendChild(dots);const manageBtn=document.createElement('a');manageBtn.className='pill secondary';manageBtn.style.cssText='font-size:0.75rem;padding:3px 10px;';manageBtn.href='/site-config?site='+encodeURIComponent(siteName);manageBtn.textContent='Manage';right.appendChild(manageBtn);head.appendChild(left);head.appendChild(right);section.appendChild(head);const infoSlot=document.createElement('div');infoSlot.className='cdot-info-slot';section.appendChild(infoSlot);const grid=document.createElement('div');grid.className='data-grid';const allSensors=[];clientList.forEach(cl=>{cl.sensors.forEach(t=>{t._clientUid=cl.uid;t._vinVoltage=cl.vinVoltage;t._updateRequestedEpoch=cl.updateRequestedEpoch||0;t._isSolar=!!cl.sol;allSensors.push(t);});if(!cl.sensors.length){allSensors.push({label:'Configured Client',sensorIndex:'',objectType:'pending',lastUpdate:0,_clientUid:cl.uid,_vinVoltage:cl.vinVoltage,_updateRequestedEpoch:cl.updateRequestedEpoch||0,_isSolar:!!cl.sol,alarm:false});}});const grouped={};allSensors.forEach(t=>{const ot=t.objectType||'tank';if(!grouped[ot])grouped[ot]=[];grouped[ot].push(t);});const typeOrder=['tank','gas','rpm','flow','engine','pump','pending'];typeOrder.forEach(ot=>{if(!grouped[ot])return;grouped[ot].forEach(t=>{grid.appendChild(renderDataCard(t,siteName));});});Object.keys(grouped).filter(ot=>!typeOrder.includes(ot)).forEach(ot=>{grouped[ot].forEach(t=>{grid.appendChild(renderDataCard(t,siteName));});});section.appendChild(grid);container.appendChild(section);});}
 )HTML" R"HTML(
 function renderDataCard(t,siteName){const card=document.createElement('div');card.className='data-card';if(t.alarm)card.classList.add('alarm-card');if(t.objectType==='pending'){card.style.opacity='0.6';card.innerHTML=`<div class="dc-type">AWAITING DATA</div><div class="dc-name" style="font-size:0.9rem;">Configured Client</div><div style="font-size:0.85rem;color:var(--muted);margin-top:6px;"><code style="font-size:0.8rem;">${escapeHtml(t._clientUid)}</code></div><div class="dc-meta"><span>Awaiting first report</span><a class="pill secondary" style="font-size:0.7rem;padding:2px 8px;" href="/config-generator?uid=${encodeURIComponent(t._clientUid)}">Edit Config</a></div>`;return card;}
 const ot=t.objectType||'tank';const mu=unitLabel(t.measurementUnit,ot);const val=formatValue(t.currentValue,t.measurementUnit,ot);const stale=isStale(t.lastUpdate);let changeHtml='';if(typeof t.change24h==='number'){const cls=t.change24h>=0?'pos':'neg';const sign=t.change24h>=0?'+':'';changeHtml=`<span class="dc-change ${cls}">${sign}${t.change24h.toFixed(1)} ${mu}/24h</span>`;}
@@ -2261,7 +2267,7 @@ let alarmHtml='';if(t.alarm)alarmHtml=`<div class="dc-alarm">ALARM: ${escapeHtml
 let contentsHtml='';if(t.contents)contentsHtml=`<div class="dc-contents">${escapeHtml(t.contents)}</div>`;
 const staleBadge=stale&&t.lastUpdate?`<span class="status-pill stale">Stale</span>`:'';
 let sparkHtml='';if(SPARKLINE_TYPES.has(ot)){const sparkKey=escapeHtml(t._clientUid)+'|'+(t.sensorIndex||1);const sparkColor=ot==='gas'?'#f59e0b':ot==='flow'?'#10b981':'#2563eb';sparkHtml=`<div class="dc-sparkline" data-spark-key="${sparkKey}" data-spark-color="${sparkColor}"><span class="spark-label">Loading trend...</span></div>`;}
-card.innerHTML=`<div class="dc-type">${objectTypeLabel(ot)} ${staleBadge}</div><div class="dc-name">${escapeHtml(t.label||'Sensor')}${t.userNumber?' #'+t.userNumber:''}</div>${contentsHtml}${t.fault?`<div class="dc-value" style="color:var(--danger);">FAULT <small style="color:var(--danger);">${escapeHtml(t.fault)}</small></div>`:`<div class="dc-value">${val} <small>${escapeHtml(mu)}</small></div>${(typeof t.sensorMa==='number'&&t.sensorMa>0)?`<div style="font-size:0.75rem;color:var(--muted);margin-top:-2px;">${t.sensorMa.toFixed(2)} mA</div>`:''}`}${sparkHtml}${changeHtml}${alarmHtml}<div class="dc-meta"><span>${t.lastUpdate?'Updated '+timeAgo(t.lastUpdate):'No data yet'}</span>${t._vinVoltage&&t._vinVoltage>0?'<span>VIN: '+t._vinVoltage.toFixed(2)+'V</span>':''}</div><div class="dc-actions"><button class="secondary btn-small" onclick="refreshSensor('${escapeHtml(t._clientUid)}')" ${state.refreshing?'disabled':''}>Refresh</button><button class="secondary btn-small" onclick="clearRelays('${escapeHtml(t._clientUid)}',${t.sensorIdx||0})" ${state.refreshing?'disabled':''}>Clear Relay</button></div>`;return card;}
+card.innerHTML=`<div class="dc-type">${objectTypeLabel(ot)} ${staleBadge}</div><div class="dc-name">${escapeHtml(t.label||'Sensor')}${t.userNumber?' #'+t.userNumber:''}</div>${contentsHtml}${t.fault?`<div class="dc-value" style="color:var(--danger);">FAULT <small style="color:var(--danger);">${escapeHtml(t.fault)}</small></div>`:`<div class="dc-value">${val} <small>${escapeHtml(mu)}</small></div>${(typeof t.sensorMa==='number'&&t.sensorMa>0)?`<div style="font-size:0.75rem;color:var(--muted);margin-top:-2px;">${t.sensorMa.toFixed(2)} mA</div>`:''}`}${sparkHtml}${changeHtml}${alarmHtml}<div class="dc-meta"><span>${t.lastUpdate?'Updated '+timeAgo(t.lastUpdate):'No data yet'}</span>${t._vinVoltage&&t._vinVoltage>0?'<span>VIN: '+t._vinVoltage.toFixed(2)+'V</span>':''}</div><div class="dc-actions">${updateActionHtml(t)}<button class="secondary btn-small" onclick="clearRelays('${escapeHtml(t._clientUid)}',${t.sensorIdx||0})" ${state.refreshing?'disabled':''}>Clear Relay</button></div>`;return card;}
 )HTML" R"HTML(
 function toggleDotInfo(section,cl,siteName){const slot=section.querySelector('.cdot-info-slot');if(state.expandedDot===cl.uid){slot.innerHTML='';state.expandedDot=null;return;}state.expandedDot=cl.uid;const color=clientStatusColor(cl);const statusText=cl.alarm?'ALARM':isStale(cl.lastUpdate)?'Stale / No Data':'Online';const sensorCount=cl.sensors.length;slot.innerHTML=`<div class="cdot-info open"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;"><div><strong>${escapeHtml(cl.uid)}</strong><span class="status-pill ${color==='red'?'alarm':color==='yellow'?'stale':'ok'}" style="margin-left:8px;">${statusText}</span>${cl.otaState&&cl.otaState!=='ok'?'<span style="margin-left:8px;background:'+(cl.otaState==='pending'?'#f59e0b':'#dc2626')+';color:#fff;padding:1px 6px;border-radius:3px;font-size:0.72rem;" title="'+escapeHtml(cl.otaDetail||'')+'">OTA '+escapeHtml(cl.otaState)+(cl.expectedFw?'&rarr;v'+escapeHtml(cl.expectedFw):'')+'</span>':''}</div><div style="display:flex;gap:6px;"><a class="pill secondary" style="font-size:0.75rem;padding:2px 10px;" href="/config-generator?uid=${encodeURIComponent(cl.uid)}">Edit Config</a><a class="pill secondary" style="font-size:0.75rem;padding:2px 10px;" href="/site-config?site=${encodeURIComponent(siteName)}">Site Config</a><button class="pill secondary" style="font-size:0.75rem;padding:2px 10px;color:var(--danger);border-color:var(--danger);" onclick="deleteClient('${escapeHtml(cl.uid)}')">Remove Client</button></div></div><div style="margin-top:6px;color:var(--muted);font-size:0.85rem;">${sensorCount} sensor${sensorCount!==1?'s':''} &middot; Last update: ${formatEpoch(cl.lastUpdate)} &middot; VIN: ${formatVoltage(cl.vinVoltage)} &middot; RS-485: ${solarHealthHtml(cl)}</div></div>`;}
 function updateStats(){const allClients=Object.values(state.sites).flatMap(s=>Object.values(s.clients));const allSensors=allClients.flatMap(c=>c.sensors);const clientIds=new Set(allClients.map(c=>c.uid));if(els.statClients)els.statClients.textContent=clientIds.size;if(els.statTanks)els.statTanks.textContent=allSensors.length;if(els.statAlarms)els.statAlarms.textContent=allSensors.filter(t=>t.alarm).length;const stale=allSensors.filter(t=>isStale(t.lastUpdate)).length;if(els.statStale)els.statStale.textContent=stale;}
@@ -2271,12 +2277,23 @@ if(els.pauseBtn){els.pauseBtn.addEventListener('click',togglePause);els.pauseBtn
 async function togglePause(){const target=!state.paused;try{const res=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:target})});if(!res.ok){throw new Error(await res.text()||'Pause toggle failed');}const data=await res.json();state.paused=!!data.paused;renderPauseButton();showToast(state.paused?'Paused for maintenance':'Resumed');}catch(err){showToast(err.message||'Pause toggle failed',true);}}
 async function refreshSensor(clientUid){if(state.refreshing)return;state.refreshing=true;renderSites();try{const res=await fetch('/api/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});if(!res.ok){throw new Error(await res.text()||'Refresh failed');}applyServerData(await res.json());showToast('Refreshed');}catch(err){showToast(err.message||'Refresh failed',true);}finally{state.refreshing=false;renderSites();}}
 window.refreshSensor=refreshSensor;
+// Per-card "Update" button: ask the remote client to take a fresh reading and
+// publish it ASAP via command.qo → telemetry_request.qi. The server stamps
+// updateRequestedEpoch; this card renders an "Update requested" pill with ETA
+// until a fresher telemetry note arrives (lastUpdate > updateRequestedEpoch).
+function maxUpdateWaitSec(isSolar){return isSolar?3600:600;}
+function sensorUpdatePending(t){if(!t||!t._updateRequestedEpoch)return false;const ref=t.lastUpdate||0;return ref<=t._updateRequestedEpoch;}
+function updateActionHtml(t){if(t.objectType==='pending')return '';if(sensorUpdatePending(t)){const nowSec=Date.now()/1000;const elapsed=Math.max(0,nowSec-t._updateRequestedEpoch);const maxWait=maxUpdateWaitSec(t._isSolar);const remaining=Math.max(0,maxWait-elapsed);const etaText=remaining>=60?Math.ceil(remaining/60)+'m':Math.ceil(remaining)+'s';const tooltip=t._isSolar?'Solar/periodic client — next inbound check up to 1 hr away':'Grid client — next inbound check ~10 min';return `<span class="status-pill stale" style="font-size:0.7rem;font-weight:500;" title="${escapeHtml(tooltip)}">⏱ Update requested · ETA ≤ ${etaText}</span>`;}return `<button class="secondary btn-small" onclick="requestUpdate('${escapeHtml(t._clientUid)}')" ${state.refreshing?'disabled':''}>Update</button>`;}
+async function requestUpdate(clientUid){if(!clientUid)return;try{const res=await fetch('/api/request-update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});const txt=await res.text();if(!res.ok){throw new Error(txt||'Update request failed');}showToast(txt||'Update requested');refreshData();}catch(err){showToast(err.message||'Update request failed',true);}}
+window.requestUpdate=requestUpdate;
 window.logout=function(){fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login';});};
 async function clearRelays(clientUid,sensorIdx){if(state.refreshing)return;state.refreshing=true;renderSites();try{const res=await fetch('/api/relay/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientUid:clientUid,sensorIdx:sensorIdx})});if(!res.ok){throw new Error(await res.text()||'Clear relay failed');}showToast('Relay clear command sent');setTimeout(()=>refreshData(),1000);}catch(err){showToast(err.message||'Clear relay failed',true);}finally{state.refreshing=false;renderSites();}}
 window.clearRelays=clearRelays;
 async function deleteClient(clientUid){if(!confirm('Remove client '+clientUid+' and all its sensor data? This cannot be undone.'))return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});if(!res.ok){throw new Error(await res.text()||'Delete failed');}showToast('Client removed: '+clientUid);state.expandedDot=null;refreshData();}catch(err){showToast(err.message||'Failed to remove client',true);}}
 window.deleteClient=deleteClient;
-function applyServerData(data){state.clients=data.cs||[];state.sites=buildSiteModel(state.clients);const srv=data.srv||{};state.paused=!!srv.ps;state.uiRefreshS=DEFAULT_REFRESH_S;renderSites();renderPauseButton();updateStats();scheduleRefresh();if(state.sparkLoaded){renderSparklines();}if(!state.sparkLoaded||Object.keys(state.sparkData).length===0){loadSparklineData();}if(!state.sparkTimer){state.sparkTimer=setInterval(loadSparklineData,300000);}}
+function applyServerData(data){state.clients=data.cs||[];state.sites=buildSiteModel(state.clients);const srv=data.srv||{};state.paused=!!srv.ps;// If any client has a pending on-demand update request, poll faster so the
+// user sees the fresh value the moment it arrives.
+const anyPending=Object.values(state.sites).some(s=>Object.values(s.clients).some(c=>c.updateRequestedEpoch&&(c.lastUpdate||0)<=c.updateRequestedEpoch));state.uiRefreshS=anyPending?10:DEFAULT_REFRESH_S;renderSites();renderPauseButton();updateStats();scheduleRefresh();if(state.sparkLoaded){renderSparklines();}if(!state.sparkLoaded||Object.keys(state.sparkData).length===0){loadSparklineData();}if(!state.sparkTimer){state.sparkTimer=setInterval(loadSparklineData,300000);}}
 function scheduleRefresh(){if(state.timer)clearInterval(state.timer);state.timer=setInterval(refreshData,state.uiRefreshS*1000);}
 async function refreshData(){try{const ac=new AbortController();const tid=setTimeout(()=>ac.abort(),10000);const res=await fetch('/api/clients?summary=1',{signal:ac.signal,headers:{'Cache-Control':'no-cache'}});clearTimeout(tid);if(!res.ok)throw new Error('HTTP '+res.status);applyServerData(await res.json());}catch(err){const msg=err.name==='AbortError'?'Request timed out (server busy)':err.message||'Fleet refresh failed';showToast(msg,true);if(els.siteContainer)els.siteContainer.innerHTML='<div class="no-data" style="color:#dc2626">Failed to load: '+escapeHtml(msg)+'<br><small>Retrying in a few seconds...</small></div>';if(!state.timer)setTimeout(refreshData,5000);}finally{hideLoading();}}
 refreshData();(async()=>{try{const r=await fetch('/api/github/update');if(!r.ok)return;const d=await r.json();const banner=document.getElementById('ghUpdateBanner');let show=false;if(d.available){const v=document.getElementById('ghUpdateVersion');const l=document.getElementById('ghUpdateLink');const sl=document.getElementById('ghUpdateServerLine');if(v)v.textContent='v'+d.latestVersion;if(l&&d.releaseUrl)l.href=d.releaseUrl;if(sl)sl.style.display='';show=true;}if(d.dfuUpdateAvailable){const dl=document.getElementById('dfuUpdateServerLine');if(dl)dl.style.display='';show=true;}if(d.outdatedClientCount>0){const cc=document.getElementById('ghUpdateClientCount');const lv=document.getElementById('ghUpdateLatestVer');const cl=document.getElementById('ghUpdateClientLine');if(cc)cc.textContent=d.outdatedClientCount;if(lv)lv.textContent=d.latestVersion||d.currentVersion;if(cl)cl.style.display='';show=true;}if(show&&banner)banner.style.display='flex';}catch(e){}})();})();
@@ -2437,6 +2454,8 @@ static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, doubl
 static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
+static void handleTelemetryRequestPost(EthernetClient &client, const String &body);
+static bool sendTelemetryRequestCommand(const char *clientUid);
 static float convertMaToLevelWithTemp(const char *clientUid, uint8_t sensorIndex, float mA, float currentTempF);
 static float resolveLevel(const char *clientUid, uint8_t sensorIndex, const char *sensorType, JsonObjectConst src);
 static ClientMetadata *findClientMetadata(const char *clientUid);
@@ -9356,6 +9375,12 @@ static void handleWebRequests() {
     } else {
       handleSyncRequestPost(client, body);
     }
+  } else if (method == "POST" && path == "/api/request-update") {
+    if (contentLength > 256) {
+      respondStatus(client, 413, "Payload Too Large");
+    } else {
+      handleTelemetryRequestPost(client, body);
+    }
   } else if (method == "POST" && path == "/api/pin") {
     if (contentLength > 256) {
       respondStatus(client, 413, "Payload Too Large");
@@ -10196,6 +10221,12 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       if (meta && meta->staleDeletionPending) {
         clientObj["dp"] = true;
       }
+      // On-demand telemetry update request (dashboard "Update" button).
+      // Dashboard treats the request as fulfilled once the next telemetry note
+      // arrives (rec.lastUpdate > meta->updateRequestedEpoch).
+      if (meta && meta->updateRequestedEpoch > 0.0) {
+        clientObj["ureq"] = meta->updateRequestedEpoch;
+      }
       // Add cellular signal strength from client metadata
       if (meta && meta->signalBars >= 0) {
         JsonObject sigObj = clientObj["sig"].to<JsonObject>();
@@ -10728,6 +10759,105 @@ static void handleSyncRequestPost(EthernetClient &client, const String &body) {
   }
 
   respondStatus(client, 200, F("Sync request sent to client"));
+}
+
+// Send an on-demand telemetry request to a specific client via command.qo with
+// _type = "telemetry_request". Route #2 delivers it to telemetry_request.qi on
+// the target. The client takes a fresh sensor reading, publishes a telemetry
+// note, then forces hub.sync so the new reading reaches Notehub immediately.
+// Returns true if the Notecard accepted the outbound note.
+static bool sendTelemetryRequestCommand(const char *clientUid) {
+  if (!clientUid || clientUid[0] == '\0') return false;
+  if (gConfig.productUid[0] == '\0') return false;
+
+  J *req = notecard.newRequest("note.add");
+  if (!req) return false;
+
+  JAddStringToObject(req, "file", COMMAND_OUTBOX_FILE);
+  JAddBoolToObject(req, "sync", true);
+
+  J *body = JCreateObject();
+  if (!body) {
+    JDelete(req);
+    return false;
+  }
+  JAddStringToObject(body, "_target", clientUid);
+  JAddStringToObject(body, "_type", "telemetry_request");
+  JAddStringToObject(body, "request", "telemetry");
+  JAddStringToObject(body, "source", "server-dashboard");
+  stampSchemaVersion(body);
+  JAddItemToObject(req, "body", body);
+
+  J *rsp = notecard.requestAndResponse(req);
+  if (!rsp) {
+    Serial.println(F("ERROR: No response from Notecard for telemetry request"));
+    return false;
+  }
+  const char *err = JGetString(rsp, "err");
+  if (err && err[0] != '\0') {
+    Serial.print(F("ERROR: Telemetry request rejected: "));
+    Serial.println(err);
+    notecard.deleteResponse(rsp);
+    return false;
+  }
+  notecard.deleteResponse(rsp);
+
+  Serial.print(F("Queued telemetry request for client "));
+  Serial.println(clientUid);
+  logTransmission(clientUid, "", "telemetry_request", "outbox", "On-demand telemetry update requested");
+  return true;
+}
+
+// POST /api/request-update
+// Dashboard "Update" button. Queues a telemetry request to the specified client
+// and stamps meta->updateRequestedEpoch so the UI can render a pending badge
+// until the client publishes a fresher telemetry note.
+//
+// Throttle: 30s per client (mirrors the front-panel USER-button cooldown). The
+// dashboard hides the button while pending, but a manual request via a separate
+// browser tab could otherwise spam the cellular link.
+static const double UPDATE_REQUEST_COOLDOWN_S = 30.0;
+
+static void handleTelemetryRequestPost(EthernetClient &client, const String &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    respondStatus(client, 400, F("Invalid JSON"));
+    return;
+  }
+
+  const char *pinValue = doc["pin"].as<const char *>();
+  if (!requireValidPin(client, pinValue)) return;
+
+  const char *clientUid = doc["client"].as<const char *>();
+  if (!clientUid || clientUid[0] == '\0') {
+    respondStatus(client, 400, F("Missing 'client' UID"));
+    return;
+  }
+
+  if (gConfig.productUid[0] == '\0') {
+    respondStatus(client, 500, F("Product UID not configured \u2014 cannot send telemetry request"));
+    return;
+  }
+
+  ClientMetadata *meta = findClientMetadata(clientUid);
+  double now = currentEpoch();
+  if (meta && meta->updateRequestedEpoch > 0.0 && now > 0.0 &&
+      (now - meta->updateRequestedEpoch) < UPDATE_REQUEST_COOLDOWN_S) {
+    respondStatus(client, 429, F("Update request already pending \u2014 try again shortly"));
+    return;
+  }
+
+  if (!sendTelemetryRequestCommand(clientUid)) {
+    respondStatus(client, 500, F("Failed to send telemetry request"));
+    return;
+  }
+
+  if (!meta) meta = findOrCreateClientMetadata(clientUid);
+  if (meta && now > 0.0) {
+    meta->updateRequestedEpoch = now;
+  }
+
+  respondStatus(client, 200, F("Update request sent to client"));
 }
 
 static void sendPinResponse(EthernetClient &client, const __FlashStringHelper *message) {
