@@ -280,6 +280,42 @@ static inline bool tankalarm_setPwm(
   return (err == 0);
 }
 
+/**
+ * Robust Soft-Start / Ramp-Up power gate to eliminate capacitive inrush current spikes.
+ * Gradually scales the PWM duty cycle from 0% -> 99.9% over a highly conservative
+ * 1.0 Second (1000 milliseconds) window using 10 discrete 100ms steps.
+ *
+ * @param ch        PWM output channel (0-3 representing P1-P4)
+ * @param i2cAddr   I2C address of the A0602 module
+ */
+static inline void tankalarm_rampUpPwm(uint8_t ch, uint8_t i2cAddr) {
+  const uint32_t steps[10] = {1000, 2000, 4000, 6000, 7000, 8000, 9000, 9500, 9800, 9999};
+  for (uint8_t i = 0; i < 10; ++i) {
+    (void)tankalarm_setPwm(ch, 10000, steps[i], i2cAddr);
+    delay(100); // 100ms delay per step (1000ms total ramp-up duration)
+  }
+}
+
+/**
+ * Robust Soft-Stop / Ramp-Down power gate to eliminate high-voltage Inductive Back-EMF spikes.
+ * Gradually scales the PWM duty cycle from 99.9% -> 0% over a highly conservative
+ * 1.0 Second (1000 milliseconds) window using 10 discrete 100ms steps.
+ *
+ * @param ch        PWM output channel (0-3 representing P1-P4)
+ * @param i2cAddr   I2C address of the A0602 module
+ */
+static inline void tankalarm_rampDownPwm(uint8_t ch, uint8_t i2cAddr) {
+  const uint32_t steps[10] = {9800, 9500, 9000, 8000, 7000, 6000, 4000, 2000, 1000, 0};
+  for (uint8_t i = 0; i < 10; ++i) {
+    if (steps[i] == 0) {
+      (void)tankalarm_setPwm(ch, 0, 0, i2cAddr);
+    } else {
+      (void)tankalarm_setPwm(ch, 10000, steps[i], i2cAddr);
+    }
+    delay(100); // 100ms delay per step (1000ms total ramp-down duration)
+  }
+}
+
 // ============================================================================
 // Current Loop Reading (A0602 Expansion)
 // ============================================================================
@@ -393,6 +429,145 @@ static inline uint8_t tankalarm_optaCrc8(const uint8_t *data, size_t len) {
     }
   }
   return crc;
+}
+
+/**
+ * Configure the 8 yellow indicator LEDs on the front cover of the A0602 module.
+ * Bit 0 corresponds to LED CH0, bit 7 to LED CH7.
+ *
+ * @return true on successful command acknowledge.
+ */
+static inline bool tankalarm_setExpansionLeds(uint8_t bitmask, uint8_t i2cAddr) {
+  uint8_t buf[5];
+  buf[0] = 0x01; // BP_CMD_SET
+  buf[1] = 0x15; // ARG_OA_SET_LED (0x15)
+  buf[2] = 0x01; // LEN_OA_SET_LED
+  buf[3] = bitmask; 
+  buf[4] = tankalarm_optaCrc8(buf, 4);
+
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(buf, 5);
+  return (Wire.endTransmission() == 0);
+}
+
+/**
+ * Bypasses blew high-side PWM transistors (P1-P4) entirely on long/damaged cables.
+ * Configures the analog input channel as an internally powered 11.0V DAC current loop.
+ *
+ * 1. Initializes the channel as a Voltage DAC with limit_current disabled (allows up to 25mA loop power).
+ * 2. Programs the DAC output to 11.0V (max possible value).
+ * 3. Adds a Current ADC on top of the SAME channel using adding_adc=1 (preserves DAC output active).
+ *
+ * @return true if all three configurations frames were successfully acknowledged.
+ */
+static inline bool tankalarm_configureDacLoopPowered(uint8_t channel, uint8_t i2cAddr) {
+  // Step 1: Set channel as Voltage DAC
+  uint8_t buf[9];
+  buf[0] = 0x01; // BP_CMD_SET
+  buf[1] = 0x0C; // ARG_OA_CH_DAC
+  buf[2] = 0x05; // LEN_OA_CH_DAC
+  buf[3] = channel;
+  buf[4] = 0x00; // OA_VOLTAGE_DAC
+  buf[5] = 0x02; // limit_current = OA_DISABLE
+  buf[6] = 0x02; // enable_slew = OA_DISABLE
+  buf[7] = 0x00; // sr = OA_SLEW_RATE_0
+  buf[8] = tankalarm_optaCrc8(buf, 8);
+
+  Wire.beginTransmission(i2cAddr);
+  if (Wire.write(buf, 9) != 9 || Wire.endTransmission() != 0) {
+    return false;
+  }
+  delay(1);
+  uint8_t ack[4];
+  uint8_t an = 0;
+  uint8_t agot = Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available() && an < 4) { ack[an++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (agot != 4 || an != 4 || ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00 || tankalarm_optaCrc8(ack, 3) != ack[3]) {
+    return false;
+  }
+
+  // Step 2: Set DAC Value to 11.0V (8191 raw)
+  uint8_t dacBuf[8];
+  dacBuf[0] = 0x01; // BP_CMD_SET
+  dacBuf[1] = 0x0D; // ARG_OA_SET_DAC
+  dacBuf[2] = 0x04; // LEN_OA_SET_DAC
+  dacBuf[3] = channel;
+  dacBuf[4] = 0xFF; // raw 8191 little-endian (0x1FFF)
+  dacBuf[5] = 0x1F;
+  dacBuf[6] = 0x01; // update immediately
+  dacBuf[7] = tankalarm_optaCrc8(dacBuf, 7);
+
+  Wire.beginTransmission(i2cAddr);
+  if (Wire.write(dacBuf, 8) != 8 || Wire.endTransmission() != 0) {
+    return false;
+  }
+  delay(1);
+  an = 0;
+  agot = Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available() && an < 4) { ack[an++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (agot != 4 || an != 4 || ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00 || tankalarm_optaCrc8(ack, 3) != ack[3]) {
+    return false;
+  }
+
+  // Step 3: Add Current ADC on top of the same channel
+  uint8_t adcBuf[11];
+  adcBuf[0] = 0x01;          // BP_CMD_SET
+  adcBuf[1] = 0x09;          // ARG_OA_CH_ADC
+  adcBuf[2] = 0x07;          // LEN_OA_CH_ADC (7-byte payload)
+  adcBuf[3] = channel;       // OA_CH_ADC_CHANNEL_POS
+  adcBuf[4] = 0x01;          // OA_CH_ADC_TYPE_POS = OA_CURRENT_ADC
+  adcBuf[5] = 0x02;          // OA_CH_ADC_PULL_DOWN_POS = OA_DISABLE (false)
+  adcBuf[6] = 0x01;          // OA_CH_ADC_REJECTION_POS = OA_ENABLE (true)
+  adcBuf[7] = 0x02;          // OA_CH_ADC_DIAGNOSTIC_POS = OA_DISABLE (false)
+  adcBuf[8] = 0x00;          // OA_CH_ADC_MOVING_AVE_POS = 0
+  adcBuf[9] = 0x01;          // OA_CH_ADC_ADDING_ADC_POS = OA_ENABLE (ADD ADC as secondary overlay)
+  adcBuf[10] = tankalarm_optaCrc8(adcBuf, 10);
+
+  Wire.beginTransmission(i2cAddr);
+  if (Wire.write(adcBuf, 11) != 11 || Wire.endTransmission() != 0) {
+    return false;
+  }
+  delay(1);
+  an = 0;
+  agot = Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available() && an < 4) { ack[an++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (agot != 4 || an != 4 || ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00 || tankalarm_optaCrc8(ack, 3) != ack[3]) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Reset a DAC-loop-powered channel back to standard High-Impedance unpowered idle state.
+ *
+ * @return true on successful command acknowledge.
+ */
+static inline bool tankalarm_disableDacLoopPowered(uint8_t channel, uint8_t i2cAddr) {
+  uint8_t buf[5];
+  buf[0] = 0x01; // BP_CMD_SET
+  buf[1] = 0x24; // ARG_OA_CH_HIGH_IMPEDENCE (0x24)
+  buf[2] = 0x01; // LEN_OA_CH_HIGH_IMPEDENCE (0x01)
+  buf[3] = channel;
+  buf[4] = tankalarm_optaCrc8(buf, 4);
+
+  Wire.beginTransmission(i2cAddr);
+  if (Wire.write(buf, 5) != 5 || Wire.endTransmission() != 0) {
+    return false;
+  }
+  delay(1);
+  uint8_t ack[4];
+  uint8_t an = 0;
+  uint8_t agot = Wire.requestFrom(i2cAddr, (uint8_t)4);
+  while (Wire.available() && an < 4) { ack[an++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (agot != 4 || an != 4 || ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00 || tankalarm_optaCrc8(ack, 3) != ack[3]) {
+    return false;
+  }
+  return true;
 }
 
 /**
