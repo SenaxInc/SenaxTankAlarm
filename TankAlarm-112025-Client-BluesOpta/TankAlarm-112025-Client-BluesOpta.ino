@@ -975,7 +975,8 @@ enum ClFaultReason : uint8_t {
   CL_FAULT_CONFIG_NACK = 2, // ADC channel config NACKed
   CL_FAULT_FUNC_WRONG = 3,  // channel not in current-ADC mode
   CL_FAULT_READ_FAIL = 4,   // every framed sample failed
-  CL_FAULT_OVER_RANGE = 5   // reading rejected as >21mA / 0xFFFF garbage
+  CL_FAULT_OVER_RANGE = 5,  // reading rejected as >21mA / 0xFFFF garbage
+  CL_FAULT_UNDER_RANGE = 6  // reading valid but below 4-20mA live-zero threshold (loop open?)
 };
 
 // Fix 12 (v2.0.51): stable short strings for the current-loop fault enum, emitted in
@@ -990,6 +991,7 @@ static inline const char *clFaultReasonString(uint8_t reason) {
     case CL_FAULT_FUNC_WRONG:  return "func_wrong";
     case CL_FAULT_READ_FAIL:   return "read_fail";
     case CL_FAULT_OVER_RANGE:  return "over_range";
+    case CL_FAULT_UNDER_RANGE: return "under_range";
     default:                   return "unknown";
   }
 }
@@ -5720,6 +5722,14 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   }
 
   if (milliamps < CURRENT_LOOP_FAULT_MA) {
+    // Live-zero threshold breach. This is a real, valid A0602 read (framed + CRC-validated)
+    // that came back below 4mA — which conventionally means the current loop is open, the
+    // sensor is unpowered, or the sensor is genuinely reporting a below-live-zero fault.
+    // Preserve the raw reading in currentSensorMa (already set at line ~5709) so telemetry
+    // can surface it for diagnosis, and flag the fault explicitly instead of returning NAN
+    // with a stale fault reason.
+    gLastClFaultReason = CL_FAULT_UNDER_RANGE;
+    gMonitorState[idx].sampleReused = true;
     return NAN;
   }
 
@@ -6151,12 +6161,19 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
       // deliberately does NOT emit a computed `lvl`/`cap` for current-loop so a failed
       // read or stale-reused value cannot silently masquerade as a real measurement.
       //   - Successful read  -> emit `ma` (always, even at live-zero ~4 mA).
-      //   - Failed read (ru) -> emit `fault: "<short_string>"` and DO NOT emit `ma`.
+      //   - Failed read (ru) -> emit `fault: "<short_string>"` AND emit the raw `ma`
+      //     the framed read returned so the operator can distinguish "loop open" (~0 mA)
+      //     from "just below 4 mA" (3.5 mA) from "stuck stale value" (~18 mA). The `fault`
+      //     tag is authoritative — server/dashboard must treat `ma` as diagnostic-only
+      //     whenever `fault` is present, and never chart it as a real sensor reading.
       // `pg` (PWM gate enable result) is kept for diagnostics on either path.
       o["st"] = "currentLoop";
       if (cfg.pwmGatingEnabled) o["pg"] = state.lastPwmEnableOk ? 1 : 0;
       if (state.sampleReused) {
         o["fault"] = clFaultReasonString(gLastClFaultReason);
+        // Emit the raw last-observed mA as a diagnostic field (distinct from a valid `ma`
+        // reading, which is only emitted when there is no `fault`).
+        o["ma_raw"] = roundTo(state.currentSensorMa, 2);
       } else {
         o["ma"] = roundTo(state.currentSensorMa, 2);
       }
