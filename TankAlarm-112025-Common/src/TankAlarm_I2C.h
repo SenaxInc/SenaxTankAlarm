@@ -696,6 +696,69 @@ static inline float tankalarm_readCurrentAdcFramed(uint8_t channel, uint8_t i2cA
   return 25.0f * (float)raw / 65535.0f; // A0602 current-ADC full scale (matches pinCurrent)
 }
 
+/**
+ * Read one 4-20mA sample from a channel configured as an INTERNALLY-POWERED DAC LOOP
+ * (tankalarm_configureDacLoopPowered: voltage DAC + added current ADC on the same channel).
+ *
+ * SCALE (v2.1.2 fix): in this mode the expansion programs the AD74412R ADC with the
+ * BIPOLAR range (OptaAnalog.cpp parse_setup_adc_channel(), add-ADC special case:
+ * CFG_ADC_RANGE_2_5V_BI across the 100R sense resistor), NOT the unipolar 0-25mA range a
+ * plain current ADC uses. Zero current sits at MID-scale (~0x8000), full scale spans
+ * -25mA..+25mA, and current SOURCED by the channel reads NEGATIVE. The managed library's
+ * pinCurrent() for this exact mode computes ((raw/65535)*5.0 - 2.5)/100 * 1000 mA.
+ * v2.1.1 wrongly applied the unipolar 25*raw/65535 formula here, so a real -4.51mA loop
+ * reading (raw 26857) was transmitted as 10.245mA. Returns the MAGNITUDE of the sourced
+ * current (matching the DAC utility's abs(pinCurrent()) convention) so the caller's
+ * 4-20mA live-zero/over-range guards work unchanged.
+ *
+ * Returns milliamps >= 0, or -1.0f on ANY I2C/framing/CRC failure or rail-value garbage.
+ */
+static inline float tankalarm_readLoopPoweredCurrentAdcFramed(uint8_t channel, uint8_t i2cAddr) {
+  uint8_t req[5];
+  req[0] = 0x02;          // BP_CMD_GET
+  req[1] = 0x0A;          // ARG_OA_GET_ADC
+  req[2] = 0x01;          // LEN_OA_GET_ADC
+  req[3] = channel;       // OA_CH_ADC_CHANNEL_POS
+  req[4] = tankalarm_optaCrc8(req, 4);
+
+  Wire.beginTransmission(i2cAddr);
+  Wire.write(req, 5);
+  if (Wire.endTransmission() != 0) {
+    return -1.0f;
+  }
+  delay(1); // allow the expansion to stage its answer buffer
+  const uint8_t ANS_LEN = 7;
+  uint8_t got = Wire.requestFrom(i2cAddr, ANS_LEN);
+  uint8_t a[7];
+  uint8_t n = 0;
+  while (Wire.available() && n < ANS_LEN) { a[n++] = Wire.read(); }
+  while (Wire.available()) { (void)Wire.read(); }
+  if (got != ANS_LEN || n != ANS_LEN) {
+    return -1.0f;
+  }
+  if (a[0] != 0x03 || a[1] != 0x0A || a[2] != 0x03) {
+    return -1.0f;
+  }
+  if (tankalarm_optaCrc8(a, 6) != a[6]) {
+    return -1.0f;
+  }
+  if (a[3] != channel) {
+    return -1.0f;
+  }
+  uint16_t raw = (uint16_t)a[4] | ((uint16_t)a[5] << 8); // little-endian
+  // Rail values are garbage signatures in bipolar mode: 0xFFFF = +25mA rail (bus pulled
+  // high), 0x0000 = -25mA rail — also the expansion's reset/not-yet-applied ADC cache
+  // value (the v2.1.0 settle bug produced exactly raw=0). A real loop cannot sit on
+  // either rail, so reject both while the raw word is still in hand.
+  if (raw == 0xFFFF || raw == 0x0000) {
+    return -1.0f;
+  }
+  // Bipolar conversion (matches pinCurrent's DAC+added-ADC branch), then magnitude:
+  // sourced loop current reads negative on this scale.
+  float ma = ((float)raw / 65535.0f) * 50.0f - 25.0f;
+  return (ma < 0.0f) ? -ma : ma;
+}
+
 // Blueprint channel-function value for a 4-20mA current ADC with external loop power.
 // Verified against the installed Arduino_Opta_Blueprint library (AnalogCommonCfg.h CfgFun_t):
 // CH_FUNC_CURRENT_INPUT_EXT_POWER = 4. COUPLING: the expansion reports this function for our

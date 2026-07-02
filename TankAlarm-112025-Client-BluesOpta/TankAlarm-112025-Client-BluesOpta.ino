@@ -5674,7 +5674,14 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   for (uint8_t s = 0; s < numSamples; ++s) {
     // Framed Blueprint GET protocol with CRC + channel-echo validation. Rejects
     // corrupted / cross-talked frames instead of accepting them as plausible 4-20mA.
-    float sample = tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
+    // v2.1.2: the two loop-power modes use DIFFERENT ADC scales on the expansion —
+    // internally-powered DAC loop = bipolar +/-25mA (zero current at mid-scale),
+    // externally-powered current ADC = unipolar 0-25mA. Using the unipolar formula on
+    // a DAC-loop channel shifted every reading by the +25mA offset/2 (e.g. a real
+    // 4.51mA loop transmitted as 10.245mA).
+    float sample = cfg.loopPowerEnabled
+                       ? tankalarm_readLoopPoweredCurrentAdcFramed((uint8_t)channel, i2cAddr)
+                       : tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
     if (sample >= 0.0f) {
       total += sample;
       validSamples++;
@@ -5720,6 +5727,20 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     return NAN;
   }
   milliamps = total / validSamples;
+
+  // v2.1.2 diagnosis aid: one line per sampling burst with the averaged loop reading, so a
+  // mis-scaled/mis-wired sensor is visible on the serial console without a Notehub round trip.
+  Serial.print(F("CL ch"));
+  Serial.print(channel);
+  Serial.print(F(": "));
+  Serial.print(milliamps, 3);
+  Serial.print(F(" mA (n="));
+  Serial.print(validSamples);
+  Serial.print(F("/"));
+  Serial.print(numSamples);
+  Serial.print(F(", loopPower="));
+  Serial.print(cfg.loopPowerEnabled ? 1 : 0);
+  Serial.println(F(")"));
 
   gMonitorState[idx].currentSensorMa = milliamps;
 
