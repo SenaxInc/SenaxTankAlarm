@@ -458,8 +458,20 @@ static inline bool tankalarm_setExpansionLeds(uint8_t bitmask, uint8_t i2cAddr) 
  * 2. Programs the DAC output to 11.0V (max possible value).
  * 3. Adds a Current ADC on top of the SAME channel using adding_adc=1 (preserves DAC output active).
  *
+ * TIMING (v2.1.1, bench-proven root cause of the v2.1.0 read_fail): the A0602 applies each
+ * SET in its own MAIN LOOP -- the 4-byte ACK only means "command queued", NOT "applied".
+ * Sent back-to-back (~1ms apart), the 11V SET_DAC value is processed while the channel is
+ * not yet a DAC, so the value is lost and the applied DAC drives 0V: every subsequent read
+ * returns a valid frame with raw=0 (0.000mA), indistinguishable from an open loop. The
+ * A0602_DAC_RawFrame_Diag A/B test proved settle=0 -> 0.000mA and settle=300ms -> live
+ * loop current on the same hardware back-to-back. Each stage below therefore waits
+ * TANKALARM_DAC_APPLY_SETTLE_MS for the expansion to apply the previous stage.
+ *
  * @return true if all three configurations frames were successfully acknowledged.
  */
+#ifndef TANKALARM_DAC_APPLY_SETTLE_MS
+#define TANKALARM_DAC_APPLY_SETTLE_MS 300
+#endif
 static inline bool tankalarm_configureDacLoopPowered(uint8_t channel, uint8_t i2cAddr) {
   // Step 1: Set channel as Voltage DAC
   uint8_t buf[9];
@@ -487,6 +499,10 @@ static inline bool tankalarm_configureDacLoopPowered(uint8_t channel, uint8_t i2
     return false;
   }
 
+  // Let the expansion main loop APPLY the DAC function before sending the value
+  // (see TIMING note above -- without this the 11V value is silently dropped).
+  delay(TANKALARM_DAC_APPLY_SETTLE_MS);
+
   // Step 2: Set DAC Value to 11.0V (8191 raw)
   uint8_t dacBuf[8];
   dacBuf[0] = 0x01; // BP_CMD_SET
@@ -510,6 +526,10 @@ static inline bool tankalarm_configureDacLoopPowered(uint8_t channel, uint8_t i2
   if (agot != 4 || an != 4 || ack[0] != 0x04 || ack[1] != 0x20 || ack[2] != 0x00 || tankalarm_optaCrc8(ack, 3) != ack[3]) {
     return false;
   }
+
+  // Let the 11V value latch into the applied DAC before overlaying the current ADC
+  // (the add-ADC special case must observe the channel already driving as a DAC).
+  delay(TANKALARM_DAC_APPLY_SETTLE_MS);
 
   // Step 3: Add Current ADC on top of the same channel
   uint8_t adcBuf[11];
