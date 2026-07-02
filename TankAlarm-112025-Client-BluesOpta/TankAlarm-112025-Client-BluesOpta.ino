@@ -330,6 +330,10 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define I2C_NORMAL_CLOCK_HZ 100000
 #endif
 
+// Sensor loop-power modes (v2.1.3). Selected per-monitor via config key "loopPowerMode".
+#define LOOP_POWER_MODE_DAC 0  // channel's own DAC drives ~11V out the sensor terminals (2-wire)
+#define LOOP_POWER_MODE_PWM 1  // P1-P4 transistor switches an external 12-24V supply (soft-ramped)
+
 #ifndef MAX_ALARMS_PER_HOUR
 #define MAX_ALARMS_PER_HOUR 10  // Maximum alarms per monitor per hour
 #endif
@@ -712,14 +716,19 @@ struct MonitorConfig {
   float sensorRangeMin;    // Minimum native sensor range (e.g., 0 for 0-5 PSI or 0-10m)
   float sensorRangeMax;    // Maximum native sensor range (e.g., 5 for 0-5 PSI, 10 for 0-10m)
   char sensorRangeUnit[8]; // Unit for sensor range: "PSI", "bar", "m", "ft", "in", etc.
-  // Sensor loop power (v2.1.0): the 4-20mA transmitter is powered by the A0602 channel's
-  // own DAC (~11V driven out the channel's +/- screw terminals) with the current ADC
-  // overlaid on the same channel. Replaces the retired P1-P4 PWM/transistor power gating,
-  // so there is no separate power-channel selection anymore — the sensor's own
-  // channel/terminal pair both powers and measures the loop.
-  bool loopPowerEnabled;         // Duty-cycled DAC loop power enabled (false = externally powered loop)
+  // Sensor loop power (v2.1.0, extended v2.1.3): the 4-20mA transmitter is powered either
+  // by the A0602 channel's own DAC (~11V out the channel's +/- screw terminals, current ADC
+  // overlaid on the same channel) or — reinstated in v2.1.3 for transmitters that need more
+  // than the 11V DAC ceiling minus the ~2V full-scale drop across the internal 100R sense
+  // resistor — by a P1-P4 high-side transistor switching an external 12-24V supply
+  // (soft-ramped on/off to protect the gate MOSFET; see the P1 failure post-mortem).
+  bool loopPowerEnabled;         // Duty-cycled loop power enabled (false = externally powered, always-on loop)
+  uint8_t loopPowerMode;         // LOOP_POWER_MODE_DAC (default) or LOOP_POWER_MODE_PWM
+  int16_t loopPowerPwmChannel;   // PWM mode only: transistor output index (0 = P1 .. 3 = P4)
   uint32_t loopPowerWarmup;      // ms of transmitter power-up stabilization before sampling (default 3000)
   uint16_t loopPowerSampleDelay; // ms between individual samples in the averaging loop (default 300)
+  float sensorMinVoltage;        // v2.1.3: transmitter's datasheet minimum supply voltage (default 10.0V);
+                                 // used by assessLoopClipping() to compute the max un-clipped loop current
   // Fluid characterization (for liquid tanks; ignored for OBJECT_GAS / non-tank objects).
   // Used as the fallback SG before the server's calibration learning takes over.
   FluidType fluidType;             // Fluid preset (default FLUID_WATER)
@@ -808,6 +817,8 @@ struct MonitorRuntime {
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
   bool lastLoopPowerOk;         // result of the last loop power-up (v2.1.0: DAC loop-power config)
+  bool clipSuspected;           // v2.1.3: last mA reading may be supply-voltage clipped (see assessLoopClipping)
+  float lastSupplyVoltage;      // v2.1.3: loop supply voltage used for the clip assessment (0 = unknown)
   float lastReportedValue;   // Last value pushed via change-based telemetry (monitor's own unit)
   float lastDailySentValue;  // Last value included in a daily report (monitor's own unit)
   bool highAlarmLatched;
@@ -975,9 +986,9 @@ static bool    gOptaControllerReady = false;
 // so the per-op 400kHz window's effect on read latency (gLastClBurstMicros) can be confirmed.
 enum ClFaultReason : uint8_t {
   CL_FAULT_NONE = 0,        // last A0602 read OK
-  CL_FAULT_PWM_NACK = 1,    // RETIRED v2.1.0 (was: P1-P4 PWM power-gate enable NACKed)
+  CL_FAULT_PWM_NACK = 1,    // PWM loop-power enable NACKed (reinstated v2.1.3 for PWM mode)
   CL_FAULT_CONFIG_NACK = 2, // channel config NACKed (DAC loop power or ext-power ADC)
-  CL_FAULT_FUNC_WRONG = 3,  // RETIRED v2.1.0 (was: channel not in current-ADC mode)
+  CL_FAULT_FUNC_WRONG = 3,  // RETIRED v2.1.0 (was: channel not in current-ADC mode; 0x40 GET unreliable)
   CL_FAULT_READ_FAIL = 4,   // every framed sample failed
   CL_FAULT_OVER_RANGE = 5,  // reading rejected as >21mA / 0xFFFF garbage
   CL_FAULT_UNDER_RANGE = 6  // reading valid but below 4-20mA live-zero threshold (loop open?)
@@ -1166,6 +1177,7 @@ static void sampleMonitors();
 static float readDigitalSensor(const MonitorConfig &cfg, uint8_t idx);
 static float readAnalogSensor(const MonitorConfig &cfg, uint8_t idx);
 static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx);
+static void assessLoopClipping(const MonitorConfig &cfg, uint8_t idx, float milliamps, bool pwmMode);
 static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx);
 static float readMonitorSensor(uint8_t idx);
 
@@ -2774,8 +2786,11 @@ static void createDefaultConfig(ClientConfig &cfg) {
   cfg.monitors[0].sensorRangeMax = 5.0f;    // Default: 5 (e.g., 5 PSI for typical pressure sensor)
   strlcpy(cfg.monitors[0].sensorRangeUnit, "PSI", sizeof(cfg.monitors[0].sensorRangeUnit)); // Default: PSI
   cfg.monitors[0].loopPowerEnabled = true;  // Default: DAC loop power on (2-wire transmitter on channel terminals)
+  cfg.monitors[0].loopPowerMode = LOOP_POWER_MODE_DAC; // Default: 11V DAC (PWM selectable for 12-24V rails)
+  cfg.monitors[0].loopPowerPwmChannel = 0;  // PWM mode only: P1
   cfg.monitors[0].loopPowerWarmup = 3000;   // Default: 3000ms stabilization delay
   cfg.monitors[0].loopPowerSampleDelay = 300; // Default: 300ms sensor read/debounce delay
+  cfg.monitors[0].sensorMinVoltage = 10.0f; // Default: 10V transmitter minimum (Dwyer 626 class)
   cfg.monitors[0].analogVoltageMin = 0.0f;  // Default: 0V (for 0-10V sensors)
   cfg.monitors[0].analogVoltageMax = 10.0f; // Default: 10V (for 0-10V sensors)
   cfg.monitors[0].fluidType = FLUID_WATER;       // Default fluid: water (SG 1.0)
@@ -2908,8 +2923,11 @@ static void initMonitorDefaults(MonitorConfig &mon, uint8_t index) {
   mon.sensorRangeMax = 5.0f;
   strlcpy(mon.sensorRangeUnit, "PSI", sizeof(mon.sensorRangeUnit));
   mon.loopPowerEnabled = true;  // Default: DAC loop power on (2-wire transmitter on channel terminals)
+  mon.loopPowerMode = LOOP_POWER_MODE_DAC; // Default: 11V DAC (PWM selectable for 12-24V rails)
+  mon.loopPowerPwmChannel = 0;  // PWM mode only: P1
   mon.loopPowerWarmup = 3000;   // Default: 3000ms stabilization delay
   mon.loopPowerSampleDelay = 300; // Default: 300ms sensor read/debounce delay
+  mon.sensorMinVoltage = 10.0f; // Default: 10V transmitter minimum (Dwyer 626 class)
   mon.analogVoltageMin = 0.0f;
   mon.analogVoltageMax = 10.0f;
 
@@ -3109,15 +3127,27 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
     mon.sensorMountHeight = fmaxf(0.0f, t["sensorMountHeight"].as<float>());
   }
 
-  // ---- Sensor loop power (v2.1.0: DAC internally-powered loop) ----
-  // Accept the legacy v1.9.x-v2.0.x "pwmGating*" keys as fallbacks so configs saved by an
-  // older server (or an old on-flash config) still parse. The legacy pwmGatingChannel
-  // (P1-P4 transistor pin) is retired and intentionally ignored: loop power now comes
-  // from the sensor's own channel +/- terminals via the DAC.
+  // ---- Sensor loop power (v2.1.0 DAC; v2.1.3 adds selectable PWM mode) ----
+  // Key precedence / migration:
+  //   1. "loopPowerMode" ("dac"/"pwm") — v2.1.3+ servers.
+  //   2. legacy "pwmGating*" keys with NO loopPower* keys — pre-2.1.0 config: those
+  //      installations are physically wired through a P1-P4 transistor, so they migrate
+  //      to PWM mode with their original gating channel preserved.
+  //   3. "loopPowerEnabled" with no mode key — v2.1.0-2.1.2 config: DAC mode (rewired era).
   if (t.containsKey("loopPowerEnabled")) {
     mon.loopPowerEnabled = t["loopPowerEnabled"].as<bool>();
   } else if (t.containsKey("pwmGatingEnabled")) {
     mon.loopPowerEnabled = t["pwmGatingEnabled"].as<bool>();
+    mon.loopPowerMode = LOOP_POWER_MODE_PWM; // pre-2.1.0 wiring is transistor-gated
+  }
+  const char *lpModeStr = t["loopPowerMode"].as<const char *>();
+  if (lpModeStr) {
+    mon.loopPowerMode = (strcmp(lpModeStr, "pwm") == 0) ? LOOP_POWER_MODE_PWM : LOOP_POWER_MODE_DAC;
+  }
+  if (t["loopPowerPwmChannel"].is<int>()) {
+    mon.loopPowerPwmChannel = t["loopPowerPwmChannel"].as<int>();
+  } else if (t["pwmGatingChannel"].is<int>()) {
+    mon.loopPowerPwmChannel = t["pwmGatingChannel"].as<int>();
   }
   if (t["loopPowerWarmup"].is<uint32_t>()) {
     mon.loopPowerWarmup = t["loopPowerWarmup"].as<uint32_t>();
@@ -3128,6 +3158,10 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
     mon.loopPowerSampleDelay = t["loopPowerSampleDelay"].as<uint16_t>();
   } else if (t["pwmGatingSampleDelay"].is<uint16_t>()) {
     mon.loopPowerSampleDelay = t["pwmGatingSampleDelay"].as<uint16_t>();
+  }
+  if (t["sensorMinVoltage"].is<float>()) {
+    float smv = t["sensorMinVoltage"].as<float>();
+    if (smv >= 0.0f && smv <= 30.0f) mon.sensorMinVoltage = smv;
   }
 
   // ---- Sensor range ----
@@ -3694,10 +3728,13 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     }
     // Save sensor mount height (for calibration)
     t["sensorMountHeight"] = cfg.monitors[i].sensorMountHeight;
-    // Save sensor loop power configuration (v2.1.0: DAC internally-powered loop)
+    // Save sensor loop power configuration (v2.1.0 DAC; v2.1.3 selectable PWM mode)
     t["loopPowerEnabled"] = cfg.monitors[i].loopPowerEnabled;
+    t["loopPowerMode"] = (cfg.monitors[i].loopPowerMode == LOOP_POWER_MODE_PWM) ? "pwm" : "dac";
+    t["loopPowerPwmChannel"] = cfg.monitors[i].loopPowerPwmChannel;
     t["loopPowerWarmup"] = cfg.monitors[i].loopPowerWarmup;
     t["loopPowerSampleDelay"] = cfg.monitors[i].loopPowerSampleDelay;
+    t["sensorMinVoltage"] = cfg.monitors[i].sensorMinVoltage;
     // Save sensor native range settings
     t["sensorRangeMin"] = cfg.monitors[i].sensorRangeMin;
     t["sensorRangeMax"] = cfg.monitors[i].sensorRangeMax;
@@ -5579,6 +5616,70 @@ static float readAnalogSensor(const MonitorConfig &cfg, uint8_t idx) {
 }
 
 /**
+ * v2.1.3: 4-20mA signal-clipping detector (the "silent failure" guard).
+ *
+ * A starved transmitter does NOT fail to 0mA — it plateaus. The loop passes through the
+ * A0602's internal 100R sense resistor, so the maximum current the supply can push before
+ * the transmitter drops below its datasheet minimum voltage is:
+ *     clipMa = (Vsupply - sensorMinVoltage) / 100R  =  (Vsupply - Vmin) * 10  [mA per volt]
+ * e.g. an 11.5V battery with a 10V-minimum sensor clips at 15mA: a 90%-full tank that
+ * needs 18.4mA reads 15mA and silently charts as 68%. The reading is VALID at low
+ * currents and only lies near the ceiling — so we flag, never fault.
+ *
+ * Supply voltage source by mode:
+ *   DAC mode:  fixed 11.0V (AD74412R full-scale output). Note the sobering corollary: a
+ *              strict-10V transmitter on DAC power clips at ~10mA (mid-scale).
+ *   PWM mode:  getEffectiveBatteryVoltage() — SunSaver MPPT via Modbus preferred, analog
+ *              Vin divider fallback (strict priority, cache-only, no bus I/O here). If
+ *              neither source has data (e.g. RS-485 down and no divider), the assessment
+ *              is skipped and `vsup` is simply absent from telemetry — the operator then
+ *              relies on the existing stuck-reading detection.
+ *   Disabled:  skipped — the external supply (e.g. a 24V PSU) is not monitored by us.
+ *
+ * Outputs (MonitorRuntime): clipSuspected + lastSupplyVoltage, emitted in telemetry as
+ * `clip:1` / `vsup`. A separate low-headroom advisory (`lv:1`) is emitted when the supply
+ * cannot guarantee FULL-SCALE 20mA (Vsupply < Vmin + 2.0V + 0.2V buffer), i.e. "this
+ * reading may be fine, but high readings from this sensor cannot be trusted right now".
+ */
+static void assessLoopClipping(const MonitorConfig &cfg, uint8_t idx, float milliamps, bool pwmMode) {
+  MonitorRuntime &st = gMonitorState[idx];
+  st.clipSuspected = false;
+  st.lastSupplyVoltage = 0.0f;
+  if (!cfg.loopPowerEnabled) {
+    return; // externally powered full-time: supply unknown/unmonitored
+  }
+  float vsup;
+  if (pwmMode) {
+    vsup = getEffectiveBatteryVoltage();
+    if (vsup <= 0.1f) {
+      return; // no voltage source available — cannot compute a ceiling
+    }
+  } else {
+    vsup = 11.0f; // DAC mode drives the AD74412R full-scale output
+  }
+  st.lastSupplyVoltage = vsup;
+  float minV = (cfg.sensorMinVoltage >= 0.5f && cfg.sensorMinVoltage <= 30.0f)
+                   ? cfg.sensorMinVoltage : 10.0f;
+  float clipMa = (vsup - minV) * 10.0f; // 100R sense resistor: 10mA per volt of headroom
+  if (clipMa < 0.0f) clipMa = 0.0f;
+  // Quarter-mA margin: a reading at/above the ceiling is indistinguishable from a plateau.
+  if (milliamps >= clipMa - 0.25f) {
+    st.clipSuspected = true;
+    Serial.print(F("WARNING: CL ch"));
+    Serial.print(cfg.currentLoopChannel);
+    Serial.print(F(" possible mA clipping: reading "));
+    Serial.print(milliamps, 2);
+    Serial.print(F(" mA >= ceiling "));
+    Serial.print(clipMa, 2);
+    Serial.print(F(" mA (vsup="));
+    Serial.print(vsup, 2);
+    Serial.print(F("V, sensorMin="));
+    Serial.print(minV, 1);
+    Serial.println(F("V) - treat high readings as suspect"));
+  }
+}
+
+/**
  * Read a 4-20mA current loop sensor (pressure or ultrasonic).
  * Handles both pressure sensors (mounted near bottom) and ultrasonic sensors
  * (mounted on top) via the currentLoopType configuration.
@@ -5600,15 +5701,92 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     i2cAddr = CURRENT_LOOP_I2C_ADDRESS;
   }
 
-  // ---- Sensor loop power (v2.1.0: internally-powered DAC loop) ----
-  // The A0602 channel's own DAC drives ~11V out the channel's +/- screw terminals to
-  // power the 2-wire 4-20mA transmitter, and a current ADC is overlaid on the SAME
-  // channel (adding_adc) to measure the loop. This retires the v1.9.x-v2.0.x P1-P4
-  // PWM/high-side-transistor gating: no separate power channel or wiring is needed,
-  // and the (failure-prone) gating MOSFETs are bypassed entirely. The channel config
-  // is re-applied on every duty cycle because the AD74412R returns to an unconfigured
-  // state whenever the expansion loses power.
-  if (cfg.loopPowerEnabled) {
+  // ---- Sensor loop power (v2.1.0 DAC; v2.1.3 reinstates selectable PWM mode) ----
+  // Three supported modes:
+  //   DAC (default): the channel's own DAC drives ~11V out the sensor's +/- terminals and
+  //     a current ADC is overlaid on the same channel (bipolar scale). 2-wire, no gate
+  //     MOSFET in the path — but supply is capped at 11V minus the ~2V full-scale drop
+  //     across the AD74412R's internal 100R sense resistor.
+  //   PWM: a P1-P4 high-side transistor switches an external 12-24V supply (e.g. the
+  //     12-13V battery-float rail) for transmitters that need more headroom than the DAC
+  //     can give. The gate is SOFT-RAMPED up/down (~1s) — the retired pre-2.1.0 code's
+  //     hard 0->100% step is the inrush/flyback stress profile implicated in the P1
+  //     MOSFET failure. The sensor channel is a plain externally-powered current ADC
+  //     (unipolar scale).
+  //   Disabled: loop is powered externally full-time; channel is a plain current ADC.
+  // Channel config is re-applied on every duty cycle because the AD74412R returns to an
+  // unconfigured state whenever the expansion loses power.
+  const bool pwmMode = (cfg.loopPowerMode == LOOP_POWER_MODE_PWM);
+  const int16_t pwmCh = (cfg.loopPowerPwmChannel >= 0 && cfg.loopPowerPwmChannel < 4)
+                            ? cfg.loopPowerPwmChannel : 0;
+  if (cfg.loopPowerEnabled && pwmMode) {
+    // Soft-start the gate over ~1s to eliminate capacitive inrush.
+    tankalarm_rampUpPwm((uint8_t)pwmCh, i2cAddr);
+    // The ramp steps are fire-and-forget; send one final ACK-checked full-on frame as the
+    // "did the expansion accept PWM" probe so a NACKing expansion still faults cleanly.
+    bool pwmOk = false;
+    for (uint8_t attempt = 0; attempt < 3 && !pwmOk; ++attempt) {
+      if (attempt > 0) delay(5);
+      pwmOk = tankalarm_setPwm((uint8_t)pwmCh, 10000, 9999, i2cAddr);
+    }
+    if (!pwmOk) {
+      Serial.print(F("WARNING: Failed to enable PWM loop power on P"));
+      Serial.print(pwmCh + 1);
+      Serial.println(F(" via I2C"));
+      gMonitorState[idx].lastLoopPowerOk = false;
+      gMonitorState[idx].currentSensorMa = 0.0f;
+      gMonitorState[idx].sampleReused = true;
+      gLastClFaultReason = CL_FAULT_PWM_NACK;
+      tankalarm_rampDownPwm((uint8_t)pwmCh, i2cAddr); // soft-stop even on failure paths
+      (void)tankalarm_setExpansionLeds(0x00, i2cAddr);
+      return NAN;
+    }
+
+    // Configure the SENSOR channel as an externally-powered current ADC. Single frame;
+    // the expansion applies it during the warmup below (ACK means queued, not applied).
+    bool configOk = false;
+    for (uint8_t attempt = 0; attempt < 3 && !configOk; ++attempt) {
+      if (attempt > 0) delay(5);
+      configOk = tankalarm_configureCurrentAdcChannel((uint8_t)channel, i2cAddr);
+    }
+    if (!configOk) {
+      Serial.print(F("WARNING: A0602 channel "));
+      Serial.print(channel);
+      Serial.println(F(" SET CH_ADC NACKed"));
+      gMonitorState[idx].lastLoopPowerOk = false;
+      gMonitorState[idx].currentSensorMa = 0.0f;
+      gMonitorState[idx].sampleReused = true;
+      gLastClFaultReason = CL_FAULT_CONFIG_NACK;
+      tankalarm_rampDownPwm((uint8_t)pwmCh, i2cAddr);
+      (void)tankalarm_setExpansionLeds(0x00, i2cAddr);
+      return NAN;
+    }
+    gMonitorState[idx].lastLoopPowerOk = true;
+
+    // Pilot light: the SENSOR channel's yellow face LED mirrors loop power, same as DAC
+    // mode, so a technician sees each powered sampling burst regardless of mode.
+    (void)tankalarm_setExpansionLeds((uint8_t)(1u << (uint8_t)channel), i2cAddr);
+
+    // Warmup honoring the configured value, chunked with watchdog kicks (the retired
+    // implementation hardcoded 3000ms and never kicked).
+    uint32_t warmupRemaining = cfg.loopPowerWarmup;
+    while (warmupRemaining > 0) {
+      uint32_t chunk = (warmupRemaining > 500UL) ? 500UL : warmupRemaining;
+      delay(chunk);
+      warmupRemaining -= chunk;
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+      mbedWatchdog.kick();
+#else
+      IWatchdog.reload();
+#endif
+#endif
+    }
+    // NOTE: the retired implementation verified the applied channel function here via
+    // GET 0x40 and hard-faulted on mismatch. Intentionally NOT reinstated: v2.1.2 bench
+    // forensics showed the 0x40 answer buffer returns stale bytes on current A0602
+    // firmware. The framed-read CRC/channel-echo + live-zero guards cover mis-config.
+  } else if (cfg.loopPowerEnabled) {
     bool powerOk = false;
     for (uint8_t attempt = 0; attempt < 3 && !powerOk; ++attempt) {
       if (attempt > 0) delay(5);
@@ -5674,12 +5852,12 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   for (uint8_t s = 0; s < numSamples; ++s) {
     // Framed Blueprint GET protocol with CRC + channel-echo validation. Rejects
     // corrupted / cross-talked frames instead of accepting them as plausible 4-20mA.
-    // v2.1.2: the two loop-power modes use DIFFERENT ADC scales on the expansion —
-    // internally-powered DAC loop = bipolar +/-25mA (zero current at mid-scale),
-    // externally-powered current ADC = unipolar 0-25mA. Using the unipolar formula on
-    // a DAC-loop channel shifted every reading by the +25mA offset/2 (e.g. a real
-    // 4.51mA loop transmitted as 10.245mA).
-    float sample = cfg.loopPowerEnabled
+    // v2.1.2: the loop-power modes use DIFFERENT ADC scales on the expansion —
+    // internally-powered DAC loop = bipolar +/-25mA (zero current at mid-scale);
+    // PWM-switched and externally-powered loops = plain current ADC, unipolar 0-25mA.
+    // Using the unipolar formula on a DAC-loop channel shifted every reading by the
+    // +25mA offset/2 (e.g. a real 4.51mA loop transmitted as 10.245mA).
+    float sample = (cfg.loopPowerEnabled && !pwmMode)
                        ? tankalarm_readLoopPoweredCurrentAdcFramed((uint8_t)channel, i2cAddr)
                        : tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
     if (sample >= 0.0f) {
@@ -5700,19 +5878,24 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // Power the loop back down between duty cycles (returns the channel to high-impedance)
-  // and clear the pilot LED.
+  // Power the loop back down between duty cycles and clear the pilot LED.
+  // DAC mode: channel returns to high-impedance. PWM mode: soft ramp-down (~1s) so the
+  // gate MOSFET absorbs inductive flyback gradually instead of snapping off.
   if (cfg.loopPowerEnabled) {
-    bool offOk = false;
-    for (uint8_t attempt = 0; attempt < 3 && !offOk; ++attempt) {
-      if (attempt > 0) delay(5);
-      offOk = tankalarm_disableDacLoopPowered((uint8_t)channel, i2cAddr);
-    }
-    if (!offOk) {
-      Serial.print(F("WARNING: Failed to disable DAC loop power on channel "));
-      Serial.print(channel);
-      Serial.println(F(" via I2C"));
-      gCurrentLoopI2cErrors++;
+    if (pwmMode) {
+      tankalarm_rampDownPwm((uint8_t)pwmCh, i2cAddr);
+    } else {
+      bool offOk = false;
+      for (uint8_t attempt = 0; attempt < 3 && !offOk; ++attempt) {
+        if (attempt > 0) delay(5);
+        offOk = tankalarm_disableDacLoopPowered((uint8_t)channel, i2cAddr);
+      }
+      if (!offOk) {
+        Serial.print(F("WARNING: Failed to disable DAC loop power on channel "));
+        Serial.print(channel);
+        Serial.println(F(" via I2C"));
+        gCurrentLoopI2cErrors++;
+      }
     }
     (void)tankalarm_setExpansionLeds(0x00, i2cAddr);
   }
@@ -5728,6 +5911,10 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   }
   milliamps = total / validSamples;
 
+  // v2.1.3: assess supply-voltage clipping BEFORE the guards so the diagnostic line and
+  // telemetry can carry the flag alongside an otherwise-valid reading.
+  assessLoopClipping(cfg, idx, milliamps, pwmMode);
+
   // v2.1.2 diagnosis aid: one line per sampling burst with the averaged loop reading, so a
   // mis-scaled/mis-wired sensor is visible on the serial console without a Notehub round trip.
   Serial.print(F("CL ch"));
@@ -5738,8 +5925,15 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   Serial.print(validSamples);
   Serial.print(F("/"));
   Serial.print(numSamples);
-  Serial.print(F(", loopPower="));
-  Serial.print(cfg.loopPowerEnabled ? 1 : 0);
+  Serial.print(F(", power="));
+  if (!cfg.loopPowerEnabled) Serial.print(F("ext"));
+  else if (pwmMode) Serial.print(F("pwm"));
+  else Serial.print(F("dac"));
+  if (gMonitorState[idx].lastSupplyVoltage > 0.1f) {
+    Serial.print(F(", vsup="));
+    Serial.print(gMonitorState[idx].lastSupplyVoltage, 2);
+  }
+  if (gMonitorState[idx].clipSuspected) Serial.print(F(", CLIP?"));
   Serial.println(F(")"));
 
   gMonitorState[idx].currentSensorMa = milliamps;
@@ -6209,6 +6403,18 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
         o["ma_raw"] = roundTo(state.currentSensorMa, 2);
       } else {
         o["ma"] = roundTo(state.currentSensorMa, 2);
+        // v2.1.3 clipping telemetry: `vsup` = loop supply voltage used for the clip
+        // assessment (absent when unknown, e.g. PWM mode with RS-485 down and no Vin
+        // divider); `clip:1` = reading at/above the computed ceiling, treat as suspect;
+        // `lv:1` = supply too low to guarantee an un-clipped FULL-SCALE reading (the
+        // reading itself may still be accurate at low currents).
+        if (cfg.loopPowerEnabled && state.lastSupplyVoltage > 0.1f) {
+          o["vsup"] = roundTo(state.lastSupplyVoltage, 1);
+          if (state.clipSuspected) o["clip"] = 1;
+          float smv = (cfg.sensorMinVoltage >= 0.5f && cfg.sensorMinVoltage <= 30.0f)
+                          ? cfg.sensorMinVoltage : 10.0f;
+          if (state.lastSupplyVoltage < smv + 2.2f) o["lv"] = 1;
+        }
       }
       break;
     case SENSOR_ANALOG:

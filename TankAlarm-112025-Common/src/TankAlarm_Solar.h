@@ -195,6 +195,10 @@ struct SolarData {
   float vRegSetpoint;         // Absorption / regulation voltage (V)
   float vFloatSetpoint;       // Float voltage (V)
   float vEqSetpoint;          // Equalization voltage (V); 0 = disabled
+
+  // v2.1.3: 12V vs 24V bank classification (LOCAL-ONLY — not transmitted; see header note
+  // above the OPTA_SUPPLY_* constants). 0 = unknown (no successful poll yet), else 12 or 24.
+  uint8_t systemNominalV;
 };
 
 // ============================================================================
@@ -211,6 +215,34 @@ enum SolarAlertType : uint8_t {
   SOLAR_ALERT_HEATSINK_TEMP     = 7,  // Heatsink overtemperature
   SOLAR_ALERT_NO_CHARGE         = 8   // No charging during daylight (potential panel issue)
 };
+
+// ============================================================================
+// 12V vs 24V system classification (v2.1.3)
+// ============================================================================
+// The Opta / A0602 supply spec is 12-24 VDC +/-20% => 28.8V absolute maximum.
+// A "24V" lead-acid bank exceeds that while charging (absorption 28.2-28.8V,
+// equalization 29.2-30.6V, plus RTS cold-weather temperature compensation), so
+// 24V installations MUST power the Opta through a DC-DC buck converter (see
+// Bill of Materials). Firmware classifies the bank from the live battery
+// voltage on every successful poll (SolarData.systemNominalV = 12 or 24) and
+// keeps it LOCAL-ONLY for future protective logic — it is deliberately NOT
+// transmitted (bandwidth): the server can derive the class from the actual
+// voltage readings already attached to telemetry (`v`) and the daily report
+// (`v`/`vs`, plus the solar block's `bv`), all emitted only when a voltage
+// source has data. No alert/SMS fires on this today (user decision
+// 2026-07-02), and firmware does not write charger setpoints over Modbus
+// (RAM setpoint regs are read-only copies; the EEPROM custom block is
+// unverified, wears, needs a controller reset, and temp compensation would
+// defeat a cap anyway). The constants below are retained for future logic.
+#ifndef OPTA_SUPPLY_ABS_MAX_V
+#define OPTA_SUPPLY_ABS_MAX_V  28.8f  // Opta datasheet: 12-24 VDC +/-20%
+#endif
+#ifndef OPTA_SUPPLY_WARN_V
+#define OPTA_SUPPLY_WARN_V     28.0f  // margin below the absolute ceiling (future use)
+#endif
+#ifndef SOLAR_24V_SYSTEM_MIN_V
+#define SOLAR_24V_SYSTEM_MIN_V 17.0f  // live battery V above this => 24V bank
+#endif
 
 // ============================================================================
 // Solar Configuration

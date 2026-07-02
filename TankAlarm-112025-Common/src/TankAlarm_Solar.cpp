@@ -484,6 +484,8 @@ bool SolarManager::readRegisters() {
       nextData.arrayVoltage   = (arrV <= 80.0f)  ? arrV : nextData.arrayVoltage;
       nextData.chargeCurrent  = (chgI <= 100.0f) ? chgI : nextData.chargeCurrent;
       nextData.loadCurrent    = (lodI <= 100.0f) ? lodI : nextData.loadCurrent;
+      // v2.1.3: classify the bank on every plausible read (tracking only, no alert).
+      nextData.systemNominalV = (battV > SOLAR_24V_SYSTEM_MIN_V) ? 24 : 12;
       sSolarLastReadImplausible = false;
     } else {
       // CRC-valid read but the battery voltage itself is implausible: a DATA problem,

@@ -97,6 +97,7 @@ Qty | Component | Link | Notes
 1 | Solar Panel (50-100W) | Various | 12V nominal output
 1 | Solar Charge Controller | [Solar Electric](https://www.solar-electric.com/mosupamoco6a.html) | SunKeeper-6 or equivalent
 1 | Deep Cycle Battery | [Walmart](https://www.walmart.com/ip/OPTIMA-YellowTop-Dual-Purpose-Battery-Group-d31t/579876980) | Optima D31T or equivalent
+1 | DC-DC Buck Converter (24V to 12V, 3A+) | Various (e.g. Victron Orion 24/12, DROK) | **REQUIRED for 24V battery banks.** The Opta/A0602 supply limit is 28.8V (12-24VDC +/-20%); a 24V bank reaches 28.2-30.6V while charging (absorption/equalization plus cold-weather temperature compensation), which exceeds the Opta's rating. Power the Opta and A0602 from the buck's regulated 12V output. Not needed for 12V banks.
 1 | Solar Panel Mounting Hardware | Various | Ground or pole mount
 
 ### External Antenna System (Optional — Recommended for Metal Enclosures)
@@ -191,8 +192,9 @@ Cellular Data Plan | [Blues Wireless](https://blues.io/pricing/) | Pay-as-you-go
 - Solar Panel: $80-150
 - Charge Controller: $60
 - Battery: $250
+- DC-DC Buck Converter 24V→12V (24V banks only): $20-70
 - Mounting Hardware: $50
-- **Subtotal: ~$440-510**
+- **Subtotal: ~$440-510** (add buck for 24V systems)
 
 ### Optional External Antenna System (per system in metal enclosure)
 - Outdoor LTE Omni Antenna (x2): $40-120

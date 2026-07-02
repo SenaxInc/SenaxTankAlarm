@@ -480,7 +480,10 @@ static inline bool tankalarm_configureDacLoopPowered(uint8_t channel, uint8_t i2
   buf[2] = 0x05; // LEN_OA_CH_DAC
   buf[3] = channel;
   buf[4] = 0x00; // OA_VOLTAGE_DAC
-  buf[5] = 0x02; // limit_current = OA_DISABLE
+  buf[5] = 0x02; // limit_current = OA_DISABLE. REQUIRED for loop power: the expansion maps
+                 // ENABLE -> 7.5mA source cap (would clip a 4-20mA loop above 7.5mA) and
+                 // DISABLE -> 30mA cap (OptaAnalog.cpp parse_setup_dac_channel), so a
+                 // shorted cable is still hardware-limited to ~30mA.
   buf[6] = 0x02; // enable_slew = OA_DISABLE
   buf[7] = 0x00; // sr = OA_SLEW_RATE_0
   buf[8] = tankalarm_optaCrc8(buf, 8);
