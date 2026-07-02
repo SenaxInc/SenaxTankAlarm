@@ -1151,6 +1151,7 @@ static void startPulseSample(uint8_t idx, const MonitorConfig &cfg);
 static float getMonitorHeight(const MonitorConfig &cfg);
 static void initializeStorage();
 static void ensureConfigLoaded();
+static void printConfigSummary();
 static void createDefaultConfig(ClientConfig &cfg);
 static bool loadConfigFromFlash(ClientConfig &cfg);
 static void initMonitorDefaults(MonitorConfig &mon, uint8_t index);
@@ -1634,6 +1635,7 @@ void setup() {
 
   initializeStorage();
   ensureConfigLoaded();
+  printConfigSummary();
 
 #if defined(SOLAR_HW_TEST_SERIAL) && defined(SOLAR_HW_TEST_FORCE_SOLAR_CONFIG)
   // Test override so RS-485 bring-up can be exercised without editing flash JSON.
@@ -2088,6 +2090,7 @@ void loop() {
     static uint16_t consecutiveSensorOnlyFailLoops = 0;
     static uint8_t sensorRecoveryBackoff = 1;
     static uint8_t sensorRecoveryTotalAttempts = 0;
+    static uint32_t readsOkAtLastRecovery = 0;  // v2.1.4: watermark for real recovery detection
     if (gNotecardAvailable) {  // Notecard is OK — isolate to sensor bus
       bool allCurrentLoopFailed = false;
       uint8_t currentLoopCount = 0;
@@ -2101,6 +2104,19 @@ void loop() {
         }
       }
       allCurrentLoopFailed = (currentLoopCount > 0 && failedCount == currentLoopCount);
+      // v2.1.4: only escalate to bus recovery when the fault signature actually implicates
+      // the bus/expansion (NACKs, framing/CRC failures). UNDER_RANGE and OVER_RANGE mean the
+      // framed read passed CRC + channel-echo validation — the I2C path is healthy and the
+      // loop itself is open/unpowered/out-of-range. SCL toggling cannot fix a de-energized
+      // loop, and every attempt publishes a diag.qo (7-event burst observed 2026-07-02 with
+      // i2c_errs:0 + cl_fault:6 while the stored config drove PWM on an unused terminal).
+      // The sensor-fault alarm + telemetry fault:"under_range"/ma_raw already give the
+      // operator full visibility of an open loop.
+      if (allCurrentLoopFailed &&
+          (gLastClFaultReason == CL_FAULT_UNDER_RANGE ||
+           gLastClFaultReason == CL_FAULT_OVER_RANGE)) {
+        allCurrentLoopFailed = false;  // loop fault, not a bus fault — skip recovery
+      }
       if (allCurrentLoopFailed) {
         consecutiveSensorOnlyFailLoops++;
         uint16_t effectiveThreshold = (uint16_t)I2C_SENSOR_ONLY_RECOVERY_THRESHOLD * sensorRecoveryBackoff;
@@ -2142,6 +2158,7 @@ void loop() {
             }
             logI2CRecoveryEvent(I2C_RECOVERY_SENSOR_ONLY);
             sensorRecoveryTotalAttempts++;
+            readsOkAtLastRecovery = gCurrentLoopReadsOk;  // v2.1.4: arm the recovery watermark
             // Reset sensor failure counters to give them a fresh chance
             for (uint8_t i = 0; i < gConfig.monitorCount; i++) {
               if (gConfig.monitors[i].sensorInterface == SENSOR_CURRENT_LOOP) {
@@ -2158,8 +2175,16 @@ void loop() {
         }
       } else {
         consecutiveSensorOnlyFailLoops = 0;
-        sensorRecoveryBackoff = 1;  // Reset backoff when sensors recover
-        sensorRecoveryTotalAttempts = 0;  // Reset circuit breaker on full recovery
+        // v2.1.4: only treat the sensors as "recovered" when a framed read has actually
+        // succeeded since the last recovery attempt. The old unconditional reset
+        // self-defeated both the exponential backoff and the circuit breaker: each
+        // recovery zeroes consecutiveFailures (above), which makes allCurrentLoopFailed
+        // false on the very next pass and landed here — resetting backoff to x1 before
+        // it could grow (observed as "backoff x1" on every attempt, 2026-07-02 bench).
+        if (gCurrentLoopReadsOk != readsOkAtLastRecovery) {
+          sensorRecoveryBackoff = 1;        // Reset backoff — a real read succeeded
+          sensorRecoveryTotalAttempts = 0;  // Reset circuit breaker on true recovery
+        }
       }
     } else {
       consecutiveSensorOnlyFailLoops = 0;  // dual-fail path handles this
@@ -2732,6 +2757,42 @@ static void ensureConfigLoaded() {
   createDefaultConfig(gConfig);
   Serial.println(F("Warning: Using default config (no persistence available)"));
 #endif
+}
+
+// v2.1.4: one-glance confirmation of WHICH config is active, printed at boot and after
+// every server config apply. The 2026-07-02 diag-burst review initially concluded the
+// saved config had been "lost during OTA" because nothing at boot showed the loaded
+// site/monitor identity — the device had simply never been given customer names. Print
+// them explicitly so a default-config fallback is instantly distinguishable from a
+// customer config, and so the active loop-power mode/terminal is visible on serial.
+static void printConfigSummary() {
+  Serial.print(F("Config active: site=\""));
+  Serial.print(gConfig.siteName);
+  Serial.print(F("\" monitors="));
+  Serial.print(gConfig.monitorCount);
+  Serial.print(F(" epoch="));
+  Serial.println((unsigned long)gConfig.configEpoch);
+  for (uint8_t i = 0; i < gConfig.monitorCount && i < MAX_MONITORS; i++) {
+    const MonitorConfig &m = gConfig.monitors[i];
+    Serial.print(F("  ["));
+    Serial.print(m.id);
+    Serial.print(F("] \""));
+    Serial.print(m.name);
+    Serial.print(F("\""));
+    if (m.sensorInterface == SENSOR_CURRENT_LOOP) {
+      Serial.print(F(" currentLoop ch"));
+      Serial.print(m.currentLoopChannel);
+      Serial.print(F(" power="));
+      if (!m.loopPowerEnabled) Serial.print(F("ext"));
+      else if (m.loopPowerMode == LOOP_POWER_MODE_PWM) {
+        Serial.print(F("pwm@P"));
+        Serial.print((int)(m.loopPowerPwmChannel + 1));
+      } else {
+        Serial.print(F("dac"));
+      }
+    }
+    Serial.println();
+  }
 }
 
 static void createDefaultConfig(ClientConfig &cfg) {
@@ -5228,6 +5289,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   }
   
   printHardwareRequirements(gConfig);
+  printConfigSummary();
   scheduleNextDailyReport();
   Serial.println(F("Configuration updated from server"));
   addSerialLog("Config updated from server");
@@ -5848,6 +5910,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   const uint8_t numSamples = 5;
   float total = 0.0f;
   uint8_t validSamples = 0;
+  uint32_t burstMicros = 0;  // v2.1.4: cumulative on-the-wire framed-read time (excludes settle delays)
 
   for (uint8_t s = 0; s < numSamples; ++s) {
     // Framed Blueprint GET protocol with CRC + channel-echo validation. Rejects
@@ -5857,9 +5920,11 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     // PWM-switched and externally-powered loops = plain current ADC, unipolar 0-25mA.
     // Using the unipolar formula on a DAC-loop channel shifted every reading by the
     // +25mA offset/2 (e.g. a real 4.51mA loop transmitted as 10.245mA).
+    uint32_t readStartUs = micros();
     float sample = (cfg.loopPowerEnabled && !pwmMode)
                        ? tankalarm_readLoopPoweredCurrentAdcFramed((uint8_t)channel, i2cAddr)
                        : tankalarm_readCurrentAdcFramed((uint8_t)channel, i2cAddr);
+    burstMicros += micros() - readStartUs;
     if (sample >= 0.0f) {
       total += sample;
       validSamples++;
@@ -5877,6 +5942,9 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
 #endif
     }
   }
+  // v2.1.4: this global was declared for the diag.qo cl_dur_us field but never assigned —
+  // every diagnostic carried cl_dur_us:0. Record the accumulated framed-read time here.
+  gLastClBurstMicros = burstMicros;
 
   // Power the loop back down between duty cycles and clear the pilot LED.
   // DAC mode: channel returns to high-impedance. PWM mode: soft ramp-down (~1s) so the
@@ -5927,7 +5995,7 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
   Serial.print(numSamples);
   Serial.print(F(", power="));
   if (!cfg.loopPowerEnabled) Serial.print(F("ext"));
-  else if (pwmMode) Serial.print(F("pwm"));
+  else if (pwmMode) { Serial.print(F("pwm@P")); Serial.print((int)(pwmCh + 1)); }
   else Serial.print(F("dac"));
   if (gMonitorState[idx].lastSupplyVoltage > 0.1f) {
     Serial.print(F(", vsup="));
