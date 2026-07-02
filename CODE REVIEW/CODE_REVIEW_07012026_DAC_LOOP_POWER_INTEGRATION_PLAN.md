@@ -2,8 +2,18 @@
 
 **Date:** 2026-07-01  
 **Author:** GitHub Copilot (Gemini 3.5 Flash)  
-**Status:** Implemented, Fully Tested & Staged  
+**Status:** Superseded by v2.1.0 (see note below)  
 **Related Firmware:** TankAlarm-112025-Client-BluesOpta `v2.0.77`  
+
+> **v2.1.0 UPDATE:** The dual-mode design described in this document
+> (`pwmGatingChannel == -2` selecting DAC mode, other values selecting the
+> P1-P4 transistor gate) was bench-verified but **not shipped**. The release
+> decision was to retire the PWM/transistor gating entirely: in v2.1.0 the
+> internally-powered DAC loop is the ONLY loop-power method, the
+> `pwmGatingChannel` config field is removed/ignored, and the config keys are
+> renamed to `loopPowerEnabled` / `loopPowerWarmup` / `loopPowerSampleDelay`
+> (legacy `pwmGating*` keys still parse). The common-library helpers described
+> in §3.A shipped unchanged. See [release-notes/v2.1.0.md](../release-notes/v2.1.0.md).
 
 ---
 

@@ -712,10 +712,14 @@ struct MonitorConfig {
   float sensorRangeMin;    // Minimum native sensor range (e.g., 0 for 0-5 PSI or 0-10m)
   float sensorRangeMax;    // Maximum native sensor range (e.g., 5 for 0-5 PSI, 10 for 0-10m)
   char sensorRangeUnit[8]; // Unit for sensor range: "PSI", "bar", "m", "ft", "in", etc.
-  bool pwmGatingEnabled;       // Gating control via high-side transistor enabled
-  int16_t pwmGatingChannel;    // Transistor output channel pin index (0 = P1, 1 = P2, 2 = P3, 3 = P4)
-  uint32_t pwmGatingWarmup;    // Time in milliseconds for physical Loop power-up stabilization (3000ms by default)
-  uint16_t pwmGatingSampleDelay; // Delay in milliseconds within the average sampling loop (e.g. 5ms or 300ms)
+  // Sensor loop power (v2.1.0): the 4-20mA transmitter is powered by the A0602 channel's
+  // own DAC (~11V driven out the channel's +/- screw terminals) with the current ADC
+  // overlaid on the same channel. Replaces the retired P1-P4 PWM/transistor power gating,
+  // so there is no separate power-channel selection anymore — the sensor's own
+  // channel/terminal pair both powers and measures the loop.
+  bool loopPowerEnabled;         // Duty-cycled DAC loop power enabled (false = externally powered loop)
+  uint32_t loopPowerWarmup;      // ms of transmitter power-up stabilization before sampling (default 3000)
+  uint16_t loopPowerSampleDelay; // ms between individual samples in the averaging loop (default 300)
   // Fluid characterization (for liquid tanks; ignored for OBJECT_GAS / non-tank objects).
   // Used as the fallback SG before the server's calibration learning takes over.
   FluidType fluidType;             // Fluid preset (default FLUID_WATER)
@@ -803,7 +807,7 @@ struct MonitorRuntime {
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
-  bool lastPwmEnableOk;         // v1.9.22: result of the last P1 power-gate enable (gated 4-20mA)
+  bool lastLoopPowerOk;         // result of the last loop power-up (v2.1.0: DAC loop-power config)
   float lastReportedValue;   // Last value pushed via change-based telemetry (monitor's own unit)
   float lastDailySentValue;  // Last value included in a daily report (monitor's own unit)
   bool highAlarmLatched;
@@ -971,9 +975,9 @@ static bool    gOptaControllerReady = false;
 // so the per-op 400kHz window's effect on read latency (gLastClBurstMicros) can be confirmed.
 enum ClFaultReason : uint8_t {
   CL_FAULT_NONE = 0,        // last A0602 read OK
-  CL_FAULT_PWM_NACK = 1,    // P1 power-gate enable NACKed (loop unpowered)
-  CL_FAULT_CONFIG_NACK = 2, // ADC channel config NACKed
-  CL_FAULT_FUNC_WRONG = 3,  // channel not in current-ADC mode
+  CL_FAULT_PWM_NACK = 1,    // RETIRED v2.1.0 (was: P1-P4 PWM power-gate enable NACKed)
+  CL_FAULT_CONFIG_NACK = 2, // channel config NACKed (DAC loop power or ext-power ADC)
+  CL_FAULT_FUNC_WRONG = 3,  // RETIRED v2.1.0 (was: channel not in current-ADC mode)
   CL_FAULT_READ_FAIL = 4,   // every framed sample failed
   CL_FAULT_OVER_RANGE = 5,  // reading rejected as >21mA / 0xFFFF garbage
   CL_FAULT_UNDER_RANGE = 6  // reading valid but below 4-20mA live-zero threshold (loop open?)
@@ -2769,10 +2773,9 @@ static void createDefaultConfig(ClientConfig &cfg) {
   cfg.monitors[0].sensorRangeMin = 0.0f;    // Default: 0 (e.g., 0 PSI or 0 meters)
   cfg.monitors[0].sensorRangeMax = 5.0f;    // Default: 5 (e.g., 5 PSI for typical pressure sensor)
   strlcpy(cfg.monitors[0].sensorRangeUnit, "PSI", sizeof(cfg.monitors[0].sensorRangeUnit)); // Default: PSI
-  cfg.monitors[0].pwmGatingEnabled = true;  // Default: gating enabled on P1 for current loop backward compat
-  cfg.monitors[0].pwmGatingChannel = 0;     // Default: P1
-  cfg.monitors[0].pwmGatingWarmup = 3000;   // Default: 3000ms stabilization delay
-  cfg.monitors[0].pwmGatingSampleDelay = 300; // Default: 300ms sensor read/debounce delay
+  cfg.monitors[0].loopPowerEnabled = true;  // Default: DAC loop power on (2-wire transmitter on channel terminals)
+  cfg.monitors[0].loopPowerWarmup = 3000;   // Default: 3000ms stabilization delay
+  cfg.monitors[0].loopPowerSampleDelay = 300; // Default: 300ms sensor read/debounce delay
   cfg.monitors[0].analogVoltageMin = 0.0f;  // Default: 0V (for 0-10V sensors)
   cfg.monitors[0].analogVoltageMax = 10.0f; // Default: 10V (for 0-10V sensors)
   cfg.monitors[0].fluidType = FLUID_WATER;       // Default fluid: water (SG 1.0)
@@ -2904,10 +2907,9 @@ static void initMonitorDefaults(MonitorConfig &mon, uint8_t index) {
   mon.sensorRangeMin = 0.0f;
   mon.sensorRangeMax = 5.0f;
   strlcpy(mon.sensorRangeUnit, "PSI", sizeof(mon.sensorRangeUnit));
-  mon.pwmGatingEnabled = true;  // Default: gating enabled on P1 for current loop backward compat
-  mon.pwmGatingChannel = 0;     // Default: P1
-  mon.pwmGatingWarmup = 3000;   // Default: 3000ms stabilization delay
-  mon.pwmGatingSampleDelay = 300; // Default: 300ms sensor read/debounce delay
+  mon.loopPowerEnabled = true;  // Default: DAC loop power on (2-wire transmitter on channel terminals)
+  mon.loopPowerWarmup = 3000;   // Default: 3000ms stabilization delay
+  mon.loopPowerSampleDelay = 300; // Default: 300ms sensor read/debounce delay
   mon.analogVoltageMin = 0.0f;
   mon.analogVoltageMax = 10.0f;
 
@@ -3107,18 +3109,25 @@ static void parseMonitorFromJson(MonitorConfig &mon, JsonObjectConst t, uint8_t 
     mon.sensorMountHeight = fmaxf(0.0f, t["sensorMountHeight"].as<float>());
   }
 
-  // ---- PWM Gating control ----
-  if (t.containsKey("pwmGatingEnabled")) {
-    mon.pwmGatingEnabled = t["pwmGatingEnabled"].as<bool>();
+  // ---- Sensor loop power (v2.1.0: DAC internally-powered loop) ----
+  // Accept the legacy v1.9.x-v2.0.x "pwmGating*" keys as fallbacks so configs saved by an
+  // older server (or an old on-flash config) still parse. The legacy pwmGatingChannel
+  // (P1-P4 transistor pin) is retired and intentionally ignored: loop power now comes
+  // from the sensor's own channel +/- terminals via the DAC.
+  if (t.containsKey("loopPowerEnabled")) {
+    mon.loopPowerEnabled = t["loopPowerEnabled"].as<bool>();
+  } else if (t.containsKey("pwmGatingEnabled")) {
+    mon.loopPowerEnabled = t["pwmGatingEnabled"].as<bool>();
   }
-  if (t["pwmGatingChannel"].is<int>()) {
-    mon.pwmGatingChannel = t["pwmGatingChannel"].as<int>();
+  if (t["loopPowerWarmup"].is<uint32_t>()) {
+    mon.loopPowerWarmup = t["loopPowerWarmup"].as<uint32_t>();
+  } else if (t["pwmGatingWarmup"].is<uint32_t>()) {
+    mon.loopPowerWarmup = t["pwmGatingWarmup"].as<uint32_t>();
   }
-  if (t["pwmGatingWarmup"].is<uint32_t>()) {
-    mon.pwmGatingWarmup = t["pwmGatingWarmup"].as<uint32_t>();
-  }
-  if (t["pwmGatingSampleDelay"].is<uint16_t>()) {
-    mon.pwmGatingSampleDelay = t["pwmGatingSampleDelay"].as<uint16_t>();
+  if (t["loopPowerSampleDelay"].is<uint16_t>()) {
+    mon.loopPowerSampleDelay = t["loopPowerSampleDelay"].as<uint16_t>();
+  } else if (t["pwmGatingSampleDelay"].is<uint16_t>()) {
+    mon.loopPowerSampleDelay = t["pwmGatingSampleDelay"].as<uint16_t>();
   }
 
   // ---- Sensor range ----
@@ -3685,11 +3694,10 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     }
     // Save sensor mount height (for calibration)
     t["sensorMountHeight"] = cfg.monitors[i].sensorMountHeight;
-    // Save PWM Gating configurations
-    t["pwmGatingEnabled"] = cfg.monitors[i].pwmGatingEnabled;
-    t["pwmGatingChannel"] = cfg.monitors[i].pwmGatingChannel;
-    t["pwmGatingWarmup"] = cfg.monitors[i].pwmGatingWarmup;
-    t["pwmGatingSampleDelay"] = cfg.monitors[i].pwmGatingSampleDelay;
+    // Save sensor loop power configuration (v2.1.0: DAC internally-powered loop)
+    t["loopPowerEnabled"] = cfg.monitors[i].loopPowerEnabled;
+    t["loopPowerWarmup"] = cfg.monitors[i].loopPowerWarmup;
+    t["loopPowerSampleDelay"] = cfg.monitors[i].loopPowerSampleDelay;
     // Save sensor native range settings
     t["sensorRangeMin"] = cfg.monitors[i].sensorRangeMin;
     t["sensorRangeMax"] = cfg.monitors[i].sensorRangeMax;
@@ -5592,32 +5600,57 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     i2cAddr = CURRENT_LOOP_I2C_ADDRESS;
   }
 
-  // Enable solid-state power gating if configured
-  if (cfg.pwmGatingEnabled) {
-    bool pwmOnSuccess = false;
-    for (uint8_t attempt = 0; attempt < 3 && !pwmOnSuccess; ++attempt) {
+  // ---- Sensor loop power (v2.1.0: internally-powered DAC loop) ----
+  // The A0602 channel's own DAC drives ~11V out the channel's +/- screw terminals to
+  // power the 2-wire 4-20mA transmitter, and a current ADC is overlaid on the SAME
+  // channel (adding_adc) to measure the loop. This retires the v1.9.x-v2.0.x P1-P4
+  // PWM/high-side-transistor gating: no separate power channel or wiring is needed,
+  // and the (failure-prone) gating MOSFETs are bypassed entirely. The channel config
+  // is re-applied on every duty cycle because the AD74412R returns to an unconfigured
+  // state whenever the expansion loses power.
+  if (cfg.loopPowerEnabled) {
+    bool powerOk = false;
+    for (uint8_t attempt = 0; attempt < 3 && !powerOk; ++attempt) {
       if (attempt > 0) delay(5);
-      pwmOnSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 10000, 9999, i2cAddr);
+      powerOk = tankalarm_configureDacLoopPowered((uint8_t)channel, i2cAddr);
     }
-    if (!pwmOnSuccess) {
-      Serial.print(F("WARNING: Failed to enable sensor power gating on P"));
-      Serial.print(cfg.pwmGatingChannel + 1);
-      Serial.println(F(" via I2C"));
-      gMonitorState[idx].lastPwmEnableOk = false;
+    if (!powerOk) {
+      Serial.print(F("WARNING: A0602 channel "));
+      Serial.print(channel);
+      Serial.println(F(" DAC loop-power configuration failed (NACK/bad ACK)"));
+      gMonitorState[idx].lastLoopPowerOk = false;
       gMonitorState[idx].currentSensorMa = 0.0f;
       gMonitorState[idx].sampleReused = true;
-      gLastClFaultReason = CL_FAULT_PWM_NACK;
-      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      gLastClFaultReason = CL_FAULT_CONFIG_NACK;
+      (void)tankalarm_disableDacLoopPowered((uint8_t)channel, i2cAddr);
+      (void)tankalarm_setExpansionLeds(0x00, i2cAddr);
       return NAN;
     }
-    gMonitorState[idx].lastPwmEnableOk = true;
+    gMonitorState[idx].lastLoopPowerOk = true;
 
-    // Re-apply A0602 current-ADC channel configuration on every power-on cycle.
-    // The AD74412R powers up in an unconfigured state every time the rail is gated;
-    // without this SET CH_ADC frame, framed reads return a stale default register value
-    // that looks plausible (constant 4-20mA) but never responds to the sensor.
-    // Fix C2 ordering (CODE_REVIEW_06302026): configure BEFORE the warmup so the sense
-    // node is connected to the I/O pin while loop current stabilizes.
+    // Pilot light: the channel's yellow face LED mirrors loop power so a technician can
+    // see each powered sampling burst at the cabinet.
+    (void)tankalarm_setExpansionLeds((uint8_t)(1u << (uint8_t)channel), i2cAddr);
+
+    // Loop stabilization: let the transmitter boot and its output settle while the DAC
+    // holds the loop at 11V. Kick the watchdog in chunks so a long configured warmup
+    // cannot starve it.
+    uint32_t warmupRemaining = cfg.loopPowerWarmup;
+    while (warmupRemaining > 0) {
+      uint32_t chunk = (warmupRemaining > 500UL) ? 500UL : warmupRemaining;
+      delay(chunk);
+      warmupRemaining -= chunk;
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+      mbedWatchdog.kick();
+#else
+      IWatchdog.reload();
+#endif
+#endif
+    }
+  } else {
+    // Externally powered loop: no DAC drive — just (re)configure the channel as a plain
+    // externally-powered current ADC before sampling.
     bool configOk = false;
     for (uint8_t attempt = 0; attempt < 3 && !configOk; ++attempt) {
       if (attempt > 0) delay(5);
@@ -5630,29 +5663,6 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       gMonitorState[idx].currentSensorMa = 0.0f;
       gMonitorState[idx].sampleReused = true;
       gLastClFaultReason = CL_FAULT_CONFIG_NACK;
-      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
-      return NAN;
-    }
-
-    // Stabilization delay
-    delay(3000);
-
-    // Verify the A0602 actually applied the channel function before we trust any sample.
-    // The SET ACK only means "command queued" — the expansion applies the channel
-    // reconfiguration in its own main loop. If the GET fails entirely (e.g. an A0602
-    // firmware that doesn't implement opcode 0x40) we proceed and rely on the framed-read
-    // CRC for validation. If it returns the WRONG function, that's a hard fault.
-    uint8_t funActual = 0xFF;
-    if (tankalarm_getAnalogChannelFunction((uint8_t)channel, i2cAddr, funActual) &&
-        funActual != TANKALARM_OA_FUNC_CURRENT_INPUT_EXT_POWER) {
-      Serial.print(F("WARNING: A0602 channel "));
-      Serial.print(channel);
-      Serial.print(F(" reports function 0x"));
-      Serial.println(funActual, HEX);
-      gMonitorState[idx].currentSensorMa = 0.0f;
-      gMonitorState[idx].sampleReused = true;
-      gLastClFaultReason = CL_FAULT_FUNC_WRONG;
-      (void)tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
       return NAN;
     }
   }
@@ -5670,9 +5680,9 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
       validSamples++;
     }
     if (s < numSamples - 1) {
-      delay(300);
+      delay(cfg.loopPowerSampleDelay);
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
-      if (cfg.pwmGatingEnabled) {
+      if (cfg.loopPowerEnabled) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
         mbedWatchdog.kick();
 #else
@@ -5683,19 +5693,21 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx) {
     }
   }
 
-  // Disable PWM power gating once readings complete
-  if (cfg.pwmGatingEnabled) {
-    bool pwmOffSuccess = false;
-    for (uint8_t attempt = 0; attempt < 3 && !pwmOffSuccess; ++attempt) {
+  // Power the loop back down between duty cycles (returns the channel to high-impedance)
+  // and clear the pilot LED.
+  if (cfg.loopPowerEnabled) {
+    bool offOk = false;
+    for (uint8_t attempt = 0; attempt < 3 && !offOk; ++attempt) {
       if (attempt > 0) delay(5);
-      pwmOffSuccess = tankalarm_setPwm(cfg.pwmGatingChannel, 0, 0, i2cAddr);
+      offOk = tankalarm_disableDacLoopPowered((uint8_t)channel, i2cAddr);
     }
-    if (!pwmOffSuccess) {
-      Serial.print(F("WARNING: Failed to disable sensor power gating on P"));
-      Serial.print(cfg.pwmGatingChannel + 1);
+    if (!offOk) {
+      Serial.print(F("WARNING: Failed to disable DAC loop power on channel "));
+      Serial.print(channel);
       Serial.println(F(" via I2C"));
       gCurrentLoopI2cErrors++;
     }
+    (void)tankalarm_setExpansionLeds(0x00, i2cAddr);
   }
 
   // Validate we got at least one good reading
@@ -6166,9 +6178,9 @@ static void buildSensorObject(JsonObject o, uint8_t idx) {
       //     from "just below 4 mA" (3.5 mA) from "stuck stale value" (~18 mA). The `fault`
       //     tag is authoritative — server/dashboard must treat `ma` as diagnostic-only
       //     whenever `fault` is present, and never chart it as a real sensor reading.
-      // `pg` (PWM gate enable result) is kept for diagnostics on either path.
+      // `pg` (loop power enable result) is kept for diagnostics on either path.
       o["st"] = "currentLoop";
-      if (cfg.pwmGatingEnabled) o["pg"] = state.lastPwmEnableOk ? 1 : 0;
+      if (cfg.loopPowerEnabled) o["pg"] = state.lastLoopPowerOk ? 1 : 0;
       if (state.sampleReused) {
         o["fault"] = clFaultReasonString(gLastClFaultReason);
         // Emit the raw last-observed mA as a diagnostic field (distinct from a valid `ma`
