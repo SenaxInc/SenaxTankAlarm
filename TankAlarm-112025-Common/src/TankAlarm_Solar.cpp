@@ -51,6 +51,18 @@ static uint32_t sSolarErrIllegalFunc  = 0;  // "Illegal function"
 static uint32_t sSolarErrOther        = 0;  // catch-all (unknown / library-init failure)
 static char     sSolarLastErrorTag[8]  = {0};  // short tag: "to"|"crc"|"ida"|"ifu"|"?"
 
+// v2.1.5: consecutive CRC-valid-but-implausible setpoint probe results. On some SunSaver
+// firmware revisions the coded setpoint addresses (SS_REG_V_REG/V_FLOAT/V_EQ) hold other
+// data, so the plausibility check rejects them on EVERY poll and the old code re-read all
+// three registers + printed a warning once per poll, forever (~4,300 wasted transactions
+// per day at the 60 s poll cadence, bench-observed 2026-07-03). The values are a property
+// of the controller firmware and cannot change at runtime, so after this many consecutive
+// plausibility rejections we stop probing until the next begin(). Transport failures do
+// NOT count toward the give-up — a flaky bus must not permanently disable chemistry
+// verification on units where the addresses are correct.
+static uint8_t  sSetpointPlausibilityRejects = 0;
+#define SOLAR_SETPOINT_PROBE_MAX_REJECTS 3
+
 // Classify the last ModbusRTUClient.lastError() string into one of five short tags.
 // Uses substring match because the library returns prose like "Illegal data address"
 // not enum codes. Tag set here is read by readRegistersWithFallback() to pick the
@@ -326,6 +338,7 @@ bool SolarManager::begin(const SolarConfig& config) {
   _initialized = true;
   _data.communicationOk = false;
   _data.consecutiveErrors = 0;
+  sSetpointPlausibilityRejects = 0;  // v2.1.5: re-arm the setpoint probe on re-init
   
   // Probe both holding and input register models before first full poll.
   uint16_t startupProbe = 0;
@@ -507,8 +520,10 @@ bool SolarManager::readRegisters() {
   // matches what the user selected in the web UI. The setpoints reflect the
   // controller's active battery service (Sealed/Gel/Flooded/Custom) and only
   // change at boot or DIP-switch change. Best-effort: failure does not mark the
-  // overall poll as failed.
-  if (success && !nextData.setpointsValid) {
+  // overall poll as failed. v2.1.5: gives up after SOLAR_SETPOINT_PROBE_MAX_REJECTS
+  // consecutive plausibility rejections (see sSetpointPlausibilityRejects).
+  if (success && !nextData.setpointsValid &&
+      sSetpointPlausibilityRejects < SOLAR_SETPOINT_PROBE_MAX_REJECTS) {
     // Read the three setpoints we actually use at their exact addresses, SKIPPING the
     // gap register 0x0034 (AH_DAILY) that sits between V_reg and V_float. A NACK on the
     // gap must not abort the (best-effort) setpoint read nor perturb the FC cache.
@@ -532,6 +547,7 @@ bool SolarManager::readRegisters() {
         nextData.vFloatSetpoint = vFloat;
         nextData.vEqSetpoint    = (vEq >= 8.0f && vEq <= 32.0f) ? vEq : 0.0f;
         nextData.setpointsValid = true;
+        sSetpointPlausibilityRejects = 0;
         Serial.print(F("Solar: setpoints read V_reg="));
         Serial.print(vReg, 2);
         Serial.print(F(" V_float="));
@@ -539,9 +555,17 @@ bool SolarManager::readRegisters() {
         Serial.print(F(" V_eq="));
         Serial.println(nextData.vEqSetpoint, 2);
       } else {
+        // CRC-valid read but the values are not battery setpoints — on this controller
+        // firmware revision the coded addresses hold other data. Count it; after the
+        // give-up threshold stop probing (and stop the once-per-poll warning spam).
+        ++sSetpointPlausibilityRejects;
         Serial.print(F("Solar: setpoint read returned implausible values, skipping verify (V_reg="));
         Serial.print(vReg, 2);
-        Serial.println(F(")"));
+        if (sSetpointPlausibilityRejects >= SOLAR_SETPOINT_PROBE_MAX_REJECTS) {
+          Serial.println(F(") - giving up until next re-init (addresses wrong for this firmware revision)"));
+        } else {
+          Serial.println(F(")"));
+        }
       }
     }
   }
