@@ -225,3 +225,134 @@ electrically present (LED lit, biasing likely intact) but functionally inert on 
 
 **End of report.** Decision point for the user: order of T-1…T-5, and whether to disable bench
 solar polling until the MRC-1 path is repaired.
+
+---
+
+## 10. Addendum 2026-07-03 — New MRC-1, SunSaver Exoneration, and Full Software Forensics
+
+### 10.1 New hardware evidence
+
+- **SunSaver PROVEN healthy:** operator connected MSView via a Morningstar **UMC-1** USB
+  MeterBus adapter and pulled live voltage/charging data directly from the SunSaver. The
+  controller, its MeterBus port, and its protocol stack all work.
+- **Test 4 — BRAND-NEW MRC-1 installed** (wired identically to the old one): raw register sweep
+  re-run (upload EXIT 0 verified) → **CRC-valid TX frames, `[0 bytes]` RX on every probe, LED
+  solid green with no flicker** — byte-for-byte identical behavior to the old adapter.
+- Two independent MRC-1s failing identically **effectively exonerates the adapter** and moves
+  suspicion to the elements common to both installs: the client Opta's RS-485 transmitter, the
+  A/B/GND wire run, the RJ-11 cable, or the MRC-1 power/switch arrangement.
+
+### 10.2 Git forensics: the week of the Apr 23 "communication established" email
+
+Operator's email confirming working communication: **Thu Apr 23, 5:51 PM** — matching commit
+`2e0dc9b` (v1.6.9, 17:51) to the minute. Changes that day/week:
+
+| Commit | When | What | Touched transport? |
+|---|---|---|---|
+| `197293a` | Apr 22 16:54 | Bring-up docs + all diagnostic sketches | setup only |
+| `977ca70` | Apr 22 20:56 | **THE breakthrough**: `RS485.setDelays(0,1200)`, register map 0x0008-0x000C, scale 96.667 | YES — created the working state |
+| `09bfd31` | Apr 22 21:30 | v1.6.4 disable solar HW test debug flags | no |
+| `2b3d0a7`/`18fec5f`/`388f58f` | Apr 22-23 | v1.6.5-7 USER button features | no |
+| `7bfc2a2` | Apr 23 17:30 | v1.6.8 battery/power-source decoupling (config generator) | no |
+| `2e0dc9b` | Apr 23 17:51 | v1.6.9 SunSaver chemistry verification (adds setpoint reads 0x0033/35/36) | reads only — **email sent at this moment** |
+| `33fbb7e` | Apr 23 17:59 | v1.6.10 tighten lithium chemistry verification | reads only |
+| `cac5881`/`f99727f` | Apr 23 18:10-18:32 | v1.6.11/12 batteryConfig persistence fixes | no |
+| `93ecf39` | Apr 23 19:10 | v1.6.13 applyConfigUpdate solarCharger, stale-solar alert | no transport change |
+
+**Transport init as of the working Apr 23 state:** `ModbusRTUClient.begin(baud, SERIAL_8N2)` on
+the **library-global `RS485` object** + `RS485.setDelays(0, 1200)`.
+
+**Transport init now:** custom `RS485Class sSolarRS485(Serial2, PB_10, PB_14, PB_13)` (introduced
+`5b68a31`, Jun 26, as part of the diagnostics session) + baud-scaled `setDelays(0, 1195)`.
+**These are functionally identical:** the installed core's Opta variant defines the global object
+as exactly `Serial2/PB_10/PB_14/PB_13` (`RS485_SERIAL_PORT=Serial2`, `RS485_DEFAULT_TX_PIN=SERIAL2_TX(PB_10)`,
+`DE=PB_14`, `RE=PB_13`). No pin or timing regression exists anywhere in the history.
+
+### 10.3 Toolchain forensics (rules out silent environment drift)
+
+| Component | Version | Installed/modified | Verdict |
+|---|---|---|---|
+| arduino:mbed_opta core | 4.5.0 | **2026-02-06** | unchanged since before April success |
+| ArduinoRS485 | 1.1.1 | **2026-01-16** | unchanged |
+| ArduinoModbus | 1.0.9 | user lib | unchanged |
+
+No repo code change, no toolchain change, byte-identical diagnostic sketch: worked Apr 22-23,
+silent since ≥ Jun 26. **Software is exonerated across the entire timeline.**
+
+### 10.4 Revised suspect ranking (after Test 4)
+
+1. **Client Opta's RS-485 transmitter dead** (ST3485 driver) — now the top suspect. The board has
+   known collateral history (fried P1 MOSFET). The 1 V AC measurement remains un-baselined
+   (§5.4) and could be phantom pickup.
+2. **A/B/GND wire run** — same wires reused for both adapters; a broken conductor or a GND (G
+   terminal) fault survives an adapter swap.
+3. **MRC-1 power/switch arrangement differs from the April-working topology** — the April-working
+   setup was "MRC-1 powered, switch ON, OEM RJ-11 cable." Verify the new unit's power-source
+   switch position and which RJ-11 cable is in use (MSView's success used the UMC-1's own cable,
+   not the MRC-1's RJ-11).
+4. ~~MRC-1 damaged~~ — effectively eliminated (two units identical).
+5. ~~SunSaver/MeterBus dead~~ — eliminated (MSView live data).
+
+### 10.5 Decisive remaining tests
+
+- **T-1 (2 min): idle AC baseline** — production client between polls or diag stopped: A–B AC.
+  ~1 V while idle ⇒ yesterday's reading was phantom ⇒ Opta TX likely dead.
+- **T-3 (15 min): server-Opta substitution** — move A/B/GND to the bench server Opta, run
+  `sunsaver-tx-stress`. LED flickers ⇒ client Opta transmitter condemned; still solid green ⇒
+  wire run / MRC-1 power topology.
+- **T-2b: MRC-1 switch + RJ-11 verification** — confirm the power-source switch matches the
+  April-working position ("switch ON") and try the OEM RJ-11 cable that MSView's UMC-1 validated
+  is NOT the variable (use the cable known to carry MeterBus).
+
+The `sunsaver-rs485-raw` diagnostic remains flashed on the client Opta and polls continuously —
+any hardware change that restores the path will immediately produce visible LED flicker and RX
+bytes on serial. Production v2.1.4 to be restored once the link is proven.
+
+---
+
+## 11. RESOLUTION 2026-07-03 — Root cause: MRC-1 power switch OFF
+
+**Fix:** operator flipped the (new) MRC-1's power switch to **ON** → the very next diagnostic
+sweep returned **valid CRC-correct frames on every register, under both 8N1 and 8N2**:
+
+```
+>>> 8N2 slv=1 fc=0x04 reg=0x0008 adc_vb_f (batt V) TX [01 04 00 08 00 01 B0 08]
+<<< RX (800ms): 01 04 02 11 83 F4 C1  [7 bytes]        -> 0x1183 = 13.22 V  ✓
+    0x0009 array V  = 0x1655 -> 16.87 V ✓    0x000A load V   = 0x1179 -> 13.19 V ✓
+    0x000B charge I = 0x0053 ->  0.20 A ✓    0x000C load I   = 0x0039 ->  0.14 A ✓
+```
+
+Values are physically plausible (charging battery on active panel) and consistent with the
+operator's same-day MSView reading. Latency well within the 800 ms window.
+
+### Why every prior hypothesis missed it
+
+- **Switch OFF leaves the LED solid green** — the MRC-1 idles happily on MeterBus power, so the
+  "power OK" indication gave no hint its RS-485 side was inert. The LED guide's "steady green =
+  power OK, no data" is literally correct but doesn't distinguish *won't-translate* from
+  *no-traffic*.
+- The switch position is invisible in every serial capture and survives adapter replacement —
+  the brand-new MRC-1 shipped/installed with the switch in the same OFF position, which is why
+  two "independent" adapters failed identically (§10.4 wrongly demoted the power-topology
+  hypothesis to #3).
+- **The old MRC-1 is probably fine.** Its switch was presumably bumped OFF during one of the
+  bench rewiring campaigns between Apr 23 (email confirms working) and Jun 26 (found dead) —
+  consistent with zero repo/toolchain changes in that window (§10.2/§10.3).
+- The April-working notes DID record the answer all along: *"MRC-1 powered, **switch ON**, OEM
+  RJ-11 cable"* (§2 timeline, 2026-04-22). The checklist existed; it wasn't re-verified after
+  bench rearrangement.
+
+### Lessons for the checklist
+
+1. **MRC-1 switch ON** is a hard prerequisite — add to the field-install/bench checklist and the
+   client README wiring table. LED green does NOT confirm it.
+2. When a previously-working link dies with zero code changes, physically re-verify every switch/
+   jumper/cable against the recorded working configuration FIRST — before any firmware forensics.
+3. A replacement unit can inherit the same configuration fault (switches ship in a default
+   position); "new hardware, same symptom" does not exonerate configuration.
+
+### End-to-end confirmation
+
+Production v2.1.4 (signed) restored after the fix; boot startup probe and first polls verified —
+see capture appended below. `getEffectiveBatteryVoltage()` now sources from the MPPT (Source 1),
+so telemetry `v`/`vsup` and the daily `solar` block are live again.

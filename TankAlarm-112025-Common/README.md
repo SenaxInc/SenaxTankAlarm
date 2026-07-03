@@ -88,7 +88,8 @@ SunSaver MPPT solar charger monitoring via Modbus RTU over RS-485:
 
 **Hardware Required:**
 - Arduino Opta with RS485 (WiFi/RS485 model or RS485 shield)
-- Morningstar MRC-1 (MeterBus to EIA-485 Adapter)
+- Morningstar MRC-1 (MeterBus to EIA-485 Adapter) — **power switch must be ON** (LED is solid
+  green either way; switch OFF = RS-485 side inert)
 - SunSaver MPPT solar charge controller
 
 ### TankAlarm_Battery.h

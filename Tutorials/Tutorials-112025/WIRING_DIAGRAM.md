@@ -513,21 +513,40 @@ static void initializeRelays() {
 ```
     Arduino Opta RS485          MRC-1 Adapter           SunSaver MPPT
     ┌──────────────┐          ┌──────────────┐         ┌──────────────┐
-    │ A (-) ───────┼─────────►│ Terminal B(-)│         │              │
-    │ B (+) ───────┼─────────►│ Terminal A(+)│         │   RJ-11      │
+    │ A (DATA+)────┼─────────►│ Terminal B(+)│         │              │
+    │ B (DATA-)────┼─────────►│ Terminal A(-)│         │   RJ-11      │
     │ GND  ───────┼─────────►│ Terminal G   │◄──RJ-11──│   MeterBus   │
-    └──────────────┘          └──────────────┘         └──────────────┘
+    └──────────────┘          │ [SWITCH: ON] │         └──────────────┘
+                              └──────────────┘
 ```
 
 | Arduino Opta RS485 | MRC-1 Terminal | Function |
 |--------------------|----------------|----------|
-| **A (-)** | **Terminal B (-)** | Data Negative |
-| **B (+)** | **Terminal A (+)** | Data Positive |
+| **A** (DATA+) | **Terminal B** (Morningstar "+", non-inverting) | Data Positive |
+| **B** (DATA-) | **Terminal A** (Morningstar "-", inverting) | Data Negative |
 | **GND** | **Terminal G** | Signal Ground |
 
-> **Warning:** A/B labeling varies between manufacturers. If communication fails, swap A and B wires at the Opta end.
+> **Morningstar uses the older/inverted A-B naming convention** (their Terminal A = DATA-,
+> Terminal B = DATA+, per Morningstar Technical Support), which is opposite of the Arduino
+> Opta's labels — that is why the wires **cross** in the table above. If communication fails
+> after wiring exactly as shown, swap A and B at the Opta end as a test.
 
-**Protocol:** Modbus RTU, Slave ID 1, 9600 baud
+> **⚠ CRITICAL: The MRC-1's power switch must be ON.** With the switch OFF the adapter still
+> shows a solid-green LED (it idles on MeterBus power from the SunSaver) but its RS-485 side
+> is completely inert — no translation, no response, no LED flicker. This is the single most
+> deceptive failure mode: correct wiring + green LED + zero communication. Verified on the
+> bench 2026-07-03 — flipping the switch ON instantly restored valid Modbus frames.
+
+**MRC-1 LED quick reference:**
+
+| LED | Meaning |
+|-----|---------|
+| Off | No power (check RJ-11 seating / SunSaver power) |
+| Solid green | Power OK — but **no data**; normal when idle, a fault indicator during active polling (check the power switch!) |
+| Green with amber/red flicker | Data on the bus — healthy link (flickers on every poll) |
+| Steady amber/orange | A/B polarity reversed |
+
+**Protocol:** Modbus RTU, Slave ID 1, 9600 baud, 8N2
 
 ---
 

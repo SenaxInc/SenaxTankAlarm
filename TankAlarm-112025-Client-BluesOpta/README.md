@@ -368,7 +368,12 @@ The system supports optional monitoring of Morningstar SunSaver MPPT solar batte
 2. **Morningstar MRC-1 Adapter** (MeterBus to EIA-485)
    - Converts SunSaver's proprietary RJ-11 MeterBus to industry-standard RS-485
    - Powered by the SunSaver via RJ-11 cable - no external power needed
-   - Simply connect to SunSaver RJ-11 port and wire RS-485 terminals to Opta
+   - **⚠ The MRC-1's power switch MUST be ON.** With the switch OFF the adapter's LED still
+     glows solid green (it idles on MeterBus power), but its RS-485 side is completely inert —
+     it will not translate or respond to any bus traffic. This exact condition caused a
+     months-long "dead link" on the bench (2026-04→07): two different MRC-1 units, correct
+     wiring, healthy SunSaver, LED green — zero communication until the switch was flipped ON.
+   - Simply connect to SunSaver RJ-11 port, wire RS-485 terminals to Opta, **switch ON**
    - Purchase from Morningstar or authorized distributors
 
 3. **SunSaver MPPT Solar Charge Controller** - Any model in the SunSaver MPPT family
@@ -385,7 +390,13 @@ Morningstar uses the older convention where their Terminal A is the inverting/ne
 
 > **Source:** Morningstar Technical Support — Terminal A on Morningstar charge controllers and the MRC-1 is inverted from the UART pin (MARK=low), and Terminal B is the same as the UART pin (MARK=high). Most modern RS-485 adapters use the opposite convention, so Morningstar A connects to the adapter's B / DATA-, and Morningstar B connects to the adapter's A / DATA+.
 >
-> **Troubleshooting:** If communication fails after correct wiring, also verify (1) Signal Ground is connected, (2) the SunSaver's RJ-11 cable is fully seated into the MRC-1 (the MRC-1 is bus-powered from the SunSaver), (3) Modbus framing is 8N2, and (4) slave ID and baud rate match the SunSaver.
+> **Troubleshooting:** If communication fails after correct wiring, verify (1) **the MRC-1's
+> power switch is ON** — a solid-green LED does NOT confirm this; the adapter idles green on
+> MeterBus power with its RS-485 side dead when the switch is OFF, (2) Signal Ground is
+> connected, (3) the SunSaver's RJ-11 cable is fully seated into the MRC-1 (the MRC-1 is
+> bus-powered from the SunSaver), (4) Modbus framing is 8N2, and (5) slave ID and baud rate
+> match the SunSaver. A healthy link makes the MRC-1 LED flicker amber/red on every poll;
+> steady green during active polling means the adapter is not seeing/translating traffic.
 
 **Configuration Parameters:**
 

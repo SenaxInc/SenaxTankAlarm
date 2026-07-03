@@ -3937,6 +3937,8 @@ static void printHardwareRequirements(const ClientConfig &cfg) {
     Serial.println(F("    Opta Lite (AFX00003) requires external RS485 transceiver"));
     Serial.println(F("  - Morningstar MRC-1 (MeterBus to EIA-485 Adapter)"));
     Serial.println(F("    Powered by SunSaver via RJ-11, no external power needed"));
+    Serial.println(F("    POWER SWITCH MUST BE ON (LED is solid green either way;"));
+    Serial.println(F("    switch OFF = RS-485 side inert, no comms despite green LED)"));
     Serial.println(F("  - RS485 Wiring: Opta A(-) to MRC-1 B(-), Opta B(+) to MRC-1 A(+)"));
     Serial.print(F("  - Modbus: Slave ID "));
     Serial.print(cfg.solarCharger.modbusSlaveId);
