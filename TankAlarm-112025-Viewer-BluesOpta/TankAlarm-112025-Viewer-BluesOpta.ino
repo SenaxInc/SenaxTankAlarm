@@ -86,9 +86,10 @@
 #define SUMMARY_FETCH_BASE_HOUR VIEWER_SUMMARY_BASE_HOUR
 #endif
 
-// Viewer is intended for GET-only use; cap request bodies to avoid memory exhaustion.
+// The viewer accepts small POSTs (contact management, update requests); cap request
+// bodies to avoid memory exhaustion.
 #ifndef MAX_HTTP_BODY_BYTES
-#define MAX_HTTP_BODY_BYTES 1024
+#define MAX_HTTP_BODY_BYTES 8192
 #endif
 
 // ---- Network Printer Configuration (JetDirect / Raw port 9100) ----
@@ -238,7 +239,36 @@ static bool gNotecardAvailable = true;
 static uint16_t gNotecardFailureCount = 0;
 static unsigned long gLastSuccessfulNotecardComm = 0;
 
-static const char VIEWER_DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Tank Alarm Viewer</title><style>:root{--bg:#f8fafc;--text:#0f172a;--header-bg:#ffffff;--meta-color:#475569;--card-bg:#ffffff;--table-border:rgba(15,23,42,0.08)}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);transition:background 0.3s,color 0.3s}header{padding:20px 28px;background:var(--header-bg);box-shadow:0 2px 10px rgba(0,0,0,0.15)}header h1{margin:0;font-size:1.7rem}header .meta{margin-top:12px;font-size:0.95rem;color:var(--meta-color);display:flex;gap:16px;flex-wrap:wrap}.title-row{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start}.header-actions{display:flex;gap:12px;align-items:center}.icon-button{width:40px;height:40px;border:1px solid rgba(148,163,184,0.4);background:var(--card-bg);color:var(--text);font-size:1.1rem;cursor:pointer}main{padding:24px;max-width:1400px;margin:0 auto}.card{background:var(--card-bg);padding:20px;box-shadow:0 25px 60px rgba(15,23,42,0.15);border:1px solid rgba(15,23,42,0.08)}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--table-border)}th{text-transform:uppercase;letter-spacing:0.05em;font-size:0.75rem;color:var(--meta-color)}tr:last-child td{border-bottom:none}tr.alarm{background:rgba(220,38,38,0.08)}.status-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;font-size:0.85rem}.status-pill.ok{background:rgba(16,185,129,0.15);color:#34d399}.status-pill.alarm{background:rgba(248,113,113,0.2);color:#fca5a5}.timestamp{font-feature-settings:"tnum";color:var(--meta-color);font-size:0.9rem}footer{margin-top:20px;color:var(--meta-color);font-size:0.85rem;text-align:center}</style></head><body><header><div class="title-row"><div><h1 id="viewerName">Tank Alarm Viewer</h1><div class="meta"><span>Viewer UID: <code id="viewerUid">--</code></span><span>Source: <strong id="sourceServer">--</strong> (<code id="sourceUid">--</code>)</span><span>Summary Generated: <span id="summaryGenerated">--</span></span><span>Last Fetch: <span id="lastFetch">--</span></span><span>Next Scheduled Fetch: <span id="nextFetch">--</span></span><span>Server cadence: <span id="refreshHint">6h @ 6 AM</span></span></div></div></div></header><div id="ghUpdateBanner" style="display:none;background:#fef9c3;border-bottom:2px solid #ca8a04;padding:10px 20px;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;"><span>&#x26A0; New firmware on GitHub: <strong id="ghUpdateVersion"></strong> &mdash; <a id="ghUpdateLink" href="#" target="_blank" rel="noopener noreferrer">View release notes</a> &mdash; Viewer auto-update is direct-first with Notehub fallback</span><button onclick="this.parentElement.style.display='none'" style="background:none;border:none;cursor:pointer;font-size:1.2rem;line-height:1;padding:0 4px;">&times;</button></div><main><section class="card"><div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap"><h2 style="margin:0;font-size:1.2rem">Fleet Snapshot</h2><span class="timestamp">Dashboard auto-refresh: )HTML" STR(WEB_REFRESH_MINUTES) R"HTML( min</span></div><table><thead><tr><th>Site</th><th>Tank</th><th>Level</th><th>24hr Change</th><th>Updated</th></tr></thead><tbody id="sensorBody"></tbody></table></section><footer>Viewer nodes are read-only mirrors. Configuration and permissions stay on the server fleet.</footer></main><script>(()=>{const REFRESH_SECONDS=)HTML" STR(WEB_REFRESH_SECONDS)R"HTML(;const els={viewerName:document.getElementById('viewerName'),viewerUid:document.getElementById('viewerUid'),sourceServer:document.getElementById('sourceServer'),sourceUid:document.getElementById('sourceUid'),summaryGenerated:document.getElementById('summaryGenerated'),lastFetch:document.getElementById('lastFetch'),nextFetch:document.getElementById('nextFetch'),refreshHint:document.getElementById('refreshHint'),sensorBody:document.getElementById('sensorBody')};const state={sensors:[]};function applySensorData(d){els.viewerName.textContent=d.vn||'Tank Alarm Viewer';els.viewerUid.textContent=d.vi||'--';els.sourceServer.textContent=d.sn||'Server';els.sourceUid.textContent=d.si||'--';els.summaryGenerated.textContent=formatEpoch(d.ge);els.lastFetch.textContent=formatEpoch(d.lf);els.nextFetch.textContent=formatEpoch(d.nf);els.refreshHint.textContent=describeCadence(d.rs,d.bh);state.sensors=d.sensors||[];renderSensorRows()}async function fetchSensors(){try{const res=await fetch('/api/sensors');if(!res.ok)throw new Error('HTTP '+res.status);const data=await res.json();applySensorData(data)}catch(err){console.error('Viewer refresh failed',err)}}function renderSensorRows(){const tbody=els.sensorBody;tbody.innerHTML='';const rows=state.sensors;if(!rows.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="5">No sensor data available</td>';tbody.appendChild(tr);return}const now=Date.now();const staleThresholdMs=93600000;rows.forEach(t=>{const tr=document.createElement('tr');const alarm=t.a;if(alarm)tr.classList.add('alarm');const lastUpdate=t.u;const isStale=lastUpdate&&((now-(lastUpdate*1000))>staleThresholdMs);const staleWarning=isStale?' ⚠️':'';tr.innerHTML=`<td>${escapeHtml(t.s,'--')}</td><td>${escapeHtml(t.n||'Tank')}${t.un?' #'+t.un:''}</td><td>${formatLevel(t.l,t.mu)}</td><td>${format24hChange(t)}</td><td>${formatEpoch(lastUpdate)}${staleWarning}</td>`;if(isStale){tr.style.opacity='0.6';tr.title='Data is over 26 hours old'}tbody.appendChild(tr)})}function statusBadge(t){const alarm=t.a;if(!alarm){return'<span class="status-pill ok">Normal</span>'}const label=escapeHtml(t.at||'Alarm','Alarm');return`<span class="status-pill alarm">${label}</span>`}function formatLevel(value,unit){if(typeof value!=='number'||!isFinite(value)||value<0)return'--';if(!unit||unit==='inches'){const feet=Math.floor(value/12);const remainingInches=value-(feet*12);return feet===0?`${remainingInches.toFixed(1)}"`:`${feet}' ${remainingInches.toFixed(1)}"`;}return`${value.toFixed(2)} ${unit}`;}function format24hChange(t){const d=t.d;if(d===undefined||d===null||typeof d!=='number'||!isFinite(d))return'--';const sign=d>0?'+':'';const unit=t.mu;if(!unit||unit==='inches')return`${sign}${d.toFixed(1)}"`;return`${sign}${d.toFixed(1)} ${unit}`;}function formatEpoch(epoch){if(!epoch)return'--';const date=new Date(epoch*1000);if(isNaN(date.getTime()))return'--';return date.toLocaleString()}function describeCadence(seconds,baseHour){const hours=seconds?(seconds/3600).toFixed(1).replace(/\.0$/,''):'6';const hourLabel=(typeof baseHour==='number')?baseHour:6;return`${hours}h cadence · starts ${hourLabel}:00`}function escapeHtml(value,fallback=''){if(value===undefined||value===null||value==='')return fallback;const entityMap={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return String(value).replace(/[&<>"']/g,c=>entityMap[c]||c)}(async()=>{try{const r=await fetch('/api/github/update');if(!r.ok)return;const d=await r.json();if(d.available){const b=document.getElementById('ghUpdateBanner');const v=document.getElementById('ghUpdateVersion');const l=document.getElementById('ghUpdateLink');if(b&&v){v.textContent='v'+d.latestVersion;if(l&&d.releaseUrl)l.href=d.releaseUrl;b.style.display='flex';}}}catch(e){}})();fetchSensors();setInterval(()=>fetchSensors(),REFRESH_SECONDS*1000)})();</script></body></html>)HTML";
+// ---- Viewer-managed contacts (auxiliary contact management) ----
+// Contacts added here are sent to the MAIN SERVER via viewer_contacts.qo, stored in the
+// server's contact directory with category "viewer", and automatically enrolled as SMS
+// alert recipients. The server pushes the authoritative list back inside every viewer
+// summary (field "vc"), so admin-side edits show up here too.
+struct ViewerContact {
+  char id[28];
+  char name[32];
+  char phone[20];
+  char email[48];
+};
+#define MAX_VIEWER_CONTACTS 12
+static ViewerContact gViewerContacts[MAX_VIEWER_CONTACTS];
+static uint8_t gViewerContactCount = 0;
+static double gViewerContactsSyncedEpoch = 0.0;
+
+// After a manual "Request Update", poll the summary inbox aggressively for a few minutes
+// so the server's reply is applied promptly instead of waiting for the next 6-hour slot.
+static uint8_t gSummaryFastPolls = 0;
+static unsigned long gLastFastPollMillis = 0;
+
+// ============================================================================
+// Server-styled web pages (v2.2.0) — visual language mirrors the main server
+// dashboard (same palette/card classes). Status-display focused: no config or
+// settings pages; auxiliary contact management lives at /contacts.
+// ============================================================================
+
+static const char VIEWER_DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tank Alarm Viewer</title><style> :root{--primary:#0066cc;--primary-hover:#004c99;--bg:#f2f2f2;--card-bg:#ffffff;--text:#333333;--muted:#666666;--border:#cccccc;--danger:#cc0000;--success:#28a745;--warning:#ffc107;--card-border:#d7d7d7} body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.5} *{box-sizing:border-box} header{background:var(--card-bg);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100} .bar{max-width:1200px;margin:0 auto;padding:0.75rem 1rem;display:flex;align-items:center;gap:1.25rem;flex-wrap:wrap} .brand{font-weight:700;font-size:1.1rem;white-space:nowrap;color:#201442} nav{display:flex;gap:12px;align-items:center;flex:1} nav a{color:var(--muted);text-decoration:none;font-size:0.95rem;padding:4px 8px} nav a.active{color:var(--primary);font-weight:600;border-bottom:2px solid var(--primary)} .btn{background:var(--primary);color:#fff;border:none;padding:8px 16px;font-size:0.9rem;cursor:pointer;border-radius:4px} .btn:hover{background:var(--primary-hover)} .btn:disabled{opacity:0.5;cursor:default} main{max-width:1200px;margin:0 auto;padding:1rem} .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px} .stat-card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;padding:14px;text-align:center} .stat-card span{font-size:0.8rem;color:var(--muted)} .stat-card strong{display:block;font-size:1.6rem;margin-top:4px} .stat-card.alarm strong{color:var(--danger)} #alarmSection{display:none;background:var(--card-bg);border:1px solid var(--danger);border-left:6px solid var(--danger);border-radius:10px;margin-bottom:16px;overflow:hidden} #alarmSection.visible{display:block} #alarmSection .site-head{background:rgba(204,0,0,0.06)} #alarmSection .site-name{color:var(--danger)} .site-section{background:var(--card-bg);border:1px solid var(--card-border);border-radius:10px;margin-bottom:16px;overflow:hidden} .site-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--card-border);flex-wrap:wrap;gap:8px} .site-name{font-size:1.15rem;font-weight:700} .data-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;padding:14px 18px} .data-card{background:var(--bg);border:1px solid var(--card-border);border-radius:8px;padding:14px;position:relative} .data-card.alarm-card{border-left:4px solid var(--danger)} .dc-type{font-size:0.7rem;text-transform:uppercase;font-weight:600;color:var(--muted);letter-spacing:0.5px;margin-bottom:6px} .dc-name{font-weight:600;font-size:0.95rem;margin-bottom:2px} .dc-value{font-size:1.5rem;font-weight:700;line-height:1.2} .dc-value small{font-size:0.55em;font-weight:400;color:var(--muted)} .dc-meta{font-size:0.8rem;color:var(--muted);margin-top:6px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px} .dc-change{font-size:0.8rem;font-weight:500} .dc-change.pos{color:#10b981} .dc-change.neg{color:#ef4444} .dc-alarm{font-size:0.8rem;font-weight:600;color:var(--danger);margin-top:4px} .meta-line{font-size:0.85rem;color:var(--muted);margin:14px 4px;display:flex;gap:16px;flex-wrap:wrap} #updBanner{display:none;background:rgba(255,193,7,0.15);border:1px solid var(--warning);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:0.9rem} #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:10px 20px;border-radius:6px;font-size:0.9rem;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:200} #toast.show{opacity:1} .empty-state{color:var(--muted);padding:24px;text-align:center} footer{max-width:1200px;margin:0 auto;padding:0 1rem 1.5rem;color:var(--muted);font-size:0.85rem;text-align:center} </style></head><body> <header><div class="bar"><span class="brand">Tank Alarm Viewer</span><nav><a href="/" class="active">Dashboard</a><a href="/contacts">Contacts</a></nav><button class="btn" id="requestUpdateBtn">Request Update</button></div></header> <main> <div id="updBanner"></div> <div id="alarmSection"><div class="site-head"><span class="site-name">&#9888; Active Alarms</span><span id="alarmCount" style="font-size:0.9rem;color:var(--danger);font-weight:600;"></span></div><div class="data-grid" id="alarmGrid"></div></div> <div class="stats-grid"><div class="stat-card"><span>Sensors</span><strong id="statSensors">-</strong></div><div class="stat-card" id="statAlarmCard"><span>Active Alarms</span><strong id="statAlarms">-</strong></div><div class="stat-card"><span>Summary Age</span><strong id="statAge" style="font-size:1.1rem;">-</strong></div><div class="stat-card"><span>Next Fetch</span><strong id="statNext" style="font-size:1.1rem;">-</strong></div></div> <div id="siteSections"><div class="empty-state">Loading&hellip;</div></div> <div class="meta-line"><span id="metaViewer"></span><span id="metaServer"></span></div> </main> <footer>Viewer node &mdash; status display mirror of the Tank Alarm server. Contact changes made here sync to the server.</footer> <div id="toast"></div> <script> function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));} function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#b91c1c':'#333';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500);} function timeAgo(epoch){if(!epoch)return'never';const s=Math.max(0,Date.now()/1000-epoch);if(s<120)return'just now';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago';} function timeUntil(epoch){if(!epoch)return'-';const s=epoch-Date.now()/1000;if(s<=0)return'due now';if(s<3600)return'in '+Math.ceil(s/60)+'m';return'in '+Math.floor(s/3600)+'h '+Math.round((s%3600)/60)+'m';} function typeLabel(ot){const m={tank:'Tank Level',gas:'Gas Pressure',rpm:'Engine RPM',engine:'Engine',flow:'Flow Rate',pump:'Pump'};return m[ot]||'Sensor';} function unitLabel(mu,ot){if(mu){return mu==='inches'?'in':mu;}const d={tank:'in',gas:'psi',rpm:'rpm',engine:'rpm',flow:'gpm'};return d[ot]||'';} function renderCard(t,withSite){const card=document.createElement('div');card.className='data-card';if(t.a)card.classList.add('alarm-card');const ot=t.ot||'tank';const mu=unitLabel(t.mu,ot);const val=(typeof t.l==='number')?t.l.toFixed(1):'-';let changeHtml='';if(typeof t.d==='number'){const cls=t.d>=0?'pos':'neg';const sign=t.d>=0?'+':'';changeHtml='<span class="dc-change '+cls+'">'+sign+t.d.toFixed(1)+' '+mu+'/24h</span>';} const numLabel=t.un?(' #'+t.un):'';const nameLine=(withSite?escapeHtml(t.s)+' &mdash; ':'')+escapeHtml(t.n||'Sensor')+numLabel; card.innerHTML='<div class="dc-type">'+escapeHtml(typeLabel(ot))+'</div>'+'<div class="dc-name">'+nameLine+'</div>'+'<div class="dc-value">'+val+' <small>'+escapeHtml(mu)+'</small></div>'+(t.a?'<div class="dc-alarm">ALARM: '+escapeHtml(t.at||'active')+'</div>':'')+'<div class="dc-meta"><span>'+(t.u?'Updated '+timeAgo(t.u):'No data yet')+'</span>'+changeHtml+'</div>'; return card;} function applyData(d){document.getElementById('metaViewer').textContent='Viewer: '+(d.vn||'')+' ('+(d.vi||'?')+')';document.getElementById('metaServer').textContent='Server: '+(d.sn||'?')+' ('+(d.si||'?')+')';document.getElementById('statSensors').textContent=(d.sensors||[]).length;document.getElementById('statAge').textContent=d.ge?timeAgo(d.ge):'-';document.getElementById('statNext').textContent=timeUntil(d.nf); const sensors=d.sensors||[];const alarms=sensors.filter(t=>t.a);document.getElementById('statAlarms').textContent=alarms.length;document.getElementById('statAlarmCard').classList.toggle('alarm',alarms.length>0); const alarmSection=document.getElementById('alarmSection');const alarmGrid=document.getElementById('alarmGrid');alarmGrid.innerHTML='';if(alarms.length>0){alarms.forEach(t=>alarmGrid.appendChild(renderCard(t,true)));document.getElementById('alarmCount').textContent=alarms.length+' alarm'+(alarms.length>1?'s':'');alarmSection.classList.add('visible');}else{alarmSection.classList.remove('visible');} const host=document.getElementById('siteSections');host.innerHTML='';if(sensors.length===0){host.innerHTML='<div class="empty-state">No sensor data yet. The server publishes a summary on its schedule &mdash; use Request Update to ask for one now.</div>';return;} const yourSites={};sensors.forEach(t=>{const s=t.s||'Unknown Site';(yourSites[s]=yourSites[s]||[]).push(t);}); Object.keys(yourSites).sort().forEach(site=>{const sec=document.createElement('div');sec.className='site-section';const head=document.createElement('div');head.className='site-head';head.innerHTML='<span class="site-name">'+escapeHtml(site)+'</span>';sec.appendChild(head);const grid=document.createElement('div');grid.className='data-grid';yourSites[site].forEach(t=>grid.appendChild(renderCard(t,false)));sec.appendChild(grid);host.appendChild(sec);});} function fetchData(){fetch('/api/sensors').then(r=>r.json()).then(applyData).catch(e=>console.error('fetch failed',e));} function fetchUpdateBanner(){fetch('/api/github/update').then(r=>r.json()).then(d=>{const b=document.getElementById('updBanner');if(d&&d.available){b.innerHTML='Firmware update available: <strong>'+escapeHtml(d.latestVersion||'')+'</strong>';b.style.display='block';}else{b.style.display='none';}}).catch(()=>{});} document.getElementById('requestUpdateBtn').addEventListener('click',function(){const btn=this;btn.disabled=true;fetch('/api/request-update',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.success){showToast('Update requested — the server will push fresh data shortly.');}else{showToast(d.message||'Request failed',true);}}).catch(e=>showToast('Request failed: '+e.message,true)).finally(()=>{setTimeout(()=>{btn.disabled=false;},5000);});}); fetchData();fetchUpdateBanner();setInterval(fetchData,60000);setInterval(fetchUpdateBanner,3600000); </script></body></html>)HTML";
+
+static const char VIEWER_CONTACTS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Viewer Contacts</title><style> :root{--primary:#0066cc;--primary-hover:#004c99;--bg:#f2f2f2;--card-bg:#ffffff;--text:#333333;--muted:#666666;--border:#cccccc;--danger:#cc0000;--card-border:#d7d7d7} body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.5} *{box-sizing:border-box} header{background:var(--card-bg);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100} .bar{max-width:1200px;margin:0 auto;padding:0.75rem 1rem;display:flex;align-items:center;gap:1.25rem;flex-wrap:wrap} .brand{font-weight:700;font-size:1.1rem;white-space:nowrap;color:#201442} nav{display:flex;gap:12px;align-items:center;flex:1} nav a{color:var(--muted);text-decoration:none;font-size:0.95rem;padding:4px 8px} nav a.active{color:var(--primary);font-weight:600;border-bottom:2px solid var(--primary)} main{max-width:800px;margin:0 auto;padding:1rem} .card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:10px;padding:18px;margin-bottom:16px} .card h2{margin:0 0 6px;font-size:1.15rem} .note{font-size:0.85rem;color:var(--muted);margin-bottom:12px} .contact-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--card-border);border-radius:8px;background:var(--bg);margin-bottom:8px;flex-wrap:wrap} .contact-name{font-weight:600} .contact-details{font-size:0.85rem;color:var(--muted)} .btn{background:var(--primary);color:#fff;border:none;padding:8px 16px;font-size:0.9rem;cursor:pointer;border-radius:4px} .btn:hover{background:var(--primary-hover)} .btn.danger{background:var(--danger)} .btn:disabled{opacity:0.5;cursor:default} .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:10px} .field span{display:block;font-size:0.8rem;color:var(--muted);margin-bottom:2px} .field input{width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;font-size:0.95rem} .empty-state{color:var(--muted);padding:16px;text-align:center} #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:10px 20px;border-radius:6px;font-size:0.9rem;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:200} #toast.show{opacity:1} .sync-line{font-size:0.8rem;color:var(--muted);margin-top:8px} </style></head><body> <header><div class="bar"><span class="brand">Tank Alarm Viewer</span><nav><a href="/">Dashboard</a><a href="/contacts" class="active">Contacts</a></nav></div></header> <main> <div class="card"><h2>Alarm Notification Contacts</h2><div class="note">Contacts added here are sent to the main server, stored as <strong>viewer contacts</strong> in its directory, and automatically enrolled to receive SMS alarm alerts. The server administrator can also view and edit these contacts. Changes may take a moment to sync.</div> <div id="contactList"><div class="empty-state">Loading&hellip;</div></div> <div class="sync-line" id="syncLine"></div></div> <div class="card"><h2>Add Contact</h2><div class="form-grid"><label class="field"><span>Name *</span><input id="cName" maxlength="31"></label><label class="field"><span>Phone (E.164, e.g. +15551234567)</span><input id="cPhone" maxlength="19"></label><label class="field"><span>Email</span><input id="cEmail" maxlength="47" type="email"></label></div><button class="btn" id="addBtn">+ Add Contact</button><div class="note" style="margin-top:8px;">Provide at least a phone number (for SMS alerts) or an email address. Maximum 12 viewer contacts.</div></div> </main> <div id="toast"></div> <script> function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));} function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#b91c1c':'#333';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500);} function timeAgo(epoch){if(!epoch)return'never';const s=Math.max(0,Date.now()/1000-epoch);if(s<120)return'just now';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago';} let contacts=[]; function render(){const host=document.getElementById('contactList');if(contacts.length===0){host.innerHTML='<div class="empty-state">No viewer contacts yet.</div>';return;}host.innerHTML=contacts.map((c,i)=>'<div class="contact-row"><div><div class="contact-name">'+escapeHtml(c.name)+'</div><div class="contact-details">'+(c.phone?escapeHtml(c.phone):'')+(c.phone&&c.email?' &middot; ':'')+(c.email?escapeHtml(c.email):'')+'</div></div><button class="btn danger" data-i="'+i+'">Remove</button></div>').join('');host.querySelectorAll('button[data-i]').forEach(b=>b.addEventListener('click',()=>removeContact(parseInt(b.dataset.i,10))));} function load(){fetch('/api/contacts').then(r=>r.json()).then(d=>{contacts=d.contacts||[];render();document.getElementById('syncLine').textContent=d.synced?('Last synced from server '+timeAgo(d.synced)):'Not yet synced from server.';}).catch(e=>showToast('Load failed: '+e.message,true));} function save(){return fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:contacts})}).then(r=>r.json()).then(d=>{if(d.success){showToast('Saved — syncing to server.');}else{showToast(d.message||'Save failed',true);load();}return d.success;});} function removeContact(i){if(!confirm('Remove '+contacts[i].name+' from alarm notifications?'))return;contacts.splice(i,1);render();save();} document.getElementById('addBtn').addEventListener('click',()=>{const name=document.getElementById('cName').value.trim();const phone=document.getElementById('cPhone').value.trim();const email=document.getElementById('cEmail').value.trim(); if(!name){showToast('Name is required',true);return;} if(!phone&&!email){showToast('Provide a phone number or email',true);return;} if(phone&&!/^\+[0-9]{7,15}$/.test(phone)){showToast('Phone must be E.164 format, e.g. +15551234567',true);return;} if(contacts.length>=12){showToast('Maximum 12 viewer contacts',true);return;} contacts.push({name:name,phone:phone,email:email});render();save().then(ok=>{if(ok){document.getElementById('cName').value='';document.getElementById('cPhone').value='';document.getElementById('cEmail').value='';}});}); load();setInterval(load,120000); </script></body></html>)HTML";
 
 static void initializeNotecard();
 static void initializeEthernet();
@@ -247,7 +277,13 @@ static bool readHttpRequest(EthernetClient &client, String &method, String &path
 static void respondJson(EthernetClient &client, const String &body);
 static void respondStatus(EthernetClient &client, int status, const char *message);
 static void sendDashboard(EthernetClient &client);
+static void sendContactsPage(EthernetClient &client);
+static void sendHtmlPage(EthernetClient &client, const char *html);
 static void sendSensorJson(EthernetClient &client);
+static void handleContactsGet(EthernetClient &client);
+static void handleContactsPost(EthernetClient &client, const String &body);
+static void handleRequestUpdatePost(EthernetClient &client);
+static bool viewerSendNote(const char *file, JsonDocument &doc);
 static void ensureTimeSync();
 static double currentEpoch();
 static double computeNextAlignedEpoch(double epoch, uint8_t baseHour, uint32_t intervalSeconds);
@@ -432,6 +468,14 @@ void loop() {
     scheduleNextSummaryFetch();
   }
 
+  // v2.2.0: after a manual Request Update, poll the inbox every 30 s (up to 10 times) so
+  // the server's fresh summary is applied within seconds-to-minutes instead of hours.
+  if (gSummaryFastPolls > 0 && (millis() - gLastFastPollMillis) >= 30000UL) {
+    gLastFastPollMillis = millis();
+    gSummaryFastPolls--;
+    fetchViewerSummary();
+  }
+
   // Daily report printing (if printer is configured)
   checkDailyPrint();
 
@@ -481,6 +525,10 @@ static void initializeNotecard() {
     // Use configurable product UID (allows fleet-specific deployments without recompilation)
     JAddStringToObject(req, "product", gConfig.productUid);
     JAddStringToObject(req, "mode", "continuous");
+    // v2.2.0: sync:true so inbound viewer_summary.qi notes are pushed to the Notecard the
+    // moment Notehub queues them — required for the Request Update round-trip to be prompt
+    // (same fix as the server's v1.9.17 real-time inbound sync).
+    JAddBoolToObject(req, "sync", true);
     // Join the viewer fleet for fleet-scoped DFU, route filtering, and device management
     JAddStringToObject(req, "fleet", "tankalarm-viewer");
     J *hubRsp = notecard.requestAndResponse(req);
@@ -685,8 +733,16 @@ static void handleWebRequests() {
 
   if (method == "GET" && path == "/") {
     sendDashboard(client);
+  } else if (method == "GET" && path == "/contacts") {
+    sendContactsPage(client);
   } else if (method == "GET" && path == "/api/sensors") {
     sendSensorJson(client);
+  } else if (method == "GET" && path == "/api/contacts") {
+    handleContactsGet(client);
+  } else if (method == "POST" && path == "/api/contacts") {
+    handleContactsPost(client, body);
+  } else if (method == "POST" && path == "/api/request-update") {
+    handleRequestUpdatePost(client);
   } else if (method == "GET" && path == "/api/github/update") {
     handleGitHubUpdateGet(client);
   } else {
@@ -833,7 +889,15 @@ static void respondStatus(EthernetClient &client, int status, const char *messag
 }
 
 static void sendDashboard(EthernetClient &client) {
-  size_t htmlLen = strlen_P(VIEWER_DASHBOARD_HTML);
+  sendHtmlPage(client, VIEWER_DASHBOARD_HTML);
+}
+
+static void sendContactsPage(EthernetClient &client) {
+  sendHtmlPage(client, VIEWER_CONTACTS_HTML);
+}
+
+static void sendHtmlPage(EthernetClient &client, const char *html) {
+  size_t htmlLen = strlen_P(html);
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: text/html; charset=utf-8"));
   client.println(F("Connection: close"));
@@ -845,7 +909,7 @@ static void sendDashboard(EthernetClient &client) {
   const size_t bufSize = 128;
   uint8_t buffer[bufSize];
   size_t remaining = htmlLen;
-  const char* ptr = VIEWER_DASHBOARD_HTML;
+  const char* ptr = html;
 
   while (remaining > 0) {
     size_t chunk = (remaining < bufSize) ? remaining : bufSize;
@@ -921,6 +985,173 @@ static void sendSensorJson(EthernetClient &client) {
   client.println(F("Cache-Control: no-cache, no-store, must-revalidate"));
   client.println();
   serializeJson(doc, client);
+}
+
+// ============================================================================
+// Outbound notes + contact management (v2.2.0)
+// ============================================================================
+
+// Queue a note to Notehub with sync:true. Returns true when the Notecard accepted it.
+// No offline buffering: callers surface failures to the UI so the user can retry.
+static bool viewerSendNote(const char *file, JsonDocument &doc) {
+  if (!gNotecardAvailable) {
+    return false;
+  }
+  doc["_sv"] = NOTEFILE_SCHEMA_VERSION;
+  String payload;
+  if (serializeJson(doc, payload) == 0) {
+    return false;
+  }
+  J *req = notecard.newRequest("note.add");
+  if (!req) {
+    gNotecardFailureCount++;
+    return false;
+  }
+  JAddStringToObject(req, "file", file);
+  JAddBoolToObject(req, "sync", true);
+  J *body = JParse(payload.c_str());
+  if (!body) {
+    JDelete(req);
+    return false;
+  }
+  JAddItemToObject(req, "body", body);
+#ifdef TANKALARM_WATCHDOG_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    mbedWatchdog.kick();
+  #endif
+#endif
+  J *rsp = notecard.requestAndResponse(req);
+  bool ok = false;
+  if (rsp) {
+    const char *err = JGetString(rsp, "err");
+    ok = !(err && err[0] != '\0');
+    if (!ok) {
+      Serial.print(F("viewerSendNote failed: "));
+      Serial.println(err);
+    }
+    notecard.deleteResponse(rsp);
+  } else {
+    Serial.println(F("viewerSendNote: no response from Notecard"));
+    gNotecardFailureCount++;
+  }
+  return ok;
+}
+
+// GET /api/contacts — the viewer's copy of its server-stored contacts.
+static void handleContactsGet(EthernetClient &client) {
+  JsonDocument doc;
+  doc["synced"] = gViewerContactsSyncedEpoch;
+  JsonArray arr = doc["contacts"].to<JsonArray>();
+  for (uint8_t i = 0; i < gViewerContactCount; ++i) {
+    JsonObject o = arr.add<JsonObject>();
+    o["id"] = gViewerContacts[i].id;
+    o["name"] = gViewerContacts[i].name;
+    if (gViewerContacts[i].phone[0] != '\0') o["phone"] = gViewerContacts[i].phone;
+    if (gViewerContacts[i].email[0] != '\0') o["email"] = gViewerContacts[i].email;
+  }
+  String out;
+  serializeJson(doc, out);
+  respondJson(client, out);
+}
+
+// POST /api/contacts — full-list replace. Validates, updates the local copy, and queues
+// the list to the server (viewer_contacts.qo). The server stores these with category
+// "viewer" and enrolls phones as SMS alert recipients; the authoritative list returns in
+// the next viewer summary (field "vc").
+static void handleContactsPost(EthernetClient &client, const String &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    respondStatus(client, 400, "Invalid JSON");
+    return;
+  }
+  JsonArray incoming = doc["contacts"].as<JsonArray>();
+  if (incoming.isNull()) {
+    respondStatus(client, 400, "Missing contacts array");
+    return;
+  }
+  if (incoming.size() > MAX_VIEWER_CONTACTS) {
+    respondStatus(client, 400, "Too many contacts (max 12)");
+    return;
+  }
+
+  ViewerContact staged[MAX_VIEWER_CONTACTS];
+  uint8_t stagedCount = 0;
+  double now = currentEpoch();
+  for (JsonVariant v : incoming) {
+    const char *name = v["name"] | "";
+    const char *phone = v["phone"] | "";
+    const char *email = v["email"] | "";
+    if (name[0] == '\0' || (phone[0] == '\0' && email[0] == '\0')) {
+      respondStatus(client, 400, "Each contact needs a name and a phone or email");
+      return;
+    }
+    ViewerContact &c = staged[stagedCount];
+    memset(&c, 0, sizeof(c));
+    const char *id = v["id"] | "";
+    if (id[0] != '\0') {
+      strlcpy(c.id, id, sizeof(c.id));
+    } else {
+      snprintf(c.id, sizeof(c.id), "vc_%lu_%u", (unsigned long)(now > 0.0 ? now : millis()), stagedCount);
+    }
+    strlcpy(c.name, name, sizeof(c.name));
+    strlcpy(c.phone, phone, sizeof(c.phone));
+    strlcpy(c.email, email, sizeof(c.email));
+    stagedCount++;
+  }
+
+  // Queue to the server first — only adopt locally when the note was accepted, so the
+  // local view never silently diverges from what the server will store.
+  JsonDocument note;
+  note["vi"] = gViewerUid;
+  note["t"] = now;
+  JsonArray arr = note["contacts"].to<JsonArray>();
+  for (uint8_t i = 0; i < stagedCount; ++i) {
+    JsonObject o = arr.add<JsonObject>();
+    o["id"] = staged[i].id;
+    o["name"] = staged[i].name;
+    if (staged[i].phone[0] != '\0') o["phone"] = staged[i].phone;
+    if (staged[i].email[0] != '\0') o["email"] = staged[i].email;
+  }
+  bool queued = viewerSendNote(VIEWER_CONTACTS_OUTBOX_FILE, note);
+
+  JsonDocument response;
+  response["success"] = queued;
+  response["queued"] = queued;
+  if (queued) {
+    for (uint8_t i = 0; i < stagedCount; ++i) {
+      gViewerContacts[i] = staged[i];
+    }
+    gViewerContactCount = stagedCount;
+    response["message"] = "Contacts queued to server";
+    Serial.print(F("Viewer contacts queued to server ("));
+    Serial.print(stagedCount);
+    Serial.println(F(" contacts)"));
+  } else {
+    response["message"] = "Notecard unavailable - changes not saved, try again";
+  }
+  String out;
+  serializeJson(response, out);
+  respondJson(client, out);
+}
+
+// POST /api/request-update — ask the server to publish a fresh viewer summary now.
+static void handleRequestUpdatePost(EthernetClient &client) {
+  JsonDocument note;
+  note["vi"] = gViewerUid;
+  note["t"] = currentEpoch();
+  bool queued = viewerSendNote(VIEWER_REQUEST_OUTBOX_FILE, note);
+  if (queued) {
+    // Poll the summary inbox every 30 s for the next ~5 min to catch the reply promptly.
+    gSummaryFastPolls = 10;
+    gLastFastPollMillis = millis();
+    Serial.println(F("Update request queued to server"));
+  }
+  JsonDocument response;
+  response["success"] = queued;
+  response["message"] = queued ? "Update requested" : "Notecard unavailable - try again";
+  String out;
+  serializeJson(response, out);
+  respondJson(client, out);
 }
 
 static void fetchViewerSummary() {
@@ -1096,6 +1327,27 @@ static void handleViewerSummary(JsonDocument &doc, double epoch) {
   }
 
   gLastSummaryFetchEpoch = currentEpoch();
+  gSummaryFastPolls = 0;  // summary received — stop any post-request fast polling
+
+  // v2.2.0: viewer-managed contacts echoed back by the server (authoritative list,
+  // including any admin-side edits made on the server's contact directory).
+  if (doc["vc"].is<JsonArray>()) {
+    gViewerContactCount = 0;
+    for (JsonVariantConst item : doc["vc"].as<JsonArrayConst>()) {
+      if (gViewerContactCount >= MAX_VIEWER_CONTACTS) break;
+      ViewerContact &c = gViewerContacts[gViewerContactCount];
+      memset(&c, 0, sizeof(c));
+      strlcpy(c.id, item["id"] | "", sizeof(c.id));
+      strlcpy(c.name, item["name"] | "", sizeof(c.name));
+      strlcpy(c.phone, item["phone"] | "", sizeof(c.phone));
+      strlcpy(c.email, item["email"] | "", sizeof(c.email));
+      if (c.name[0] != '\0') {
+        gViewerContactCount++;
+      }
+    }
+    gViewerContactsSyncedEpoch = gLastSummaryFetchEpoch;
+  }
+
   Serial.print(F("Viewer summary applied ("));
   Serial.print(gSensorRecordCount);
   Serial.println(F(" sensors)"));

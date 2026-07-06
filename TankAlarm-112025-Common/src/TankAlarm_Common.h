@@ -16,11 +16,11 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "2.1.6"
+#define FIRMWARE_VERSION "2.2.0"
 #endif
 
 #ifndef FIRMWARE_BUILD_SEQ
-#define FIRMWARE_BUILD_SEQ 286   // monotonic; bump every release (v2.1.6 = 286)
+#define FIRMWARE_BUILD_SEQ 287   // monotonic; bump every release (v2.2.0 = 287)
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.
@@ -259,6 +259,24 @@ struct RelayRuntime {
 
 #ifndef VIEWER_SUMMARY_INBOX_FILE
 #define VIEWER_SUMMARY_INBOX_FILE "viewer_summary.qi"   // Viewer receives summary
+#endif
+
+// --- Viewer-managed contacts (auxiliary contact management on the viewer) ---
+#ifndef VIEWER_CONTACTS_OUTBOX_FILE
+#define VIEWER_CONTACTS_OUTBOX_FILE "viewer_contacts.qo"  // Viewer sends contact edits
+#endif
+
+#ifndef VIEWER_CONTACTS_INBOX_FILE
+#define VIEWER_CONTACTS_INBOX_FILE "viewer_contacts.qi"   // Server receives contact edits
+#endif
+
+// --- Viewer update request (dashboard "Request Update" button) ---
+#ifndef VIEWER_REQUEST_OUTBOX_FILE
+#define VIEWER_REQUEST_OUTBOX_FILE "viewer_request.qo"    // Viewer asks for a fresh summary
+#endif
+
+#ifndef VIEWER_REQUEST_INBOX_FILE
+#define VIEWER_REQUEST_INBOX_FILE "viewer_request.qi"     // Server receives the request
 #endif
 
 // Viewer summary cadence (shared between Server and Viewer)

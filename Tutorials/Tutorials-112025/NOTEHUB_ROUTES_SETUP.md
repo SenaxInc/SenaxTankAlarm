@@ -67,7 +67,7 @@ TankAlarm uses **5 routes** total:
 
 | # | Route Name | Purpose | Trigger | Target |
 |---|-----------|---------|---------|--------|
-| 1 | **ClientToServerRelay** | Delivers client telemetry/alarms to server | 9 specific client `.qo` notefiles | Server device `.qi` inbox |
+| 1 | **ClientToServerRelay** | Delivers client telemetry/alarms (and viewer requests) to server | 11 specific `.qo` notefiles | Server device `.qi` inbox |
 | 2 | **ServerToClientRelay** | Delivers server commands to clients | `command.qo` from server device | Target client's `.qi` inbox |
 | 3 | **ServerToViewerRelay** | Delivers viewer summary to viewer devices | `viewer_summary.qo` from server | Viewer device `.qi` inbox |
 | 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device (one note per recipient) | Twilio, To = `[body.to]` |
@@ -108,6 +108,8 @@ location_request.qi <─────────────
 VIEWER DEVICE                    NOTEHUB                         SERVER DEVICE
 ─────────────                    ───────                         ─────────────
 viewer_summary.qi <── Route #3   viewer_summary.qo <── note.add (server)
+viewer_contacts.qo ──> Route #1 ──> viewer_contacts.qi ──> handleViewerContacts()
+viewer_request.qo  ──> Route #1 ──> viewer_request.qi  ──> publishViewerSummary()
 
                                  sms.qo   ──> Route #4 ──> Twilio SMS
                                  email.qo ──> Route #5 ──> SMTP Email
@@ -213,7 +215,13 @@ This passes the entire event body through to the server's `.qi` notefile.
 | Setting | Value |
 |---------|-------|
 | **Fleets** | Select your **client fleet** only |
-| **Notefiles** | `telemetry.qo`, `alarm.qo`, `daily.qo`, `unload.qo`, `serial_log.qo`, `serial_ack.qo`, `config_ack.qo`, `location_response.qo`, `relay_forward.qo` |
+| **Notefiles** | `telemetry.qo`, `alarm.qo`, `daily.qo`, `unload.qo`, `serial_log.qo`, `serial_ack.qo`, `config_ack.qo`, `location_response.qo`, `relay_forward.qo`, `viewer_contacts.qo`, `viewer_request.qo` |
+
+> **Viewer notefiles (v2.2.0+):** `viewer_contacts.qo` (viewer-managed alarm contacts) and
+> `viewer_request.qo` (dashboard "Request Update" button) originate from the **viewer**
+> device, not a client. The route matches on notefile name, so simply adding them to this
+> route's Selected Notefiles list is enough — but if you scoped this route to the client
+> fleet, either widen it to all devices or duplicate it for the `tankalarm-viewer` fleet.
 
 > **⚡ Tip:** The `[filebase]` placeholder variable is a reserved Blues Notehub string that strips the file extension and any characters after the first dot in the Notefile name. So `telemetry.qo` becomes `telemetry`, `relay_forward.qo` becomes `relay_forward`, and so on. The URL appends `.qi` — resulting in the note being added to (e.g.) `telemetry.qi` on the server. See the [Blues placeholder docs](https://dev.blues.io/notehub/notehub-walkthrough/#using-placeholder-variable-substitution-interpolation) for the full list of reserved placeholder strings.
 
@@ -440,6 +448,8 @@ After setting up all routes, verify each one works:
 ### Route #3: ServerToViewerRelay
 - [ ] Server publishes viewer summary → Viewer receives `viewer_summary.qi`
 - [ ] Viewer dashboard updates with new tank data
+- [ ] Viewer "Request Update" button → server receives `viewer_request.qi` → fresh summary arrives within ~1 minute
+- [ ] Viewer adds a contact → server receives `viewer_contacts.qi` → contact appears on the server's /contacts page with a VIEWER badge → echoed back to the viewer's Contacts page
 
 ### Route #4–5: SMS and Email
 - [ ] Send Test SMS (server Settings page) → one `sms.qo` event per recipient, all routed 2xx

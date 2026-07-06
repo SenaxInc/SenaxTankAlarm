@@ -2170,7 +2170,7 @@ async funct)HTML" R"HTML(ion togglePauseFlow(){const targetPaused=!pause_state.p
 funct)HTML" R"HTML(ion loadData(){fetch('/api/contacts').then(response => response.json()).then(data =>{contacts = data.contacts || [];dailyReportRecipients = data.dailyReportRecipients || [];sites = data.sites || [];alarms = data.alarms || [];renderContacts();renderDailyReportRecipients();updateFilters();}).catch(err =>{console.error('Failed to load contacts:',err);showToast('Failed to load contacts data:' +(err && err.message ? err.message:err)+ '. Please check your network connection and try again.');});}
 funct)HTML" R"HTML(ion saveData(){fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:contacts,dailyReportRecipients:dailyReportRecipients})}).then(response => response.json()).then(data =>{if(data.success){showToast('Changes saved successfully');loadData();}else{showToast('Failed to save changes:' +(data.error || 'Unknown error'));}}).catch(err =>{console.error('Failed to save contacts:',err);showToast('Failed to save changes:' +(err && err.message ? err.message:err));});}document.getElementById('viewFilter').addEventListener('change',(e)=>{const view = e.target.value;document.getElementById('siteFilterGroup').style.display = view === 'site' ? 'block':'none';document.getElementById('alarmFilterGroup').style.display = view === 'alarm' ? 'block':'none';renderContacts();});document.getElementById('siteSelect').addEventListener('change',()=> renderContacts());document.getElementById('alarmSelect').addEventListener('change',()=> renderContacts());
 funct)HTML" R"HTML(ion updateFilters(){const siteSelect = document.getElementById('siteSelect');const alarmSelect = document.getElementById('alarmSelect');siteSelect.innerHTML = '<option value="">All Sites</option>';sites.forEach(site =>{const option = document.createElement('option');option.value = site;option.textContent = site;siteSelect.appendChild(option);});alarmSelect.innerHTML = '<option value="">All Alarms</option>';alarms.forEach(alarm =>{const option = document.createElement('option');option.value = alarm.id;option.textContent = `${alarm.site}- ${alarm.label}(${alarm.type})`;alarmSelect.appendChild(option);});}
-funct)HTML" R"HTML(ion renderContacts(){const container = document.getElementById('contactsList');const viewFilter = document.getElementById('viewFilter').value;const siteFilter = document.getElementById('siteSelect').value;const alarmFilter = document.getElementById('alarmSelect').value;let filteredContacts = contacts;if(viewFilter === 'site' && siteFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.some(a =>{const alarm = alarms.find(al => al.id === a);return alarm && alarm.site === siteFilter;}));}else if(viewFilter === 'alarm' && alarmFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.includes(alarmFilter));}if(filteredContacts.length === 0){container.innerHTML = '<div class="empty-state">No contacts match the current filter.</div>';return;}container.innerHTML = filteredContacts.map(contact =>{const associatedAlarms =(contact.alarmAssociations || []).map(alarmId => alarms.find(a => a.id === alarmId)).filter(a => a);const groupedBySite ={};associatedAlarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});return ` <div class="contact-card"><div class="contact-header"><div class="contact-info"><div class="contact-name">${escapeHtml(contact.name)}</div><div class="contact-details"> ${contact.phone ? `<div>Phone: ${escapeHtml(contact.phone)}</div>`:''}${contact.email ? `<div>Email: ${escapeHtml(contact.email)}</div>`:''}</div></div><div class="contact-actions"><button class="btn btn-small btn-secondary" data-contact-id="${escapeHtml(contact.id)}" data-action="edit">Edit</button><button class="btn btn-small btn-danger" data-contact-id="${escapeHtml(contact.id)}" data-action="delete">Delete</button></div></div> ${associatedAlarms.length > 0 ? ` <div class="associations"> ${Object.keys(groupedBySite).map(site => ` <div class="association-section"><h4>${escapeHtml(site)}</h4><div class="association-list"> ${groupedBySite[site)HTML" R"HTML(].map(alarm => ` <div class="association-tag"> ${escapeHtml(alarm.label)}(${escapeHtml(alarm.type)})<button class="remove-tag" data-contact-id="${escapeHtml(contact.id)}" data-alarm-id="${escapeHtml(alarm.id)}">&times;</button></div> `).join('')}</div></div> `).join('')}</div> `:''}</div> `;}).join('');container.querySelectorAll('[data-action="edit"]').forEach(btn =>{btn.addEventListener('click',()=> editContact(btn.dataset.contactId));});container.querySelectorAll('[data-action="delete"]').forEach(btn =>{btn.addEventListener('click',()=> deleteContact(btn.dataset.contactId));});container.querySelectorAll('.remove-tag').forEach(btn =>{btn.addEventListener('click',funct)HTML" R"HTML(ion(){removeAlarmAssociation(this.dataset.contactId,this.dataset.alarmId);});});}
+funct)HTML" R"HTML(ion renderContacts(){const container = document.getElementById('contactsList');const viewFilter = document.getElementById('viewFilter').value;const siteFilter = document.getElementById('siteSelect').value;const alarmFilter = document.getElementById('alarmSelect').value;let filteredContacts = contacts;if(viewFilter === 'site' && siteFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.some(a =>{const alarm = alarms.find(al => al.id === a);return alarm && alarm.site === siteFilter;}));}else if(viewFilter === 'alarm' && alarmFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.includes(alarmFilter));}if(filteredContacts.length === 0){container.innerHTML = '<div class="empty-state">No contacts match the current filter.</div>';return;}container.innerHTML = filteredContacts.map(contact =>{const associatedAlarms =(contact.alarmAssociations || []).map(alarmId => alarms.find(a => a.id === alarmId)).filter(a => a);const groupedBySite ={};associatedAlarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});return ` <div class="contact-card"><div class="contact-header"><div class="contact-info"><div class="contact-name">${escapeHtml(contact.name)}${contact.cat==='viewer'?' <span style="font-size:0.65rem;background:var(--chip);padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">VIEWER</span>':''}</div><div class="contact-details"> ${contact.phone ? `<div>Phone: ${escapeHtml(contact.phone)}</div>`:''}${contact.email ? `<div>Email: ${escapeHtml(contact.email)}</div>`:''}</div></div><div class="contact-actions"><button class="btn btn-small btn-secondary" data-contact-id="${escapeHtml(contact.id)}" data-action="edit">Edit</button><button class="btn btn-small btn-danger" data-contact-id="${escapeHtml(contact.id)}" data-action="delete">Delete</button></div></div> ${associatedAlarms.length > 0 ? ` <div class="associations"> ${Object.keys(groupedBySite).map(site => ` <div class="association-section"><h4>${escapeHtml(site)}</h4><div class="association-list"> ${groupedBySite[site)HTML" R"HTML(].map(alarm => ` <div class="association-tag"> ${escapeHtml(alarm.label)}(${escapeHtml(alarm.type)})<button class="remove-tag" data-contact-id="${escapeHtml(contact.id)}" data-alarm-id="${escapeHtml(alarm.id)}">&times;</button></div> `).join('')}</div></div> `).join('')}</div> `:''}</div> `;}).join('');container.querySelectorAll('[data-action="edit"]').forEach(btn =>{btn.addEventListener('click',()=> editContact(btn.dataset.contactId));});container.querySelectorAll('[data-action="delete"]').forEach(btn =>{btn.addEventListener('click',()=> deleteContact(btn.dataset.contactId));});container.querySelectorAll('.remove-tag').forEach(btn =>{btn.addEventListener('click',funct)HTML" R"HTML(ion(){removeAlarmAssociation(this.dataset.contactId,this.dataset.alarmId);});});}
 funct)HTML" R"HTML(ion renderDailyReportRecipients(){const container = document.getElementById('dailyReportList');if(dailyReportRecipients.length === 0){container.innerHTML = '<div class="empty-state">No daily report recipients configured.</div>';return;}container.innerHTML = dailyReportRecipients.map(recipientId =>{const contact = contacts.find(c => c.id === recipientId);if(!contact)return '';return ` <div class="daily-report-item"><div><strong>${escapeHtml(contact.name)}</strong> ${contact.email ? ` - ${escapeHtml(contact.email)}`:''}</div><button class="btn btn-small btn-danger" data-recipient-id="${escapeHtml(recipientId)}" data-action="remove-recipient">Remove</button></div> `;}).filter(Boolean).join('');container.querySelectorAll('[data-action="remove-recipient"]').forEach(btn =>{btn.addEventListener('click',()=> removeDailyReportRecipient(btn.dataset.recipientId));});}
 window.openAddContactModal = funct)HTML" R"HTML(ion(){editingContactId = null;document.getElementById('modalTitle').textContent = 'Add Contact';document.getElementById('contactName').value = '';document.getElementById('contactPhone').value = '';document.getElementById('contactEmail').value = '';renderAlarmAssociations([]);document.getElementById('contactModal').classList.remove('hidden');};window.editContact = funct)HTML" R"HTML(ion(contactId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;editingContactId = contactId;document.getElementById('modalTitle').textContent = 'Edit Contact';document.getElementById('contactName').value = contact.name;document.getElementById('contactPhone').value = contact.phone || '';document.getElementById('contactEmail').value = contact.email || '';renderAlarmAssociations(contact.alarmAssociations || []);document.getElementById('contactModal').classList.remove('hidden');};window.closeContactModal = funct)HTML" R"HTML(ion(){document.getElementById('contactModal').classList.add('hidden');};funct)HTML" R"HTML(ion renderAlarmAssociations(selectedAlarms){const container = document.getElementById('alarmAssociations');if(alarms.length === 0){container.innerHTML = '<p style="color:var(--muted);font-style:italic;">No alarms configured in the system.</p>';return;}const groupedBySite ={};alarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});container.innerHTML = Object.keys(groupedBySite).map(site => ` <div style="grid-column:1 / -1;"><strong style="display:block;margin-bottom:8px;">${escapeHtml(site)}</strong> ${groupedBySite[site].map((alarm,idx)=>{const checkboxId = 'alarm_' + escapeHtml(alarm.id)+ '_' + idx;return ` <label for="${checkboxId}" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" id="${checkboxId}" name="alarmAssoc" value="${escapeHtml(alarm.id)}" ${selectedAlarms.includes(alarm.id)? 'checked':''}><span>${escapeHtml(alarm.label)}(${escapeHtml(alarm.ty)HTML" R"HTML(pe)})</span></label> `;}).join('')}</div> `).join('');}document.getElementById('contactForm').addEventListener('submit',(e)=>{e.preventDefault();const name = document.getElementById('contactName').value.trim();const phone = document.getElementById('contactPhone').value.trim();const email = document.getElementById('contactEmail').value.trim();if(!name){showToast('Contact name is required');return;}if(!phone && !email){showToast('Either phone or email is required');return;}const alarmAssociations = Array.from(document.querySelectorAll('input[name="alarmAssoc"]:checked')).map(cb => cb.value);if(editingContactId){const contact = contacts.find(c => c.id === editingContactId);if(contact){contact.name = name;contact.phone = phone;contact.email = email;contact.alarmAssociations = alarmAssociations;}}else{const newContact ={id:'contact_' + Date.now()+ '_' + Math.random().toString(36).substr(2,9),name:name,phone:phone,email:email,alarmAssociations:alarmAssociations};contacts.push(newContact);}saveData();closeContactModal();});window.deleteContact = funct)HTML" R"HTML(ion(contactId){if(!confirm('Are you sure you want to delete this contact?'))return;contacts = contacts.filter(c => c.id !== contactId);dailyReportRecipients = dailyReportRecipients.filter(r => r !== contactId);saveData();};window.removeAlarmAssociation = funct)HTML" R"HTML(ion(contactId,alarmId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;contact.alarmAssociations =(contact.alarmAssociations || []).filter(a => a !== alarmId);saveData();};window.openAddDailyReportModal = funct)HTML" R"HTML(ion(){const select = document.getElementById('dailyReportContactSelect');select.innerHTML = '<option value="">Choose a contact...</option>';contacts.forEach(contact =>{if(contact.email && !dailyReportRecipients.includes(contact.id)){const option = document.createElement('option');option.value = contact.id;option.textContent = `${contact.name}(${contact.email})`;select.appendChild(option);}});if(select.options.length === 1){showToast('No con)HTML" R"HTML(tacts with email addresses available');return;}document.getElementById('dailyReportModal').classList.remove('hidden');};window.closeDailyReportModal = funct)HTML" R"HTML(ion(){document.getElementById('dailyReportModal').classList.add('hidden');};document.getElementById('dailyReportForm').addEventListener('submit',(e)=>{e.preventDefault();const contactId = document.getElementById('dailyReportContactSelect').value;if(!contactId){showToast('Please select a contact');return;}if(!dailyReportRecipients.includes(contactId)){dailyReportRecipients.push(contactId);saveData();loadData();}closeDailyReportModal();});window.removeDailyReportRecipient = funct)HTML" R"HTML(ion(recipientId){dailyReportRecipients = dailyReportRecipients.filter(r => r !== recipientId);saveData();};funct)HTML" R"HTML(ion escapeHtml(text){const div = document.createElement('div');div.textContent = text;return div.innerHTML;}loadData();})();
 </script></body></html>)HTML";
@@ -2466,6 +2466,8 @@ static ClientMetadata *findClientMetadata(const char *clientUid);
 static ClientMetadata *findOrCreateClientMetadata(const char *clientUid);
 static bool checkSmsRateLimit(SensorRecord *rec, bool bypassMinimumInterval = false);
 static void publishViewerSummary();
+static void handleViewerContacts(JsonDocument &doc, double epoch);
+static void handleViewerRequest(JsonDocument &doc, double epoch);
 // Persistence: sensor registry and client metadata
 static void saveSensorRegistry();
 static void loadSensorRegistry();
@@ -11968,6 +11970,9 @@ static void pollNotecard() {
   processNotefile(RELAY_FORWARD_FILE, handleRelayForward);
   processNotefile(LOCATION_RESPONSE_FILE, handleLocationResponse);
   processNotefile(CONFIG_ACK_INBOX_FILE, handleConfigAck);
+  // v2.2.0: viewer-originated notes (auxiliary contact management + update requests)
+  processNotefile(VIEWER_CONTACTS_INBOX_FILE, handleViewerContacts);
+  processNotefile(VIEWER_REQUEST_INBOX_FILE, handleViewerRequest);
 }
 
 struct NotefileParseFailureTracker {
@@ -13925,6 +13930,25 @@ static void publishViewerSummary() {
   doc["ge"] = now;
   doc["rs"] = VIEWER_SUMMARY_INTERVAL_SECONDS;
   doc["bh"] = VIEWER_SUMMARY_BASE_HOUR;
+
+  // v2.2.0: echo the viewer-managed contacts (category "viewer") back to the viewer so
+  // its /contacts page always reflects the authoritative server-side list — including
+  // edits made by the server admin on the contact directory.
+  {
+    JsonDocument contactsDoc;
+    if (loadContactsConfig(contactsDoc) && contactsDoc["contacts"].is<JsonArray>()) {
+      JsonArray vcArr = doc["vc"].to<JsonArray>();
+      for (JsonVariant cv : contactsDoc["contacts"].as<JsonArray>()) {
+        if (strcmp(cv["cat"] | "", "viewer") != 0) continue;
+        JsonObject o = vcArr.add<JsonObject>();
+        o["id"] = cv["id"];
+        o["name"] = cv["name"];
+        if (cv["phone"].is<const char *>()) o["phone"] = cv["phone"];
+        if (cv["email"].is<const char *>()) o["email"] = cv["email"];
+      }
+    }
+  }
+
   JsonArray arr = doc["sensors"].to<JsonArray>();
   for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
     JsonObject obj = arr.add<JsonObject>();
@@ -14002,6 +14026,130 @@ static void publishViewerSummary() {
     Serial.println(F("Viewer summary queue failed"));
     logTransmission("", gConfig.serverName, "viewer_summary", "failed", "Viewer summary queue failed");
   }
+}
+
+// ============================================================================
+// Viewer-managed contacts + update requests (v2.2.0)
+// ============================================================================
+// The viewer's /contacts page lets viewer users add/remove alarm notification contacts.
+// The viewer sends its FULL contact list in viewer_contacts.qo; the server stores them in
+// the shared contact directory tagged cat:"viewer" (full-subset replace, last writer
+// wins), auto-enrolls their phone numbers as SMS alert recipients, and echoes the
+// authoritative list back in the next viewer summary. The server admin retains full edit
+// rights via the /contacts page (viewer contacts show a VIEWER badge there).
+static void handleViewerContacts(JsonDocument &doc, double epoch) {
+  JsonArray incoming = doc["contacts"].as<JsonArray>();
+  if (incoming.isNull()) {
+    return;  // malformed note — processNotefile counts it via schema/parse guards
+  }
+  const char *viewerUid = doc["vi"] | "";
+
+  JsonDocument contactsDoc;
+  loadContactsConfig(contactsDoc);
+  if (!contactsDoc["contacts"].is<JsonArray>()) contactsDoc["contacts"].to<JsonArray>();
+  if (!contactsDoc["smsAlertRecipients"].is<JsonArray>()) contactsDoc["smsAlertRecipients"].to<JsonArray>();
+  if (!contactsDoc["dailyReportRecipients"].is<JsonArray>()) contactsDoc["dailyReportRecipients"].to<JsonArray>();
+  JsonArray contacts = contactsDoc["contacts"].as<JsonArray>();
+  JsonArray smsRecipients = contactsDoc["smsAlertRecipients"].as<JsonArray>();
+  JsonArray dailyRecipients = contactsDoc["dailyReportRecipients"].as<JsonArray>();
+
+  // Full-subset replace: drop all existing viewer-category contacts, then adopt the list
+  // from this note. Admin (non-viewer) contacts are untouched.
+  for (size_t i = contacts.size(); i > 0; --i) {
+    if (strcmp(contacts[i - 1]["cat"] | "", "viewer") == 0) {
+      contacts.remove(i - 1);
+    }
+  }
+
+  uint8_t added = 0;
+  double now = (epoch > 0.0) ? epoch : currentEpoch();
+  for (JsonVariant v : incoming) {
+    if (added >= 20) break;  // hard cap on viewer contacts
+    const char *name = v["name"] | "";
+    const char *phone = v["phone"] | "";
+    const char *email = v["email"] | "";
+    if (name[0] == '\0' || (phone[0] == '\0' && email[0] == '\0')) continue;
+    JsonObject c = contacts.add<JsonObject>();
+    const char *id = v["id"] | "";
+    if (id[0] != '\0') {
+      c["id"] = v["id"];  // cross-document assignment deep-copies
+    } else {
+      char idBuf[28];
+      snprintf(idBuf, sizeof(idBuf), "vc_%lu_%u", (unsigned long)now, added);
+      c["id"] = idBuf;  // char[] assignment copies into the document
+    }
+    c["name"] = v["name"];
+    if (phone[0] != '\0') c["phone"] = v["phone"];
+    if (email[0] != '\0') c["email"] = v["email"];
+    c["cat"] = "viewer";
+    added++;
+  }
+
+  // Prune recipient IDs that no longer reference an existing contact (removed viewer
+  // contacts leave both lists), mirroring handleContactsPost's CONTACT-1 hygiene.
+  const char *recipientKeys[2] = { "dailyReportRecipients", "smsAlertRecipients" };
+  for (uint8_t a = 0; a < 2; ++a) {
+    JsonArray list = contactsDoc[recipientKeys[a]].as<JsonArray>();
+    for (size_t i = list.size(); i > 0; --i) {
+      const char *rid = list[i - 1].as<const char *>();
+      bool found = false;
+      if (rid) {
+        for (JsonVariant c : contacts) {
+          if (strcmp(c["id"] | "", rid) == 0) { found = true; break; }
+        }
+      }
+      if (!found) list.remove(i - 1);
+    }
+  }
+  (void)dailyRecipients;
+
+  // Auto-enroll every viewer contact with a phone number as an SMS alert recipient —
+  // that is the point of the viewer's "alarm notification contacts" page.
+  for (JsonVariant cv : contacts) {
+    if (strcmp(cv["cat"] | "", "viewer") != 0) continue;
+    const char *phone = cv["phone"] | "";
+    const char *cid = cv["id"] | "";
+    if (!isRealPhoneNumber(phone) || cid[0] == '\0') continue;
+    bool present = false;
+    for (JsonVariant r : smsRecipients) {
+      if (strcmp(r | "", cid) == 0) { present = true; break; }
+    }
+    if (!present) {
+      smsRecipients.add(cv["id"]);
+    }
+  }
+
+  bool saved = saveContactsConfig(contactsDoc);
+  Serial.print(F("Viewer contacts applied from "));
+  Serial.print(viewerUid[0] ? viewerUid : "?");
+  Serial.print(F(": "));
+  Serial.print(added);
+  Serial.println(saved ? F(" contact(s), saved") : F(" contact(s), SAVE FAILED"));
+  addServerSerialLog("Viewer contacts updated", "info", "viewer");
+  logTransmission(viewerUid, "", "viewer_contacts", saved ? "applied" : "error",
+                  saved ? "Viewer contact list applied" : "Contacts save failed");
+
+  // Echo the authoritative state back promptly so the viewer UI confirms the change.
+  publishViewerSummary();
+}
+
+// Viewer pressed "Request Update": publish a fresh summary now (rate-limited so a stuck
+// button or duplicate notes cannot flood the outbox).
+static void handleViewerRequest(JsonDocument &doc, double epoch) {
+  (void)epoch;
+  const char *viewerUid = doc["vi"] | "";
+  Serial.print(F("Viewer update request from "));
+  Serial.println(viewerUid[0] ? viewerUid : "?");
+  addServerSerialLog("Viewer requested summary update", "info", "viewer");
+
+  static double sLastRequestPublishEpoch = 0.0;
+  double now = currentEpoch();
+  if (now > 0.0 && sLastRequestPublishEpoch > 0.0 && (now - sLastRequestPublishEpoch) < 60.0) {
+    Serial.println(F("Viewer update request rate-limited"));
+    return;
+  }
+  sLastRequestPublishEpoch = now;
+  publishViewerSummary();
 }
 
 static ClientConfigSnapshot *findClientConfigSnapshot(const char *clientUid) {
