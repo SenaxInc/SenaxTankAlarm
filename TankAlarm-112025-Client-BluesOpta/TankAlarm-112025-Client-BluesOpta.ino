@@ -2320,7 +2320,8 @@ void loop() {
       // A poll was attempted - check alerts using the refreshed communication state
       // (suppress alarm sending in CRITICAL to save power).
       SolarAlertType alert = gSolarManager.checkAlerts();
-      if (alert != SOLAR_ALERT_NONE && gNotecardAvailable && gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
+      if (alert != SOLAR_ALERT_NONE && gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
+        // SMS-1 fix: no gNotecardAvailable gate — sendSolarAlarm buffers via publishNote.
         // Only send alert if different from last, or enough time has passed
         if (alert != gLastSolarAlert || 
             (now - gLastSolarAlarmMillis >= SOLAR_ALARM_MIN_INTERVAL_MS)) {
@@ -2341,7 +2342,8 @@ void loop() {
   // Always poll even in CRITICAL — needed to detect battery recovery.
   // Fix 11: pollBatteryVoltage no longer issues Notecard I/O, so the previous Fix 10 Opta
   // compile guard and the `gNotecardAvailable` gate are no longer required for the poll
-  // itself. sendBatteryAlarm() is still internally gated on gNotecardAvailable.
+  // itself. sendBatteryAlarm() publishes via publishNote(), which buffers to flash when the
+  // Notecard is unavailable (SMS-1 fix).
   if (gConfig.batteryMonitor.enabled) {
     unsigned long batteryPollInterval = (unsigned long)gConfig.batteryMonitor.pollIntervalSec * 1000UL;
     // In reduced power states, poll less often (but still poll for recovery detection)
@@ -6821,43 +6823,40 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
   MonitorRuntime &state = gMonitorState[idx];
   state.lastAlarmSendMillis = millis();
 
-  // Try to send via network if available
-  if (gNotecardAvailable) {
-    JsonDocument doc;
-    doc["c"] = gDeviceUID;
-    doc["s"] = gConfig.siteName;
-    doc["k"] = cfg.sensorIndex;
-    if (cfg.userNumber > 0) doc["un"] = cfg.userNumber;
-    doc["y"] = alarmType;
-    // Object type, measurement unit, sensor type, raw reading, lvl, cap, cv
-    buildSensorObject(doc.as<JsonObject>(), idx);
+  // SMS-1 fix (07062026): publish unconditionally. publishNote() buffers the note to flash
+  // via bufferNoteForRetry() when the Notecard is unavailable and flushBufferedNotes()
+  // re-sends it on recovery. The previous `if (gNotecardAvailable)` gate silently DISCARDED
+  // edge-triggered alarms raised during a Notecard outage (never re-sent, no SMS, no server
+  // record).
+  JsonDocument doc;
+  doc["c"] = gDeviceUID;
+  doc["s"] = gConfig.siteName;
+  doc["k"] = cfg.sensorIndex;
+  if (cfg.userNumber > 0) doc["un"] = cfg.userNumber;
+  doc["y"] = alarmType;
+  // Object type, measurement unit, sensor type, raw reading, lvl, cap, cv
+  buildSensorObject(doc.as<JsonObject>(), idx);
 
-    doc["th"] = roundTo(cfg.highAlarmThreshold, 1);
-    doc["tl"] = roundTo(cfg.lowAlarmThreshold, 1);
-    if (allowSmsEscalation) {
-      doc["se"] = true;  // Only include when true (false is default)
-    }
-    doc["t"] = currentEpoch();
-
-    publishNote(ALARM_FILE, doc, true);
-    Serial.print(F("Alarm sent for monitor "));
-    Serial.print(cfg.name);
-    Serial.print(F(" type "));
-    Serial.println(alarmType);
-    
-    char logMsg[128];
-    // Universal (not liquid-level-specific): label the reading with the monitor's own unit
-    // (psi/rpm/gpm/inches) rather than a hardcoded "in" suffix. Falls back to "in" only when
-    // no unit is configured (legacy/bootstrap default).
-    const char *logUnit = (cfg.measurementUnit[0] != '\0') ? cfg.measurementUnit : "in";
-    snprintf(logMsg, sizeof(logMsg), "Alarm: %s - %s - %.1f %s", cfg.name, alarmType, inches, logUnit);
-    addSerialLog(logMsg);
-  } else {
-    Serial.print(F("Network offline - local alarm only for monitor "));
-    Serial.print(cfg.name);
-    Serial.print(F(" type "));
-    Serial.println(alarmType);
+  doc["th"] = roundTo(cfg.highAlarmThreshold, 1);
+  doc["tl"] = roundTo(cfg.lowAlarmThreshold, 1);
+  if (allowSmsEscalation) {
+    doc["se"] = true;  // Only include when true (false is default)
   }
+  doc["t"] = currentEpoch();
+
+  publishNote(ALARM_FILE, doc, true);
+  Serial.print(F("Alarm sent for monitor "));
+  Serial.print(cfg.name);
+  Serial.print(F(" type "));
+  Serial.println(alarmType);
+
+  char logMsg[128];
+  // Universal (not liquid-level-specific): label the reading with the monitor's own unit
+  // (psi/rpm/gpm/inches) rather than a hardcoded "in" suffix. Falls back to "in" only when
+  // no unit is configured (legacy/bootstrap default).
+  const char *logUnit = (cfg.measurementUnit[0] != '\0') ? cfg.measurementUnit : "in";
+  snprintf(logMsg, sizeof(logMsg), "Alarm: %s - %s - %.1f %s", cfg.name, alarmType, inches, logUnit);
+  addSerialLog(logMsg);
 }
 
 // ============================================================================
@@ -6985,45 +6984,42 @@ static void sendUnloadEvent(uint8_t idx, float peakInches, float currentValue, d
            cfg.name, peakInches, currentValue);
   addSerialLog(logMsg);
 
-  // Send unload event via Notecard if network available
-  if (gNotecardAvailable) {
-    JsonDocument doc;
-    doc["c"] = gDeviceUID;
-    doc["s"] = gConfig.siteName;
-    doc["k"] = cfg.sensorIndex;
-    // Note: "type" = "unload" omitted — routing is by file (unload.qi)
-    doc["pk"] = roundTo(peakInches, 1);      // Peak height
-    doc["em"] = roundTo(currentValue, 1);   // Empty/low height
-    doc["pt"] = peakEpoch;                    // Peak timestamp
-    doc["t"] = currentEpoch();               // Event timestamp
-    
-    // Include raw sensor readings only if available
-    if (state.unloadPeakSensorMa >= 4.0f) {
-      doc["pma"] = roundTo(state.unloadPeakSensorMa, 2);
-    }
-    if (state.currentSensorMa >= 4.0f) {
-      doc["ema"] = roundTo(state.currentSensorMa, 2);
-    }
-    // Include measurement unit so server can display correct units
-    if (cfg.measurementUnit[0] != '\0') {
-      doc["mu"] = cfg.measurementUnit;
-    }
+  // Send unload event (SMS-1 fix: publishNote buffers to flash if the Notecard is down,
+  // so unload SMS/email requests survive a Notecard outage)
+  JsonDocument doc;
+  doc["c"] = gDeviceUID;
+  doc["s"] = gConfig.siteName;
+  doc["k"] = cfg.sensorIndex;
+  // Note: "type" = "unload" omitted — routing is by file (unload.qi)
+  doc["pk"] = roundTo(peakInches, 1);      // Peak height
+  doc["em"] = roundTo(currentValue, 1);   // Empty/low height
+  doc["pt"] = peakEpoch;                    // Peak timestamp
+  doc["t"] = currentEpoch();               // Event timestamp
 
-    // BugFix 04022026 (HIGH-8): Include notification preferences so server can
-    // trigger SMS/email for unload events. Previously these fields were missing,
-    // causing handleUnload() on the server to read undefined values.
-    if (cfg.unloadAlarmSms) {
-      doc["sms"] = true;
-    }
-    if (cfg.unloadAlarmEmail) {
-      doc["email"] = true;
-    }
-
-    publishNote(UNLOAD_FILE, doc, true);
-    Serial.println(F("Unload event sent to server"));
-  } else {
-    Serial.println(F("Network offline - unload event not sent"));
+  // Include raw sensor readings only if available
+  if (state.unloadPeakSensorMa >= 4.0f) {
+    doc["pma"] = roundTo(state.unloadPeakSensorMa, 2);
   }
+  if (state.currentSensorMa >= 4.0f) {
+    doc["ema"] = roundTo(state.currentSensorMa, 2);
+  }
+  // Include measurement unit so server can display correct units
+  if (cfg.measurementUnit[0] != '\0') {
+    doc["mu"] = cfg.measurementUnit;
+  }
+
+  // BugFix 04022026 (HIGH-8): Include notification preferences so server can
+  // trigger SMS/email for unload events. Previously these fields were missing,
+  // causing handleUnload() on the server to read undefined values.
+  if (cfg.unloadAlarmSms) {
+    doc["sms"] = true;
+  }
+  if (cfg.unloadAlarmEmail) {
+    doc["email"] = true;
+  }
+
+  publishNote(UNLOAD_FILE, doc, true);
+  Serial.println(F("Unload event sent to server"));
 }
 
 // ============================================================================
@@ -7121,12 +7117,9 @@ static void sendSolarAlarm(SolarAlertType alertType) {
   char logMsg[128];
   snprintf(logMsg, sizeof(logMsg), "Solar: %s (%.2fV)", alertDesc, data.batteryVoltage);
   addSerialLog(logMsg);
-  
-  if (!gNotecardAvailable) {
-    Serial.println(F("Network offline - solar alarm not sent"));
-    return;
-  }
-  
+
+  // SMS-1 fix: no gNotecardAvailable gate — publishNote buffers to flash when the card is down.
+
   JsonDocument doc;
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
@@ -7400,7 +7393,8 @@ static void checkBatteryAlerts(const BatteryData &data, const BatteryConfig &cfg
       shouldSend = true;
     }
     
-    if (shouldSend && gNotecardAvailable) {
+    if (shouldSend) {
+      // SMS-1 fix: no gNotecardAvailable gate — sendBatteryAlarm buffers via publishNote.
       sendBatteryAlarm(alert, data.voltage);
       gLastBatteryAlert = alert;
       gLastBatteryAlarmMillis = now;
@@ -7435,12 +7429,9 @@ static void sendBatteryAlarm(BatteryAlertType alertType, float voltage) {
   char logMsg[128];
   snprintf(logMsg, sizeof(logMsg), "Battery: %s (%.2fV)", alertDesc, voltage);
   addSerialLog(logMsg);
-  
-  if (!gNotecardAvailable) {
-    Serial.println(F("Network offline - battery alarm not sent"));
-    return;
-  }
-  
+
+  // SMS-1 fix: no gNotecardAvailable gate — publishNote buffers to flash when the card is down.
+
   JsonDocument doc;
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
@@ -7576,12 +7567,10 @@ static void sendPowerStateChange(PowerState oldState, PowerState newState, float
   Serial.print(F("Power state change: "));
   Serial.println(alertDesc);
   addSerialLog(alertDesc);
-  
-  if (!gNotecardAvailable) {
-    Serial.println(F("Network offline - power state change not sent"));
-    return;
-  }
-  
+
+  // SMS-1 fix: no gNotecardAvailable gate — publishNote buffers to flash when the card is
+  // down, so hibernation entry/exit alarms survive a Notecard outage.
+
   JsonDocument doc;
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
@@ -7949,8 +7938,9 @@ static void checkSolarOnlySunsetProtocol(unsigned long now) {
           }
         }
         
-        // Send a sunset notification to the server
-        if (gNotecardAvailable) {
+        // Send a sunset notification to the server (SMS-1 fix: unconditional —
+        // publishNote buffers to flash if the Notecard is down)
+        {
           JsonDocument doc;
           doc["c"] = gDeviceUID;
           doc["s"] = gConfig.siteName;
@@ -8199,8 +8189,9 @@ static void updatePowerState() {
         Serial.println(F("BATTERY FAILURE DETECTED — enabling solar-only fallback behaviors"));
         addSerialLog("Battery failure: solar-only fallback active");
         
-        // Notify server
-        if (gNotecardAvailable) {
+        // Notify server (SMS-1 fix: unconditional — publishNote buffers to flash if the
+        // Notecard is down, so the se:true SMS escalation survives a Notecard outage)
+        {
           JsonDocument doc;
           doc["c"] = gDeviceUID;
           doc["s"] = gConfig.siteName;

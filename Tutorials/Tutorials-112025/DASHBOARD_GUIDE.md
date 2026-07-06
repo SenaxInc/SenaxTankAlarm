@@ -395,10 +395,6 @@ Each client supports up to 8 tanks (A-H):
 │  ☑ Email Notifications                       │
 │  ☑ Include in Daily Report                   │
 │                                              │
-│  Custom SMS Number:  [            ]          │
-│  (Blank = use server default)                │
-│                                              │
-│  ☑ Send test notification                    │
 └──────────────────────────────────────────────┘
 ```
 
@@ -406,7 +402,12 @@ Each client supports up to 8 tanks (A-H):
 - **SMS**: Send text messages on alarms
 - **Email**: Send emails on alarms
 - **Daily Report**: Include this client in daily summary
-- **Custom Number**: Override server default SMS recipient
+
+> **Who receives SMS?** Recipients are managed centrally on the server: Contacts → SMS
+> Alert Recipients. Per-contact **alarm associations** control which alarms each contact
+> receives. Use the **Send Test SMS** button on the server Settings page to verify
+> delivery end-to-end. While an alarm stays active, the server re-sends a reminder SMS
+> every 6 hours (configurable `smsReminderHours`, 0 disables) until the alarm clears.
 
 ### Saving Configuration
 

@@ -70,7 +70,7 @@ TankAlarm uses **5 routes** total:
 | 1 | **ClientToServerRelay** | Delivers client telemetry/alarms to server | 9 specific client `.qo` notefiles | Server device `.qi` inbox |
 | 2 | **ServerToClientRelay** | Delivers server commands to clients | `command.qo` from server device | Target client's `.qi` inbox |
 | 3 | **ServerToViewerRelay** | Delivers viewer summary to viewer devices | `viewer_summary.qo` from server | Viewer device `.qi` inbox |
-| 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device | Twilio or Blues SMS |
+| 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device (one note per recipient) | Twilio, To = `[body.to]` |
 | 5 | **EmailRoute** | Sends email reports | `email.qo` from server device | SMTP or Blues Email |
 
 ### Notefile Flow Diagram
@@ -341,22 +341,63 @@ For most deployments (1–2 viewers), this is simple to manage. If you have many
 
 ## Step 6: Create Route #4 — SMS Alerts (Optional)
 
-If you're using SMS alerts, create a route for the `sms.qo` notefile. This connects to your SMS provider (Twilio, Blues SMS, etc.).
+If you're using SMS alerts, create a route for the `sms.qo` notefile using Notehub's **Twilio** route type.
 
-### For Twilio:
+### What the server sends
+
+When an alarm warrants an SMS, the TankAlarm server (v2.1.6+) adds **one note per recipient**
+to `sms.qo`, each with a scalar `to` field:
+
+```json
+{
+  "message": "Silas #1 high alarm 43.8 psi",
+  "to": "+15551234567"
+}
+```
+
+Because each event carries exactly one destination, a **single Twilio route** using the
+`[body.to]` placeholder delivers to every recipient — the dashboard's Contacts → SMS Alert
+Recipients list (and each contact's alarm associations) fully controls delivery. No
+per-recipient routes are needed.
+
+> **Upgrading from firmware older than v2.1.6?** Those versions sent a single note with a
+> `numbers[]` array that a Twilio route cannot fan out over — delivery went only to the
+> route's static To Number. Update the route to the configuration below when you update the
+> server firmware.
+
+### Route configuration
 
 | Setting | Value |
 |---------|-------|
 | **Route Name** | `SMSRoute` |
-| **Route Type** | **Twilio SMS** |
+| **Route Type** | **Twilio** |
 | **Account SID** | Your Twilio Account SID |
 | **Auth Token** | Your Twilio Auth Token |
-| **From Number** | Your Twilio phone number |
-| **Notefiles** | `sms.qo` |
+| **From Number** | Your Twilio phone number (E.164, e.g. `+18005551212`) |
+| **To Number** | `[body.to]` — pulls the recipient from each note. **Required.** |
+| **Message** | `[body.message]` — pulls the alert text from each note. **Required.** |
+| **Notefiles** | Selected Notefiles → `sms.qo` |
+| **Automatic reroute on failure** | Enable (retries at 5 s / 1 min / 5 min) |
 
-### For Blues SMS (Notehub built-in):
+> **Twilio trial accounts:** every recipient number must be a Verified Caller ID in Twilio,
+> and all numbers must be E.164 formatted (`+1...`).
 
-Notehub has built-in SMS support — check the [Blues documentation](https://dev.blues.io) for details.
+### Recipient management (server side)
+
+- Recipients are managed on the server dashboard: Contacts → **SMS Alert Recipients**.
+- A contact with **alarm associations** configured receives only those alarms (plus
+  fleet-wide alerts such as OTA/stale-client/server notices); a contact with **no**
+  associations receives everything.
+- The server de-duplicates numbers and caps sends at **10 recipients per alert** as a cost
+  guard.
+
+### Test it
+
+Use the **Send Test SMS** button on the server's Settings page (next to the SMS recipient
+list) — it queues a real `sms.qo` note to every configured recipient. Then confirm: the
+events appear in Notehub → Events (one per recipient), the route log shows a 2xx response
+for each, and every phone receives the text. Route errors (invalid number, unverified trial
+recipient) appear when you click the event's error icon.
 
 ---
 
@@ -401,7 +442,8 @@ After setting up all routes, verify each one works:
 - [ ] Viewer dashboard updates with new tank data
 
 ### Route #4–5: SMS and Email
-- [ ] SMS alerts arrive at configured phone numbers
+- [ ] Send Test SMS (server Settings page) → one `sms.qo` event per recipient, all routed 2xx
+- [ ] SMS alerts arrive at every configured recipient's phone
 - [ ] Email reports arrive at configured addresses
 
 ---

@@ -418,6 +418,7 @@ struct ServerConfig {
   bool smsOnHigh;
   bool smsOnLow;
   bool smsOnClear;
+  uint8_t smsReminderHours;  // Re-send SMS for a still-active alarm every N hours (0 = disabled, default 6)
   bool serverDownSmsEnabled;
   // Optional viewer device (summary publishing)
   bool viewerEnabled;
@@ -517,7 +518,7 @@ struct ClientMetadata {
   bool staleAlertSent;       // Whether a stale alert has been sent for this client
   bool staleDeletionPending; // Whether deletion of this stale client is pending operator approval
   // Last system-level alarm (solar/battery/power) — stored here, not on SensorRecord
-  char lastSystemAlarmType[16];  // "solar", "battery", "power", or ""
+  char lastSystemAlarmType[16];  // "solar", "battery", "power", "battery_failure", "solar_sunset", "i2c-error-rate", or ""
   double lastSystemAlarmEpoch;   // When the last system alarm was received
   double lastSystemSmsEpoch;     // When the last system-alarm SMS was sent (per-client rate limit)
   // Cellular signal strength (from client daily reports)
@@ -1754,7 +1755,7 @@ tbody tr:nth-child(even){background:#fafafa}
 }
 )HTML";
 
-static const char SERVER_SETTINGS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Settings - Tank Alarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Configuration</h2><form id="settingsForm"><h3>Blues Notehub</h3><div class="form-grid"><label class="field"><span>Product UID <span style="color:var(--danger);">*</span></span><input id="productUidInput" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>GitHub Route Alias</span><input id="githubRouteAliasInput" type="text" placeholder="github-api"></label></div><p style="color:var(--muted);font-size:0.85rem;margin:-8px 0 16px;">Required. The Product UID from your Blues Notehub project (e.g. com.company.product:project). Changing this requires a device restart to fully apply.</p><h3>Server SMS Alert Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive SMS alerts for server events (e.g., power restoration after outage).</p><div id="smsRecipientsList" class="recipient-list"><div class="empty-state">No SMS recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><button type="button" class="secondary" id="addSmsRecipientBtn">+ Add SMS Recipient</button></div><div class="toggle-group" style="margin-top:-12px;"><label class="toggle"><span>Server down (power loss &gt; 24h)<span class="tooltip-icon" tabindex="0" data-tooltip="Sends an SMS if the server was offline for at least 24 hours before reboot.">?</span></span><input type="checkbox" id="serverDownSmsToggle" checked></label></div><h3>Daily Email Report Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive the daily tank level summary email.</p><div class="form-grid"><label class="field"><span>Daily Email Time (HH:MM, UTC)</span><input id="dailyEmailTimeInput" type="time" value="05:00"></label></div><div id="dailyRecipientsList" class="recipient-list"><div class="empty-state">No daily report recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><div id="dailyRecipientControls" style="display:flex;gap:8px;align-items:center;"><select id="dailyRecipientDropdown" style="min-width:250px;"><option value="">Choose a contact...</option></select><button type="button" id="addSelectedDailyRecipient" class="secondary">Add</button></div><a class="pill secondary" href="/contacts" id="addNewContactLink" style="display:none;">+ Add New Contact</a><a class="pill secondary" href="/email-format" style="margin-left:8px;">Email Formatting</a></div><h3>Security</h3><div class="actions" style="margin-bottom: 24px;"><button type="button" class="secondary" id="changePinBtn">Change Admin PIN</button><span id="pinBadge" class="pin-chip hidden">PIN SET</span><span id="pinStatus" style="margin-left:12px;font-size:0.9rem;color:var(--muted)"></span></div><h3>FTP Backup & Restore</h3><div class="form-grid"><label class="field"><span>FTP Host</span><input id="ftpHost" type="text" placeholder="192.168.1.50"></label><label class="field"><span>FTP Port</span><input id="ftpPort" type="number" min="1" max="65535" value="21"></label><label class="field"><span>FTP User</span><input id="ftpUser" type="text" placeholder="user"></label><label class="field"><span>FTP Password <small style="color:var(--muted);font-weight:400;">(leave blank to keep)</small></span><input id="ftpPass" type="password" autocomplete="off"></label><label class="field"><span>FTP Path</span><input id="ftpPath" type="text" placeholder="/tankalarm/server"></label><label class="field"><span>TLS Server Name (SNI)</span><input id="ftpsTlsServerName" type="text" placeholder="ftp.example.com"></label><label class="field"><span>SHA-256 Fingerprint</span><div style="display:flex;gap:6px;align-items:stretch;"><input id="ftpsFingerprint" type="text" placeholder="64 hex chars" maxlength="64" style="flex:1;min-width:0;"><button type="button" class="secondary" id="ftpsDiscoverFingerprintBtn" style="white-space:nowrap;">Discover</button></div></label><label class="field"><span>FTPS Trust Mode</span><select id="ftpsTrustMode"><option value="0">Fingerprint</option><option value="1">Imported Certificate</option></select></label></div><div class="toggle-group"><label class="toggle"><span>Enable FTP</span><input type="checkbox" id="ftpEnabled"></label><label class="toggle"><span>Passive Mode</span><input type="checkbox" id="ftpPassive" checked></label><label class="toggle"><span>Enable FTPS (Explicit TLS)</span><input type="checkbox" id="ftpsEnabled"></label><label class="toggle"><span>Auto-backup on save</span><input type="checkbox" id="ftpBackupOnChange"></label><label class="toggle"><span>Restore on boot</span><input type="checkbox" id="ftpRestoreOnBoot"></label></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px;">Fingerprint trust mode is currently supported. Imported certificate mode is reserved for a follow-up update.</p><div class="actions"><button type="button" class="secondary" id="ftpTestNow">Test Connection</button><button type="button" id="ftpBackupNow">Backup Now</button><button type="button" class="secondary" id="ftpRestoreNow">Restore Now</button></div><div id="ftpTestStatus" style="display:none;margin-top:12px;padding:10px 14px;border-radius:6px;font-size:0.85rem;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;line-height:1.5;"></div><h3>Viewer Device</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Enable periodic viewer summary publishing via Notecard. Only enable this if you have a Viewer Opta device set up and connected.</p><div class="toggle-group"><label class="toggle"><span>Enable Viewer Summary<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the server publishes sensor summary data to a Viewer Opta device every 6 hours via Notecard.">?</span></span><input type="checkbox" id="viewerEnabled"></label></div><h3>Update Policy</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Choose how the server handles firmware updates. Alert modes notify you on the dashboard when an update is available. Automatic modes apply updates without user intervention.</p><div class="form-grid"><label class="field" style="min-width:260px;"><span>Update Policy</span><select id="updatePolicy"><option value="0">Disabled</option><option value="1">Alert for DFU update available</option><option value="2">Alert for GitHub update available</option><option value="3">Update from GitHub automatically</option><option value="4">Update from DFU automatically</option></select></label></div><div class="toggle-group" style="margin-top:12px;"><label class="toggle"><span>Alert when connected clients report outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if any connected client is running a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkClientVersionAlerts" checked></label><label class="toggle"><span>Alert when viewer reports outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if the connected Viewer device reports a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkViewerVersionAlerts" checked></label></div><div class="actions"><button type="submit">Save Settings</button></div></form></div><div class="card"><h2>Tools & System Info</h2><h3>System Status</h3><div class="form-grid"><div class="field"><span>Firmware Version</span><div id="fwVersionDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Build Date</span><div id="fwBuildDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Firmware Last Updated</span><div id="fwLastUpdatedDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Notecard Supply (V+ rail)</span><div id="serverVoltageDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Server Time</span><div id="serverTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div></div><h3>Notecard Status</h3><div id="notecardStatusPanel" style="padding:16px;background:var(--chip);border:1px solid var(--card-border);border-radius:var(--radius);margin-bottom:16px;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><span id="notecardStatusDot" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#888;"></span><strong id="notecardStatusLabel">Checking...</strong></div><div class="form-grid" style="margin:0;"><div class="field"><span>Connection</span><div id="ncConnStatus" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Product UID</span><div id="ncProductUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Server UID</span><div id="ncServerUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Sync Mode</span><div id="ncSyncMode" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div></div><div class="actions" style="margin-top:12px;"><button type="button" class="secondary" id="ncRefreshBtn">Refresh Notecard Status</button></div></div><h3>Firmware Update (DFU)</h3><div id="dfuStatus" style="padding:12px;background:var(--chip);border:1px solid var(--card-border);margin-bottom:12px"><span id="dfuStatusText">Checking for updates...</span></div><div class="actions"><button type="button" id="dfuCheckBtn" class="secondary">Check for Update</button><button type="button" id="dfuEnableBtn" disabled>Install Update</button></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px">Manual install uses the policy source. GitHub Alert/Auto policies try GitHub Direct first and fall back to Notehub DFU. All other policies use Notehub DFU.</p><h3>Quick Access</h3><div class="actions"><button type="button" class="secondary" id="pauseBodyBtn">Pause Server</button><a class="pill" href="/serial-monitor">Open Serial Monitor</a><a class="pill" href="/transmission-log">Transmission Log</a><a class="pill secondary" href="https://github.com/SenaxInc/SenaxTankAlarm/blob/master/Tutorials/Tutorials-112025/SERVER_INSTALLATION_GUIDE.md" target="_blank" title="View Server Installation Guide">Help</a></div></div></main><div id="toast"></div><div id="contactSelectModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2 id="contactSelectTitle">Add Recipient</h2><button class="modal-close" onclick="closeContactSelectModal()">&times;</button></div><form id="contactSelectForm"><div class="form-grid"><div class="form-field"><label>Select Contact</label><select id="contactSelectDropdown" required><option value="">Choose a contact...</option></select></div></div><div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;"><button type="button" class="btn btn-secondary" onclick="closeContactSelectModal()">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div></form></div></div><div id="pinModal" class="modal hidden"><div class="modal-card"><div class="modal-badge" id="pinSessionBadge">Session</div><h2 id="pinModalTitle">Set Admin PIN</h2><p id="pinModalDescription">Enter a 4-digit PIN to unlock configuration changes.</p><form id="pinForm"><label class="field hidden" id="pinCurrentGroup"><span>Current PIN</span><input type="password" id="pinCurrentInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><label class="field" id="pinPrimaryGroup"><span id="pinPrimaryLabel">PIN</span><input type="password" id="pinInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off" required placeholder="4 digits" aria-describedby="pinHint" title="Enter exactly four digits (0-9)"><small class="pin-hint" id="pinHint">Use exactly 4 digits (0-9). The PIN is kept locally in this browser for 90 days.</small></label><label class="field hidden" id="pinConfirmGroup"><span>Confirm PIN</span><input type="password" id="pinConfirmInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><div class="actions"><button type="submit" id="pinSubmit">Save PIN</button><button type="button" class="secondary" id="pinCancel">Cancel</button></div></form></div></div><script>document.addEventListener('DOMContentLoaded', async () => {try{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const state={pin:null,pinConfigured:false,pendingAction:null,contacts:[],smsAlertRecipients:[],dailyReportRecipients:[],contactSelectMode:null};
+static const char SERVER_SETTINGS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Settings - Tank Alarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Configuration</h2><form id="settingsForm"><h3>Blues Notehub</h3><div class="form-grid"><label class="field"><span>Product UID <span style="color:var(--danger);">*</span></span><input id="productUidInput" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>GitHub Route Alias</span><input id="githubRouteAliasInput" type="text" placeholder="github-api"></label></div><p style="color:var(--muted);font-size:0.85rem;margin:-8px 0 16px;">Required. The Product UID from your Blues Notehub project (e.g. com.company.product:project). Changing this requires a device restart to fully apply.</p><h3>Server SMS Alert Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive SMS alerts for server events (e.g., power restoration after outage).</p><div id="smsRecipientsList" class="recipient-list"><div class="empty-state">No SMS recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><button type="button" class="secondary" id="addSmsRecipientBtn">+ Add SMS Recipient</button> <button type="button" class="secondary" id="testSmsBtn">Send Test SMS</button></div><div class="toggle-group" style="margin-top:-12px;"><label class="toggle"><span>Server down (power loss &gt; 24h)<span class="tooltip-icon" tabindex="0" data-tooltip="Sends an SMS if the server was offline for at least 24 hours before reboot.">?</span></span><input type="checkbox" id="serverDownSmsToggle" checked></label></div><h3>Daily Email Report Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive the daily tank level summary email.</p><div class="form-grid"><label class="field"><span>Daily Email Time (HH:MM, UTC)</span><input id="dailyEmailTimeInput" type="time" value="05:00"></label></div><div id="dailyRecipientsList" class="recipient-list"><div class="empty-state">No daily report recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><div id="dailyRecipientControls" style="display:flex;gap:8px;align-items:center;"><select id="dailyRecipientDropdown" style="min-width:250px;"><option value="">Choose a contact...</option></select><button type="button" id="addSelectedDailyRecipient" class="secondary">Add</button></div><a class="pill secondary" href="/contacts" id="addNewContactLink" style="display:none;">+ Add New Contact</a><a class="pill secondary" href="/email-format" style="margin-left:8px;">Email Formatting</a></div><h3>Security</h3><div class="actions" style="margin-bottom: 24px;"><button type="button" class="secondary" id="changePinBtn">Change Admin PIN</button><span id="pinBadge" class="pin-chip hidden">PIN SET</span><span id="pinStatus" style="margin-left:12px;font-size:0.9rem;color:var(--muted)"></span></div><h3>FTP Backup & Restore</h3><div class="form-grid"><label class="field"><span>FTP Host</span><input id="ftpHost" type="text" placeholder="192.168.1.50"></label><label class="field"><span>FTP Port</span><input id="ftpPort" type="number" min="1" max="65535" value="21"></label><label class="field"><span>FTP User</span><input id="ftpUser" type="text" placeholder="user"></label><label class="field"><span>FTP Password <small style="color:var(--muted);font-weight:400;">(leave blank to keep)</small></span><input id="ftpPass" type="password" autocomplete="off"></label><label class="field"><span>FTP Path</span><input id="ftpPath" type="text" placeholder="/tankalarm/server"></label><label class="field"><span>TLS Server Name (SNI)</span><input id="ftpsTlsServerName" type="text" placeholder="ftp.example.com"></label><label class="field"><span>SHA-256 Fingerprint</span><div style="display:flex;gap:6px;align-items:stretch;"><input id="ftpsFingerprint" type="text" placeholder="64 hex chars" maxlength="64" style="flex:1;min-width:0;"><button type="button" class="secondary" id="ftpsDiscoverFingerprintBtn" style="white-space:nowrap;">Discover</button></div></label><label class="field"><span>FTPS Trust Mode</span><select id="ftpsTrustMode"><option value="0">Fingerprint</option><option value="1">Imported Certificate</option></select></label></div><div class="toggle-group"><label class="toggle"><span>Enable FTP</span><input type="checkbox" id="ftpEnabled"></label><label class="toggle"><span>Passive Mode</span><input type="checkbox" id="ftpPassive" checked></label><label class="toggle"><span>Enable FTPS (Explicit TLS)</span><input type="checkbox" id="ftpsEnabled"></label><label class="toggle"><span>Auto-backup on save</span><input type="checkbox" id="ftpBackupOnChange"></label><label class="toggle"><span>Restore on boot</span><input type="checkbox" id="ftpRestoreOnBoot"></label></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px;">Fingerprint trust mode is currently supported. Imported certificate mode is reserved for a follow-up update.</p><div class="actions"><button type="button" class="secondary" id="ftpTestNow">Test Connection</button><button type="button" id="ftpBackupNow">Backup Now</button><button type="button" class="secondary" id="ftpRestoreNow">Restore Now</button></div><div id="ftpTestStatus" style="display:none;margin-top:12px;padding:10px 14px;border-radius:6px;font-size:0.85rem;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;line-height:1.5;"></div><h3>Viewer Device</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Enable periodic viewer summary publishing via Notecard. Only enable this if you have a Viewer Opta device set up and connected.</p><div class="toggle-group"><label class="toggle"><span>Enable Viewer Summary<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the server publishes sensor summary data to a Viewer Opta device every 6 hours via Notecard.">?</span></span><input type="checkbox" id="viewerEnabled"></label></div><h3>Update Policy</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Choose how the server handles firmware updates. Alert modes notify you on the dashboard when an update is available. Automatic modes apply updates without user intervention.</p><div class="form-grid"><label class="field" style="min-width:260px;"><span>Update Policy</span><select id="updatePolicy"><option value="0">Disabled</option><option value="1">Alert for DFU update available</option><option value="2">Alert for GitHub update available</option><option value="3">Update from GitHub automatically</option><option value="4">Update from DFU automatically</option></select></label></div><div class="toggle-group" style="margin-top:12px;"><label class="toggle"><span>Alert when connected clients report outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if any connected client is running a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkClientVersionAlerts" checked></label><label class="toggle"><span>Alert when viewer reports outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if the connected Viewer device reports a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkViewerVersionAlerts" checked></label></div><div class="actions"><button type="submit">Save Settings</button></div></form></div><div class="card"><h2>Tools & System Info</h2><h3>System Status</h3><div class="form-grid"><div class="field"><span>Firmware Version</span><div id="fwVersionDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Build Date</span><div id="fwBuildDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Firmware Last Updated</span><div id="fwLastUpdatedDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Notecard Supply (V+ rail)</span><div id="serverVoltageDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Server Time</span><div id="serverTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div></div><h3>Notecard Status</h3><div id="notecardStatusPanel" style="padding:16px;background:var(--chip);border:1px solid var(--card-border);border-radius:var(--radius);margin-bottom:16px;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><span id="notecardStatusDot" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#888;"></span><strong id="notecardStatusLabel">Checking...</strong></div><div class="form-grid" style="margin:0;"><div class="field"><span>Connection</span><div id="ncConnStatus" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Product UID</span><div id="ncProductUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Server UID</span><div id="ncServerUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Sync Mode</span><div id="ncSyncMode" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div></div><div class="actions" style="margin-top:12px;"><button type="button" class="secondary" id="ncRefreshBtn">Refresh Notecard Status</button></div></div><h3>Firmware Update (DFU)</h3><div id="dfuStatus" style="padding:12px;background:var(--chip);border:1px solid var(--card-border);margin-bottom:12px"><span id="dfuStatusText">Checking for updates...</span></div><div class="actions"><button type="button" id="dfuCheckBtn" class="secondary">Check for Update</button><button type="button" id="dfuEnableBtn" disabled>Install Update</button></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px">Manual install uses the policy source. GitHub Alert/Auto policies try GitHub Direct first and fall back to Notehub DFU. All other policies use Notehub DFU.</p><h3>Quick Access</h3><div class="actions"><button type="button" class="secondary" id="pauseBodyBtn">Pause Server</button><a class="pill" href="/serial-monitor">Open Serial Monitor</a><a class="pill" href="/transmission-log">Transmission Log</a><a class="pill secondary" href="https://github.com/SenaxInc/SenaxTankAlarm/blob/master/Tutorials/Tutorials-112025/SERVER_INSTALLATION_GUIDE.md" target="_blank" title="View Server Installation Guide">Help</a></div></div></main><div id="toast"></div><div id="contactSelectModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2 id="contactSelectTitle">Add Recipient</h2><button class="modal-close" onclick="closeContactSelectModal()">&times;</button></div><form id="contactSelectForm"><div class="form-grid"><div class="form-field"><label>Select Contact</label><select id="contactSelectDropdown" required><option value="">Choose a contact...</option></select></div></div><div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;"><button type="button" class="btn btn-secondary" onclick="closeContactSelectModal()">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div></form></div></div><div id="pinModal" class="modal hidden"><div class="modal-card"><div class="modal-badge" id="pinSessionBadge">Session</div><h2 id="pinModalTitle">Set Admin PIN</h2><p id="pinModalDescription">Enter a 4-digit PIN to unlock configuration changes.</p><form id="pinForm"><label class="field hidden" id="pinCurrentGroup"><span>Current PIN</span><input type="password" id="pinCurrentInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><label class="field" id="pinPrimaryGroup"><span id="pinPrimaryLabel">PIN</span><input type="password" id="pinInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off" required placeholder="4 digits" aria-describedby="pinHint" title="Enter exactly four digits (0-9)"><small class="pin-hint" id="pinHint">Use exactly 4 digits (0-9). The PIN is kept locally in this browser for 90 days.</small></label><label class="field hidden" id="pinConfirmGroup"><span>Confirm PIN</span><input type="password" id="pinConfirmInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><div class="actions"><button type="submit" id="pinSubmit">Save PIN</button><button type="button" class="secondary" id="pinCancel">Cancel</button></div></form></div></div><script>document.addEventListener('DOMContentLoaded', async () => {try{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const state={pin:null,pinConfigured:false,pendingAction:null,contacts:[],smsAlertRecipients:[],dailyReportRecipients:[],contactSelectMode:null};
 const getEl=(id)=>document.getElementById(id);const els={pauseBtn:getEl('pauseBtn'),pauseBodyBtn:getEl('pauseBodyBtn'),toast:getEl('toast'),form:getEl('settingsForm'),productUid:getEl('productUidInput'),githubRouteAlias:getEl('githubRouteAliasInput'),serverDownSmsToggle:getEl('serverDownSmsToggle'),dailyEmailTime:getEl('dailyEmailTimeInput'),ftpEnabled:getEl('ftpEnabled'),ftpPassive:getEl('ftpPassive'),ftpsEnabled:getEl('ftpsEnabled'),ftpsTrustMode:getEl('ftpsTrustMode'),ftpsFingerprint:getEl('ftpsFingerprint'),ftpsTlsServerName:getEl('ftpsTlsServerName'),ftpBackupOnChange:getEl('ftpBackupOnChange'),ftpRestoreOnBoot:getEl('ftpRestoreOnBoot'),ftpHost:getEl('ftpHost'),ftpPort:getEl('ftpPort'),ftpUser:getEl('ftpUser'),ftpPass:getEl('ftpPass'),ftpPath:getEl('ftpPath'),ftpBackupNow:getEl('ftpBackupNow'),ftpRestoreNow:getEl('ftpRestoreNow'),ftpTestNow:getEl('ftpTestNow'),ftpTestStatus:getEl('ftpTestStatus'),ftpsDiscoverFingerprintBtn:getEl('ftpsDiscoverFingerprintBtn'),changePinBtn:getEl('changePinBtn'),pinStatus:getEl('pinStatus'),pinBadge:getEl('pinBadge'),smsRecipientsList:getEl('smsRecipientsList'),dailyRecipientsList:getEl('dailyRecipientsList'),addSmsRecipientBtn:getEl('addSmsRecipientBtn'),dailyRecipientDropdown:getEl('dailyRecipientDropdown'),addSelectedDailyRecipient:getEl('addSelectedDailyRecipient'),contactSelectModal:getEl('contactSelectModal'),contactSelectTitle:getEl('contactSelectTitle'),contactSelectDropdown:getEl('contactSelectDropdown'),contactSelectForm:getEl('contactSelectForm'),viewerEnabled:getEl('viewerEnabled'),updatePolicy:getEl('updatePolicy'),checkClientVersionAlerts:getEl('checkClientVersionAlerts'),checkViewerVersionAlerts:getEl('checkViewerVersionAlerts')};if(els.pauseBtn)els.pauseBtn.addEventListener('click',togglePause);if(els.pauseBodyBtn)els.pauseBodyBtn.addEventListener('click',togglePause);const pinEls={modal:getEl('pinModal'),title:getEl('pinModalTitle'),desc:getEl('pinModalDescription'),form:getEl('pinForm'),currentGroup:getEl('pinCurrentGroup'),currentInput:getEl('pinCurrentInput'),primaryGroup:getEl('pinPrimaryGroup'),primaryLabel:getEl('pinPrimaryLabel'),input:getEl('pinInput'),confirmGroup:getEl('pinConfirmGroup'),confirmInput:getEl('pinConfirmInput'),submit:getEl('pinSubmit'),cancel:getEl('pinCancel'),badge:getEl('pinSessionBadge')};)HTML"
 R"HTML(let pinMode='unlock';state.paused=false;funct)HTML" R"HTML(ion showToast(message, isError){if(els.toast)els.toast.textContent=message;if(els.toast)els.toast.style.background=isError?'#dc2626':'#0284c7';if(els.toast)els.toast.classList.add('show');setTimeout(()=>{if(els.toast)els.toast.classList.remove('show')},2500);})HTML"
 R"HTML(funct)HTML" R"HTML(ion escapeHtml(text){const div=document.createElement('div');div.textContent=text;return div.innerHTML;})HTML"
@@ -1770,7 +1771,7 @@ funct)HTML" R"HTML(ion renderDailyRecipients(){const container=els.dailyRecipien
 funct)HTML" R"HTML(ion removeSmsRecipient(recipientId){state.smsAlertRecipients=state.smsAlertRecipients.filter(r=>r!==recipientId);renderSmsRecipients();saveContactsData();}
 funct)HTML" R"HTML(ion removeDailyRecipient(recipientId){state.dailyReportRecipients=state.dailyReportRecipients.filter(r=>r!==recipientId);renderDailyRecipients();saveContactsData();}
 funct)HTML" R"HTML(ion openContactSelectModal(mode){state.contactSelectMode=mode;const dropdown=mode==='sms'?els.contactSelectDropdown:els.dailyRecipientDropdown;dropdown.innerHTML='<option value="">Choose a contact...</option>';const existingRecipients=mode==='sms'?state.smsAlertRecipients:state.dailyReportRecipients;const filterField=mode==='sms'?'phone':'email';state.contacts.forEach(contact=>{if(contact[filterField]&&!existingRecipients.includes(contact.id)){const option=document.createElement('option');option.value=contact.id;option.textContent=`${contact.name} (${contact[filterField]})`;dropdown.appendChild(option);}});if(mode==='sms'){if(dropdown.options.length===1){showToast('No contacts with phone numbers available',true);return;}els.contactSelectTitle.textContent='Add SMS Recipient';els.contactSelectModal.classList.remove('hidden');}else{const dailyControls=getEl('dailyRecipientControls');const addNewLink=getEl('addNewContactLink');if(dropdown.options.length===1){if(dailyControls)dailyControls.style.display='none';if(addNewLink)addNewLink.style.display='inline-block';}else{if(dailyControls)dailyControls.style.display='flex';if(addNewLink)addNewLink.style.display='none';}}}
-window.closeContactSelectModal=funct)HTML" R"HTML(ion(){els.contactSelectModal.classList.add('hidden');state.contactSelectMode=null;};els.contactSelectForm.addEventListener('submit',(e)=>{e.preventDefault();const contactId=els.contactSelectDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(state.contactSelectMode==='sms'){if(!state.smsAlertRecipients.includes(contactId)){state.smsAlertRecipients.push(contactId);renderSmsRecipients();saveContactsData();}}closeContactSelectModal();});els.addSmsRecipientBtn.addEventListener('click',()=>openContactSelectModal('sms'));if(els.addSelectedDailyRecipient){els.addSelectedDailyRecipient.addEventListener('click',()=>{const contactId=els.dailyRecipientDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(!state.dailyReportRecipients.includes(contactId)){state.dailyReportRecipients.push(contactId);renderDailyRecipients();openContactSelectModal('daily');saveContactsData();}});}loadSettings().then(()=>openContactSelectModal('daily'));)HTML"
+window.closeContactSelectModal=funct)HTML" R"HTML(ion(){els.contactSelectModal.classList.add('hidden');state.contactSelectMode=null;};els.contactSelectForm.addEventListener('submit',(e)=>{e.preventDefault();const contactId=els.contactSelectDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(state.contactSelectMode==='sms'){if(!state.smsAlertRecipients.includes(contactId)){state.smsAlertRecipients.push(contactId);renderSmsRecipients();saveContactsData();}}closeContactSelectModal();});els.addSmsRecipientBtn.addEventListener('click',()=>openContactSelectModal('sms'));const _tsb=document.getElementById('testSmsBtn');if(_tsb){_tsb.addEventListener('click',async()=>{_tsb.disabled=true;try{const r=await fetch('/api/sms/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(r.ok&&d.success){showToast('Test SMS queued to '+d.recipients+' recipient(s)');}else{showToast(d.message||'Test SMS failed',true);}}catch(e){showToast('Test SMS failed: '+e.message,true);}finally{_tsb.disabled=false;}});}if(els.addSelectedDailyRecipient){els.addSelectedDailyRecipient.addEventListener('click',()=>{const contactId=els.dailyRecipientDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(!state.dailyReportRecipients.includes(contactId)){state.dailyReportRecipients.push(contactId);renderDailyRecipients();openContactSelectModal('daily');saveContactsData();}});}loadSettings().then(()=>openContactSelectModal('daily'));)HTML"
 R"HTML(async funct)HTML" R"HTML(ion loadContactsData(){try{const res=await fetch('/api/contacts');if(!res.ok)throw new Error('Failed to load contacts');const data=await res.json();state.contacts=data.contacts||[];state.smsAlertRecipients=data.smsAlertRecipients||[];state.dailyReportRecipients=data.dailyReportRecipients||[];renderSmsRecipients();renderDailyRecipients();}catch(err){console.error('Failed to load contacts:',err);}}
 async funct)HTML" R"HTML(ion saveContactsData(){try{const res=await fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:state.contacts,smsAlertRecipients:state.smsAlertRecipients,dailyReportRecipients:state.dailyReportRecipients})});if(!res.ok)throw new Error('Failed to save contacts');showToast('Recipients updated');}catch(err){showToast('Failed to save: '+err.message,true);}}
 async funct)HTML" R"HTML(ion loadSettings(){if(els.pinStatus){els.pinStatus.textContent='Loading...';els.pinStatus.style.color='var(--muted)';}try{const res=await fetch('/api/clients?summary=1');if(!res.ok)throw new Error('Server returned '+res.status);const data=await res.json();const s=(data&&data.srv)||{};const hour=typeof s.dh==='number'?s.dh:5;const minute=typeof s.dm==='number'?s.dm:0;const timeStr=String(hour).padStart(2,'0')+':'+String(minute).padStart(2,'0');state.pinConfigured=!!s.pc;state.paused=!!s.ps;updatePinButton();renderPauseButtons();if(els.productUid)els.productUid.value=s.pu||'';if(els.githubRouteAlias)els.githubRouteAlias.value=s.gra||'';if(els.serverDownSmsToggle)els.serverDownSmsToggle.checked=s.sds!==false;if(els.dailyEmailTime)els.dailyEmailTime.value=timeStr;const ftp=s.ftp||{};if(els.ftpEnabled)els.ftpEnabled.checked=!!ftp.enabled;if(els.ftpPassive)els.ftpPassive.checked=ftp.passive!==false;if(els.ftpsEnabled)els.ftpsEnabled.checked=!!ftp.ftpsEnabled;if(els.ftpsTrustMode)els.ftpsTrustMode.value=String(typeof ftp.ftpsTrustMode==='number'?ftp.ftpsTrustMode:0);if(els.ftpsFingerprint)els.ftpsFingerprint.value=ftp.ftpsFingerprint||'';if(els.ftpsTlsServerName)els.ftpsTlsServerName.value=ftp.ftpsTlsServerName||'';if(els.ftpBackupOnChange)els.ftpBackupOnChange.checked=!!ftp.backupOnChange;if(els.ftpRestoreOnBoot)els.ftpRestoreOnBoot.checked=!!ftp.restoreOnBoot;if(els.ftpHost)els.ftpHost.value=ftp.host||'';if(els.ftpPort)els.ftpPort.value=ftp.port||21;if(els.ftpUser)els.ftpUser.value=ftp.user||'';if(els.ftpPath)els.ftpPath.value=ftp.path||'/tankalarm/server';if(els.ftpPass)els.ftpPass.value='';if(els.viewerEnabled)els.viewerEnabled.checked=!!s.ve;if(els.updatePolicy)els.updatePolicy.value=String(typeof s.up==='number'?s.up:0);if(els.checkClientVersionAlerts)els.checkClientVersionAlerts.checked=s.ccva!==false;if(els.checkViewerVersionAlerts)els.checkViewerVersionAlerts.checked=s.cvva!==false;await loadContactsData();}catch(err){showToast(err.message||'Failed to load settings',true);if(els.pinStatus){els.pinStatus.textContent='Failed to load';els.pinStatus.style.color='#ef4444';}}})HTML"
@@ -2401,6 +2402,7 @@ static void handleArchivedClients(EthernetClient &client, const String &query);
 static void handleServerSettingsPost(EthernetClient &client, const String &body);
 static void handleContactsGet(EthernetClient &client);
 static void handleContactsPost(EthernetClient &client, const String &body);
+static void handleSmsTestPost(EthernetClient &client, const String &body);
 static void handleEmailFormatGet(EthernetClient &client);
 static void handleEmailFormatPost(EthernetClient &client, const String &body);
 static void handleDfuStatusGet(EthernetClient &client);
@@ -2435,7 +2437,8 @@ static ClientSerialBuffer *findOrCreateClientSerialBuffer(const char *clientUid)
 static void addClientSerialLog(const char *clientUid, const char *message, double timestamp, const char *level = "info", const char *source = "client");
 static SerialRequestResult requestClientSerialLogs(const char *clientUid, String &errorMessage);
 static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex);
-static void sendSmsAlert(const char *message);
+static uint8_t sendSmsAlert(const char *message, const char *alarmId = nullptr);
+static void checkAlarmReminders();
 static void sendDailyEmail();
 static void loadClientConfigSnapshots();
 static void saveClientConfigSnapshots();
@@ -4637,6 +4640,16 @@ void loop() {
     scheduleNextDailyEmail();
   }
 
+  // Re-notification sweep for still-active alarms (~1/min; cheap linear scan). Sends a
+  // reminder SMS every gConfig.smsReminderHours until the alarm clears (0 = disabled).
+  {
+    static unsigned long gLastReminderScanMillis = 0;
+    if (millis() - gLastReminderScanMillis >= 60000UL) {
+      gLastReminderScanMillis = millis();
+      checkAlarmReminders();
+    }
+  }
+
   if (gConfig.viewerEnabled && gNextViewerSummaryEpoch > 0.0 && currentEpoch() >= gNextViewerSummaryEpoch) {
     publishViewerSummary();
     scheduleNextViewerSummary();
@@ -4908,6 +4921,7 @@ static void createDefaultConfig(ServerConfig &cfg) {
   cfg.smsOnHigh = true;
   cfg.smsOnLow = true;
   cfg.smsOnClear = false;
+  cfg.smsReminderHours = 6;  // remind every 6h while an alarm stays active
   cfg.serverDownSmsEnabled = true;
   cfg.viewerEnabled = false;  // Viewer device disabled by default
   cfg.updatePolicy = UPDATE_POLICY_DISABLED;  // No update checking by default
@@ -5128,6 +5142,7 @@ static bool loadConfig(ServerConfig &cfg) {
   cfg.smsOnHigh = doc["smsOnHigh"].is<bool>() ? doc["smsOnHigh"].as<bool>() : true;
   cfg.smsOnLow = doc["smsOnLow"].is<bool>() ? doc["smsOnLow"].as<bool>() : true;
   cfg.smsOnClear = doc["smsOnClear"].is<bool>() ? doc["smsOnClear"].as<bool>() : false;
+  cfg.smsReminderHours = doc["smsReminderHours"].is<uint8_t>() ? doc["smsReminderHours"].as<uint8_t>() : 6;
   cfg.serverDownSmsEnabled = doc["serverDownSmsEnabled"].is<bool>() ? doc["serverDownSmsEnabled"].as<bool>() : true;
   cfg.viewerEnabled = doc["viewerEnabled"].is<bool>() ? doc["viewerEnabled"].as<bool>() : false;
   if (doc["updatePolicy"].is<uint8_t>()) {
@@ -5288,6 +5303,7 @@ static bool saveConfig(const ServerConfig &cfg) {
   doc["smsOnHigh"] = cfg.smsOnHigh;
   doc["smsOnLow"] = cfg.smsOnLow;
   doc["smsOnClear"] = cfg.smsOnClear;
+  doc["smsReminderHours"] = cfg.smsReminderHours;
   doc["serverDownSmsEnabled"] = cfg.serverDownSmsEnabled;
   doc["viewerEnabled"] = cfg.viewerEnabled;
   doc["updatePolicy"] = cfg.updatePolicy;
@@ -9292,7 +9308,8 @@ static void handleWebRequests() {
   } else if (method == "GET" && path == "/api/calibration") {
     handleCalibrationGet(client);
   } else if (method == "GET" && path == "/api/contacts") {
-    // Note: PII (phone/email) exposed on LAN — add auth if ever internet-exposed
+    // Session middleware above already gates this route (all /api/* except login/session
+    // check require a valid session), so contact PII is login-protected.
     handleContactsGet(client);
   } else if (method == "GET" && path == "/api/email-format") {
     handleEmailFormatGet(client);
@@ -9335,10 +9352,18 @@ static void handleWebRequests() {
       handleClientDeleteRequest(client, body);
     }
   } else if (method == "POST" && path == "/api/contacts") {
-    if (contentLength > 8192) {
+    // CONTACT-5 fix (07062026): was 8192, which contradicted the 100-contact validation
+    // limit (~15KB with alarm associations). Use the global body cap the reader enforces.
+    if (contentLength > MAX_HTTP_BODY_BYTES) {
       respondStatus(client, 413, "Payload Too Large");
     } else {
       handleContactsPost(client, body);
+    }
+  } else if (method == "POST" && path == "/api/sms/test") {
+    if (contentLength > 256) {
+      respondStatus(client, 413, "Payload Too Large");
+    } else {
+      handleSmsTestPost(client, body);
     }
   } else if (method == "POST" && path == "/api/email-format") {
     if (contentLength > 2048) {
@@ -10088,6 +10113,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
   serverObj["soh"] = gConfig.smsOnHigh;
   serverObj["sol"] = gConfig.smsOnLow;
   serverObj["soc"] = gConfig.smsOnClear;
+  serverObj["srh"] = gConfig.smsReminderHours;
   serverObj["sds"] = gConfig.serverDownSmsEnabled;
   serverObj["ve"] = gConfig.viewerEnabled;
   serverObj["up"] = gConfig.updatePolicy;
@@ -10485,6 +10511,9 @@ static void handleConfigPost(EthernetClient &client, const String &body) {
     }
     if (serverObj.containsKey("smsOnClear")) {
       gConfig.smsOnClear = serverObj["smsOnClear"].as<bool>();
+    }
+    if (serverObj.containsKey("smsReminderHours")) {
+      gConfig.smsReminderHours = serverObj["smsReminderHours"].as<uint8_t>();
     }
 
     if (serverObj.containsKey("ftp") && serverObj["ftp"].is<JsonObject>()) {
@@ -12562,11 +12591,18 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     return;
   }
 
-  // System alarms (solar/battery/power) don't reference a specific sensor.
+  // System alarms don't reference a specific sensor.
   // Store on ClientMetadata instead of creating a phantom sensorIndex=0 SensorRecord.
+  // SMS-2 fix (07062026): battery_failure, solar_sunset, and i2c-error-rate were missing
+  // from this list — they fell through to the sensor path, latched a phantom un-clearable
+  // alarm on sensor #0, and battery_failure's se:true SMS escalation was silently dropped
+  // (no smsOn* policy branch matches those types).
   bool isSystemAlarm = (strcmp(type, "solar") == 0) ||
                        (strcmp(type, "battery") == 0) ||
-                       (strcmp(type, "power") == 0);
+                       (strcmp(type, "power") == 0) ||
+                       (strcmp(type, "battery_failure") == 0) ||
+                       (strcmp(type, "solar_sunset") == 0) ||
+                       (strcmp(type, "i2c-error-rate") == 0);
   if (isSystemAlarm) {
     ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
     if (meta) {
@@ -12605,6 +12641,11 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
           const char *to = doc["to"] | "?";
           float v = doc["v"] | 0.0f;
           written = snprintf(message, sizeof(message), "%s Power: %s->%s (%.1fV)", siteName, from, to, v);
+        } else if (strcmp(type, "battery_failure") == 0) {
+          // SMS-2 fix: client escalates this with se:true — battery failed persistently,
+          // solar-only fallback behaviors are now active on the client.
+          float v = doc["v"] | 0.0f;
+          written = snprintf(message, sizeof(message), "%s Battery FAILURE - solar-only fallback (%.1fV)", siteName, v);
         }
         // W-4: if the formatted message was truncated, fall back to a compact, safe message.
         if (written < 0 || written >= (int)sizeof(message)) {
@@ -12780,7 +12821,11 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     } else {
       snprintf(message, sizeof(message), "%s%s%d %s alarm %.1f %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, rec->alarmType, level, rec->measurementUnit[0] ? rec->measurementUnit : "in");
     }
-    sendSmsAlert(message);
+    // CONTACT-2a: pass the alarm id so contacts with alarmAssociations only receive
+    // the alarms they opted into (id format matches handleContactsGet).
+    char alarmId[64];
+    snprintf(alarmId, sizeof(alarmId), "%s_%d", clientUid, (int)rec->sensorIndex);
+    sendSmsAlert(message, alarmId);
   }
 }
 
@@ -13264,8 +13309,12 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   // Log the unload event
   logUnloadEvent(entry);
   
-  // Send SMS notification if requested
-  if (wantsSms && (strlen(gConfig.smsPrimary) > 0 || strlen(gConfig.smsSecondary) > 0)) {
+  // Send SMS notification if requested.
+  // SMS-5 fix (07062026): previously gated on the LEGACY smsPrimary/smsSecondary fields
+  // only, so contacts-based recipients (smsAlertRecipients) never received unload SMS once
+  // the legacy fields were cleared. sendSmsAlert() resolves contacts first and no-ops when
+  // zero recipients are configured, so no recipient pre-check is needed here.
+  if (wantsSms) {
     sendUnloadSms(entry);
   }
   
@@ -13307,7 +13356,10 @@ static void sendUnloadSms(const UnloadLogEntry &entry) {
            entry.siteName, entry.sensorIndex, delivered, u,
            entry.peakInches, entry.emptyInches);
   
-  sendSmsAlert(message);
+  // CONTACT-2a: unload SMS respects per-contact alarm associations for this sensor.
+  char alarmId[64];
+  snprintf(alarmId, sizeof(alarmId), "%s_%d", entry.clientUid, (int)entry.sensorIndex);
+  sendSmsAlert(message, alarmId);
   Serial.print(F("Unload SMS sent: "));
   Serial.println(message);
 }
@@ -13422,6 +13474,15 @@ static bool checkSmsRateLimit(SensorRecord *rec, bool bypassMinimumInterval) {
     return false;  // No time sync yet, deny SMS until clock is available
   }
 
+  // SMS-6 fix (07062026): clear/recovery SMS bypass the limiter ENTIRELY — they no longer
+  // consume the hourly alarm budget nor refresh lastSmsAlertEpoch. Previously one
+  // high+clear cycle exhausted the 2/hr cap, so a genuine re-alarm within the hour sent no
+  // SMS. Clears are self-limiting (alarms latch — one clear per excursion), and
+  // lastSmsAlertEpoch must track ALARM sends only for the re-notification engine.
+  if (bypassMinimumInterval) {
+    return true;
+  }
+
   // Check minimum interval since last SMS for this sensor
   if (!bypassMinimumInterval && now - rec->lastSmsAlertEpoch < MIN_SMS_ALERT_INTERVAL_SECONDS) {
     Serial.print(F("SMS rate limit: Too soon since last alert for "));
@@ -13466,91 +13527,258 @@ static bool checkSmsRateLimit(SensorRecord *rec, bool bypassMinimumInterval) {
   return true;
 }
 
-static void sendSmsAlert(const char *message) {
-  // Build list of phone numbers from contacts config
+// SMS-4 fix (07062026): the factory-default placeholder number must not count as a
+// configured recipient — otherwise a fresh server emits sms.qo events (consuming Notehub
+// credits) with a bogus destination before the operator configures anything.
+static bool isRealPhoneNumber(const char *p) {
+  return p && p[0] != '\0' && strcmp(p, "+15555555555") != 0;
+}
+
+// CONTACT-3 fix (07062026): same guard for the daily-email legacy fallback — the factory
+// placeholder must not cause email.qo events to a bogus example.com address.
+static bool isRealEmailAddress(const char *e) {
+  return e && e[0] != '\0' && strcmp(e, "reports@example.com") != 0;
+}
+
+// CONTACT-2a (07062026): SMS delivery is now ONE sms.qo note PER recipient with a scalar
+// "to" field, so a SINGLE Notehub Twilio route (To Number = [body.to], Message =
+// [body.message]) delivers to every configured recipient — the dashboard contact list is
+// now authoritative for delivery. (Previously one note carried a numbers[] array that a
+// Twilio route cannot fan out over, so only the route's static To Number ever got texts.)
+// alarmId ("clientUid_sensorIndex", matching the alarm ids served by handleContactsGet)
+// scopes sensor alerts: a contact with a NON-EMPTY alarmAssociations array only receives
+// the alarms listed there; contacts with no associations receive everything (backward
+// compatible). Fleet-wide alerts (system/OTA/stale/server-down/test) pass alarmId=nullptr
+// and go to all SMS recipients. Returns the number of notes queued.
+#ifndef MAX_SMS_RECIPIENTS_PER_ALERT
+#define MAX_SMS_RECIPIENTS_PER_ALERT 10  // cost guard: one Twilio SMS per recipient per alert
+#endif
+
+static uint8_t sendSmsAlert(const char *message, const char *alarmId) {
+  if (!message || message[0] == '\0') {
+    return 0;
+  }
+
   JsonDocument contactsDoc;
   bool loaded = loadContactsConfig(contactsDoc);
-  
-  JsonDocument doc;
-  doc["message"] = message;
-  JsonArray numbers = doc["numbers"].to<JsonArray>();
-  
-  // Add phone numbers from smsAlertRecipients in contacts config
+
+  // Resolve recipient phone numbers (contacts first; legacy fallback below). Pointers
+  // reference contactsDoc/gConfig storage, both alive for the whole function.
+  const char *numbers[MAX_SMS_RECIPIENTS_PER_ALERT];
+  uint8_t numberCount = 0;
+
   if (loaded && contactsDoc["smsAlertRecipients"].is<JsonArray>()) {
     JsonArray recipients = contactsDoc["smsAlertRecipients"].as<JsonArray>();
     JsonArray contacts = contactsDoc["contacts"].as<JsonArray>();
-    
+
     for (JsonVariant recipientId : recipients) {
       const char *id = recipientId.as<const char *>();
       if (!id) continue;
-      
-      // Find contact with this ID
+
       for (JsonVariant contactVar : contacts) {
         JsonObject contact = contactVar.as<JsonObject>();
-        if (strcmp(contact["id"] | "", id) == 0) {
-          const char *phone = contact["phone"] | "";
-          if (strlen(phone) > 0) {
-            numbers.add(phone);
-          }
-          break;
+        if (strcmp(contact["id"] | "", id) != 0) {
+          continue;
         }
+        // Association filter (sensor-scoped alerts only)
+        if (alarmId && alarmId[0] != '\0' && contact["alarmAssociations"].is<JsonArray>()) {
+          JsonArray assoc = contact["alarmAssociations"].as<JsonArray>();
+          if (assoc.size() > 0) {
+            bool match = false;
+            for (JsonVariant a : assoc) {
+              if (strcmp(a | "", alarmId) == 0) { match = true; break; }
+            }
+            if (!match) {
+              break;  // contact opted into other alarms only — skip
+            }
+          }
+        }
+        const char *phone = contact["phone"] | "";
+        if (isRealPhoneNumber(phone)) {
+          bool dup = false;
+          for (uint8_t i = 0; i < numberCount; ++i) {
+            if (strcmp(numbers[i], phone) == 0) { dup = true; break; }
+          }
+          if (!dup) {
+            if (numberCount < MAX_SMS_RECIPIENTS_PER_ALERT) {
+              numbers[numberCount++] = phone;
+            } else {
+              Serial.println(F("WARNING: SMS recipient cap reached - extra recipients skipped"));
+            }
+          }
+        }
+        break;
       }
     }
   }
-  
-  // Fall back to legacy config if no contacts configured
-  if (numbers.size() == 0) {
-    if (strlen(gConfig.smsPrimary) > 0) {
-      numbers.add(gConfig.smsPrimary);
+
+  // Fall back to legacy config if no contacts resolved (SMS-4: placeholder excluded)
+  if (numberCount == 0) {
+    if (isRealPhoneNumber(gConfig.smsPrimary)) {
+      numbers[numberCount++] = gConfig.smsPrimary;
     }
-    if (strlen(gConfig.smsSecondary) > 0) {
-      numbers.add(gConfig.smsSecondary);
+    if (isRealPhoneNumber(gConfig.smsSecondary) &&
+        (numberCount == 0 || strcmp(numbers[0], gConfig.smsSecondary) != 0)) {
+      numbers[numberCount++] = gConfig.smsSecondary;
     }
   }
-  
-  // No recipients configured
-  if (numbers.size() == 0) {
+
+  if (numberCount == 0) {
+    return 0;  // nothing configured (or all recipients filtered out)
+  }
+
+  uint8_t queued = 0;
+  for (uint8_t n = 0; n < numberCount; ++n) {
+    JsonDocument doc;
+    doc["message"] = message;
+    doc["to"] = numbers[n];
+
+    // CONTACT-4 (07062026): static (not stack — Mbed thread stacks are small) buffer with
+    // overflow logging. Per-recipient payloads are small (message<=160 + one number).
+    static char buffer[512];
+    size_t len = serializeJson(doc, buffer, sizeof(buffer));
+    if (len == 0 || len >= sizeof(buffer)) {
+      Serial.println(F("ERROR: SMS payload exceeds buffer - recipient skipped"));
+      logTransmission("", "", "sms", "error", "Payload too large");
+      continue;
+    }
+    buffer[len] = '\0';
+
+    // SMS-7 (07062026): one bounded retry when the Notecard transaction fails. WDT kicked
+    // before every attempt — up to MAX_SMS_RECIPIENTS_PER_ALERT x2 Notecard transactions.
+    bool sent = false;
+    for (uint8_t attempt = 0; attempt < 2 && !sent; ++attempt) {
+      dfuKickWatchdog();
+      if (attempt > 0) {
+        delay(250);
+      }
+      J *req = notecard.newRequest("note.add");
+      if (!req) {
+        continue;
+      }
+      JAddStringToObject(req, "file", "sms.qo");
+      JAddBoolToObject(req, "sync", true);
+      J *body = JParse(buffer);
+      if (!body) {
+        JDelete(req);  // our own serialized JSON failed to parse — retry won't help
+        break;
+      }
+      stampSchemaVersion(body);
+      JAddItemToObject(req, "body", body);
+
+      J *smsRsp = notecard.requestAndResponse(req);
+      if (smsRsp) {
+        const char *smsErr = JGetString(smsRsp, "err");
+        if (!smsErr || smsErr[0] == '\0') {
+          sent = true;
+        } else if (attempt == 1) {
+          Serial.print(F("WARNING: SMS note.add failed: "));
+          Serial.println(smsErr);
+          logTransmission("", "", "sms", "error", smsErr);
+        }
+        notecard.deleteResponse(smsRsp);
+      } else if (attempt == 1) {
+        Serial.println(F("WARNING: SMS note.add returned no response"));
+        logTransmission("", "", "sms", "error", "No response from Notecard");
+      }
+    }
+    if (sent) {
+      queued++;
+    }
+  }
+
+  if (queued > 0) {
+    char detail[112];
+    snprintf(detail, sizeof(detail), "%u recipient(s): %.80s", (unsigned)queued, message);
+    logTransmission("", "", "sms", "outbox", detail);
+    Serial.print(F("SMS alert dispatched to "));
+    Serial.print(queued);
+    Serial.print(F(" recipient(s): "));
+    Serial.println(message);
+  }
+  return queued;
+}
+
+// Re-notification engine (07062026): alarms are edge-triggered — one SMS per excursion —
+// so a missed text meant a tank could sit in alarm silently for days. While a sensor alarm
+// stays active, re-send its SMS every gConfig.smsReminderHours (default 6 h, 0 disables)
+// until it clears. Anchored on lastSmsAlertEpoch, which (a) clears no longer refresh
+// (SMS-6) and (b) is only non-zero when the ORIGINAL alarm actually produced an SMS
+// (client se flag + server policy) — so reminders never fire for alarms that never texted.
+// lastSmsAlertEpoch and alarmActive both persist in the sensor registry, so reminders
+// survive a server reboot.
+static void checkAlarmReminders() {
+  if (gConfig.smsReminderHours == 0) {
+    return;
+  }
+  double now = currentEpoch();
+  if (now <= 0.0) {
+    return;  // no clock yet
+  }
+  double intervalSec = (double)gConfig.smsReminderHours * 3600.0;
+
+  for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
+    SensorRecord &rec = gSensorRecords[i];
+    if (!rec.alarmActive) continue;
+    if (rec.lastSmsAlertEpoch <= 0.0) continue;               // original alarm never SMS'd
+    if (now - rec.lastSmsAlertEpoch < intervalSec) continue;  // not due yet
+
+    // Operator-actionable alarm types only — diagnostics/relay events get no reminders.
+    const char *type = rec.alarmType;
+    bool isHighLike = (strcmp(type, "high") == 0) || (strcmp(type, "triggered") == 0) ||
+                      (strcmp(type, "not_triggered") == 0);
+    bool isLow = (strcmp(type, "low") == 0);
+    if (!isHighLike && !isLow) continue;
+    if (isHighLike && !gConfig.smsOnHigh) continue;
+    if (isLow && !gConfig.smsOnLow) continue;
+
+    char shortSite[24];
+    strlcpy(shortSite, rec.site, sizeof(shortSite));
+    char message[160];
+    snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%.1f %s)",
+             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+             type, rec.currentValue,
+             rec.measurementUnit[0] ? rec.measurementUnit : "in");
+
+    char alarmId[64];
+    snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
+    sendSmsAlert(message, alarmId);
+
+    // Advance the anchor regardless of send outcome so an unconfigured/offline server
+    // doesn't re-attempt on every sweep; the next reminder lands one interval from now.
+    rec.lastSmsAlertEpoch = now;
+    gSensorRegistryDirty = true;
+  }
+}
+
+// POST /api/sms/test — queue a test SMS to every configured recipient so the operator can
+// verify the sms.qo → Notehub → Twilio route end-to-end without forcing a real alarm.
+static void handleSmsTestPost(EthernetClient &client, const String &body) {
+  JsonDocument doc;
+  if (body.length() > 0 && deserializeJson(doc, body)) {
+    respondStatus(client, 400, F("Invalid JSON"));
+    return;
+  }
+  const char *pinValue = doc["pin"].as<const char *>();
+  if (!requireValidPin(client, pinValue)) {
     return;
   }
 
-  char buffer[512];
-  size_t len = serializeJson(doc, buffer, sizeof(buffer));
-  if (len == 0 || len >= sizeof(buffer)) {
-    return;
-  }
-  buffer[len] = '\0';
+  char message[120];
+  snprintf(message, sizeof(message), "TankAlarm test SMS from server %s (v%s)",
+           gConfig.serverName[0] ? gConfig.serverName : "?", FIRMWARE_VERSION);
+  uint8_t queued = sendSmsAlert(message);
 
-  J *req = notecard.newRequest("note.add");
-  if (!req) {
-    return;
-  }
-  JAddStringToObject(req, "file", "sms.qo");
-  JAddBoolToObject(req, "sync", true);
-  J *body = JParse(buffer);
-  if (!body) {
-    JDelete(req);  // Free the request (use JDelete for newRequest objects, not deleteResponse)
-    return;
-  }
-  stampSchemaVersion(body);
-  JAddItemToObject(req, "body", body);
-
-  J *smsRsp = notecard.requestAndResponse(req);
-  if (smsRsp) {
-    const char *smsErr = JGetString(smsRsp, "err");
-    if (smsErr && smsErr[0] != '\0') {
-      Serial.print(F("WARNING: SMS note.add failed: "));
-      Serial.println(smsErr);
-      logTransmission("", "", "sms", "error", smsErr);
-    } else {
-      logTransmission("", "", "sms", "outbox", message ? message : "SMS alert");
-      Serial.print(F("SMS alert dispatched: "));
-      Serial.println(message);
-    }
-    notecard.deleteResponse(smsRsp);
-  } else {
-    Serial.println(F("WARNING: SMS note.add returned no response"));
-    logTransmission("", "", "sms", "error", "No response from Notecard");
-  }
+  JsonDocument response;
+  response["success"] = (queued > 0);
+  response["recipients"] = queued;
+  response["message"] = (queued > 0)
+      ? "Test SMS queued"
+      : "No SMS recipients configured (or Notecard unavailable)";
+  String out;
+  serializeJson(response, out);
+  respondJson(client, out);
 }
 
 static void sendDailyEmail() {
@@ -13585,8 +13813,8 @@ static void sendDailyEmail() {
     }
   }
   
-  // Fall back to legacy config if no contacts configured
-  if (emailList.length() == 0 && strlen(gConfig.dailyEmail) > 0) {
+  // Fall back to legacy config if no contacts configured (CONTACT-3: placeholder excluded)
+  if (emailList.length() == 0 && isRealEmailAddress(gConfig.dailyEmail)) {
     emailList = gConfig.dailyEmail;
   }
   
@@ -16534,14 +16762,50 @@ static void handleContactsPost(EthernetClient &client, const String &body) {
     return;
   }
 
-  if (!doc["contacts"].is<JsonArray>()) {
-    doc["contacts"].to<JsonArray>();
+  // CONTACT-1 fix (07062026): merge-on-save. The /contacts manager page POSTs only
+  // {contacts, dailyReportRecipients} while the settings page POSTs all three arrays.
+  // Previously any array missing from the request was replaced with an EMPTY one and the
+  // whole file overwritten — so saving from one page silently wiped lists managed by the
+  // other (e.g. any save on /contacts erased all smsAlertRecipients). Preserve any
+  // top-level array absent from the request from the stored config instead. (An array
+  // explicitly present but empty in the request still clears the list — intended.)
+  {
+    JsonDocument stored;
+    bool haveStored = loadContactsConfig(stored);
+    const char *mergeKeys[3] = { "contacts", "dailyReportRecipients", "smsAlertRecipients" };
+    for (uint8_t i = 0; i < 3; ++i) {
+      const char *key = mergeKeys[i];
+      if (!doc[key].is<JsonArray>()) {
+        if (haveStored && stored[key].is<JsonArray>()) {
+          doc[key] = stored[key];  // deep copy preserves the other page's list
+        } else {
+          doc[key].to<JsonArray>();
+        }
+      }
+    }
   }
-  if (!doc["dailyReportRecipients"].is<JsonArray>()) {
-    doc["dailyReportRecipients"].to<JsonArray>();
-  }
-  if (!doc["smsAlertRecipients"].is<JsonArray>()) {
-    doc["smsAlertRecipients"].to<JsonArray>();
+
+  // CONTACT-1 fix (part 2): prune recipient IDs that no longer reference an existing
+  // contact. Covers contact deletion from EITHER page — the /contacts page's delete only
+  // purged dailyReportRecipients, leaving dangling IDs in smsAlertRecipients.
+  {
+    JsonArray contactsArr = doc["contacts"].as<JsonArray>();
+    const char *recipientKeys[2] = { "dailyReportRecipients", "smsAlertRecipients" };
+    for (uint8_t a = 0; a < 2; ++a) {
+      JsonArray list = doc[recipientKeys[a]].as<JsonArray>();
+      for (size_t i = list.size(); i > 0; --i) {
+        const char *id = list[i - 1].as<const char *>();
+        bool found = false;
+        if (id) {
+          for (JsonVariant c : contactsArr) {
+            if (strcmp(c["id"] | "", id) == 0) { found = true; break; }
+          }
+        }
+        if (!found) {
+          list.remove(i - 1);
+        }
+      }
+    }
   }
 
   String cachePayload;
