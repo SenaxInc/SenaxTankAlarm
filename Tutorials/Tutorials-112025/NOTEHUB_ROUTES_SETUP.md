@@ -71,7 +71,7 @@ TankAlarm uses **5 routes** total:
 | 2 | **ServerToClientRelay** | Delivers server commands to clients | `command.qo` from server device | Target client's `.qi` inbox |
 | 3 | **ServerToViewerRelay** | Delivers viewer summary to viewer devices | `viewer_summary.qo` from server | Viewer device `.qi` inbox |
 | 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device (one note per recipient) | Twilio, To = `[body.to]` |
-| 5 | **EmailRoute** | Sends email reports | `email.qo` from server device | SMTP or Blues Email |
+| 5 | **EmailRoute** | Sends email reports & alerts | `email.qo` from server device | General HTTP → email API (e.g. SendGrid) |
 
 ### Notefile Flow Diagram
 
@@ -112,7 +112,7 @@ viewer_contacts.qo ──> Route #1 ──> viewer_contacts.qi ──> handleVie
 viewer_request.qo  ──> Route #1 ──> viewer_request.qi  ──> publishViewerSummary()
 
                                  sms.qo   ──> Route #4 ──> Twilio SMS
-                                 email.qo ──> Route #5 ──> SMTP Email
+                                 email.qo ──> Route #5 ──> Email API (SendGrid etc.)
 ```
 
 ### Relay Forwarding Flow (Client → Server → Client)
@@ -409,15 +409,88 @@ recipient) appear when you click the event's error icon.
 
 ---
 
-## Step 7: Create Route #5 — Email Reports (Optional)
+## Step 7: Create Route #5 — Email Reports & Alerts (Optional)
+
+> **Important:** Notehub has **no native SMTP/email route type**. Email is delivered by a
+> **General HTTP/HTTPS route** that calls an email provider's API (SendGrid shown below;
+> Mailgun, Postmark, or any HTTP email API works the same way with a different URL/payload).
+
+### What the server sends
+
+The server publishes **two body shapes** to `email.qo`:
+
+**Daily report** (scheduled, one note, all recipients comma-joined):
+
+```json
+{
+  "to": "ops@example.com,owner@example.com",
+  "subject": "Daily Sensor Summary - 2026-07-08",
+  "serverName": "Tank Alarm Server",
+  "sensors": [ { "client": "dev:...", "site": "Silas", "label": "Cox Wellhead",
+                 "sensorIndex": 1, "levelInches": 43.8, "sensorMa": 8.2,
+                 "alarm": false, "alarmType": "clear" } ],
+  "fmt": { "groupBySite": true, "fieldLevelInches": true, "...": "..." }
+}
+```
+
+The `subject` comes from the **/email-format** page (`{date}` token supported), and the
+page's field/summary toggles ride along in `fmt` so your route template can honor them.
+
+**Alarm / unload / test alert** (event-driven, v2.2.1+, sent to contacts with the
+**Email alerts** checkbox enabled on the /contacts page):
+
+```json
+{ "to": "ops@example.com", "subject": "TankAlarm Alert",
+  "message": "Silas #1 high alarm 43.8 psi", "type": "alarm" }
+```
+
+Use `body.type = "alarm"` in your template to distinguish the two shapes.
+
+### Route configuration (SendGrid example)
 
 | Setting | Value |
 |---------|-------|
 | **Route Name** | `EmailRoute` |
-| **Route Type** | **SMTP Email** or **General HTTP** to your email service |
-| **Notefiles** | `email.qo` |
+| **Route Type** | **General HTTP/HTTPS Request/Response** |
+| **URL** | `https://api.sendgrid.com/v3/mail/send` |
+| **HTTP Headers** | `Authorization: Bearer YOUR_SENDGRID_API_KEY` and `Content-Type: application/json` |
+| **Notefiles** | Selected Notefiles → `email.qo` |
+| **Transform Data** | **JSONata Expression** (below) |
+| **Automatic reroute on failure** | Enable |
 
-Configure according to your email provider's requirements.
+**JSONata expression** — converts both body shapes into a SendGrid v3 payload (splits the
+comma-joined `to` list and builds a plain-text body from either the alarm `message` or the
+daily `sensors` array):
+
+```jsonata
+{
+  "personalizations": [{ "to": $map($split(body.to, ","), function($e) {{ "email": $trim($e) }}) }],
+  "from": { "email": "alerts@yourdomain.com", "name": "TankAlarm" },
+  "subject": body.subject,
+  "content": [{
+    "type": "text/plain",
+    "value": body.type = "alarm"
+      ? body.message
+      : $join($map(body.sensors, function($s) {
+          $s.site & " " & $s.label & " #" & $string($s.sensorIndex) & ": " &
+          $string($s.levelInches) & ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
+        }), "\n")
+  }]
+}
+```
+
+> **Provider notes:** the `from` address must be a verified sender in SendGrid. For richer
+> formatting, point `content.type` at `text/html` and expand the template using the `fmt`
+> toggles. Any other HTTP email API (Mailgun `/v3/<domain>/messages`, Postmark
+> `/email`, etc.) works with the same pattern — swap the URL, auth header, and JSONata shape.
+
+### Recipient management (server side)
+
+- **Daily report** recipients: Contacts page → daily report list (or the settings page).
+- **Alarm/unload emails**: per-contact **Email alerts** checkbox on the /contacts page.
+  Contacts with alarm associations only receive their selected alarms.
+- Use the **Send Test Email** button on the server settings page (`POST /api/email/test`)
+  to verify the route end-to-end without waiting for a real alarm.
 
 ---
 
@@ -454,7 +527,8 @@ After setting up all routes, verify each one works:
 ### Route #4–5: SMS and Email
 - [ ] Send Test SMS (server Settings page) → one `sms.qo` event per recipient, all routed 2xx
 - [ ] SMS alerts arrive at every configured recipient's phone
-- [ ] Email reports arrive at configured addresses
+- [ ] Send Test Email (server Settings page) → `email.qo` event routed 2xx, email arrives at every opted-in contact
+- [ ] Daily report email arrives at configured addresses
 
 ---
 

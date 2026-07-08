@@ -737,6 +737,7 @@ static uint8_t gUnloadLogWriteIndex = 0;  // Ring buffer write pointer
 static void handleUnload(JsonDocument &doc, double epoch);
 static void logUnloadEvent(const UnloadLogEntry &entry);
 static void sendUnloadSms(const UnloadLogEntry &entry);
+static void sendUnloadEmail(const UnloadLogEntry &entry);
 
 // Structure for hourly telemetry snapshots (hot tier)
 #ifndef MAX_HOURLY_HISTORY_PER_SENSOR
@@ -1755,7 +1756,7 @@ tbody tr:nth-child(even){background:#fafafa}
 }
 )HTML";
 
-static const char SERVER_SETTINGS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Settings - Tank Alarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Configuration</h2><form id="settingsForm"><h3>Blues Notehub</h3><div class="form-grid"><label class="field"><span>Product UID <span style="color:var(--danger);">*</span></span><input id="productUidInput" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>GitHub Route Alias</span><input id="githubRouteAliasInput" type="text" placeholder="github-api"></label></div><p style="color:var(--muted);font-size:0.85rem;margin:-8px 0 16px;">Required. The Product UID from your Blues Notehub project (e.g. com.company.product:project). Changing this requires a device restart to fully apply.</p><h3>Server SMS Alert Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive SMS alerts for server events (e.g., power restoration after outage).</p><div id="smsRecipientsList" class="recipient-list"><div class="empty-state">No SMS recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><button type="button" class="secondary" id="addSmsRecipientBtn">+ Add SMS Recipient</button> <button type="button" class="secondary" id="testSmsBtn">Send Test SMS</button></div><div class="toggle-group" style="margin-top:-12px;"><label class="toggle"><span>Server down (power loss &gt; 24h)<span class="tooltip-icon" tabindex="0" data-tooltip="Sends an SMS if the server was offline for at least 24 hours before reboot.">?</span></span><input type="checkbox" id="serverDownSmsToggle" checked></label></div><h3>Daily Email Report Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive the daily tank level summary email.</p><div class="form-grid"><label class="field"><span>Daily Email Time (HH:MM, UTC)</span><input id="dailyEmailTimeInput" type="time" value="05:00"></label></div><div id="dailyRecipientsList" class="recipient-list"><div class="empty-state">No daily report recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><div id="dailyRecipientControls" style="display:flex;gap:8px;align-items:center;"><select id="dailyRecipientDropdown" style="min-width:250px;"><option value="">Choose a contact...</option></select><button type="button" id="addSelectedDailyRecipient" class="secondary">Add</button></div><a class="pill secondary" href="/contacts" id="addNewContactLink" style="display:none;">+ Add New Contact</a><a class="pill secondary" href="/email-format" style="margin-left:8px;">Email Formatting</a></div><h3>Security</h3><div class="actions" style="margin-bottom: 24px;"><button type="button" class="secondary" id="changePinBtn">Change Admin PIN</button><span id="pinBadge" class="pin-chip hidden">PIN SET</span><span id="pinStatus" style="margin-left:12px;font-size:0.9rem;color:var(--muted)"></span></div><h3>FTP Backup & Restore</h3><div class="form-grid"><label class="field"><span>FTP Host</span><input id="ftpHost" type="text" placeholder="192.168.1.50"></label><label class="field"><span>FTP Port</span><input id="ftpPort" type="number" min="1" max="65535" value="21"></label><label class="field"><span>FTP User</span><input id="ftpUser" type="text" placeholder="user"></label><label class="field"><span>FTP Password <small style="color:var(--muted);font-weight:400;">(leave blank to keep)</small></span><input id="ftpPass" type="password" autocomplete="off"></label><label class="field"><span>FTP Path</span><input id="ftpPath" type="text" placeholder="/tankalarm/server"></label><label class="field"><span>TLS Server Name (SNI)</span><input id="ftpsTlsServerName" type="text" placeholder="ftp.example.com"></label><label class="field"><span>SHA-256 Fingerprint</span><div style="display:flex;gap:6px;align-items:stretch;"><input id="ftpsFingerprint" type="text" placeholder="64 hex chars" maxlength="64" style="flex:1;min-width:0;"><button type="button" class="secondary" id="ftpsDiscoverFingerprintBtn" style="white-space:nowrap;">Discover</button></div></label><label class="field"><span>FTPS Trust Mode</span><select id="ftpsTrustMode"><option value="0">Fingerprint</option><option value="1">Imported Certificate</option></select></label></div><div class="toggle-group"><label class="toggle"><span>Enable FTP</span><input type="checkbox" id="ftpEnabled"></label><label class="toggle"><span>Passive Mode</span><input type="checkbox" id="ftpPassive" checked></label><label class="toggle"><span>Enable FTPS (Explicit TLS)</span><input type="checkbox" id="ftpsEnabled"></label><label class="toggle"><span>Auto-backup on save</span><input type="checkbox" id="ftpBackupOnChange"></label><label class="toggle"><span>Restore on boot</span><input type="checkbox" id="ftpRestoreOnBoot"></label></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px;">Fingerprint trust mode is currently supported. Imported certificate mode is reserved for a follow-up update.</p><div class="actions"><button type="button" class="secondary" id="ftpTestNow">Test Connection</button><button type="button" id="ftpBackupNow">Backup Now</button><button type="button" class="secondary" id="ftpRestoreNow">Restore Now</button></div><div id="ftpTestStatus" style="display:none;margin-top:12px;padding:10px 14px;border-radius:6px;font-size:0.85rem;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;line-height:1.5;"></div><h3>Viewer Device</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Enable periodic viewer summary publishing via Notecard. Only enable this if you have a Viewer Opta device set up and connected.</p><div class="toggle-group"><label class="toggle"><span>Enable Viewer Summary<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the server publishes sensor summary data to a Viewer Opta device every 6 hours via Notecard.">?</span></span><input type="checkbox" id="viewerEnabled"></label></div><h3>Update Policy</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Choose how the server handles firmware updates. Alert modes notify you on the dashboard when an update is available. Automatic modes apply updates without user intervention.</p><div class="form-grid"><label class="field" style="min-width:260px;"><span>Update Policy</span><select id="updatePolicy"><option value="0">Disabled</option><option value="1">Alert for DFU update available</option><option value="2">Alert for GitHub update available</option><option value="3">Update from GitHub automatically</option><option value="4">Update from DFU automatically</option></select></label></div><div class="toggle-group" style="margin-top:12px;"><label class="toggle"><span>Alert when connected clients report outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if any connected client is running a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkClientVersionAlerts" checked></label><label class="toggle"><span>Alert when viewer reports outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if the connected Viewer device reports a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkViewerVersionAlerts" checked></label></div><div class="actions"><button type="submit">Save Settings</button></div></form></div><div class="card"><h2>Tools & System Info</h2><h3>System Status</h3><div class="form-grid"><div class="field"><span>Firmware Version</span><div id="fwVersionDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Build Date</span><div id="fwBuildDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Firmware Last Updated</span><div id="fwLastUpdatedDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Notecard Supply (V+ rail)</span><div id="serverVoltageDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Server Time</span><div id="serverTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div></div><h3>Notecard Status</h3><div id="notecardStatusPanel" style="padding:16px;background:var(--chip);border:1px solid var(--card-border);border-radius:var(--radius);margin-bottom:16px;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><span id="notecardStatusDot" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#888;"></span><strong id="notecardStatusLabel">Checking...</strong></div><div class="form-grid" style="margin:0;"><div class="field"><span>Connection</span><div id="ncConnStatus" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Product UID</span><div id="ncProductUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Server UID</span><div id="ncServerUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Sync Mode</span><div id="ncSyncMode" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div></div><div class="actions" style="margin-top:12px;"><button type="button" class="secondary" id="ncRefreshBtn">Refresh Notecard Status</button></div></div><h3>Firmware Update (DFU)</h3><div id="dfuStatus" style="padding:12px;background:var(--chip);border:1px solid var(--card-border);margin-bottom:12px"><span id="dfuStatusText">Checking for updates...</span></div><div class="actions"><button type="button" id="dfuCheckBtn" class="secondary">Check for Update</button><button type="button" id="dfuEnableBtn" disabled>Install Update</button></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px">Manual install uses the policy source. GitHub Alert/Auto policies try GitHub Direct first and fall back to Notehub DFU. All other policies use Notehub DFU.</p><h3>Quick Access</h3><div class="actions"><button type="button" class="secondary" id="pauseBodyBtn">Pause Server</button><a class="pill" href="/serial-monitor">Open Serial Monitor</a><a class="pill" href="/transmission-log">Transmission Log</a><a class="pill secondary" href="https://github.com/SenaxInc/SenaxTankAlarm/blob/master/Tutorials/Tutorials-112025/SERVER_INSTALLATION_GUIDE.md" target="_blank" title="View Server Installation Guide">Help</a></div></div></main><div id="toast"></div><div id="contactSelectModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2 id="contactSelectTitle">Add Recipient</h2><button class="modal-close" onclick="closeContactSelectModal()">&times;</button></div><form id="contactSelectForm"><div class="form-grid"><div class="form-field"><label>Select Contact</label><select id="contactSelectDropdown" required><option value="">Choose a contact...</option></select></div></div><div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;"><button type="button" class="btn btn-secondary" onclick="closeContactSelectModal()">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div></form></div></div><div id="pinModal" class="modal hidden"><div class="modal-card"><div class="modal-badge" id="pinSessionBadge">Session</div><h2 id="pinModalTitle">Set Admin PIN</h2><p id="pinModalDescription">Enter a 4-digit PIN to unlock configuration changes.</p><form id="pinForm"><label class="field hidden" id="pinCurrentGroup"><span>Current PIN</span><input type="password" id="pinCurrentInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><label class="field" id="pinPrimaryGroup"><span id="pinPrimaryLabel">PIN</span><input type="password" id="pinInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off" required placeholder="4 digits" aria-describedby="pinHint" title="Enter exactly four digits (0-9)"><small class="pin-hint" id="pinHint">Use exactly 4 digits (0-9). The PIN is kept locally in this browser for 90 days.</small></label><label class="field hidden" id="pinConfirmGroup"><span>Confirm PIN</span><input type="password" id="pinConfirmInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><div class="actions"><button type="submit" id="pinSubmit">Save PIN</button><button type="button" class="secondary" id="pinCancel">Cancel</button></div></form></div></div><script>document.addEventListener('DOMContentLoaded', async () => {try{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const state={pin:null,pinConfigured:false,pendingAction:null,contacts:[],smsAlertRecipients:[],dailyReportRecipients:[],contactSelectMode:null};
+static const char SERVER_SETTINGS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Settings - Tank Alarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Server Configuration</h2><form id="settingsForm"><h3>Blues Notehub</h3><div class="form-grid"><label class="field"><span>Product UID <span style="color:var(--danger);">*</span></span><input id="productUidInput" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>GitHub Route Alias</span><input id="githubRouteAliasInput" type="text" placeholder="github-api"></label></div><p style="color:var(--muted);font-size:0.85rem;margin:-8px 0 16px;">Required. The Product UID from your Blues Notehub project (e.g. com.company.product:project). Changing this requires a device restart to fully apply.</p><h3>Server SMS Alert Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive SMS alerts for server events (e.g., power restoration after outage).</p><div id="smsRecipientsList" class="recipient-list"><div class="empty-state">No SMS recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><button type="button" class="secondary" id="addSmsRecipientBtn">+ Add SMS Recipient</button> <button type="button" class="secondary" id="testSmsBtn">Send Test SMS</button> <button type="button" class="secondary" id="testEmailBtn">Send Test Email</button></div><div class="toggle-group" style="margin-top:-12px;"><label class="toggle"><span>Server down (power loss &gt; 24h)<span class="tooltip-icon" tabindex="0" data-tooltip="Sends an SMS if the server was offline for at least 24 hours before reboot.">?</span></span><input type="checkbox" id="serverDownSmsToggle" checked></label></div><h3>Daily Email Report Recipients</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Contacts who receive the daily tank level summary email.</p><div class="form-grid"><label class="field"><span>Daily Email Time (HH:MM, UTC)</span><input id="dailyEmailTimeInput" type="time" value="05:00"></label></div><div id="dailyRecipientsList" class="recipient-list"><div class="empty-state">No daily report recipients configured.</div></div><div class="actions" style="margin-bottom:16px;"><div id="dailyRecipientControls" style="display:flex;gap:8px;align-items:center;"><select id="dailyRecipientDropdown" style="min-width:250px;"><option value="">Choose a contact...</option></select><button type="button" id="addSelectedDailyRecipient" class="secondary">Add</button></div><a class="pill secondary" href="/contacts" id="addNewContactLink" style="display:none;">+ Add New Contact</a><a class="pill secondary" href="/email-format" style="margin-left:8px;">Email Formatting</a></div><h3>Security</h3><div class="actions" style="margin-bottom: 24px;"><button type="button" class="secondary" id="changePinBtn">Change Admin PIN</button><span id="pinBadge" class="pin-chip hidden">PIN SET</span><span id="pinStatus" style="margin-left:12px;font-size:0.9rem;color:var(--muted)"></span></div><h3>FTP Backup & Restore</h3><div class="form-grid"><label class="field"><span>FTP Host</span><input id="ftpHost" type="text" placeholder="192.168.1.50"></label><label class="field"><span>FTP Port</span><input id="ftpPort" type="number" min="1" max="65535" value="21"></label><label class="field"><span>FTP User</span><input id="ftpUser" type="text" placeholder="user"></label><label class="field"><span>FTP Password <small style="color:var(--muted);font-weight:400;">(leave blank to keep)</small></span><input id="ftpPass" type="password" autocomplete="off"></label><label class="field"><span>FTP Path</span><input id="ftpPath" type="text" placeholder="/tankalarm/server"></label><label class="field"><span>TLS Server Name (SNI)</span><input id="ftpsTlsServerName" type="text" placeholder="ftp.example.com"></label><label class="field"><span>SHA-256 Fingerprint</span><div style="display:flex;gap:6px;align-items:stretch;"><input id="ftpsFingerprint" type="text" placeholder="64 hex chars" maxlength="64" style="flex:1;min-width:0;"><button type="button" class="secondary" id="ftpsDiscoverFingerprintBtn" style="white-space:nowrap;">Discover</button></div></label><label class="field"><span>FTPS Trust Mode</span><select id="ftpsTrustMode"><option value="0">Fingerprint</option><option value="1">Imported Certificate</option></select></label></div><div class="toggle-group"><label class="toggle"><span>Enable FTP</span><input type="checkbox" id="ftpEnabled"></label><label class="toggle"><span>Passive Mode</span><input type="checkbox" id="ftpPassive" checked></label><label class="toggle"><span>Enable FTPS (Explicit TLS)</span><input type="checkbox" id="ftpsEnabled"></label><label class="toggle"><span>Auto-backup on save</span><input type="checkbox" id="ftpBackupOnChange"></label><label class="toggle"><span>Restore on boot</span><input type="checkbox" id="ftpRestoreOnBoot"></label></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px;">Fingerprint trust mode is currently supported. Imported certificate mode is reserved for a follow-up update.</p><div class="actions"><button type="button" class="secondary" id="ftpTestNow">Test Connection</button><button type="button" id="ftpBackupNow">Backup Now</button><button type="button" class="secondary" id="ftpRestoreNow">Restore Now</button></div><div id="ftpTestStatus" style="display:none;margin-top:12px;padding:10px 14px;border-radius:6px;font-size:0.85rem;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;line-height:1.5;"></div><h3>Viewer Device</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Enable periodic viewer summary publishing via Notecard. Only enable this if you have a Viewer Opta device set up and connected.</p><div class="toggle-group"><label class="toggle"><span>Enable Viewer Summary<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, the server publishes sensor summary data to a Viewer Opta device every 6 hours via Notecard.">?</span></span><input type="checkbox" id="viewerEnabled"></label></div><h3>Update Policy</h3><p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px;">Choose how the server handles firmware updates. Alert modes notify you on the dashboard when an update is available. Automatic modes apply updates without user intervention.</p><div class="form-grid"><label class="field" style="min-width:260px;"><span>Update Policy</span><select id="updatePolicy"><option value="0">Disabled</option><option value="1">Alert for DFU update available</option><option value="2">Alert for GitHub update available</option><option value="3">Update from GitHub automatically</option><option value="4">Update from DFU automatically</option></select></label></div><div class="toggle-group" style="margin-top:12px;"><label class="toggle"><span>Alert when connected clients report outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if any connected client is running a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkClientVersionAlerts" checked></label><label class="toggle"><span>Alert when viewer reports outdated firmware<span class="tooltip-icon" tabindex="0" data-tooltip="When enabled, a banner appears on the dashboard if the connected Viewer device reports a firmware version older than the latest GitHub release.">?</span></span><input type="checkbox" id="checkViewerVersionAlerts" checked></label></div><div class="actions"><button type="submit">Save Settings</button></div></form></div><div class="card"><h2>Tools & System Info</h2><h3>System Status</h3><div class="form-grid"><div class="field"><span>Firmware Version</span><div id="fwVersionDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Build Date</span><div id="fwBuildDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Firmware Last Updated</span><div id="fwLastUpdatedDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Notecard Supply (V+ rail)</span><div id="serverVoltageDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div><div class="field"><span>Server Time</span><div id="serverTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border)">Loading...</div></div></div><h3>Notecard Status</h3><div id="notecardStatusPanel" style="padding:16px;background:var(--chip);border:1px solid var(--card-border);border-radius:var(--radius);margin-bottom:16px;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><span id="notecardStatusDot" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#888;"></span><strong id="notecardStatusLabel">Checking...</strong></div><div class="form-grid" style="margin:0;"><div class="field"><span>Connection</span><div id="ncConnStatus" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Product UID</span><div id="ncProductUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Server UID</span><div id="ncServerUid" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div><div class="field"><span>Sync Mode</span><div id="ncSyncMode" style="padding:6px 10px;background:var(--bg);border:1px solid var(--card-border);font-size:0.9rem;">--</div></div></div><div class="actions" style="margin-top:12px;"><button type="button" class="secondary" id="ncRefreshBtn">Refresh Notecard Status</button></div></div><h3>Firmware Update (DFU)</h3><div id="dfuStatus" style="padding:12px;background:var(--chip);border:1px solid var(--card-border);margin-bottom:12px"><span id="dfuStatusText">Checking for updates...</span></div><div class="actions"><button type="button" id="dfuCheckBtn" class="secondary">Check for Update</button><button type="button" id="dfuEnableBtn" disabled>Install Update</button></div><p style="color:var(--muted);font-size:0.85rem;margin-top:8px">Manual install uses the policy source. GitHub Alert/Auto policies try GitHub Direct first and fall back to Notehub DFU. All other policies use Notehub DFU.</p><h3>Quick Access</h3><div class="actions"><button type="button" class="secondary" id="pauseBodyBtn">Pause Server</button><a class="pill" href="/serial-monitor">Open Serial Monitor</a><a class="pill" href="/transmission-log">Transmission Log</a><a class="pill secondary" href="https://github.com/SenaxInc/SenaxTankAlarm/blob/master/Tutorials/Tutorials-112025/SERVER_INSTALLATION_GUIDE.md" target="_blank" title="View Server Installation Guide">Help</a></div></div></main><div id="toast"></div><div id="contactSelectModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2 id="contactSelectTitle">Add Recipient</h2><button class="modal-close" onclick="closeContactSelectModal()">&times;</button></div><form id="contactSelectForm"><div class="form-grid"><div class="form-field"><label>Select Contact</label><select id="contactSelectDropdown" required><option value="">Choose a contact...</option></select></div></div><div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px;"><button type="button" class="btn btn-secondary" onclick="closeContactSelectModal()">Cancel</button><button type="submit" class="btn btn-primary">Add</button></div></form></div></div><div id="pinModal" class="modal hidden"><div class="modal-card"><div class="modal-badge" id="pinSessionBadge">Session</div><h2 id="pinModalTitle">Set Admin PIN</h2><p id="pinModalDescription">Enter a 4-digit PIN to unlock configuration changes.</p><form id="pinForm"><label class="field hidden" id="pinCurrentGroup"><span>Current PIN</span><input type="password" id="pinCurrentInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><label class="field" id="pinPrimaryGroup"><span id="pinPrimaryLabel">PIN</span><input type="password" id="pinInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off" required placeholder="4 digits" aria-describedby="pinHint" title="Enter exactly four digits (0-9)"><small class="pin-hint" id="pinHint">Use exactly 4 digits (0-9). The PIN is kept locally in this browser for 90 days.</small></label><label class="field hidden" id="pinConfirmGroup"><span>Confirm PIN</span><input type="password" id="pinConfirmInput" inputmode="numeric" pattern="\d*" maxlength="4" autocomplete="off"></label><div class="actions"><button type="submit" id="pinSubmit">Save PIN</button><button type="button" class="secondary" id="pinCancel">Cancel</button></div></form></div></div><script>document.addEventListener('DOMContentLoaded', async () => {try{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);const state={pin:null,pinConfigured:false,pendingAction:null,contacts:[],smsAlertRecipients:[],dailyReportRecipients:[],contactSelectMode:null};
 const getEl=(id)=>document.getElementById(id);const els={pauseBtn:getEl('pauseBtn'),pauseBodyBtn:getEl('pauseBodyBtn'),toast:getEl('toast'),form:getEl('settingsForm'),productUid:getEl('productUidInput'),githubRouteAlias:getEl('githubRouteAliasInput'),serverDownSmsToggle:getEl('serverDownSmsToggle'),dailyEmailTime:getEl('dailyEmailTimeInput'),ftpEnabled:getEl('ftpEnabled'),ftpPassive:getEl('ftpPassive'),ftpsEnabled:getEl('ftpsEnabled'),ftpsTrustMode:getEl('ftpsTrustMode'),ftpsFingerprint:getEl('ftpsFingerprint'),ftpsTlsServerName:getEl('ftpsTlsServerName'),ftpBackupOnChange:getEl('ftpBackupOnChange'),ftpRestoreOnBoot:getEl('ftpRestoreOnBoot'),ftpHost:getEl('ftpHost'),ftpPort:getEl('ftpPort'),ftpUser:getEl('ftpUser'),ftpPass:getEl('ftpPass'),ftpPath:getEl('ftpPath'),ftpBackupNow:getEl('ftpBackupNow'),ftpRestoreNow:getEl('ftpRestoreNow'),ftpTestNow:getEl('ftpTestNow'),ftpTestStatus:getEl('ftpTestStatus'),ftpsDiscoverFingerprintBtn:getEl('ftpsDiscoverFingerprintBtn'),changePinBtn:getEl('changePinBtn'),pinStatus:getEl('pinStatus'),pinBadge:getEl('pinBadge'),smsRecipientsList:getEl('smsRecipientsList'),dailyRecipientsList:getEl('dailyRecipientsList'),addSmsRecipientBtn:getEl('addSmsRecipientBtn'),dailyRecipientDropdown:getEl('dailyRecipientDropdown'),addSelectedDailyRecipient:getEl('addSelectedDailyRecipient'),contactSelectModal:getEl('contactSelectModal'),contactSelectTitle:getEl('contactSelectTitle'),contactSelectDropdown:getEl('contactSelectDropdown'),contactSelectForm:getEl('contactSelectForm'),viewerEnabled:getEl('viewerEnabled'),updatePolicy:getEl('updatePolicy'),checkClientVersionAlerts:getEl('checkClientVersionAlerts'),checkViewerVersionAlerts:getEl('checkViewerVersionAlerts')};if(els.pauseBtn)els.pauseBtn.addEventListener('click',togglePause);if(els.pauseBodyBtn)els.pauseBodyBtn.addEventListener('click',togglePause);const pinEls={modal:getEl('pinModal'),title:getEl('pinModalTitle'),desc:getEl('pinModalDescription'),form:getEl('pinForm'),currentGroup:getEl('pinCurrentGroup'),currentInput:getEl('pinCurrentInput'),primaryGroup:getEl('pinPrimaryGroup'),primaryLabel:getEl('pinPrimaryLabel'),input:getEl('pinInput'),confirmGroup:getEl('pinConfirmGroup'),confirmInput:getEl('pinConfirmInput'),submit:getEl('pinSubmit'),cancel:getEl('pinCancel'),badge:getEl('pinSessionBadge')};)HTML"
 R"HTML(let pinMode='unlock';state.paused=false;funct)HTML" R"HTML(ion showToast(message, isError){if(els.toast)els.toast.textContent=message;if(els.toast)els.toast.style.background=isError?'#dc2626':'#0284c7';if(els.toast)els.toast.classList.add('show');setTimeout(()=>{if(els.toast)els.toast.classList.remove('show')},2500);})HTML"
 R"HTML(funct)HTML" R"HTML(ion escapeHtml(text){const div=document.createElement('div');div.textContent=text;return div.innerHTML;})HTML"
@@ -1771,7 +1772,7 @@ funct)HTML" R"HTML(ion renderDailyRecipients(){const container=els.dailyRecipien
 funct)HTML" R"HTML(ion removeSmsRecipient(recipientId){state.smsAlertRecipients=state.smsAlertRecipients.filter(r=>r!==recipientId);renderSmsRecipients();saveContactsData();}
 funct)HTML" R"HTML(ion removeDailyRecipient(recipientId){state.dailyReportRecipients=state.dailyReportRecipients.filter(r=>r!==recipientId);renderDailyRecipients();saveContactsData();}
 funct)HTML" R"HTML(ion openContactSelectModal(mode){state.contactSelectMode=mode;const dropdown=mode==='sms'?els.contactSelectDropdown:els.dailyRecipientDropdown;dropdown.innerHTML='<option value="">Choose a contact...</option>';const existingRecipients=mode==='sms'?state.smsAlertRecipients:state.dailyReportRecipients;const filterField=mode==='sms'?'phone':'email';state.contacts.forEach(contact=>{if(contact[filterField]&&!existingRecipients.includes(contact.id)){const option=document.createElement('option');option.value=contact.id;option.textContent=`${contact.name} (${contact[filterField]})`;dropdown.appendChild(option);}});if(mode==='sms'){if(dropdown.options.length===1){showToast('No contacts with phone numbers available',true);return;}els.contactSelectTitle.textContent='Add SMS Recipient';els.contactSelectModal.classList.remove('hidden');}else{const dailyControls=getEl('dailyRecipientControls');const addNewLink=getEl('addNewContactLink');if(dropdown.options.length===1){if(dailyControls)dailyControls.style.display='none';if(addNewLink)addNewLink.style.display='inline-block';}else{if(dailyControls)dailyControls.style.display='flex';if(addNewLink)addNewLink.style.display='none';}}}
-window.closeContactSelectModal=funct)HTML" R"HTML(ion(){els.contactSelectModal.classList.add('hidden');state.contactSelectMode=null;};els.contactSelectForm.addEventListener('submit',(e)=>{e.preventDefault();const contactId=els.contactSelectDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(state.contactSelectMode==='sms'){if(!state.smsAlertRecipients.includes(contactId)){state.smsAlertRecipients.push(contactId);renderSmsRecipients();saveContactsData();}}closeContactSelectModal();});els.addSmsRecipientBtn.addEventListener('click',()=>openContactSelectModal('sms'));const _tsb=document.getElementById('testSmsBtn');if(_tsb){_tsb.addEventListener('click',async()=>{_tsb.disabled=true;try{const r=await fetch('/api/sms/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(r.ok&&d.success){showToast('Test SMS queued to '+d.recipients+' recipient(s)');}else{showToast(d.message||'Test SMS failed',true);}}catch(e){showToast('Test SMS failed: '+e.message,true);}finally{_tsb.disabled=false;}});}if(els.addSelectedDailyRecipient){els.addSelectedDailyRecipient.addEventListener('click',()=>{const contactId=els.dailyRecipientDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(!state.dailyReportRecipients.includes(contactId)){state.dailyReportRecipients.push(contactId);renderDailyRecipients();openContactSelectModal('daily');saveContactsData();}});}loadSettings().then(()=>openContactSelectModal('daily'));)HTML"
+window.closeContactSelectModal=funct)HTML" R"HTML(ion(){els.contactSelectModal.classList.add('hidden');state.contactSelectMode=null;};els.contactSelectForm.addEventListener('submit',(e)=>{e.preventDefault();const contactId=els.contactSelectDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(state.contactSelectMode==='sms'){if(!state.smsAlertRecipients.includes(contactId)){state.smsAlertRecipients.push(contactId);renderSmsRecipients();saveContactsData();}}closeContactSelectModal();});els.addSmsRecipientBtn.addEventListener('click',()=>openContactSelectModal('sms'));const _tsb=document.getElementById('testSmsBtn');if(_tsb){_tsb.addEventListener('click',async()=>{_tsb.disabled=true;try{const r=await fetch('/api/sms/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(r.ok&&d.success){showToast('Test SMS queued to '+d.recipients+' recipient(s)');}else{showToast(d.message||'Test SMS failed',true);}}catch(e){showToast('Test SMS failed: '+e.message,true);}finally{_tsb.disabled=false;}});}const _teb=document.getElementById('testEmailBtn');if(_teb){_teb.addEventListener('click',async()=>{_teb.disabled=true;try{const r=await fetch('/api/email/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(r.ok&&d.success){showToast('Test email queued to '+d.recipients+' recipient(s)');}else{showToast(d.message||'Test email failed',true);}}catch(e){showToast('Test email failed: '+e.message,true);}finally{_teb.disabled=false;}});}if(els.addSelectedDailyRecipient){els.addSelectedDailyRecipient.addEventListener('click',()=>{const contactId=els.dailyRecipientDropdown.value;if(!contactId){showToast('Please select a contact',true);return;}if(!state.dailyReportRecipients.includes(contactId)){state.dailyReportRecipients.push(contactId);renderDailyRecipients();openContactSelectModal('daily');saveContactsData();}});}loadSettings().then(()=>openContactSelectModal('daily'));)HTML"
 R"HTML(async funct)HTML" R"HTML(ion loadContactsData(){try{const res=await fetch('/api/contacts');if(!res.ok)throw new Error('Failed to load contacts');const data=await res.json();state.contacts=data.contacts||[];state.smsAlertRecipients=data.smsAlertRecipients||[];state.dailyReportRecipients=data.dailyReportRecipients||[];renderSmsRecipients();renderDailyRecipients();}catch(err){console.error('Failed to load contacts:',err);}}
 async funct)HTML" R"HTML(ion saveContactsData(){try{const res=await fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:state.contacts,smsAlertRecipients:state.smsAlertRecipients,dailyReportRecipients:state.dailyReportRecipients})});if(!res.ok)throw new Error('Failed to save contacts');showToast('Recipients updated');}catch(err){showToast('Failed to save: '+err.message,true);}}
 async funct)HTML" R"HTML(ion loadSettings(){if(els.pinStatus){els.pinStatus.textContent='Loading...';els.pinStatus.style.color='var(--muted)';}try{const res=await fetch('/api/clients?summary=1');if(!res.ok)throw new Error('Server returned '+res.status);const data=await res.json();const s=(data&&data.srv)||{};const hour=typeof s.dh==='number'?s.dh:5;const minute=typeof s.dm==='number'?s.dm:0;const timeStr=String(hour).padStart(2,'0')+':'+String(minute).padStart(2,'0');state.pinConfigured=!!s.pc;state.paused=!!s.ps;updatePinButton();renderPauseButtons();if(els.productUid)els.productUid.value=s.pu||'';if(els.githubRouteAlias)els.githubRouteAlias.value=s.gra||'';if(els.serverDownSmsToggle)els.serverDownSmsToggle.checked=s.sds!==false;if(els.dailyEmailTime)els.dailyEmailTime.value=timeStr;const ftp=s.ftp||{};if(els.ftpEnabled)els.ftpEnabled.checked=!!ftp.enabled;if(els.ftpPassive)els.ftpPassive.checked=ftp.passive!==false;if(els.ftpsEnabled)els.ftpsEnabled.checked=!!ftp.ftpsEnabled;if(els.ftpsTrustMode)els.ftpsTrustMode.value=String(typeof ftp.ftpsTrustMode==='number'?ftp.ftpsTrustMode:0);if(els.ftpsFingerprint)els.ftpsFingerprint.value=ftp.ftpsFingerprint||'';if(els.ftpsTlsServerName)els.ftpsTlsServerName.value=ftp.ftpsTlsServerName||'';if(els.ftpBackupOnChange)els.ftpBackupOnChange.checked=!!ftp.backupOnChange;if(els.ftpRestoreOnBoot)els.ftpRestoreOnBoot.checked=!!ftp.restoreOnBoot;if(els.ftpHost)els.ftpHost.value=ftp.host||'';if(els.ftpPort)els.ftpPort.value=ftp.port||21;if(els.ftpUser)els.ftpUser.value=ftp.user||'';if(els.ftpPath)els.ftpPath.value=ftp.path||'/tankalarm/server';if(els.ftpPass)els.ftpPass.value='';if(els.viewerEnabled)els.viewerEnabled.checked=!!s.ve;if(els.updatePolicy)els.updatePolicy.value=String(typeof s.up==='number'?s.up:0);if(els.checkClientVersionAlerts)els.checkClientVersionAlerts.checked=s.ccva!==false;if(els.checkViewerVersionAlerts)els.checkViewerVersionAlerts.checked=s.cvva!==false;await loadContactsData();}catch(err){showToast(err.message||'Failed to load settings',true);if(els.pinStatus){els.pinStatus.textContent='Failed to load';els.pinStatus.style.color='#ef4444';}}})HTML"
@@ -2166,13 +2167,13 @@ static const char CONTACTS_MANAGER_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html 
 const pause_state={paused:false};if(pause_els.btn)pause_els.btn.addEventListener('click',togglePauseFlow);if(pause_els.btn)pause_els.btn.addEventListener('mouseenter',()=>{if(pause_state.paused)pause_els.btn.textContent='Resume';});if(pause_els.btn)pause_els.btn.addEventListener('mouseleave',()=>{renderPauseBtn();});await fetch('/api/clients?summary=1').then(r=>r.json()).then(d=>{if(d&&d.srv){pause_state.paused=!!d.srv.ps;renderPauseBtn();}}).catch(e=>console.error('Failed to load pause state',e));
 funct)HTML" R"HTML(ion showPauseToast(message,isError){if(!pause_els.toast)return;const t=pause_els.toast;t.textContent=message;t.style.background=isError?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}
 funct)HTML" R"HTML(ion renderPauseBtn(){const btn=pause_els.btn;if(!btn)return;if(pause_state.paused){btn.classList.add('paused');btn.style.display='';btn.textContent='Unpause';btn.title='Resume data flow';}else{btn.classList.remove('paused');btn.style.display='none';}}
-async funct)HTML" R"HTML(ion togglePauseFlow(){const targetPaused=!pause_state.paused;try{const res=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:targetPaused})});if(!res.ok){const text=await res.text();throw new Error(text||'Pause toggle failed');}const data=await res.json();pause_state.paused=!!data.paused;renderPauseBtn();showPauseToast(pause_state.paused?'Paused for maintenance':'Resumed');}catch(err){showPauseToast(err.message||'Pause toggle failed',true);}}let contacts = [];let dailyReportRecipients = [];let sites = [];let alarms = [];let editingContactId = null;funct)HTML" R"HTML(ion showToast(message){const toast = document.getElementById('toast');toast.textContent = message;toast.classList.add('show');setTimeout(()=>{toast.classList.remove('show');},3000);}
-funct)HTML" R"HTML(ion loadData(){fetch('/api/contacts').then(response => response.json()).then(data =>{contacts = data.contacts || [];dailyReportRecipients = data.dailyReportRecipients || [];sites = data.sites || [];alarms = data.alarms || [];renderContacts();renderDailyReportRecipients();updateFilters();}).catch(err =>{console.error('Failed to load contacts:',err);showToast('Failed to load contacts data:' +(err && err.message ? err.message:err)+ '. Please check your network connection and try again.');});}
-funct)HTML" R"HTML(ion saveData(){fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:contacts,dailyReportRecipients:dailyReportRecipients})}).then(response => response.json()).then(data =>{if(data.success){showToast('Changes saved successfully');loadData();}else{showToast('Failed to save changes:' +(data.error || 'Unknown error'));}}).catch(err =>{console.error('Failed to save contacts:',err);showToast('Failed to save changes:' +(err && err.message ? err.message:err));});}document.getElementById('viewFilter').addEventListener('change',(e)=>{const view = e.target.value;document.getElementById('siteFilterGroup').style.display = view === 'site' ? 'block':'none';document.getElementById('alarmFilterGroup').style.display = view === 'alarm' ? 'block':'none';renderContacts();});document.getElementById('siteSelect').addEventListener('change',()=> renderContacts());document.getElementById('alarmSelect').addEventListener('change',()=> renderContacts());
+async funct)HTML" R"HTML(ion togglePauseFlow(){const targetPaused=!pause_state.paused;try{const res=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:targetPaused})});if(!res.ok){const text=await res.text();throw new Error(text||'Pause toggle failed');}const data=await res.json();pause_state.paused=!!data.paused;renderPauseBtn();showPauseToast(pause_state.paused?'Paused for maintenance':'Resumed');}catch(err){showPauseToast(err.message||'Pause toggle failed',true);}}let contacts = [];let dailyReportRecipients = [];let smsAlertRecipients = [];let emailAlertRecipients = [];let sites = [];let alarms = [];let editingContactId = null;funct)HTML" R"HTML(ion showToast(message){const toast = document.getElementById('toast');toast.textContent = message;toast.classList.add('show');setTimeout(()=>{toast.classList.remove('show');},3000);}
+funct)HTML" R"HTML(ion loadData(){fetch('/api/contacts').then(response => response.json()).then(data =>{contacts = data.contacts || [];dailyReportRecipients = data.dailyReportRecipients || [];smsAlertRecipients = data.smsAlertRecipients || [];emailAlertRecipients = data.emailAlertRecipients || [];sites = data.sites || [];alarms = data.alarms || [];renderContacts();renderDailyReportRecipients();updateFilters();}).catch(err =>{console.error('Failed to load contacts:',err);showToast('Failed to load contacts data:' +(err && err.message ? err.message:err)+ '. Please check your network connection and try again.');});}
+funct)HTML" R"HTML(ion saveData(){fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:contacts,dailyReportRecipients:dailyReportRecipients,smsAlertRecipients:smsAlertRecipients,emailAlertRecipients:emailAlertRecipients})}).then(response => response.json()).then(data =>{if(data.success){showToast('Changes saved successfully');loadData();}else{showToast('Failed to save changes:' +(data.error || 'Unknown error'));}}).catch(err =>{console.error('Failed to save contacts:',err);showToast('Failed to save changes:' +(err && err.message ? err.message:err));});}document.getElementById('viewFilter').addEventListener('change',(e)=>{const view = e.target.value;document.getElementById('siteFilterGroup').style.display = view === 'site' ? 'block':'none';document.getElementById('alarmFilterGroup').style.display = view === 'alarm' ? 'block':'none';renderContacts();});document.getElementById('siteSelect').addEventListener('change',()=> renderContacts());document.getElementById('alarmSelect').addEventListener('change',()=> renderContacts());
 funct)HTML" R"HTML(ion updateFilters(){const siteSelect = document.getElementById('siteSelect');const alarmSelect = document.getElementById('alarmSelect');siteSelect.innerHTML = '<option value="">All Sites</option>';sites.forEach(site =>{const option = document.createElement('option');option.value = site;option.textContent = site;siteSelect.appendChild(option);});alarmSelect.innerHTML = '<option value="">All Alarms</option>';alarms.forEach(alarm =>{const option = document.createElement('option');option.value = alarm.id;option.textContent = `${alarm.site}- ${alarm.label}(${alarm.type})`;alarmSelect.appendChild(option);});}
-funct)HTML" R"HTML(ion renderContacts(){const container = document.getElementById('contactsList');const viewFilter = document.getElementById('viewFilter').value;const siteFilter = document.getElementById('siteSelect').value;const alarmFilter = document.getElementById('alarmSelect').value;let filteredContacts = contacts;if(viewFilter === 'site' && siteFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.some(a =>{const alarm = alarms.find(al => al.id === a);return alarm && alarm.site === siteFilter;}));}else if(viewFilter === 'alarm' && alarmFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.includes(alarmFilter));}if(filteredContacts.length === 0){container.innerHTML = '<div class="empty-state">No contacts match the current filter.</div>';return;}container.innerHTML = filteredContacts.map(contact =>{const associatedAlarms =(contact.alarmAssociations || []).map(alarmId => alarms.find(a => a.id === alarmId)).filter(a => a);const groupedBySite ={};associatedAlarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});return ` <div class="contact-card"><div class="contact-header"><div class="contact-info"><div class="contact-name">${escapeHtml(contact.name)}${contact.cat==='viewer'?' <span style="font-size:0.65rem;background:var(--chip);padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">VIEWER</span>':''}</div><div class="contact-details"> ${contact.phone ? `<div>Phone: ${escapeHtml(contact.phone)}</div>`:''}${contact.email ? `<div>Email: ${escapeHtml(contact.email)}</div>`:''}</div></div><div class="contact-actions"><button class="btn btn-small btn-secondary" data-contact-id="${escapeHtml(contact.id)}" data-action="edit">Edit</button><button class="btn btn-small btn-danger" data-contact-id="${escapeHtml(contact.id)}" data-action="delete">Delete</button></div></div> ${associatedAlarms.length > 0 ? ` <div class="associations"> ${Object.keys(groupedBySite).map(site => ` <div class="association-section"><h4>${escapeHtml(site)}</h4><div class="association-list"> ${groupedBySite[site)HTML" R"HTML(].map(alarm => ` <div class="association-tag"> ${escapeHtml(alarm.label)}(${escapeHtml(alarm.type)})<button class="remove-tag" data-contact-id="${escapeHtml(contact.id)}" data-alarm-id="${escapeHtml(alarm.id)}">&times;</button></div> `).join('')}</div></div> `).join('')}</div> `:''}</div> `;}).join('');container.querySelectorAll('[data-action="edit"]').forEach(btn =>{btn.addEventListener('click',()=> editContact(btn.dataset.contactId));});container.querySelectorAll('[data-action="delete"]').forEach(btn =>{btn.addEventListener('click',()=> deleteContact(btn.dataset.contactId));});container.querySelectorAll('.remove-tag').forEach(btn =>{btn.addEventListener('click',funct)HTML" R"HTML(ion(){removeAlarmAssociation(this.dataset.contactId,this.dataset.alarmId);});});}
+funct)HTML" R"HTML(ion renderContacts(){const container = document.getElementById('contactsList');const viewFilter = document.getElementById('viewFilter').value;const siteFilter = document.getElementById('siteSelect').value;const alarmFilter = document.getElementById('alarmSelect').value;let filteredContacts = contacts;if(viewFilter === 'site' && siteFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.some(a =>{const alarm = alarms.find(al => al.id === a);return alarm && alarm.site === siteFilter;}));}else if(viewFilter === 'alarm' && alarmFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.includes(alarmFilter));}if(filteredContacts.length === 0){container.innerHTML = '<div class="empty-state">No contacts match the current filter.</div>';return;}container.innerHTML = filteredContacts.map(contact =>{const associatedAlarms =(contact.alarmAssociations || []).map(alarmId => alarms.find(a => a.id === alarmId)).filter(a => a);const groupedBySite ={};associatedAlarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});return ` <div class="contact-card"><div class="contact-header"><div class="contact-info"><div class="contact-name">${escapeHtml(contact.name)}${contact.cat==='viewer'?' <span style="font-size:0.65rem;background:var(--chip);padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">VIEWER</span>':''}</div><div class="contact-details"> ${contact.phone ? `<div>Phone: ${escapeHtml(contact.phone)}</div>`:''}${contact.email ? `<div>Email: ${escapeHtml(contact.email)}</div>`:''}</div><div class="contact-channels" style="margin-top:6px;display:flex;gap:16px;font-size:0.85rem;"><label style="display:flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" class="chan-sms" data-contact-id="${escapeHtml(contact.id)}"${smsAlertRecipients.includes(contact.id)?' checked':''}${contact.phone?'':' disabled'}>SMS alerts</label><label style="display:flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" class="chan-email" data-contact-id="${escapeHtml(contact.id)}"${emailAlertRecipients.includes(contact.id)?' checked':''}${contact.email?'':' disabled'}>Email alerts</label></div></div><div class="contact-actions"><button class="btn btn-small btn-secondary" data-contact-id="${escapeHtml(contact.id)}" data-action="edit">Edit</button><button class="btn btn-small btn-danger" data-contact-id="${escapeHtml(contact.id)}" data-action="delete">Delete</button></div></div> ${associatedAlarms.length > 0 ? ` <div class="associations"> ${Object.keys(groupedBySite).map(site => ` <div class="association-section"><h4>${escapeHtml(site)}</h4><div class="association-list"> ${groupedBySite[site)HTML" R"HTML(].map(alarm => ` <div class="association-tag"> ${escapeHtml(alarm.label)}(${escapeHtml(alarm.type)})<button class="remove-tag" data-contact-id="${escapeHtml(contact.id)}" data-alarm-id="${escapeHtml(alarm.id)}">&times;</button></div> `).join('')}</div></div> `).join('')}</div> `:''}</div> `;}).join('');container.querySelectorAll('[data-action="edit"]').forEach(btn =>{btn.addEventListener('click',()=> editContact(btn.dataset.contactId));});container.querySelectorAll('[data-action="delete"]').forEach(btn =>{btn.addEventListener('click',()=> deleteContact(btn.dataset.contactId));});container.querySelectorAll('.chan-sms').forEach(cb =>{cb.addEventListener('change',()=>{const id=cb.dataset.contactId;if(cb.checked){if(!smsAlertRecipients.includes(id))smsAlertRecipients.push(id);}else{smsAlertRecipients=smsAlertRecipients.filter(r=>r!==id);}saveData();});});container.querySelectorAll('.chan-email').forEach(cb =>{cb.addEventListener('change',()=>{const id=cb.dataset.contactId;if(cb.checked){if(!emailAlertRecipients.includes(id))emailAlertRecipients.push(id);}else{emailAlertRecipients=emailAlertRecipients.filter(r=>r!==id);}saveData();});});container.querySelectorAll('.remove-tag').forEach(btn =>{btn.addEventListener('click',funct)HTML" R"HTML(ion(){removeAlarmAssociation(this.dataset.contactId,this.dataset.alarmId);});});}
 funct)HTML" R"HTML(ion renderDailyReportRecipients(){const container = document.getElementById('dailyReportList');if(dailyReportRecipients.length === 0){container.innerHTML = '<div class="empty-state">No daily report recipients configured.</div>';return;}container.innerHTML = dailyReportRecipients.map(recipientId =>{const contact = contacts.find(c => c.id === recipientId);if(!contact)return '';return ` <div class="daily-report-item"><div><strong>${escapeHtml(contact.name)}</strong> ${contact.email ? ` - ${escapeHtml(contact.email)}`:''}</div><button class="btn btn-small btn-danger" data-recipient-id="${escapeHtml(recipientId)}" data-action="remove-recipient">Remove</button></div> `;}).filter(Boolean).join('');container.querySelectorAll('[data-action="remove-recipient"]').forEach(btn =>{btn.addEventListener('click',()=> removeDailyReportRecipient(btn.dataset.recipientId));});}
-window.openAddContactModal = funct)HTML" R"HTML(ion(){editingContactId = null;document.getElementById('modalTitle').textContent = 'Add Contact';document.getElementById('contactName').value = '';document.getElementById('contactPhone').value = '';document.getElementById('contactEmail').value = '';renderAlarmAssociations([]);document.getElementById('contactModal').classList.remove('hidden');};window.editContact = funct)HTML" R"HTML(ion(contactId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;editingContactId = contactId;document.getElementById('modalTitle').textContent = 'Edit Contact';document.getElementById('contactName').value = contact.name;document.getElementById('contactPhone').value = contact.phone || '';document.getElementById('contactEmail').value = contact.email || '';renderAlarmAssociations(contact.alarmAssociations || []);document.getElementById('contactModal').classList.remove('hidden');};window.closeContactModal = funct)HTML" R"HTML(ion(){document.getElementById('contactModal').classList.add('hidden');};funct)HTML" R"HTML(ion renderAlarmAssociations(selectedAlarms){const container = document.getElementById('alarmAssociations');if(alarms.length === 0){container.innerHTML = '<p style="color:var(--muted);font-style:italic;">No alarms configured in the system.</p>';return;}const groupedBySite ={};alarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});container.innerHTML = Object.keys(groupedBySite).map(site => ` <div style="grid-column:1 / -1;"><strong style="display:block;margin-bottom:8px;">${escapeHtml(site)}</strong> ${groupedBySite[site].map((alarm,idx)=>{const checkboxId = 'alarm_' + escapeHtml(alarm.id)+ '_' + idx;return ` <label for="${checkboxId}" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" id="${checkboxId}" name="alarmAssoc" value="${escapeHtml(alarm.id)}" ${selectedAlarms.includes(alarm.id)? 'checked':''}><span>${escapeHtml(alarm.label)}(${escapeHtml(alarm.ty)HTML" R"HTML(pe)})</span></label> `;}).join('')}</div> `).join('');}document.getElementById('contactForm').addEventListener('submit',(e)=>{e.preventDefault();const name = document.getElementById('contactName').value.trim();const phone = document.getElementById('contactPhone').value.trim();const email = document.getElementById('contactEmail').value.trim();if(!name){showToast('Contact name is required');return;}if(!phone && !email){showToast('Either phone or email is required');return;}const alarmAssociations = Array.from(document.querySelectorAll('input[name="alarmAssoc"]:checked')).map(cb => cb.value);if(editingContactId){const contact = contacts.find(c => c.id === editingContactId);if(contact){contact.name = name;contact.phone = phone;contact.email = email;contact.alarmAssociations = alarmAssociations;}}else{const newContact ={id:'contact_' + Date.now()+ '_' + Math.random().toString(36).substr(2,9),name:name,phone:phone,email:email,alarmAssociations:alarmAssociations};contacts.push(newContact);}saveData();closeContactModal();});window.deleteContact = funct)HTML" R"HTML(ion(contactId){if(!confirm('Are you sure you want to delete this contact?'))return;contacts = contacts.filter(c => c.id !== contactId);dailyReportRecipients = dailyReportRecipients.filter(r => r !== contactId);saveData();};window.removeAlarmAssociation = funct)HTML" R"HTML(ion(contactId,alarmId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;contact.alarmAssociations =(contact.alarmAssociations || []).filter(a => a !== alarmId);saveData();};window.openAddDailyReportModal = funct)HTML" R"HTML(ion(){const select = document.getElementById('dailyReportContactSelect');select.innerHTML = '<option value="">Choose a contact...</option>';contacts.forEach(contact =>{if(contact.email && !dailyReportRecipients.includes(contact.id)){const option = document.createElement('option');option.value = contact.id;option.textContent = `${contact.name}(${contact.email})`;select.appendChild(option);}});if(select.options.length === 1){showToast('No con)HTML" R"HTML(tacts with email addresses available');return;}document.getElementById('dailyReportModal').classList.remove('hidden');};window.closeDailyReportModal = funct)HTML" R"HTML(ion(){document.getElementById('dailyReportModal').classList.add('hidden');};document.getElementById('dailyReportForm').addEventListener('submit',(e)=>{e.preventDefault();const contactId = document.getElementById('dailyReportContactSelect').value;if(!contactId){showToast('Please select a contact');return;}if(!dailyReportRecipients.includes(contactId)){dailyReportRecipients.push(contactId);saveData();loadData();}closeDailyReportModal();});window.removeDailyReportRecipient = funct)HTML" R"HTML(ion(recipientId){dailyReportRecipients = dailyReportRecipients.filter(r => r !== recipientId);saveData();};funct)HTML" R"HTML(ion escapeHtml(text){const div = document.createElement('div');div.textContent = text;return div.innerHTML;}loadData();})();
+window.openAddContactModal = funct)HTML" R"HTML(ion(){editingContactId = null;document.getElementById('modalTitle').textContent = 'Add Contact';document.getElementById('contactName').value = '';document.getElementById('contactPhone').value = '';document.getElementById('contactEmail').value = '';renderAlarmAssociations([]);document.getElementById('contactModal').classList.remove('hidden');};window.editContact = funct)HTML" R"HTML(ion(contactId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;editingContactId = contactId;document.getElementById('modalTitle').textContent = 'Edit Contact';document.getElementById('contactName').value = contact.name;document.getElementById('contactPhone').value = contact.phone || '';document.getElementById('contactEmail').value = contact.email || '';renderAlarmAssociations(contact.alarmAssociations || []);document.getElementById('contactModal').classList.remove('hidden');};window.closeContactModal = funct)HTML" R"HTML(ion(){document.getElementById('contactModal').classList.add('hidden');};funct)HTML" R"HTML(ion renderAlarmAssociations(selectedAlarms){const container = document.getElementById('alarmAssociations');if(alarms.length === 0){container.innerHTML = '<p style="color:var(--muted);font-style:italic;">No alarms configured in the system.</p>';return;}const groupedBySite ={};alarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});container.innerHTML = Object.keys(groupedBySite).map(site => ` <div style="grid-column:1 / -1;"><strong style="display:block;margin-bottom:8px;">${escapeHtml(site)}</strong> ${groupedBySite[site].map((alarm,idx)=>{const checkboxId = 'alarm_' + escapeHtml(alarm.id)+ '_' + idx;return ` <label for="${checkboxId}" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" id="${checkboxId}" name="alarmAssoc" value="${escapeHtml(alarm.id)}" ${selectedAlarms.includes(alarm.id)? 'checked':''}><span>${escapeHtml(alarm.label)}(${escapeHtml(alarm.ty)HTML" R"HTML(pe)})</span></label> `;}).join('')}</div> `).join('');}document.getElementById('contactForm').addEventListener('submit',(e)=>{e.preventDefault();const name = document.getElementById('contactName').value.trim();const phone = document.getElementById('contactPhone').value.trim();const email = document.getElementById('contactEmail').value.trim();if(!name){showToast('Contact name is required');return;}if(!phone && !email){showToast('Either phone or email is required');return;}const alarmAssociations = Array.from(document.querySelectorAll('input[name="alarmAssoc"]:checked')).map(cb => cb.value);if(editingContactId){const contact = contacts.find(c => c.id === editingContactId);if(contact){contact.name = name;contact.phone = phone;contact.email = email;contact.alarmAssociations = alarmAssociations;}}else{const newContact ={id:'contact_' + Date.now()+ '_' + Math.random().toString(36).substr(2,9),name:name,phone:phone,email:email,alarmAssociations:alarmAssociations};contacts.push(newContact);}saveData();closeContactModal();});window.deleteContact = funct)HTML" R"HTML(ion(contactId){if(!confirm('Are you sure you want to delete this contact?'))return;contacts = contacts.filter(c => c.id !== contactId);dailyReportRecipients = dailyReportRecipients.filter(r => r !== contactId);smsAlertRecipients = smsAlertRecipients.filter(r => r !== contactId);emailAlertRecipients = emailAlertRecipients.filter(r => r !== contactId);saveData();};window.removeAlarmAssociation = funct)HTML" R"HTML(ion(contactId,alarmId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;contact.alarmAssociations =(contact.alarmAssociations || []).filter(a => a !== alarmId);saveData();};window.openAddDailyReportModal = funct)HTML" R"HTML(ion(){const select = document.getElementById('dailyReportContactSelect');select.innerHTML = '<option value="">Choose a contact...</option>';contacts.forEach(contact =>{if(contact.email && !dailyReportRecipients.includes(contact.id)){const option = document.createElement('option');option.value = contact.id;option.textContent = `${contact.name}(${contact.email})`;select.appendChild(option);}});if(select.options.length === 1){showToast('No con)HTML" R"HTML(tacts with email addresses available');return;}document.getElementById('dailyReportModal').classList.remove('hidden');};window.closeDailyReportModal = funct)HTML" R"HTML(ion(){document.getElementById('dailyReportModal').classList.add('hidden');};document.getElementById('dailyReportForm').addEventListener('submit',(e)=>{e.preventDefault();const contactId = document.getElementById('dailyReportContactSelect').value;if(!contactId){showToast('Please select a contact');return;}if(!dailyReportRecipients.includes(contactId)){dailyReportRecipients.push(contactId);saveData();loadData();}closeDailyReportModal();});window.removeDailyReportRecipient = funct)HTML" R"HTML(ion(recipientId){dailyReportRecipients = dailyReportRecipients.filter(r => r !== recipientId);saveData();};funct)HTML" R"HTML(ion escapeHtml(text){const div = document.createElement('div');div.textContent = text;return div.innerHTML;}loadData();})();
 </script></body></html>)HTML";
 
 static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tank Alarm Server</title><link rel="stylesheet" href="/style.css"><style>
@@ -2403,8 +2404,10 @@ static void handleServerSettingsPost(EthernetClient &client, const String &body)
 static void handleContactsGet(EthernetClient &client);
 static void handleContactsPost(EthernetClient &client, const String &body);
 static void handleSmsTestPost(EthernetClient &client, const String &body);
+static void handleEmailTestPost(EthernetClient &client, const String &body);
 static void handleEmailFormatGet(EthernetClient &client);
 static void handleEmailFormatPost(EthernetClient &client, const String &body);
+static bool loadEmailFormat(JsonDocument &doc);
 static void handleDfuStatusGet(EthernetClient &client);
 static void handleDfuCheckPost(EthernetClient &client, const String &body);
 static void handleDfuEnablePost(EthernetClient &client, const String &body);
@@ -2438,6 +2441,7 @@ static void addClientSerialLog(const char *clientUid, const char *message, doubl
 static SerialRequestResult requestClientSerialLogs(const char *clientUid, String &errorMessage);
 static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex);
 static uint8_t sendSmsAlert(const char *message, const char *alarmId = nullptr);
+static uint8_t sendEmailAlert(const char *subject, const char *message, const char *alarmId = nullptr);
 static void checkAlarmReminders();
 static void sendDailyEmail();
 static void loadClientConfigSnapshots();
@@ -9367,6 +9371,12 @@ static void handleWebRequests() {
     } else {
       handleSmsTestPost(client, body);
     }
+  } else if (method == "POST" && path == "/api/email/test") {
+    if (contentLength > 256) {
+      respondStatus(client, 413, "Payload Too Large");
+    } else {
+      handleEmailTestPost(client, body);
+    }
   } else if (method == "POST" && path == "/api/email-format") {
     if (contentLength > 2048) {
       respondStatus(client, 413, "Payload Too Large");
@@ -12657,6 +12667,7 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
           snprintf(message, sizeof(message), "System alert: %s", type);
         }
         sendSmsAlert(message);
+        sendEmailAlert("TankAlarm Alert", message);  // per-contact email channel
         if (meta) {
           meta->lastSystemSmsEpoch = smsNow;
           gClientMetadataDirty = true;
@@ -12831,6 +12842,7 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     char alarmId[64];
     snprintf(alarmId, sizeof(alarmId), "%s_%d", clientUid, (int)rec->sensorIndex);
     sendSmsAlert(message, alarmId);
+    sendEmailAlert("TankAlarm Alert", message, alarmId);  // per-contact email channel
   }
 }
 
@@ -13322,6 +13334,12 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   if (wantsSms) {
     sendUnloadSms(entry);
   }
+
+  // EMAIL-3 fix (07082026): the unload note's email flag now actually sends an email
+  // alert to opted-in contacts (was parsed into metadata but never dispatched).
+  if (wantsEmail) {
+    sendUnloadEmail(entry);
+  }
   
   // Update sensor record with current level
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
@@ -13367,6 +13385,23 @@ static void sendUnloadSms(const UnloadLogEntry &entry) {
   sendSmsAlert(message, alarmId);
   Serial.print(F("Unload SMS sent: "));
   Serial.println(message);
+}
+
+// EMAIL-3 fix (07082026): honor the client's unload email request (`email:true` in the
+// unload note was parsed but never acted on). Mirrors sendUnloadSms via the email channel.
+static void sendUnloadEmail(const UnloadLogEntry &entry) {
+  char message[160];
+  float delivered = entry.peakInches - entry.emptyInches;
+  const char *u = entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "in";
+
+  snprintf(message, sizeof(message),
+           "%s #%d unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
+           entry.siteName, entry.sensorIndex, delivered, u,
+           entry.peakInches, entry.emptyInches);
+
+  char alarmId[64];
+  snprintf(alarmId, sizeof(alarmId), "%s_%d", entry.clientUid, (int)entry.sensorIndex);
+  sendEmailAlert("TankAlarm Unload Report", message, alarmId);
 }
 
 static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex) {
@@ -13704,6 +13739,142 @@ static uint8_t sendSmsAlert(const char *message, const char *alarmId) {
   return queued;
 }
 
+// Email alert channel (07082026): per-contact opt-in via the emailAlertRecipients list
+// (the "Email alerts" checkbox on the /contacts page). Resolves recipient addresses with
+// the same alarmAssociations filtering as SMS, joins them into ONE email.qo note
+// {to, subject, message, type:"alarm"} (email supports multi-recipient natively), and the
+// Notehub Route #5 (General HTTP → email API) delivers. No legacy fallback: alarm emails
+// are strictly opt-in per contact — the legacy dailyEmail field remains daily-report-only.
+// Returns 1 when a note was queued, 0 otherwise.
+#ifndef MAX_EMAIL_ALERT_RECIPIENTS
+#define MAX_EMAIL_ALERT_RECIPIENTS 10  // cost/size guard per alert
+#endif
+
+static uint8_t sendEmailAlert(const char *subject, const char *message, const char *alarmId) {
+  if (!message || message[0] == '\0') {
+    return 0;
+  }
+
+  JsonDocument contactsDoc;
+  bool loaded = loadContactsConfig(contactsDoc);
+  if (!loaded || !contactsDoc["emailAlertRecipients"].is<JsonArray>()) {
+    return 0;  // nothing opted in
+  }
+
+  JsonArray recipients = contactsDoc["emailAlertRecipients"].as<JsonArray>();
+  JsonArray contacts = contactsDoc["contacts"].as<JsonArray>();
+  String emailList = "";
+  uint8_t emailCount = 0;
+
+  for (JsonVariant recipientId : recipients) {
+    const char *id = recipientId.as<const char *>();
+    if (!id) continue;
+    if (emailCount >= MAX_EMAIL_ALERT_RECIPIENTS) {
+      Serial.println(F("WARNING: email recipient cap reached - extra recipients skipped"));
+      break;
+    }
+    for (JsonVariant contactVar : contacts) {
+      JsonObject contact = contactVar.as<JsonObject>();
+      if (strcmp(contact["id"] | "", id) != 0) {
+        continue;
+      }
+      // Association filter (sensor-scoped alerts only) — same semantics as SMS.
+      if (alarmId && alarmId[0] != '\0' && contact["alarmAssociations"].is<JsonArray>()) {
+        JsonArray assoc = contact["alarmAssociations"].as<JsonArray>();
+        if (assoc.size() > 0) {
+          bool match = false;
+          for (JsonVariant a : assoc) {
+            if (strcmp(a | "", alarmId) == 0) { match = true; break; }
+          }
+          if (!match) {
+            break;  // contact opted into other alarms only — skip
+          }
+        }
+      }
+      const char *email = contact["email"] | "";
+      if (isRealEmailAddress(email)) {
+        // De-duplicate addresses shared by multiple contacts
+        String needle = String(",") + email + ",";
+        String haystack = String(",") + emailList + ",";
+        if (haystack.indexOf(needle) < 0) {
+          if (emailList.length() > 0) emailList += ",";
+          emailList += email;
+          emailCount++;
+        }
+      }
+      break;
+    }
+  }
+
+  if (emailList.length() == 0) {
+    return 0;
+  }
+
+  JsonDocument doc;
+  doc["to"] = emailList;
+  doc["subject"] = subject ? subject : "TankAlarm Alert";
+  doc["message"] = message;
+  doc["type"] = "alarm";  // lets the Route #5 template distinguish alarms from daily reports
+
+  static char buffer[1024];
+  size_t len = serializeJson(doc, buffer, sizeof(buffer));
+  if (len == 0 || len >= sizeof(buffer)) {
+    Serial.println(F("ERROR: email alert payload exceeds buffer - dropped"));
+    logTransmission("", "", "email", "error", "Alert payload too large");
+    return 0;
+  }
+  buffer[len] = '\0';
+
+  // One bounded retry, mirroring the SMS channel.
+  bool sent = false;
+  for (uint8_t attempt = 0; attempt < 2 && !sent; ++attempt) {
+    dfuKickWatchdog();
+    if (attempt > 0) {
+      delay(250);
+    }
+    J *req = notecard.newRequest("note.add");
+    if (!req) {
+      continue;
+    }
+    JAddStringToObject(req, "file", "email.qo");
+    JAddBoolToObject(req, "sync", true);
+    J *body = JParse(buffer);
+    if (!body) {
+      JDelete(req);
+      break;
+    }
+    stampSchemaVersion(body);
+    JAddItemToObject(req, "body", body);
+    J *rsp = notecard.requestAndResponse(req);
+    if (rsp) {
+      const char *err = JGetString(rsp, "err");
+      if (!err || err[0] == '\0') {
+        sent = true;
+      } else if (attempt == 1) {
+        Serial.print(F("WARNING: email alert note.add failed: "));
+        Serial.println(err);
+        logTransmission("", "", "email", "error", err);
+      }
+      notecard.deleteResponse(rsp);
+    } else if (attempt == 1) {
+      Serial.println(F("WARNING: email alert note.add returned no response"));
+      logTransmission("", "", "email", "error", "No response from Notecard");
+    }
+  }
+
+  if (sent) {
+    char detail[112];
+    snprintf(detail, sizeof(detail), "%u recipient(s): %.80s", (unsigned)emailCount, message);
+    logTransmission("", "", "email", "outbox", detail);
+    Serial.print(F("Email alert dispatched to "));
+    Serial.print(emailCount);
+    Serial.print(F(" recipient(s): "));
+    Serial.println(message);
+    return 1;
+  }
+  return 0;
+}
+
 // Re-notification engine (07062026): alarms are edge-triggered — one SMS per excursion —
 // so a missed text meant a tank could sit in alarm silently for days. While a sensor alarm
 // stays active, re-send its SMS every gConfig.smsReminderHours (default 6 h, 0 disables)
@@ -13749,6 +13920,7 @@ static void checkAlarmReminders() {
     char alarmId[64];
     snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
     sendSmsAlert(message, alarmId);
+    sendEmailAlert("TankAlarm Reminder", message, alarmId);  // per-contact email channel
 
     // Advance the anchor regardless of send outcome so an unconfigured/offline server
     // doesn't re-attempt on every sweep; the next reminder lands one interval from now.
@@ -13781,6 +13953,35 @@ static void handleSmsTestPost(EthernetClient &client, const String &body) {
   response["message"] = (queued > 0)
       ? "Test SMS queued"
       : "No SMS recipients configured (or Notecard unavailable)";
+  String out;
+  serializeJson(response, out);
+  respondJson(client, out);
+}
+
+// POST /api/email/test — queue a test email to every opted-in contact so the operator can
+// verify the email.qo → Notehub Route #5 → email provider path end-to-end.
+static void handleEmailTestPost(EthernetClient &client, const String &body) {
+  JsonDocument doc;
+  if (body.length() > 0 && deserializeJson(doc, body)) {
+    respondStatus(client, 400, F("Invalid JSON"));
+    return;
+  }
+  const char *pinValue = doc["pin"].as<const char *>();
+  if (!requireValidPin(client, pinValue)) {
+    return;
+  }
+
+  char message[120];
+  snprintf(message, sizeof(message), "TankAlarm test email from server %s (v%s)",
+           gConfig.serverName[0] ? gConfig.serverName : "?", FIRMWARE_VERSION);
+  uint8_t queued = sendEmailAlert("TankAlarm Test Email", message);
+
+  JsonDocument response;
+  response["success"] = (queued > 0);
+  response["recipients"] = queued;
+  response["message"] = (queued > 0)
+      ? "Test email queued"
+      : "No email alert recipients configured (or Notecard unavailable)";
   String out;
   serializeJson(response, out);
   respondJson(client, out);
@@ -13840,7 +14041,50 @@ static void sendDailyEmail() {
   // ArduinoJson v7: JsonDocument auto-sizes
   JsonDocument doc;
   doc["to"] = emailList;
-  doc["subject"] = "Daily Sensor Summary";
+
+  // EMAIL-1 fix (07082026): apply the /email-format settings — previously they were
+  // stored and served to the UI but NEVER used, so the whole format page was decorative.
+  // The subject template ({date} token supported) is applied here; the full format object
+  // rides along as "fmt" so the Notehub Route #5 template can honor the field/summary
+  // toggles when rendering the email body.
+  {
+    JsonDocument fmtDoc;
+    bool haveFmt = loadEmailFormat(fmtDoc);
+    char subject[96];
+    const char *subjTemplate = haveFmt ? (fmtDoc["emailSubject"] | "Daily Sensor Summary")
+                                       : "Daily Sensor Summary";
+    const char *tok = strstr(subjTemplate, "{date}");
+    if (tok) {
+      char dateStr[16];
+      time_t t = (time_t)now;
+      struct tm *tmv = gmtime(&t);
+      if (tmv) {
+        snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d",
+                 tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday);
+      } else {
+        strlcpy(dateStr, "", sizeof(dateStr));
+      }
+      size_t prefixLen = (size_t)(tok - subjTemplate);
+      if (prefixLen >= sizeof(subject)) prefixLen = sizeof(subject) - 1;
+      memcpy(subject, subjTemplate, prefixLen);
+      subject[prefixLen] = '\0';
+      strlcat(subject, dateStr, sizeof(subject));
+      strlcat(subject, tok + 6, sizeof(subject));  // skip "{date}"
+    } else {
+      strlcpy(subject, subjTemplate, sizeof(subject));
+    }
+    doc["subject"] = subject;  // char[] assignment copies into the document
+    if (haveFmt) {
+      const char *company = fmtDoc["companyName"] | "";
+      if (company[0] != '\0') {
+        doc["company"] = fmtDoc["companyName"];
+      }
+      if (fmtDoc["includeServerName"] | true) {
+        doc["serverName"] = gConfig.serverName;
+      }
+      doc["fmt"] = fmtDoc;  // deep copy: route templates can honor the toggles
+    }
+  }
   JsonArray sensors = doc["sensors"].to<JsonArray>();
   for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
     JsonObject obj = sensors.add<JsonObject>();
@@ -13901,6 +14145,7 @@ static void sendDailyEmail() {
   JAddItemToObject(req, "body", body);
 
   J *emailRsp = notecard.requestAndResponse(req);
+  bool emailSent = false;
   if (emailRsp) {
     const char *emailErr = JGetString(emailRsp, "err");
     if (emailErr && emailErr[0] != '\0') {
@@ -13908,14 +14153,43 @@ static void sendDailyEmail() {
       Serial.println(emailErr);
       logTransmission("", "", "email", "error", emailErr);
     } else {
-      gLastDailyEmailSentEpoch = now;
-      Serial.println(F("Daily email queued"));
-      logTransmission("", "", "email", "outbox", "Daily sensor summary email");
+      emailSent = true;
     }
     notecard.deleteResponse(emailRsp);
   } else {
     Serial.println(F("WARNING: Email note.add returned no response"));
     logTransmission("", "", "email", "error", "No response from Notecard");
+  }
+
+  // EMAIL-5 fix (07082026): one bounded retry — a transient Notecard hiccup previously
+  // lost that day's report entirely (the scheduler moves on to tomorrow regardless).
+  if (!emailSent) {
+    dfuKickWatchdog();
+    delay(250);
+    J *req2 = notecard.newRequest("note.add");
+    if (req2) {
+      JAddStringToObject(req2, "file", "email.qo");
+      JAddBoolToObject(req2, "sync", true);
+      J *body2 = JParse(buffer);
+      if (body2) {
+        stampSchemaVersion(body2);
+        JAddItemToObject(req2, "body", body2);
+        J *rsp2 = notecard.requestAndResponse(req2);
+        if (rsp2) {
+          const char *err2 = JGetString(rsp2, "err");
+          emailSent = !(err2 && err2[0] != '\0');
+          notecard.deleteResponse(rsp2);
+        }
+      } else {
+        JDelete(req2);
+      }
+    }
+  }
+
+  if (emailSent) {
+    gLastDailyEmailSentEpoch = now;
+    Serial.println(F("Daily email queued"));
+    logTransmission("", "", "email", "outbox", "Daily sensor summary email");
   }
 }
 
@@ -14048,9 +14322,11 @@ static void handleViewerContacts(JsonDocument &doc, double epoch) {
   loadContactsConfig(contactsDoc);
   if (!contactsDoc["contacts"].is<JsonArray>()) contactsDoc["contacts"].to<JsonArray>();
   if (!contactsDoc["smsAlertRecipients"].is<JsonArray>()) contactsDoc["smsAlertRecipients"].to<JsonArray>();
+  if (!contactsDoc["emailAlertRecipients"].is<JsonArray>()) contactsDoc["emailAlertRecipients"].to<JsonArray>();
   if (!contactsDoc["dailyReportRecipients"].is<JsonArray>()) contactsDoc["dailyReportRecipients"].to<JsonArray>();
   JsonArray contacts = contactsDoc["contacts"].as<JsonArray>();
   JsonArray smsRecipients = contactsDoc["smsAlertRecipients"].as<JsonArray>();
+  JsonArray emailRecipients = contactsDoc["emailAlertRecipients"].as<JsonArray>();
   JsonArray dailyRecipients = contactsDoc["dailyReportRecipients"].as<JsonArray>();
 
   // Full-subset replace: drop all existing viewer-category contacts, then adopt the list
@@ -14086,9 +14362,9 @@ static void handleViewerContacts(JsonDocument &doc, double epoch) {
   }
 
   // Prune recipient IDs that no longer reference an existing contact (removed viewer
-  // contacts leave both lists), mirroring handleContactsPost's CONTACT-1 hygiene.
-  const char *recipientKeys[2] = { "dailyReportRecipients", "smsAlertRecipients" };
-  for (uint8_t a = 0; a < 2; ++a) {
+  // contacts leave all lists), mirroring handleContactsPost's CONTACT-1 hygiene.
+  const char *recipientKeys[3] = { "dailyReportRecipients", "smsAlertRecipients", "emailAlertRecipients" };
+  for (uint8_t a = 0; a < 3; ++a) {
     JsonArray list = contactsDoc[recipientKeys[a]].as<JsonArray>();
     for (size_t i = list.size(); i > 0; --i) {
       const char *rid = list[i - 1].as<const char *>();
@@ -14116,6 +14392,22 @@ static void handleViewerContacts(JsonDocument &doc, double epoch) {
     }
     if (!present) {
       smsRecipients.add(cv["id"]);
+    }
+  }
+
+  // Symmetric email enrollment (07082026): viewer contacts with an email address are
+  // auto-enrolled in the email alert channel as well.
+  for (JsonVariant cv : contacts) {
+    if (strcmp(cv["cat"] | "", "viewer") != 0) continue;
+    const char *email = cv["email"] | "";
+    const char *cid = cv["id"] | "";
+    if (!isRealEmailAddress(email) || cid[0] == '\0') continue;
+    bool present = false;
+    for (JsonVariant r : emailRecipients) {
+      if (strcmp(r | "", cid) == 0) { present = true; break; }
+    }
+    if (!present) {
+      emailRecipients.add(cv["id"]);
     }
   }
 
@@ -16799,6 +17091,9 @@ static void handleContactsGet(EthernetClient &client) {
   if (!loaded || !doc["smsAlertRecipients"].is<JsonArray>()) {
     doc["smsAlertRecipients"].to<JsonArray>();
   }
+  if (!loaded || !doc["emailAlertRecipients"].is<JsonArray>()) {
+    doc["emailAlertRecipients"].to<JsonArray>();
+  }
   
   // Build list of unique sites from sensor records
   // Use simple linear scan - with typical fleet sizes (< 100 sensors), performance is adequate
@@ -16910,6 +17205,12 @@ static void handleContactsPost(EthernetClient &client, const String &body) {
     return;
   }
 
+  // Validate email alert recipients array if present
+  if (doc["emailAlertRecipients"] && !doc["emailAlertRecipients"].is<JsonArray>()) {
+    respondStatus(client, 400, F("emailAlertRecipients must be an array"));
+    return;
+  }
+
   // CONTACT-1 fix (07062026): merge-on-save. The /contacts manager page POSTs only
   // {contacts, dailyReportRecipients} while the settings page POSTs all three arrays.
   // Previously any array missing from the request was replaced with an EMPTY one and the
@@ -16920,8 +17221,8 @@ static void handleContactsPost(EthernetClient &client, const String &body) {
   {
     JsonDocument stored;
     bool haveStored = loadContactsConfig(stored);
-    const char *mergeKeys[3] = { "contacts", "dailyReportRecipients", "smsAlertRecipients" };
-    for (uint8_t i = 0; i < 3; ++i) {
+    const char *mergeKeys[4] = { "contacts", "dailyReportRecipients", "smsAlertRecipients", "emailAlertRecipients" };
+    for (uint8_t i = 0; i < 4; ++i) {
       const char *key = mergeKeys[i];
       if (!doc[key].is<JsonArray>()) {
         if (haveStored && stored[key].is<JsonArray>()) {
@@ -16938,8 +17239,8 @@ static void handleContactsPost(EthernetClient &client, const String &body) {
   // purged dailyReportRecipients, leaving dangling IDs in smsAlertRecipients.
   {
     JsonArray contactsArr = doc["contacts"].as<JsonArray>();
-    const char *recipientKeys[2] = { "dailyReportRecipients", "smsAlertRecipients" };
-    for (uint8_t a = 0; a < 2; ++a) {
+    const char *recipientKeys[3] = { "dailyReportRecipients", "smsAlertRecipients", "emailAlertRecipients" };
+    for (uint8_t a = 0; a < 3; ++a) {
       JsonArray list = doc[recipientKeys[a]].as<JsonArray>();
       for (size_t i = list.size(); i > 0; --i) {
         const char *id = list[i - 1].as<const char *>();
