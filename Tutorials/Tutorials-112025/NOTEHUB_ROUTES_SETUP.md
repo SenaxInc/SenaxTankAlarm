@@ -552,6 +552,11 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
   Contacts with alarm associations only receive their selected alarms.
 - Use the **Send Test Email** button on the server settings page (`POST /api/email/test`)
   to verify the route end-to-end without waiting for a real alarm.
+- **Opt-outs (v2.2.4+):** addresses on the /contacts **Email Opt-Out List** receive no
+  email of any kind (including daily reports). Recipients can self-unsubscribe by replying
+  STOP if you wire the optional Apps Script reply-forwarder documented on the server's
+  `/email-setup` page (forwards replies into `email_inbound.qi` via the Notehub API — no
+  new route needed).
 
 ---
 

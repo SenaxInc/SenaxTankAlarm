@@ -16,11 +16,11 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "2.2.3"
+#define FIRMWARE_VERSION "2.2.4"
 #endif
 
 #ifndef FIRMWARE_BUILD_SEQ
-#define FIRMWARE_BUILD_SEQ 290   // monotonic; bump every release (v2.2.3 = 290)
+#define FIRMWARE_BUILD_SEQ 291   // monotonic; bump every release (v2.2.4 = 291)
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.
@@ -284,6 +284,12 @@ struct RelayRuntime {
 // Notehub API (cloud->device only; there is no .qo counterpart).
 #ifndef SMS_INBOUND_INBOX_FILE
 #define SMS_INBOUND_INBOX_FILE "sms_inbound.qi"           // Server receives SMS replies
+#endif
+
+// --- Inbound email replies (STOP/START) ---
+// Injected by the optional Apps Script reply-forwarder via the Notehub API.
+#ifndef EMAIL_INBOUND_INBOX_FILE
+#define EMAIL_INBOUND_INBOX_FILE "email_inbound.qi"       // Server receives email replies
 #endif
 
 // Viewer summary cadence (shared between Server and Viewer)
