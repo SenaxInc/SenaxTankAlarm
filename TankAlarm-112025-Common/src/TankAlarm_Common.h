@@ -16,11 +16,11 @@
 // Firmware Version
 // ============================================================================
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "2.2.2"
+#define FIRMWARE_VERSION "2.2.3"
 #endif
 
 #ifndef FIRMWARE_BUILD_SEQ
-#define FIRMWARE_BUILD_SEQ 289   // monotonic; bump every release (v2.2.2 = 289)
+#define FIRMWARE_BUILD_SEQ 290   // monotonic; bump every release (v2.2.3 = 290)
 #endif
 
 // Notefile schema version — increment when payload field names or semantics change.
@@ -277,6 +277,13 @@ struct RelayRuntime {
 
 #ifndef VIEWER_REQUEST_INBOX_FILE
 #define VIEWER_REQUEST_INBOX_FILE "viewer_request.qi"     // Server receives the request
+#endif
+
+// --- Inbound SMS replies (STOP/START/HELP) ---
+// Injected into the server device by the operator's Twilio Function via the
+// Notehub API (cloud->device only; there is no .qo counterpart).
+#ifndef SMS_INBOUND_INBOX_FILE
+#define SMS_INBOUND_INBOX_FILE "sms_inbound.qi"           // Server receives SMS replies
 #endif
 
 // Viewer summary cadence (shared between Server and Viewer)

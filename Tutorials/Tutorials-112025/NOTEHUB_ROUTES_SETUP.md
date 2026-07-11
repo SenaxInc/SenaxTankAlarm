@@ -407,6 +407,22 @@ events appear in Notehub → Events (one per recipient), the route log shows a 2
 for each, and every phone receives the text. Route errors (invalid number, unverified trial
 recipient) appear when you click the event's error icon.
 
+### Inbound STOP/START/HELP + welcome messages (v2.2.3+)
+
+- Every **newly enrolled SMS recipient** automatically receives a welcome text:
+  *"You are now receiving alerts from TankAlarm. For help, reply HELP. To opt-out, reply STOP."*
+- **STOP replies:** Twilio blocks the number at the platform level automatically (later
+  sends fail with error 21610). The server *additionally* tracks opt-outs — an **OPTED
+  OUT** badge and an **SMS Opt-Out List** section appear on the `/contacts` page, and all
+  SMS to those numbers is suppressed — once you wire the inbound webhook: a small **Twilio
+  Function** forwards each reply through the Notehub API into `sms_inbound.qi` on the
+  server device (no new Notehub route needed).
+- **START replies** remove the number from the list and re-send the welcome message.
+- **HELP replies** are answered by Twilio — set the text under Console → Messaging →
+  Opt-out management.
+- Full step-by-step including the Function code: server dashboard → **Server Settings →
+  SMS Setup Guide** (`/sms-setup`).
+
 ---
 
 ## Step 7: Create Route #5 — Email Reports & Alerts (Optional)
