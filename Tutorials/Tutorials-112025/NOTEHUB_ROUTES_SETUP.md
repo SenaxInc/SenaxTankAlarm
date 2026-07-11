@@ -71,7 +71,7 @@ TankAlarm uses **5 routes** total:
 | 2 | **ServerToClientRelay** | Delivers server commands to clients | `command.qo` from server device | Target client's `.qi` inbox |
 | 3 | **ServerToViewerRelay** | Delivers viewer summary to viewer devices | `viewer_summary.qo` from server | Viewer device `.qi` inbox |
 | 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device (one note per recipient) | Twilio, To = `[body.to]` |
-| 5 | **EmailRoute** | Sends email reports & alerts | `email.qo` from server device | General HTTP → email API (e.g. SendGrid) |
+| 5 | **EmailRoute** | Sends email reports & alerts | `email.qo` from server device | General HTTP → email API (SendGrid) or Google Workspace Apps Script |
 
 ### Notefile Flow Diagram
 
@@ -412,8 +412,10 @@ recipient) appear when you click the event's error icon.
 ## Step 7: Create Route #5 — Email Reports & Alerts (Optional)
 
 > **Important:** Notehub has **no native SMTP/email route type**. Email is delivered by a
-> **General HTTP/HTTPS route** that calls an email provider's API (SendGrid shown below;
-> Mailgun, Postmark, or any HTTP email API works the same way with a different URL/payload).
+> **General HTTP/HTTPS route** that calls an HTTP endpoint. Two supported options:
+> **Option A — SendGrid** (transactional email API) or **Option B — Google Workspace**
+> (a free Apps Script bridge that sends from your real company mailbox). Mailgun, Postmark,
+> or any HTTP email API works like Option A with a different URL/payload.
 
 ### What the server sends
 
@@ -446,7 +448,7 @@ page's field/summary toggles ride along in `fmt` so your route template can hono
 
 Use `body.type = "alarm"` in your template to distinguish the two shapes.
 
-### Route configuration (SendGrid example)
+### Option A — Route configuration (SendGrid)
 
 | Setting | Value |
 |---------|-------|
@@ -483,6 +485,49 @@ daily `sensors` array):
 > formatting, point `content.type` at `text/html` and expand the template using the `fmt`
 > toggles. Any other HTTP email API (Mailgun `/v3/<domain>/messages`, Postmark
 > `/email`, etc.) works with the same pattern — swap the URL, auth header, and JSONata shape.
+
+### Option B — Route configuration (Google Workspace via Apps Script)
+
+Use this option to send alerts **from your real Google Workspace mailbox** (e.g.
+`alerts@yourcompany.com`) with no third-party email account. A ~40-line Google Apps
+Script deployed as a Web App receives the routed note and calls `MailApp.sendEmail()`.
+
+> **Interactive version:** the server dashboard has a step-by-step guide with the full
+> copy-paste script at **Server Settings → Email Setup Guide** (`/email-setup`, v2.2.2+).
+> The steps below are the condensed reference.
+
+**1. Create the Apps Script** — sign in at [script.google.com](https://script.google.com)
+with the sending account, create a new project, and paste the bridge script (shown on the
+server's `/email-setup` page). It authenticates requests with a `SECRET` query parameter,
+parses the note `body`, handles both body shapes above (alarm `message` vs daily
+`sensors[]`), and sends via `MailApp.sendEmail()`. Set `SECRET` to a long random string.
+
+**2. Deploy as Web App** — Deploy → New deployment → type **Web app**, **Execute as: Me**,
+**Who has access: Anyone**, authorize, and copy the `/exec` URL.
+
+> To update the script later, use Deploy → **Manage deployments** → edit → **Version: New**
+> so the URL is preserved. A brand-new deployment gets a *different* URL and breaks the route.
+
+**3. Configure the route:**
+
+| Setting | Value |
+|---------|-------|
+| **Route Name** | `EmailRoute` |
+| **Route Type** | **General HTTP/HTTPS Request/Response** |
+| **URL** | `https://script.google.com/macros/s/DEPLOYMENT_ID/exec?key=YOUR_SECRET` |
+| **HTTP Headers** | none required |
+| **Notefiles** | Selected Notefiles → `email.qo` |
+| **Transform Data** | none — the script reads `.body` from the full event |
+| **Automatic reroute on failure** | Enable |
+
+**4. Expectations & limits:**
+
+- The Notehub route log will show **HTTP 302** for successful deliveries — this is normal
+  (Apps Script answers POSTs with a redirect). Real send results are in the Apps Script
+  editor under **Executions**.
+- Quotas: Workspace accounts ≈ 1,500 recipients/day via Apps Script (consumer Gmail: 100/day).
+- The daily report's `fmt` object (from the server's `/email-format` page) is available to
+  the script if you want to expand the sample renderer.
 
 ### Recipient management (server side)
 
