@@ -70,7 +70,7 @@ TankAlarm uses **5 routes** total:
 | 1 | **ClientToServerRelay** | Delivers client telemetry/alarms (and viewer requests) to server | 11 specific `.qo` notefiles | Server device `.qi` inbox |
 | 2 | **ServerToClientRelay** | Delivers server commands to clients | `command.qo` from server device | Target client's `.qi` inbox |
 | 3 | **ServerToViewerRelay** | Delivers viewer summary to viewer devices | `viewer_summary.qo` from server | Viewer device `.qi` inbox |
-| 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device (one note per recipient) | Twilio, To = `[body.to]` |
+| 4 | **SMSRoute** | Sends SMS alerts | `sms.qo` from server device (one note per recipient) | Twilio, To = `[.body.to]` |
 | 5 | **EmailRoute** | Sends email reports & alerts | `email.qo` from server device | General HTTP → email API (SendGrid) or Google Workspace Apps Script |
 
 ### Notefile Flow Diagram
@@ -364,7 +364,7 @@ to `sms.qo`, each with a scalar `to` field:
 ```
 
 Because each event carries exactly one destination, a **single Twilio route** using the
-`[body.to]` placeholder delivers to every recipient — the dashboard's Contacts → SMS Alert
+`[.body.to]` placeholder delivers to every recipient — the dashboard's Contacts → SMS Alert
 Recipients list (and each contact's alarm associations) fully controls delivery. No
 per-recipient routes are needed.
 
@@ -382,8 +382,8 @@ per-recipient routes are needed.
 | **Account SID** | Your Twilio Account SID |
 | **Auth Token** | Your Twilio Auth Token |
 | **From Number** | Your Twilio phone number (E.164, e.g. `+18005551212`) |
-| **To Number** | `[body.to]` — pulls the recipient from each note. **Required.** |
-| **Message** | `[body.message]` — pulls the alert text from each note. **Required.** |
+| **To Number** | `[.body.to]` — pulls the recipient from each note. **Required, and the leading dot matters:** `[body.to]` (no dot) is not a valid placeholder, so Notehub sends the literal text to Twilio, which fails with error 21265 ("'To' number cannot be a Short Code"). |
+| **Message** | `[.body.message]` — pulls the alert text from each note. **Required.** |
 | **Notefiles** | Selected Notefiles → `sms.qo` |
 | **Automatic reroute on failure** | Enable (retries at 5 s / 1 min / 5 min) |
 
