@@ -120,6 +120,43 @@
 #define PRINT_DAILY_HOUR 8         // UTC hour (0–23) at which the daily report is printed
 #endif
 
+// ---- Network configuration defaults (override in ViewerConfig.h for a custom build) ----
+// #313 follow-up: the viewer tries DHCP first. If the router's DHCP pool is
+// unavailable (or the site router hands out no lease), it falls back to the
+// static profile below. Defaults follow the Starlink router convention:
+// gateway 192.168.1.1, subnet /24, DHCP pool 192.168.1.20-254 - so addresses
+// .2-.19 are never auto-assigned and 192.168.1.15 is a safe manual choice.
+// The server can also push a network profile over Notehub (viewer summary
+// "net" object); a pushed profile overrides these compile-time defaults and
+// persists across reboots when QSPI storage is available.
+#ifndef VIEWER_USE_STATIC_IP
+#define VIEWER_USE_STATIC_IP false // false = DHCP first with static fallback; true = static only
+#endif
+#ifndef VIEWER_STATIC_IP_1
+#define VIEWER_STATIC_IP_1 192
+#define VIEWER_STATIC_IP_2 168
+#define VIEWER_STATIC_IP_3 1
+#define VIEWER_STATIC_IP_4 15      // Starlink-safe manual range: .2-.19
+#endif
+#ifndef VIEWER_GATEWAY_1
+#define VIEWER_GATEWAY_1 192
+#define VIEWER_GATEWAY_2 168
+#define VIEWER_GATEWAY_3 1
+#define VIEWER_GATEWAY_4 1         // Starlink router IP
+#endif
+#ifndef VIEWER_SUBNET_1
+#define VIEWER_SUBNET_1 255
+#define VIEWER_SUBNET_2 255
+#define VIEWER_SUBNET_3 255
+#define VIEWER_SUBNET_4 0
+#endif
+#ifndef VIEWER_DNS_1
+#define VIEWER_DNS_1 1
+#define VIEWER_DNS_2 1
+#define VIEWER_DNS_3 1
+#define VIEWER_DNS_4 1             // Cloudflare DNS
+#endif
+
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
@@ -138,6 +175,7 @@ struct ViewerConfig {
   uint8_t printerIp[4];         // Network printer IPv4 address
   uint16_t printerPort;         // Printer TCP port (9100 = JetDirect/Raw — the only protocol implemented here)
   uint8_t printDailyHour;       // UTC hour (0–23) at which the daily report fires
+  double netConfigRev;          // Revision epoch of the last server-pushed network profile (0 = none)
 };
 
 struct SensorRecord {
@@ -165,17 +203,18 @@ struct SensorRecord {
 static ViewerConfig gConfig = {
   VIEWER_NAME,                   // viewerName
   DEFAULT_VIEWER_PRODUCT_UID,    // productUid - default, can be overridden
-  false,                         // useStaticIp - DHCP by default
+  VIEWER_USE_STATIC_IP,          // useStaticIp - DHCP by default (override in ViewerConfig.h)
   { 0x02, 0x00, 0x01, 0x11, 0x20, 0x25 },  // macAddress
-  { 192, 168, 1, 210 },          // staticIp
-  { 192, 168, 1, 1 },            // staticGateway  
-  { 255, 255, 255, 0 },          // staticSubnet
-  { 8, 8, 8, 8 },                // staticDns
+  { VIEWER_STATIC_IP_1, VIEWER_STATIC_IP_2, VIEWER_STATIC_IP_3, VIEWER_STATIC_IP_4 },  // staticIp (Starlink-safe default)
+  { VIEWER_GATEWAY_1, VIEWER_GATEWAY_2, VIEWER_GATEWAY_3, VIEWER_GATEWAY_4 },  // staticGateway
+  { VIEWER_SUBNET_1, VIEWER_SUBNET_2, VIEWER_SUBNET_3, VIEWER_SUBNET_4 },  // staticSubnet
+  { VIEWER_DNS_1, VIEWER_DNS_2, VIEWER_DNS_3, VIEWER_DNS_4 },  // staticDns
   // Printer defaults (override in ViewerConfig.h)
   PRINT_ENABLED,                 // printEnabled
   { PRINTER_IP_1, PRINTER_IP_2, PRINTER_IP_3, PRINTER_IP_4 },  // printerIp
   PRINTER_PORT,                  // printerPort
-  PRINT_DAILY_HOUR               // printDailyHour
+  PRINT_DAILY_HOUR,              // printDailyHour
+  0.0                            // netConfigRev - no server-pushed profile yet
 };
 
 static SensorRecord gSensorRecords[MAX_SENSOR_RECORDS];
@@ -272,6 +311,10 @@ static const char VIEWER_CONTACTS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html l
 
 static void initializeNotecard();
 static void initializeEthernet();
+static void initializeNetConfigStorage();
+static bool loadNetConfig();
+static bool saveNetConfig();
+static void applyServerNetConfig(JsonObjectConst net);
 static void handleWebRequests();
 static bool readHttpRequest(EthernetClient &client, String &method, String &path, String &body, size_t &contentLength, bool &bodyTooLarge);
 static void respondJson(EthernetClient &client, const String &body);
@@ -338,6 +381,190 @@ static void safeSleep(unsigned long ms) {
  */
 static uint32_t freeRam() { return tankalarm_freeRam(); }
 
+// ============================================================================
+// Network profile persistence (QSPI partition 4, LittleFS)
+// ============================================================================
+// Mirrors the client's app-data mount: partition 4 only, never reformat the
+// whole device. If the board has no MBR (never provisioned), the viewer runs
+// without persistence - the server re-pushes the profile in every summary, so
+// the configuration self-heals after the next fetch (cellular, not Ethernet).
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+#include "BlockDevice.h"
+#include "MBRBlockDevice.h"
+#include "LittleFileSystem.h"
+#define VIEWER_NET_CONFIG_PATH "/vcfg/viewer_net.json"
+#define VIEWER_APP_DATA_PARTITION 4
+static BlockDevice *gNetCfgBD = nullptr;
+static mbed::MBRBlockDevice *gNetCfgPart = nullptr;
+static LittleFileSystem *gNetCfgFS = nullptr;
+static bool gNetCfgStorageOk = false;
+#endif
+static bool gEthernetStarted = false;  // guards live re-init before first bring-up
+
+static void initializeNetConfigStorage() {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  gNetCfgStorageOk = false;
+  gNetCfgBD = BlockDevice::get_default_instance();
+  if (!gNetCfgBD) {
+    Serial.println(F("Net config: no block device - profile will not persist"));
+    return;
+  }
+  gNetCfgPart = new mbed::MBRBlockDevice(gNetCfgBD, VIEWER_APP_DATA_PARTITION);
+  if (gNetCfgPart->init() != 0) {
+    Serial.println(F("Net config: QSPI partition 4 not found - profile will not persist"));
+    delete gNetCfgPart;
+    gNetCfgPart = nullptr;
+    return;
+  }
+  gNetCfgFS = new LittleFileSystem("vcfg");
+  int err = gNetCfgFS->mount(gNetCfgPart);
+  if (err) {
+    Serial.println(F("Net config: mount failed, formatting partition 4..."));
+    err = gNetCfgFS->reformat(gNetCfgPart);
+    if (err) {
+      Serial.println(F("Net config: format failed - profile will not persist"));
+      delete gNetCfgFS;
+      gNetCfgFS = nullptr;
+      return;
+    }
+  }
+  gNetCfgStorageOk = true;
+  Serial.println(F("Net config storage ready (QSPI p4)"));
+#endif
+}
+
+static bool loadNetConfig() {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  if (!gNetCfgStorageOk) return false;
+  FILE *f = fopen(VIEWER_NET_CONFIG_PATH, "r");
+  if (!f) return false;
+  char buf[256];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) != DeserializationError::Ok) return false;
+  gConfig.useStaticIp = doc["m"].as<int>() == 1;
+  JsonArrayConst ip = doc["ip"], gw = doc["gw"], sn = doc["sn"], dns = doc["dns"];
+  for (uint8_t i = 0; i < 4; i++) {
+    if (ip.size() == 4) gConfig.staticIp[i] = ip[i].as<uint8_t>();
+    if (gw.size() == 4) gConfig.staticGateway[i] = gw[i].as<uint8_t>();
+    if (sn.size() == 4) gConfig.staticSubnet[i] = sn[i].as<uint8_t>();
+    if (dns.size() == 4) gConfig.staticDns[i] = dns[i].as<uint8_t>();
+  }
+  gConfig.netConfigRev = doc["rev"] | 0.0;
+  Serial.print(F("Net profile loaded ("));
+  Serial.print(gConfig.useStaticIp ? F("static ") : F("DHCP, fallback "));
+  Serial.print(gConfig.staticIp[0]); Serial.print('.');
+  Serial.print(gConfig.staticIp[1]); Serial.print('.');
+  Serial.print(gConfig.staticIp[2]); Serial.print('.');
+  Serial.print(gConfig.staticIp[3]);
+  Serial.println(F(")"));
+  return true;
+#else
+  return false;
+#endif
+}
+
+static bool saveNetConfig() {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  if (!gNetCfgStorageOk) return false;
+  JsonDocument doc;
+  doc["m"] = gConfig.useStaticIp ? 1 : 0;
+  JsonArray ip = doc["ip"].to<JsonArray>();
+  JsonArray gw = doc["gw"].to<JsonArray>();
+  JsonArray sn = doc["sn"].to<JsonArray>();
+  JsonArray dns = doc["dns"].to<JsonArray>();
+  for (uint8_t i = 0; i < 4; i++) {
+    ip.add(gConfig.staticIp[i]);
+    gw.add(gConfig.staticGateway[i]);
+    sn.add(gConfig.staticSubnet[i]);
+    dns.add(gConfig.staticDns[i]);
+  }
+  doc["rev"] = gConfig.netConfigRev;
+  char buf[256];
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len == 0 || len >= sizeof(buf)) return false;
+  FILE *f = fopen(VIEWER_NET_CONFIG_PATH ".tmp", "w");
+  if (!f) return false;
+  size_t written = fwrite(buf, 1, len, f);
+  fclose(f);
+  if (written != len) {
+    remove(VIEWER_NET_CONFIG_PATH ".tmp");
+    return false;
+  }
+  remove(VIEWER_NET_CONFIG_PATH);
+  if (rename(VIEWER_NET_CONFIG_PATH ".tmp", VIEWER_NET_CONFIG_PATH) != 0) return false;
+  Serial.println(F("Net profile saved"));
+  return true;
+#else
+  return false;
+#endif
+}
+
+// Parse "a.b.c.d" into 4 octets; returns false on malformed input.
+static bool parseIpString(const char *s, uint8_t out[4]) {
+  if (!s || !*s) return false;
+  unsigned int a, b, c, d;
+  char extra;
+  if (sscanf(s, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4) return false;
+  if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+  out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+  return true;
+}
+
+// Apply a server-pushed network profile from the viewer summary's "net" object.
+// {m:0|1, ip:"a.b.c.d", gw:..., sn:..., dns:..., rev:<epoch>}
+// rev guards re-application: profiles are applied once, survive reboots when
+// storage is available, and are re-offered in every summary (self-healing when
+// storage is unavailable).
+static void applyServerNetConfig(JsonObjectConst net) {
+  double rev = net["rev"] | 0.0;
+  if (rev <= 0.0 || rev <= gConfig.netConfigRev) {
+    return;  // nothing new
+  }
+  bool wantStatic = (net["m"] | 0) == 1;
+  uint8_t ip[4], gw[4], sn[4], dns[4];
+  if (wantStatic) {
+    // Static mode requires at least a valid IP; gateway/subnet/DNS keep current
+    // values when absent or malformed.
+    if (!parseIpString(net["ip"] | "", ip)) {
+      Serial.println(F("Server net profile rejected: bad ip"));
+      return;
+    }
+    memcpy(gConfig.staticIp, ip, 4);
+    if (parseIpString(net["gw"] | "", gw)) memcpy(gConfig.staticGateway, gw, 4);
+    if (parseIpString(net["sn"] | "", sn)) memcpy(gConfig.staticSubnet, sn, 4);
+    if (parseIpString(net["dns"] | "", dns)) memcpy(gConfig.staticDns, dns, 4);
+  } else {
+    // DHCP mode may still update the fallback profile when provided.
+    if (parseIpString(net["ip"] | "", ip)) memcpy(gConfig.staticIp, ip, 4);
+    if (parseIpString(net["gw"] | "", gw)) memcpy(gConfig.staticGateway, gw, 4);
+    if (parseIpString(net["sn"] | "", sn)) memcpy(gConfig.staticSubnet, sn, 4);
+    if (parseIpString(net["dns"] | "", dns)) memcpy(gConfig.staticDns, dns, 4);
+  }
+  gConfig.useStaticIp = wantStatic;
+  gConfig.netConfigRev = rev;
+  saveNetConfig();  // best effort; without storage the summary re-applies it
+
+  Serial.print(F("Server net profile applied: "));
+  Serial.print(wantStatic ? F("static ") : F("DHCP (fallback "));
+  Serial.print(gConfig.staticIp[0]); Serial.print('.');
+  Serial.print(gConfig.staticIp[1]); Serial.print('.');
+  Serial.print(gConfig.staticIp[2]); Serial.print('.');
+  Serial.print(gConfig.staticIp[3]);
+  Serial.println(wantStatic ? F("") : F(")"));
+
+  // Re-initialize the network with the new profile. Only after the first
+  // bring-up: during boot the summary is fetched before Ethernet starts and
+  // initializeEthernet() will use the freshly applied profile anyway.
+  if (gEthernetStarted) {
+    Serial.println(F("Re-initializing Ethernet with new profile..."));
+    initializeEthernet();
+    gWebServer.begin();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 2000) {
@@ -359,6 +586,11 @@ void setup() {
     const char *expectedNames[] = { "Notecard" };
     tankalarm_scanI2CBus(expectedAddrs, expectedNames, 1);
   }
+
+  // Restore any persisted network profile BEFORE the first summary fetch and
+  // Ethernet bring-up (rev dedupe + correct boot addressing).
+  initializeNetConfigStorage();
+  loadNetConfig();
 
   initializeNotecard();
 #if defined(TANKALARM_DFU_MCUBOOT)
@@ -687,6 +919,16 @@ static void initializeEthernet() {
     if (status == 0) {
       Serial.println(F("Ethernet initialization failed after retries"));
     }
+    // #313 follow-up: DHCP unavailable (no router lease). Fall back to the
+    // static profile so the dashboard stays reachable at a predictable address
+    // (default 192.168.1.15 - inside the Starlink router's never-auto-assigned
+    // .2-.19 range; override via ViewerConfig.h or a server-pushed profile).
+    if (status == 0 && !gConfig.useStaticIp) {
+      Serial.print(F("Falling back to static IP "));
+      Serial.print(staticIp);
+      Serial.println(F(" ..."));
+      status = Ethernet.begin(gConfig.macAddress, staticIp, staticDns, staticGateway, staticSubnet);
+    }
   }
 
   if (status != 0) {
@@ -705,6 +947,7 @@ static void initializeEthernet() {
     Serial.print(F("Gateway: "));
     Serial.println(Ethernet.gatewayIP());
   }
+  gEthernetStarted = true;
 }
 
 static void handleWebRequests() {
@@ -1327,6 +1570,13 @@ static void handleViewerSummary(JsonDocument &doc, double epoch) {
   }
 
   gLastSummaryFetchEpoch = currentEpoch();
+
+  // #313 follow-up: server-pushed network profile (server settings -> Notehub ->
+  // viewer). Applied once per revision; persists across reboots when QSPI
+  // storage is available.
+  if (doc["net"].is<JsonObjectConst>()) {
+    applyServerNetConfig(doc["net"].as<JsonObjectConst>());
+  }
   gSummaryFastPolls = 0;  // summary received — stop any post-request fast polling
 
   // v2.2.0: viewer-managed contacts echoed back by the server (authoritative list,
