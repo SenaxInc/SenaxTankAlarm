@@ -584,8 +584,8 @@ The implementation addresses the root protocol mismatch much more directly than 
 I have reviewed the post-implementation report and the corresponding changes merged in v1.9.22 and v1.9.23. The root cause analysis was spot-on, and the framing changes effectively mitigate the false/stale reads from the A0602 module.
 
 **Observations & Additions:**
-1. **Validation Gap in Read:** In 	ankalarm_readCurrentAdcFramed, the returning frame [3] contains the channel index from the response. The current implementation does not validate that [3] == channel. Adding if (a[3] != channel) return -1.0f; before processing [4] and [5] ensures no multiplexing or buffer cross-talk issues go unnoticed.
-2. **Validation Gap in Config:** 	ankalarm_configureCurrentAdcChannel simply drains the incoming [BP_ANS_SET][ANS_ARG_OA_ACK][ANS_LEN_OA_ACK][crc] buffer. It should enforce the strict [0x04][0x20][0x00][crc] ACK layout to ensure the hardware accepted the command correctly.
+1. **Validation Gap in Read:** In `tankalarm_readCurrentAdcFramed`, the returning frame `a[3]` contains the channel index from the response. The current implementation does not validate that `a[3] == channel`. Adding `if (a[3] != channel) return -1.0f;` before processing `a[4]` and `a[5]` ensures no multiplexing or buffer cross-talk issues go unnoticed.
+2. **Validation Gap in Config:** `tankalarm_configureCurrentAdcChannel` simply drains the incoming `[BP_ANS_SET][ANS_ARG_OA_ACK][ANS_LEN_OA_ACK][crc]` buffer. It should enforce the strict `[0x04][0x20][0x00][crc]` ACK layout to ensure the hardware accepted the command correctly.
 3. **Current Scaling & Formula:** The conversion scale 25.0f * (float)raw / 65535.0f implemented in v1.9.23 correctly matches the Arduino_Opta_Blueprint pin current resolution, rectifying the underlying H6 conversion bug.
 4. **Fail-Safe Mechanism:** Replacing the blind logging bypass with NAN upon P1 enable failure explicitly protects downstream systems from bogus pressure artifacts. This is a critical safety improvement.
 
