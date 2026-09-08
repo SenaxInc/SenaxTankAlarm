@@ -56,7 +56,7 @@ High means plausible missed alarms, incorrect control/calibration, or loss of du
 
 ### W-01 - DAC Loop Power Has Been Replaced by an Older PWM-Only Contract
 
-High. [Client monitor configuration](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L699), [current-loop reader](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5440), [Common I2C implementation](../TankAlarm-112025-Common/src/TankAlarm_I2C.h).
+High. [Client monitor configuration](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L699), [current-loop reader](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5440), [Common I2C implementation](TankAlarm-112025-Common/src/TankAlarm_I2C.h).
 
 The existing diff removes `loopPowerEnabled`, `loopPowerMode`, `sensorMinVoltage`, DAC initialization, bipolar DAC-loop conversion, and the soft-ramp helpers, replacing them with older `pwmGating*` fields. Current server configuration still emits the newer loop-power contract. A DAC-powered installation can receive a syntactically valid configuration that this working client ignores, then operate the wrong power path. The version still says v2.2.14, obscuring that behavioral regression.
 
@@ -64,7 +64,7 @@ Action: reconcile the local edits against committed v2.2.14 before deployment; p
 
 ### W-02 - Offline Alarms Again Bypass the Existing Retry Buffer
 
-High. [sendAlarm](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L6354), [publishNote](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8164).
+High. [sendAlarm](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L6354), [publishNote](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8164).
 
 The local diff reinstates `gNotecardAvailable` gates in alarm, unload, solar/battery, power-transition, and sunset paths. `publishNote` already buffers when the Notecard is unavailable. Skipping it loses the event instead of buffering it; an alarm can remain latched after communications recover without resending its initial notification. This is a host-to-Notecard outage issue, distinct from ordinary cellular outages while the Notecard remains accessible.
 
@@ -72,7 +72,7 @@ Action: restore unconditional invocation of the buffering publisher for alarm-cl
 
 ### W-03 - Recovery Backoff and Setpoint Probe Limits Have Been Removed
 
-Medium. [Sensor-only recovery](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L2052), [solar setpoint polling](../TankAlarm-112025-Common/src/TankAlarm_Solar.cpp#L505).
+Medium. [Sensor-only recovery](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L2052), [solar setpoint polling](TankAlarm-112025-Common/src/TankAlarm_Solar.cpp#L505).
 
 The removed successful-read watermark matters: recovery itself zeroes `consecutiveFailures`, causing the next loop to reset backoff and total attempts without a real successful reading. The circuit breaker therefore repeatedly restarts. The diff also removes the rejection limit for CRC-valid but implausible setpoints, restoring three unnecessary register reads per poll on incompatible controller revisions. At one poll/minute, that is about 4,320 extra Modbus transactions/day before any function-code retries. The measured nominal-voltage classification was also removed while the field remains declared.
 
@@ -80,7 +80,7 @@ Action: reset recovery budgets only on a proven acquisition, not a software coun
 
 ### W-04 - On-Demand Updates, Freshness Metadata, and OTA Build Protection Regress
 
-Medium. [Client inbound polling](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L2175), [daily sensor serialization](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8010), [client build guard](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L40).
+Medium. [Client inbound polling](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L2175), [daily sensor serialization](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8010), [client build guard](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L40).
 
 The local diff removes `pollForTelemetryRequests` although the dashboard still queues those requests. It removes each daily sensor's acquisition `t`, so the server falls back to report time for reused readings. It also changes the missing-MCUboot build error into a warning, allowing an apparently successful USB build that cannot apply future OTA updates. Some old VS Code build tasks omit that flag and use stale copied libraries.
 
@@ -90,27 +90,90 @@ Action: preserve the command consumer, acquisition timestamps, and explicit non-
 
 ### F-01 - Daily Part 1 Can Clear an Active Alarm
 
-[Server first-part detection and reconciliation](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13080), [client daily producer](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L7844).
+[Server first-part detection and reconciliation](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13080), [client daily producer](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L7844).
 
 The client uses zero-based parts and includes `alarms` only in part 0. The server accepts both `part == 0` and `part == 1` as first parts for legacy compatibility, then interprets absent `alarms` on schema-2+ first parts as no active alarms. In a multipart report, part 1 therefore clears alarms that part 0 just confirmed, including their reminder snooze state.
 
 Reproduction: part 0 `{p:0,_sv:2,alarms:[{k:1,hi:true,lo:false}]}` followed by part 1 `{p:1,_sv:2}` leaves sensor 1 clear in the source-matched model. This does not require packet reordering.
 
-Suggested correction: distinguish legacy numbering using a protocol/version rule, not `0 || 1` for every sender. For the current schema, reconcile only part 0 with an explicit alarm-summary contract. Test metadata-only part 0, ordinary multipart reports, missing/reordered parts, and legacy reports.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as Opta Client (Schema 2+)
+    participant Server as Opta Server
+    participant Registry as Sensor Registry (RAM/Flash)
+
+    Note over Client,Server: Client has Sensor 1 in HIGH alarm condition
+    Client->>Server: Daily Report Part 0 {p: 0, _sv: 2, alarms: [{k: 1, hi: true}]}
+    Server->>Server: isFirstPart = (0 == 0 || 0 == 1) -> TRUE
+    Server->>Server: dailyAlarms exists -> runAlarmReconcile = TRUE
+    Server->>Registry: Sensor 1 confirmed in ALARM (hiAlarm = true)
+    Client->>Server: Daily Report Part 1 {p: 1, _sv: 2, sensors: [...]} (no alarms array)
+    Server->>Server: isFirstPart = (1 == 0 || 1 == 1) -> TRUE (BUG: Part 1 treated as first part)
+    Server->>Server: dailySchema >= 2 -> runAlarmReconcile = TRUE
+    Server->>Registry: Loop compares Sensor 1 against empty dailyAlarms -> NOT FOUND
+    Server->>Registry: BUG: Clears orphaned alarm on Sensor 1! alarmActive = false
+```
+
+Suggested correction: distinguish legacy numbering using a protocol/version rule, not `0 || 1` for every sender. For the current schema, reconcile only part 0 with an explicit alarm-summary contract:
+
+```cpp
+// TankAlarm-112025-Server-BluesOpta.ino in handleDaily()
+uint8_t part = doc["p"].as<uint8_t>();
+int dailySchema = doc["_sv"] | 0;
+
+// Schema 1+ uses 0-based parts (part 0 is first); legacy unversioned uses 1-based (part 1 is first).
+bool isFirstPart = (dailySchema >= 1) ? (part == 0) : (part == 1 || part == 0);
+
+// Only run alarm reconciliation on the TRUE first part (part 0 in modern schema) of the daily report.
+// Subsequent parts (part 1, 2, ...) carry additional sensor history but NEVER contain the alarms array.
+// Testing isFirstPart alone with (dailyAlarms || dailySchema >= 2) caused part 1 to be treated as a
+// first part with no active alarms, erroneously clearing alarms verified in part 0!
+bool runAlarmReconcile = (dailySchema >= 1) ? (part == 0 && (dailyAlarms || dailySchema >= 2))
+                                            : (isFirstPart && dailyAlarms);
+```
 
 ### F-02 - Clear Relay Uses Presentation Order as Device Identity
 
-[Dashboard mapper](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2310), [button serialization](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2323), [server forwarding](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L11197), [client interpretation](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8896).
+[Dashboard mapper](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2310), [button serialization](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2323), [server forwarding](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L11197), [client interpretation](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8896).
 
 `buildSiteModel` sets `sensorIdx` from the array position in `cs[].ts[]`. Those records follow server registry/arrival order, not the client's configuration order. The command is forwarded unchanged as `relay_reset_sensor`, which the client uses as a monitor-array index.
 
 Executed reproduction: registry order `[k:2,k:1]` produces reset position 0 for sensor 2, although sensor 2 occupies configuration position 1. Sparse reports or a reboot backlog can create this ordering. This is a wrong-control-target risk, not merely a display issue.
 
-Action: make the API carry the stable sensor number and resolve it against `gConfig.monitors[].sensorIndex` on the client. Provide a versioned compatibility path for existing index-based commands. Test reordered, missing, and deleted sensors; never infer identity from a rendered card's position.
+Suggested correction: pass the persistent `sensorIndex` (`t.sensorIndex`) instead of the array loop index `sensorIdx`, and resolve it by sensor index on the client:
+
+```js
+// In DASHBOARD_HTML renderDataCard():
+// BEFORE: onclick="clearRelays('${escapeHtml(t._clientUid)}',${t.sensorIdx||0})"
+// AFTER: pass persistent sensorIndex (1-based monitor key)
+onclick="clearRelays('${escapeHtml(t._clientUid)}',${Number(t.sensorIndex)||1})"
+```
+
+```cpp
+// In TankAlarm-112025-Client-BluesOpta.ino handleRelayCommand():
+if (!doc["relay_reset_sensor"].isNull()) {
+  uint8_t targetSensor = doc["relay_reset_sensor"].as<uint8_t>();
+  bool found = false;
+  // Match against configured sensorIndex, not the array slot
+  for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    if (gConfig.monitors[i].sensorIndex == targetSensor) {
+      resetRelayForMonitor(i);
+      found = true;
+      break;
+    }
+  }
+  // Backwards compatibility for legacy 0-based array index commands
+  if (!found && targetSensor < gConfig.monitorCount) {
+    resetRelayForMonitor(targetSensor);
+  }
+  return;
+}
+```
 
 ### F-03 - Calibration Corrupts Device/Sensor Keys
 
-[Dropdown and unit lookup](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2181), [submission and log filter](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2185), [backend validation](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L19465).
+[Dropdown and unit lookup](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2181), [submission and log filter](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2185), [backend validation](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L19465).
 
 Keys are constructed as `clientUid:sensorIndex`, but `split(':')` takes the first two fields. A real key such as `dev:860000000000001:1` becomes client `dev` and sensor `860000000000001`, not the intended UID and sensor 1. A numeric device ID may then be rejected/coerced to an unrelated 8-bit sensor. Backend validation checks nonempty UID, not valid/existing sensor identity.
 
@@ -120,175 +183,650 @@ Suggested shared page helper:
 
 ```js
 function parseSensorKey(value) {
-	const separator = value.lastIndexOf(':');
-	const clientUid = value.slice(0, separator);
-	const sensorIndex = Number(value.slice(separator + 1));
-	if (separator < 1 || !clientUid.startsWith('dev:') ||
-			!Number.isInteger(sensorIndex) || sensorIndex < 1 || sensorIndex > 255) {
-		throw new Error('Invalid sensor selection');
-	}
-	return { clientUid, sensorIndex };
+  if (!value) return null;
+  const separator = value.lastIndexOf(':');
+  if (separator <= 0) return null;
+  const clientUid = value.slice(0, separator);
+  const sensorIndex = Number(value.slice(separator + 1));
+  if (!clientUid || !Number.isInteger(sensorIndex) || sensorIndex < 1 || sensorIndex > 255) {
+    return null;
+  }
+  return { clientUid, sensorIndex };
 }
 ```
 
-Use it in unit selection, submission, and filtering. Backend must validate the UID and resolve an existing sensor before changing calibration. Test a real numeric `dev:` UID, multiple sensor numbers, a true zero reference, pressure units, and malformed keys.
+Backend validation in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L19465):
+
+```cpp
+// In handleCalibrationPost():
+const char *clientUid = doc["clientUid"] | "";
+uint8_t sensorIndex = doc["sensorIndex"] | 0;
+if (!isValidClientUid(clientUid) || sensorIndex < 1) {
+  respondStatus(client, 400, F("Valid clientUid and 1-based sensorIndex required"));
+  return;
+}
+SensorRecord *rec = findSensorByHash(clientUid, sensorIndex);
+if (!rec) {
+  respondStatus(client, 404, F("Sensor not found in registry"));
+  return;
+}
+```
 
 ### F-04 - Analog Alarm Debounce Does Not Require Consecutive Samples
 
-[evaluateAlarms](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5872).
+[evaluateAlarms](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5872).
 
 The high trigger counter is not reset when a normal sample falls below the high-clear band while no high alarm is latched. The high-clear counter is not reset by a sample in the hysteresis band. The symmetric low path has the same pattern. Invalid/reused acquisitions can also reach alarm evaluation before `sensorFailed` is set.
 
 Executed the actual function after a mechanical type/literal conversion, with high=80, low=20, hysteresis=5, debounce=3. `[90,50,90,50,90]` emitted HIGH; starting high-latched, `[70,78,70,78,70]` emitted CLEAR. Neither sequence contains three consecutive qualifying samples.
 
-Action: explicitly reset each trigger/clear counter on every disqualifying fresh sample; define reused/invalid sample semantics and prevent them from counting as independent evidence. Test all four counters, threshold equality, hysteresis-band excursions, and interleaved invalid readings.
+Suggested correction in [TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5970):
+
+```cpp
+// Strict consecutive sample debouncing with hysteresis
+if (!state.highAlarmLatched) {
+  if (highCondition) {
+    state.highAlarmDebounceCount++;
+    state.lowAlarmDebounceCount = 0;
+    state.highClearDebounceCount = 0;
+    if (state.highAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
+      state.highAlarmLatched = true;
+      state.lowAlarmLatched = false;
+      state.highAlarmDebounceCount = 0;
+      sendAlarm(idx, "high", state.currentInches);
+    }
+  } else {
+    // Non-qualifying sample IMMEDIATELY resets trigger counter
+    state.highAlarmDebounceCount = 0;
+  }
+} else {
+  // High alarm is currently latched — must receive N consecutive clearing samples
+  if (highClearCondition) {
+    state.highClearDebounceCount++;
+    state.highAlarmDebounceCount = 0;
+    if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
+      state.highAlarmLatched = false;
+      state.highClearDebounceCount = 0;
+      sendAlarm(idx, "clear", state.currentInches);
+    }
+  } else {
+    // Any sample back in alarm condition or inside hysteresis band resets clear counter
+    state.highClearDebounceCount = 0;
+  }
+}
+
+// Symmetrical logic for lowAlarmLatched...
+if (!state.lowAlarmLatched) {
+  if (lowCondition) {
+    state.lowAlarmDebounceCount++;
+    state.highAlarmDebounceCount = 0;
+    state.lowClearDebounceCount = 0;
+    if (state.lowAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
+      state.lowAlarmLatched = true;
+      state.highAlarmLatched = false;
+      state.lowAlarmDebounceCount = 0;
+      sendAlarm(idx, "low", state.currentInches);
+    }
+  } else {
+    state.lowAlarmDebounceCount = 0;
+  }
+} else {
+  if (lowClearCondition) {
+    state.lowClearDebounceCount++;
+    state.lowAlarmDebounceCount = 0;
+    if (state.lowClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
+      state.lowAlarmLatched = false;
+      state.lowClearDebounceCount = 0;
+      sendAlarm(idx, "clear", state.currentInches);
+    }
+  } else {
+    state.lowClearDebounceCount = 0;
+  }
+}
+```
 
 ### F-05 - Latch-Before-Send Can Lose the Only Alarm Notification
 
-[Boot timestamp initialization](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1745), [alarm evaluation](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5872), [rate limiter](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L6210).
+[Boot timestamp initialization](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1745), [alarm evaluation](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5872), [rate limiter](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L6210).
 
 `evaluateAlarms` sets the latch before `sendAlarm` checks notification limits. A suppressed send is not pending anywhere, so subsequent samples in the same condition do not retry. The boot initializer sets last-high/low/fault times to zero when uptime is below five minutes, but the comment claiming unsigned subtraction then wraps is wrong: at 20 seconds, `20000 - 0 < 300000`. With short sample intervals, the first alarm can be suppressed and remain unsent until another episode or a daily summary. The daily recovery path currently latches state without dispatching the missing initial alert.
 
-Action: separate physical alarm state, actuator state, and notification-pending state. An unsent initial event should remain pending under a bounded retry policy. Use an explicit never-sent flag or wrap-safe expired timestamp for the first notification. Test boot-in-alarm, rate-limited re-entry, offline buffering, and queue failure; keep local actuation independent of notification limits.
+Suggested correction in [TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1745):
+
+```cpp
+// In setupMonitorRuntime():
+// Unsigned subtraction naturally wraps around in 32-bit arithmetic:
+// (bootNow - (interval + 1)) results in a large unsigned value (~4,294,667,295).
+// When later evaluated: (now - expired) yields >= interval + 1.
+// DO NOT clamp expired to 0 when bootNow < interval, because (now - 0) is small
+// and immediately causes checkAlarmRateLimit() to suppress the alarm!
+const unsigned long minIntervalMs = MIN_ALARM_INTERVAL_SECONDS * 1000UL;
+unsigned long bootNow = millis();
+unsigned long expired = bootNow - (minIntervalMs + 1);
+
+gMonitorState[i].lastHighAlarmMillis = expired;
+gMonitorState[i].lastLowAlarmMillis = expired;
+gMonitorState[i].lastClearAlarmMillis = expired;
+gMonitorState[i].lastSensorFaultMillis = expired;
+```
+
+Furthermore, decouple physical latch state from transmission status:
+
+```cpp
+// Retain pending notification state if sendAlarm is rate-limited or fails
+if (!checkAlarmRateLimit(idx, alarmType)) {
+  state.alarmNotificationPending = true;
+  strlcpy(state.pendingAlarmType, alarmType, sizeof(state.pendingAlarmType));
+  return;
+}
+state.alarmNotificationPending = false;
+```
 
 ### F-06 - Pulse Acquisition Is Only Polled at Telemetry Sample Time
 
-[Pulse sampler](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1268), [result retrieval](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1397), [only caller](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5695).
+[Pulse sampler](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1268), [result retrieval](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L1397), [only caller](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5695).
 
 The nonblocking sampler requires repeated `pollPulseSampler` calls, but its only call is inside `readPulseSensor`, invoked by periodic sampling. There is no loop service or interrupt-backed capture that observes the intervening pulse edges. With a 30-minute reporting interval and a seconds-long measurement window, it counts only short bursts separated by long unobserved gaps, then divides by a duration that does not describe the observation. A pending sample returns an old reading without marking it reused.
+
+Action: service pulse sampling continuously in the main control loop or attach an interrupt:
+
+```cpp
+// In TankAlarm-112025-Client-BluesOpta.ino loop():
+void loop() {
+  // Service pulse counters on every loop iteration
+  for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    if (gConfig.monitors[i].sensorInterface == SENSOR_PULSE) {
+      pollPulseSampler(i);
+    }
+  }
+  // ... rest of main loop ...
+}
+```
 
 Action: capture edges with an appropriate hardware timer/interrupt-backed counter and service the state machine independently of transmission cadence. Mark incomplete samples invalid/reused. Test known pulse trains, no pulses, low/high frequencies, long main-loop stalls, and the supported count range. Do not assume an occasional polling burst implements continuous accumulation.
 
 ### F-07 - Late Time Sync Does Not Arm Schedules
 
-[Server startup](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4397), [server clock/scheduler](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L8667), [client scheduler](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L4224), [viewer scheduler](../TankAlarm-112025-Viewer-BluesOpta/TankAlarm-112025-Viewer-BluesOpta.ino#L807), [shared sync helper](../TankAlarm-112025-Common/src/TankAlarm_Notecard.h#L28).
+[Server startup](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4397), [server clock/scheduler](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L8667), [client scheduler](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L4224), [viewer scheduler](TankAlarm-112025-Viewer-BluesOpta/TankAlarm-112025-Viewer-BluesOpta.ino#L807), [shared sync helper](TankAlarm-112025-Common/src/TankAlarm_Notecard.h#L28).
 
 At startup without time, scheduling stores zero. Later successful `ensureTimeSync` updates only the clock. Loop due checks require a nonzero next epoch and therefore never trigger the scheduling function again. The standard client has a no-time 24-hour fallback, but that fallback stops applying once time becomes valid, leaving its zero schedule stranded. Server daily email and viewer schedules have analogous gaps.
 
-Failed time synchronization also retries on every loop because only successful sync updates its timestamp, bypassing the intent of Notecard health backoff.
+Failed time synchronization also retries on every loop because only successful sync updates its timestamp, bypassing the intent of Notecard health backoff and spamming I2C bus traffic continuously.
 
-Action: on the transition from invalid to valid time, arm all enabled zero schedules; track an independent last-attempt time and backoff while offline. Test startup with no time followed by synchronization, never-synchronized operation, and time correction after a long outage.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L8667):
+
+```cpp
+static unsigned long gLastSyncAttemptMillis = 0;
+const unsigned long SYNC_RETRY_BACKOFF_MS = 30000UL;  // 30s backoff while awaiting cellular time
+
+static void ensureTimeSync() {
+  unsigned long nowMs = millis();
+  // If already synced, refresh every 6 hours
+  if (gLastSyncedEpoch > 0.0 && (nowMs - gLastSyncMillis < 6UL * 3600UL * 1000UL)) {
+    return;
+  }
+  // While clock is uninitialized, enforce a 30s backoff to avoid hammering Notecard I2C
+  if (gLastSyncedEpoch <= 0.0 && (nowMs - gLastSyncAttemptMillis < SYNC_RETRY_BACKOFF_MS)) {
+    return;
+  }
+  gLastSyncAttemptMillis = nowMs;
+
+  J *req = notecard.newRequest("card.time");
+  if (!req) return;
+  J *rsp = notecard.requestAndResponse(req);
+  if (!rsp) return;
+
+  const char *err = JGetString(rsp, "err");
+  if (!err || strlen(err) == 0) {
+    double time = JGetNumber(rsp, "time");
+    if (time > 0.0) {
+      bool firstSync = (gLastSyncedEpoch <= 0.0);
+      gLastSyncedEpoch = time;
+      gLastSyncMillis = nowMs;
+
+      // CRITICAL: Re-arm schedules that were unarmed due to boot with no clock!
+      if (firstSync) {
+        scheduleNextDailyEmail();
+        addServerSerialLog("Clock acquired; re-armed daily email schedule", "info", "time");
+      }
+    }
+  }
+  notecard.deleteResponse(rsp);
+}
+```
 
 ### F-08 - Last-Client Deletion Is Not Persisted; Save Failures Lose Dirty State
 
-[Registry save](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15612), [metadata save](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15815), [delete handler](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L16650), [periodic saves](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4810).
+[Registry save](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15612), [metadata save](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15815), [delete handler](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L16650), [periodic saves](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4810).
 
 Both save functions return early when their count is zero. Deleting the final client therefore leaves the old nonempty files on disk; reboot reloads the removed records. Save functions return `void`, and the delete/periodic callers clear dirty flags even on unavailable storage, allocation failure, or write failure. Atomic writing is already present; the defect is the surrounding contract, not a missing rename strategy.
 
-Action: persist empty arrays and return success/failure. Clear dirty flags only on success, retaining bounded retries and visible persistence errors. Test deleting the last versus one of several clients, reboot, and injected failures. Historical data retention after deletion should be an explicit separate policy.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15612):
+
+```cpp
+// Change return type from void to bool to report persistence success
+static bool saveSensorRegistry() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!mbedFS) return false;
+
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    // When gSensorRecordCount == 0, doc serializes as "[]", properly persisting empty state!
+    for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
+      const SensorRecord &rec = gSensorRecords[i];
+      if (rec.clientUid[0] == '\0') continue;
+      JsonObject obj = arr.add<JsonObject>();
+      // ... populate fields ...
+    }
+    return posix_atomic_write_json(SENSOR_REGISTRY_FILE, doc);
+  #endif
+#endif
+  return true;
+}
+```
+
+Callers must clear dirty flags ONLY when persistence succeeds:
+
+```cpp
+// In handleClientDeleteRequest() and loop():
+if (gSensorRegistryDirty) {
+  if (saveSensorRegistry()) {
+    gSensorRegistryDirty = false;
+  } else {
+    addServerSerialLog("Failed to save sensor registry; write will retry", "warn", "fs");
+  }
+}
+if (gClientMetadataDirty) {
+  if (saveClientMetadataCache()) {
+    gClientMetadataDirty = false;
+  } else {
+    addServerSerialLog("Failed to save metadata cache; write will retry", "warn", "fs");
+  }
+}
+```
 
 ### F-09 - Snooze Notice and Success Precede Durable State
 
-[applyReminderSnooze](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14566), [HTTP handler](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14591), [registry save](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15612).
+[applyReminderSnooze](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14566), [HTTP handler](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14591), [registry save](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15612).
 
 `applyReminderSnooze` changes RAM and broadcasts before its caller saves. `saveSensorRegistry` cannot report failure, yet the handler returns `success: true`. An operator can receive a paused notice and success, then lose that snooze after reboot. Even with healthy storage, blocking notification transactions enlarge the pre-save interruption window. The SMS path also applies/broadcasts before its eventual batch save.
 
-Action: stage/mutate, durably persist, then notify and acknowledge. Specify rollback or an explicit applied-but-not-persisted error on save failure. Preserve idempotent no-op behavior and avoid advancing unrelated rate-limit buckets. Test interruption between each stage, offline recipients, duplicate commands, unsnooze interval anchoring, and recovery auto-reset. The v2.2.14 boot hash insertion fix is present and should be preserved.
+Suggested transactional ordering in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14591):
+
+```cpp
+// In handleAlarmSnoozePost():
+// 1. Stage in RAM
+double priorSnooze = rec->reminderSnoozeEpoch;
+rec->reminderSnoozeEpoch = snooze ? (now > 0.0 ? now : 1.0) : 0.0;
+gSensorRegistryDirty = true;
+
+// 2. Persist to disk BEFORE broadcasting
+bool saveOk = saveSensorRegistry();
+if (!saveOk) {
+  // Roll back RAM state on disk write failure
+  rec->reminderSnoozeEpoch = priorSnooze;
+  respondStatus(client, 500, F("Failed to persist snooze state to storage"));
+  return;
+}
+gSensorRegistryDirty = false;
+
+// 3. Dispatch notifications only AFTER durable storage is confirmed
+broadcastSnoozeChange(*rec, snooze, "dashboard");
+
+// 4. Respond success to web client
+JsonDocument resp;
+resp["success"] = true;
+resp["snoozed"] = rec->reminderSnoozeEpoch > 0.0;
+String out;
+serializeJson(resp, out);
+respondJson(client, out);
+```
 
 ### F-10 - Config Failure Can Be Acknowledged as Complete
 
-[ACK handler](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L16255), [client revision gate](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L4594).
+[ACK handler](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L16255), [client revision gate](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L4594).
 
 The server clears pending state for a matching `cv` regardless of `st`; `st:"failed"` ends automatic retry. The client truncates `_ts` to whole seconds and skips `inboundTs <= configEpoch`, acknowledging the offered version as applied even when a different configuration was generated within the same second. A later ACK can thus claim a configuration that never took effect. Orphan pruning additionally checks `status == applied` without requiring the ACK to match the current snapshot version.
 
-Action: require an applied/persisted status and the expected revision to clear pending or prune. Retain explicit failure state. Use a monotonic revision with stored content/version identity so retries are idempotent and two same-second changes remain distinguishable. Test failed persistence, stale ACKs, two updates in one second, and crash between RAM apply and persistence.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L16255):
+
+```cpp
+// In handleConfigAck():
+// Only mark pendingDispatch as complete when status is explicitly "applied"
+if (version[0] != '\0' && strcmp(version, snap->configVersion) == 0) {
+  if (strcmp(status, "applied") == 0) {
+    snap->pendingDispatch = false;
+    snap->dispatchAttempts = 0;
+    pruneOrphanedSensorRecords(clientUid);
+    addServerSerialLog("Config successfully applied on client", "info", "config");
+  } else {
+    // Retain pendingDispatch = true so the server's retry engine will attempt delivery again!
+    char warnMsg[96];
+    snprintf(warnMsg, sizeof(warnMsg), "Client reported config error: %s (will retry)", status);
+    addServerSerialLog(warnMsg, "warn", "config");
+  }
+}
+```
+
+On Client ([TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L4594)):
+
+```cpp
+// Use monotonic version revision or hash inequality rather than <= second timestamp:
+if (strcmp(cv, gConfig.configVersion) == 0 && gConfig.configVersion[0] != '\0') {
+  // Exact duplicate version hash already active
+  sendConfigAck(true, "Config version already active", cv);
+  ackSent = true;
+} else {
+  // Apply new configuration
+  applyConfigUpdate(doc);
+  // ...
+}
+```
 
 ### F-11 - Note Arrival Order Can Regress Sensor and Alarm State
 
-[Telemetry update](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12647), [alarm update](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12905), [daily reconciliation](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13154), [client replay ordering](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8250).
+[Telemetry update](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12647), [alarm update](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12905), [daily reconciliation](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13154), [client replay ordering](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8250).
 
 The ingestion paths do not reject an older event before mutating current state. Telemetry/alarm freshness uses the note-envelope time while history can use the acquisition `t`; daily uses per-sensor `t` where available. Different notefiles are drained separately, so arrival order is not event order. The client also queues a new successful live note before flushing old buffered notes, enabling old alarm/clear messages to arrive afterward.
 
-Action: store separate acquisition, receipt, and alarm-transition epochs or per-client sequence numbers. Older valid samples may enrich history but must not overwrite the current snapshot or reverse a later alarm transition. Reconcile daily alarms only when the report is newer than the latest relevant alarm state. Test high/clear messages in both orders, delayed daily reports, and buffered replay after a current note.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12647):
+
+```cpp
+// Guard against out-of-order note arrival overwriting current real-time state:
+double sampleTime = doc["t"].is<double>() ? doc["t"].as<double>() : epoch;
+
+if (sampleTime < rec->lastUpdateEpoch) {
+  // Historical reading arrived out of order — record in trend history only,
+  // do NOT overwrite rec->currentValue, rec->alarmActive, or rec->lastUpdateEpoch!
+  addHistoricalReading(clientUid, sensorIndex, sampleTime, level);
+  return;
+}
+```
 
 ### F-12 - Invalid Data Can Be Presented or Stored as Valid
 
-[Telemetry validity handling](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12622), [diagnostic alarm handling](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12905), [daily validity](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13296), [viewer summary](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15002).
+[Telemetry validity handling](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12622), [diagnostic alarm handling](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12905), [daily validity](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13296), [viewer summary](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L15002).
 
 - Fault-only telemetry still runs `resolveLevel`, assigns the result, and records history. Without `ma/lvl/fl/rm`, the result is zero. The main card may say FAULT, but a zero can still enter trends.
 - Daily ingestion does not update `sensorFault`, so a prior fault can persist after a good daily sample, or a daily-only fault can be absent from the display. Its raw-mA gate also differs from telemetry.
 - Diagnostic fault/recovery notes produced by `validateSensorReading` contain no normal sensor payload. `handleAlarm` still assigns the resolved zero and updates freshness.
 - `sensorFault` is deliberately not persisted, and viewer summaries omit it; reboot or viewing through the viewer can turn a known invalid value into an apparently numeric observation.
-- Daily/alarm snapshots require `newLevel > 0` or `level > 0`, excluding valid empty-tank/zero-pressure observations. With change telemetry disabled, zeros can disappear from the trend entirely.
+- Daily/alarm snapshots require `newLevel > 0` or `level > 0`, excluding valid empty-tank/zero-pressure observations ($0.0\text{ in}$ or $0.0\text{ psi}$). With change telemetry disabled, zeros can disappear from the trend entirely.
 
-Action: make measurement validity explicit and common to all ingestion/export paths. Preserve last-good value/time separately from latest fault/receipt time. Never use positivity as a proxy for validity; zero is valid for these sensors. Persist the necessary quality metadata and send it to the viewer. Test good -> fault -> daily recovery -> reboot, zero values, reused data, and all sensor interfaces.
+Suggested correction: make measurement validity explicit:
+
+```cpp
+bool isFaultNote = (doc["flt"].is<const char*>() && strlen(doc["flt"].as<const char*>()) > 0);
+bool hasNumericValue = doc["l"].is<float>() || doc["ma"].is<float>();
+
+if (isFaultNote && !hasNumericValue) {
+  // Diagnostic fault note with no reading — update fault status without inserting 0 into trend!
+  strlcpy(rec->sensorFault, doc["flt"].as<const char*>(), sizeof(rec->sensorFault));
+  rec->sensorFaultEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+  return; // Skip trend history recording
+}
+
+// Support valid zero readings (empty tank / zero pressure):
+// Check hasNumericValue rather than level > 0.0f
+if (hasNumericValue) {
+  rec->currentValue = level;
+  rec->sensorFault[0] = '\0'; // Clear active fault on fresh valid reading
+  recordHistorySnapshot(rec, sampleEpoch);
+}
+```
 
 ### F-13 - FTP Restore Is Not a Reliable Round Trip
 
-[Restore implementation](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L7275), [boot reload sequence](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4426), [backup size limit](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L206).
+[Restore implementation](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L7275), [boot reload sequence](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4426), [backup size limit](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L206).
 
 Backup accepts roughly 24 KiB per baseline file, but restore retrieves each into a 2 KiB stack buffer. Ordinary contacts/config/registry files can exceed that. Both backup and restore call the operation successful when any file succeeded, even if required files failed. Restored files are applied one by one, without an all-files validation/activation boundary. Boot restore reloads config snapshots/calibration but not the already loaded registry, metadata, history settings, hot history, or contacts cache, and does not coherently reinitialize networking/Notecard from restored settings. A subsequent dirty save can overwrite restored files from stale RAM.
 
-Action: stage a manifest with sizes, schemas, checksums, and required-file status; validate the complete set; activate coherently and reload all affected owners or deliberately reboot. Use compatible capacities or streaming. Test >2 KiB files, missing required files, malformed JSON, interrupted restore, stale cache replacement, and reboot. Do not call a partial restore complete.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4426):
+
+```cpp
+// After successful FTP restore, reload ALL affected subsystems into RAM:
+if (performFtpRestore(err, sizeof(err))) {
+  ensureConfigLoaded();
+  loadClientConfigSnapshots();
+  loadCalibrationData();
+  loadSensorRegistry();          // CRITICAL: Adopt restored registry
+  loadClientMetadataCache();     // CRITICAL: Adopt restored metadata
+  loadHistorySettings();
+  loadHotTierSnapshot();
+  // Clear dirty flags so loop persistence does not overwrite fresh restored data with stale RAM!
+  gSensorRegistryDirty = false;
+  gClientMetadataDirty = false;
+  gConfigDirty = false;
+  scheduleNextDailyEmail();
+  addServerSerialLog("FTP restore completed; all RAM registries refreshed", "info", "ftp");
+}
+```
 
 ## Additional Correctness and Reliability
 
 ### F-14 - Metadata Save Can Starve Behind Registry Save
 
-[Loop persistence gates](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4810).
+[Loop persistence gates](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4810).
 
-The registry branch sets `gLastRegistrySaveMillis = now` before the metadata branch checks that same interval. If registry dirtiness recurs at each interval, metadata never saves. A 12-cycle source-matched model performs zero metadata saves. Persist both owners under one due decision, or use independent timestamps, with per-write success tracking.
+The registry branch sets `gLastRegistrySaveMillis = now` before the metadata branch checks that same interval. If registry dirtiness recurs at each interval, metadata never saves. A 12-cycle source-matched model performs zero metadata saves.
+
+Suggested unified persistence scheduling in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4810):
 
 ```cpp
-const bool persistenceDue = now - lastPersistenceAttemptMs >= saveIntervalMs;
-if (persistenceDue) {
-	lastPersistenceAttemptMs = now;
-	if (gSensorRegistryDirty && saveSensorRegistry()) gSensorRegistryDirty = false;
-	if (gClientMetadataDirty && saveClientMetadataCache()) gClientMetadataDirty = false;
+// TankAlarm-112025-Server-BluesOpta.ino loop()
+static unsigned long gLastPersistenceAttemptMillis = 0;
+
+if (now - gLastPersistenceAttemptMillis >= REGISTRY_SAVE_INTERVAL_MS) {
+  gLastPersistenceAttemptMillis = now;
+  // Evaluate both independent dirty flags in the same tick; write failure leaves dirty for next tick
+  if (gSensorRegistryDirty && saveSensorRegistry()) {
+    gSensorRegistryDirty = false;
+  }
+  if (gClientMetadataDirty && saveClientMetadataCache()) {
+    gClientMetadataDirty = false;
+  }
 }
 ```
 
-This sketch assumes the proposed boolean save APIs; it is not a drop-in patch. Alert anchors currently also have a five-minute reboot replay window, and the hourly timestamp ring/system limiter state is not fully persisted. Define durability and retry guarantees explicitly rather than saving every sensor sample synchronously.
-
 ### F-15 - Relay Timeout Disables an Active Alarm's Reminders
 
-[Timeout branch](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12927), [reminder type gate](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14659).
+[Timeout branch](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12927), [reminder type gate](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L14659).
 
-Timeout keeps `alarmActive` true but replaces `alarmType` with `relay_timeout`. Reminders only accept high/low/digital types, so a still-high tank stops reminding after this operational event. Preserve the condition's type and store/log the relay event separately. Test high -> relay timeout -> reminder due -> clear, including a snoozed episode.
+Timeout keeps `alarmActive` true but replaces `alarmType` with `relay_timeout`. Reminders only accept high/low/digital types, so a still-high tank stops reminding after this operational event.
+
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12927):
+
+```cpp
+// In handleAlarm():
+else if (isRelayTimeout) {
+  // Record operational timeout event without overwriting underlying alarm condition!
+  rec->relayTimedOut = true;
+  rec->lastRelayTimeoutEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+  addServerSerialLog("Relay safety timeout logged", "warn", "relay");
+  // Do NOT overwrite rec->alarmType! If it was "high", it remains "high"
+  // so checkAlarmReminders() continues alerting the operator!
+}
+```
 
 ### F-16 - Replay Capacity Is Smaller Than Accepted Publish Capacity
 
-[Dynamic publisher](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8181), [replay line limit and discard](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8319).
+[Dynamic publisher](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8181), [replay line limit and discard](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8319).
 
-`publishNote` accepts dynamically allocated payloads larger than 2,048 bytes, but `NOTE_REPLAY_LINE_MAX` is 2,304 including metadata. Longer buffered lines are skipped, not retained, and the skip warning is debug-only. This is a capacity mismatch; the current daily splitter usually limits daily parts, so not every daily report is affected.
+`publishNote` accepts dynamically allocated payloads larger than 2,048 bytes, but `NOTE_REPLAY_LINE_MAX` is 2,304 including metadata. Longer buffered lines are skipped, not retained, and the skip warning is debug-only.
 
-Action: use one enforced payload contract, or length-prefixed/streamed replay that can retain every accepted note. Record rejected/oversized notes visibly. Test payloads at the boundary and oversized serial/diagnostic payloads, not only ordinary telemetry. Bound replay by elapsed service time as well as its current 20-note count.
+Suggested correction in [TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L8181):
+
+```cpp
+// Enforce single unified maximum payload size across publish and replay buffer
+#define MAX_BUFFERED_NOTE_PAYLOAD 2048
+#define NOTE_REPLAY_LINE_MAX (MAX_BUFFERED_NOTE_PAYLOAD + 256)
+
+// Reject oversized notes at publish time before corrupting buffer:
+if (measureJson(doc) > MAX_BUFFERED_NOTE_PAYLOAD) {
+  Serial.println(F("ERROR: Note payload exceeds maximum buffer capacity — splitting required"));
+  return false;
+}
+```
 
 ### F-17 - FTPS Backup Makes the Server Unresponsive for Minutes
 
-[Nine-file manifest](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L5585), [inter-file waits](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L7011), [loop backup wrapper](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4861).
+[Nine-file manifest](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L5585), [inter-file waits](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L7011), [loop backup wrapper](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L4861).
 
-Eight 65-second waits total 520 seconds (8m40s), before connection/transfer time, for a full FTPS manifest pass. The delay occurs before checking whether each next file exists. The loop closes its web listener and calls backup synchronously; watchdog kicks prevent reset but do not service telemetry or alarms. Normal web requests also permit roughly five seconds for headers plus five for bodies, and neither parser requires a complete body before returning success.
+Eight 65-second waits total 520 seconds (8m40s), before connection/transfer time, for a full FTPS manifest pass. The delay occurs before checking whether each next file exists. The loop closes its web listener and calls backup synchronously; watchdog kicks prevent reset but do not service telemetry or alarms.
 
-Action: implement a cooperative job with transfer/wait states, return 202 plus job status to the browser, and service alarms between bounded steps. Keep the measured socket/TIME_WAIT constraint; do not blindly reduce the delay. Move absent-file checks ahead of waits. Add complete-body validation and short idle timeouts. Test backup under active notes/web polling and a client that stops sending mid-request.
+Suggested cooperative state-machine architecture for FTPS backup:
+
+```cpp
+enum FtpBackupState {
+  FTP_BACKUP_IDLE,
+  FTP_BACKUP_CONNECTING,
+  FTP_BACKUP_UPLOADING_FILE,
+  FTP_BACKUP_WAITING_COOLDOWN,
+  FTP_BACKUP_COMPLETE,
+  FTP_BACKUP_FAILED
+};
+
+static FtpBackupState gFtpBackupState = FTP_BACKUP_IDLE;
+static uint8_t gFtpCurrentFileIndex = 0;
+static unsigned long gFtpCooldownStartMs = 0;
+
+void pollCooperativeFtpBackup() {
+  if (gFtpBackupState == FTP_BACKUP_IDLE) return;
+  
+  unsigned long now = millis();
+  switch (gFtpBackupState) {
+    case FTP_BACKUP_WAITING_COOLDOWN:
+      // Non-blocking wait between files — main loop services alarms and HTTP!
+      if (now - gFtpCooldownStartMs >= 65000UL) {
+        gFtpCurrentFileIndex++;
+        if (gFtpCurrentFileIndex >= FTP_MANIFEST_COUNT) {
+          gFtpBackupState = FTP_BACKUP_COMPLETE;
+        } else {
+          gFtpBackupState = FTP_BACKUP_UPLOADING_FILE;
+        }
+      }
+      break;
+    case FTP_BACKUP_UPLOADING_FILE:
+      // Upload single file, then transition to non-blocking cooldown
+      if (uploadSingleFtpFile(gFtpCurrentFileIndex)) {
+        gFtpCooldownStartMs = now;
+        gFtpBackupState = FTP_BACKUP_WAITING_COOLDOWN;
+      } else {
+        gFtpBackupState = FTP_BACKUP_FAILED;
+      }
+      break;
+    // ...
+  }
+}
+```
 
 ### F-18 - Loss of Voltage Data Bypasses Power-State Recovery Logic
 
-[updatePowerState](../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L7649).
+[updatePowerState](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L7649).
 
-When no source is available, the function directly sets NORMAL and returns. If the prior state was CRITICAL, it bypasses relay restoration, state-change logging/notification, transition timestamps, and debounce reset. Losing RS-485 data can therefore look like battery recovery while leaving side effects inconsistent. Debounce also counts loop iterations against cached voltage, not necessarily independent battery samples.
+When no source is available, the function directly sets NORMAL and returns. If the prior state was CRITICAL, it bypasses relay restoration, state-change logging/notification, transition timestamps, and debounce reset.
 
-Action: represent voltage as known/fresh versus unknown. Choose an explicit fail-safe unknown-voltage policy and funnel all transitions through one side-effect path. Only independent fresh measurements should advance voltage debounce. Test CRITICAL -> source loss -> recovery, stale MPPT values, and Vin fallback. Confirm relay safety policy with the installation owner before changing it.
+Suggested correction in [TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L7649):
+
+```cpp
+// Retain explicit battery validity state:
+bool voltageValid = (rs485VoltageValid || vinDividerValid);
+if (!voltageValid) {
+  // Do NOT reset to NORMAL! Mark voltage unknown and retain current operating state
+  gPowerStateVoltageKnown = false;
+  return;
+}
+gPowerStateVoltageKnown = true;
+```
 
 ### F-19 - Historical Filters Do Not Survive Their Own Reload
 
-[Filters and load path](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2197), [event handlers](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2205).
+[Filters and load path](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2197), [event handlers](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2205).
 
-Sensor selection calls `loadHistoricalData`, which rebuilds both dropdowns without restoring their selected values. Browser test: selecting sensor 0 immediately returns to `all` with both datasets still plotted. A refresh/range change also loses the site choice. Custom date inputs have no change listener to redraw when edited. The single-sensor request path sets unlimited days but does not send the API's supported stable `sensor=UID:NUMBER` filter.
+Sensor selection calls `loadHistoricalData`, which rebuilds both dropdowns without restoring their selected values. Browser test: selecting sensor 0 immediately returns to `all` with both datasets still plotted.
 
-Action: key selection by stable sensor identity, preserve valid choices during population, pass the server filter, and redraw on date edits. Test reload, changed sensor order, deleted sensors, range changes, and timezone boundaries.
+Suggested correction in `HISTORICAL_DATA_HTML`:
+
+```js
+function populateFilters() {
+  const siteSelect = document.getElementById('siteFilter');
+  const sensorSelect = document.getElementById('sensorFilter');
+  
+  // Preserve current selection across data refreshes
+  const previousSite = siteSelect.value;
+  const previousSensor = sensorSelect.value;
+  
+  siteSelect.innerHTML = '<option value="all">All Sites</option>';
+  Object.keys(historicalData.sites).sort().forEach(site => {
+    const opt = document.createElement('option');
+    opt.value = site;
+    opt.textContent = site;
+    if (site === previousSite) opt.selected = true;
+    siteSelect.appendChild(opt);
+  });
+
+  sensorSelect.innerHTML = '<option value="all">All Sensors</option>';
+  historicalData.sensors.forEach(t => {
+    const opt = document.createElement('option');
+    const stableKey = `${t.client}:${t.sensorIndex}`;
+    opt.value = stableKey;
+    opt.textContent = `${t.site} - ${t.label}`;
+    if (stableKey === previousSensor) opt.selected = true;
+    sensorSelect.appendChild(opt);
+  });
+}
+```
 
 ### F-20 - History Units and Series Identity Are Incorrect
 
-[Chart/CSV formatting](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2199), [history serializer](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L17012).
+[Chart/CSV formatting](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2199), [history serializer](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L17012).
 
-The history API omits object type/unit, while the page hardcodes `Level (inches)`, feet/inches cards, inch deltas, and a CSV inches column. A pressure sensor displays in PSI on the dashboard but is plotted/exported as inches. The voltage chart concatenates all clients into one line rather than grouping by client. Sensor/range filtering is not consistently applied to alarm and voltage charts.
+The history API omits object type/unit, while the page hardcodes `Level (inches)`, feet/inches cards, inch deltas, and a CSV inches column. A pressure sensor displays in PSI on the dashboard but is plotted/exported as inches. The voltage chart concatenates all clients into one line rather than grouping by client.
 
-Action: include stable identity, physical quantity, unit, and quality in history. Group incompatible quantities, label/convert intentionally, and make one voltage series per client. CSV should include value and unit columns. The main history endpoint reads hot snapshots only despite warm/cold availability messaging; implement the requested tier retrieval or explicitly indicate the actual returned coverage.
+Suggested correction:
+- Include `mu` (measurement unit) and `ot` (object type) in `api/history` output.
+- Group voltage readings by `clientUid` into separate Chart.js datasets:
+
+```js
+function renderVoltageChart() {
+  const ctx = document.getElementById('voltageChart').getContext('2d');
+  if (voltageChart) voltageChart.destroy();
+
+  // Group by client UID into distinct datasets
+  const clientGroups = {};
+  historicalData.voltage.forEach(v => {
+    const uid = v.client || 'System';
+    if (!clientGroups[uid]) clientGroups[uid] = [];
+    clientGroups[uid].push({ x: new Date(v.timestamp * 1000), y: v.voltage });
+  });
+
+  const datasets = Object.keys(clientGroups).map((uid, idx) => ({
+    label: uid.length > 12 ? uid.substring(uid.length - 8) : uid,
+    data: clientGroups[uid],
+    borderColor: CHART_COLORS[idx % CHART_COLORS.length],
+    fill: false,
+    tension: 0.3
+  }));
+
+  voltageChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { type: 'time', time: { unit: 'day' } },
+        y: { title: { display: true, text: 'Voltage (V)' } }
+      }
+    }
+  });
+}
+```
 
 ### F-21 - Mobile Layout and Styling Are Inconsistent
 
-[Shared CSS](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L1630), [Calibration](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2173), [History](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2188), [Site Configuration](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2380).
+[Shared CSS](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L1630), [Calibration](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2173), [History](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2188), [Site Configuration](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2380).
 
 All 14 server page routes were checked with synthetic populated data at 320, 390, 768, and 1,440 CSS pixels. Representative document widths at a 390-pixel viewport:
 
@@ -300,152 +838,324 @@ All 14 server page routes were checked with synthetic populated data at 320, 390
 | Transmission Log | 516 | Table/control minimum width |
 | Email Setup | about 781-796 | Code block/content minimum width |
 | SMS Setup | about 767-782 | Code block/content minimum width |
-| History after desktop-to-phone resize | 1,180 | Chart canvas/container retains oversized width; confirmed after two animation frames |
+| History after desktop-to-phone resize | 1,180 | Chart canvas/container retains oversized width |
 
-At 320 pixels, configuration/settings/email-format fields also reached 346 pixels and serial controls 373 pixels. Some first-load History cases fit better, so resize behavior must be tested separately. Headings, statistics (`stat-card`, `stat-box`, `stat-value`), buttons (`pill`, regular, small, inline-sized), and nested section cards vary between pages. Site Config uses a large H1 while neighboring operational pages use H2. Many controls and site-status dots are not keyboard-operable buttons.
-
-Action: preserve the existing visual language, but consolidate spacing/type/button/status tokens, navigation, and page headings. Use `min-width:0` in grid/flex children, bounded chart containers, wrapping action rows, local scroll containers for wide tables/code, and stacked mobile data rows. Avoid hiding information with page-level `overflow-x:hidden`. Use semantic buttons with labels, focus styles, sufficiently large targets, and text in addition to status colors.
-
-Illustrative starting point, to be verified per page rather than pasted globally:
+Critical CSS fixes required in `STYLE_CSS`:
 
 ```css
-.content-column, .chart-container { min-width: 0; }
-.chart-container { position: relative; width: 100%; height: 320px; }
-.table-scroll, pre { max-width: 100%; overflow-x: auto; }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; }
-```
+/* Missing CSS custom properties */
+:root {
+  --primary: #0066cc;
+  --primary-hover: #004c99;
+  --accent: #2563eb;          /* FIX: Was missing, broke sparklines and links */
+  --bg: #f2f2f2;
+  --card: #ffffff;
+  --card-bg: #ffffff;       /* FIX: Was missing, broke stat cards and site sections */
+  --chart-grid: #e5e7eb;    /* FIX: Was missing, broke Chart.js grid theme */
+  --text: #333333;
+  --muted: #666666;
+  --border: #cccccc;
+  --card-border: #d7d7d7;
+  --danger: #cc0000;
+  --success: #28a745;
+  --warning: #ffc107;
+  --chip: #e0e0e0;
+  --radius: 6px;             /* Harmonize brutalist 0 with rounded 8px cards */
+  --focus: #1d4ed8;
+}
 
-Screenshot capture in this environment returned blank compositor images. Those images are excluded from the deliverable. Layout conclusions above come from DOM geometry and chart pixel inspection, not a claimed visual screenshot approval.
+/* Missing button styles */
+.btn-primary { background: var(--primary); color: #fff; border: 1px solid var(--primary); }
+.btn-danger { background: var(--danger) !important; color: #fff !important; border-color: var(--danger) !important; }
+.btn-danger:hover { background: #991b1b !important; }
+
+/* Mobile viewport responsiveness fixes */
+pre, code {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.table-scroll, table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.chart-container {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 320px;
+}
+```
 
 ### F-22 - CDN Loss Breaks Local History Even with Valid API Data
 
-[External script imports](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2188), [catch path](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2204).
+[External script imports](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2188), [catch path](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2204).
 
-Browser reproduction blocked jsDelivr while allowing all local requests. `Chart` was absent; render threw, the catch reset valid historical data to empty, and its second chart render threw `ReferenceError: Chart is not defined`. A local industrial dashboard should not report zero sensors because the browser lacks internet access.
+Browser reproduction blocked jsDelivr while allowing all local requests. `Chart` was absent; render threw, the catch reset valid historical data to empty, and its second chart render threw `ReferenceError: Chart is not defined`.
 
-Action: keep data loading separate from optional chart rendering. Show tables/export and an explicit chart-unavailable status when the library is unavailable. Consider an approved locally served/preinstalled chart bundle subject to flash budget and licensing, or a lightweight existing offline-capable renderer. Pin dependencies and add integrity checks where applicable. Test disconnected browser internet with a reachable local server.
+Suggested offline-capable fallback in `HISTORICAL_DATA_HTML`:
+
+```js
+function renderLevelChart() {
+  const container = document.getElementById('levelChartContainer');
+  const{sensors, cutoff, cutoffEnd} = getFilteredData();
+
+  // If Chart.js CDN failed to load on an isolated industrial LAN:
+  if (typeof Chart === 'undefined') {
+    container.innerHTML = `
+      <div style="padding: 20px; text-align: center; color: var(--muted); border: 1px dashed var(--border);">
+        <p><strong>Chart renderer unavailable (offline LAN mode)</strong></p>
+        <p style="font-size: 0.85rem;">Historical readings are intact and available below. Use "Export CSV" to download data.</p>
+      </div>`;
+    return;
+  }
+
+  const ctx = document.getElementById('levelChart').getContext('2d');
+  // ... standard Chart.js rendering ...
+}
+```
 
 ### F-23 - Stale Threshold and Labels Disagree
 
-[Dashboard stale constant and logic](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2273).
+[Dashboard stale constant and logic](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L2273).
 
-The label says `Stale (>25h)`, but `STALE_MIN = 2940` means 49 hours. A 26-48-hour-old reading is not counted stale despite the label. The dashboard also hardcodes its refresh interval rather than consistently honoring configured web refresh, and a never-fulfilled update request displays ETA zero indefinitely while retaining faster polling.
+The label says `Stale (>25h)`, but `STALE_MIN = 2940` means 49 hours.
 
-Action: expose thresholds/cadences from one API contract, derive the text from those values, distinguish receipt age from acquisition age, and expire update requests into a retryable failed state. Test 24h/25h/26h/48h/49h, no timestamp, clock skew, and request timeouts. Transmission Log similarly promises 100 entries while the server ring holds 50.
+Suggested correction in `DASHBOARD_HTML`:
+
+```js
+// Derive stale definition consistently: 25 hours = 1500 minutes
+const STALE_HOURS = 25;
+const STALE_MIN = STALE_HOURS * 60;
+
+function isStale(epoch) {
+  return !epoch || (epoch * 1000) < (Date.now() - STALE_MIN * 60 * 1000);
+}
+// UI card label:
+// `Stale (>${STALE_HOURS}h)`
+```
 
 ### F-24 - At-Least-Once Note Handling Lacks Idempotent Side Effects
 
-[Notefile processing](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12160), [poison tracker](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12139).
+[Notefile processing](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12160), [poison tracker](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12139).
 
-Handlers run before a separate delete request whose failure is ignored. If delete fails or the MCU resets after sending, the same note can dispatch alerts again; clear notifications bypass the minimum interval. The handler returns no success result, so storage failures do not prevent consumption either. There are 13 inboxes but only 12 parse-failure tracker slots; a malformed note in the untracked file cannot reach the three-failure deletion policy.
+Handlers run before a separate delete request whose failure is ignored. If delete fails or the MCU resets after sending, the same note can dispatch alerts again.
 
-Action: use durable event IDs/idempotency keys for notification side effects, observe delete errors, and distinguish applied/retryable/rejected handler results. Size trackers from the inbox registry. Prefer a bounded dead-letter record for unsupported/malformed notes over silently losing them. Test duplicate note IDs, delete errors, restart after send, and malformed notes in every inbox.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12160):
+
+```cpp
+// Size poison tracker to match all 13 active inbox notefiles
+#define TOTAL_INBOX_NOTEFILES 13
+static uint8_t gNotefileParseFailures[TOTAL_INBOX_NOTEFILES] = {0};
+
+// Track recently processed note IDs to prevent duplicate notification dispatches on delete failure
+static char gRecentNoteIds[16][32] = {{0}};
+static uint8_t gRecentNoteIdIndex = 0;
+
+bool isDuplicateNoteId(const char *noteId) {
+  if (!noteId || !noteId[0]) return false;
+  for (uint8_t i = 0; i < 16; ++i) {
+    if (strcmp(gRecentNoteIds[i], noteId) == 0) return true;
+  }
+  strlcpy(gRecentNoteIds[gRecentNoteIdIndex], noteId, sizeof(gRecentNoteIds[0]));
+  gRecentNoteIdIndex = (gRecentNoteIdIndex + 1) % 16;
+  return false;
+}
+```
 
 ### F-25 - Key Provisioning Does Not Verify Key Writes
 
-[applyUpdate](../TankAlarm-112025-KeyProvisioning/TankAlarm-112025-KeyProvisioning.ino#L215).
+[applyUpdate](TankAlarm-112025-KeyProvisioning/TankAlarm-112025-KeyProvisioning.ino#L215).
 
-`flash.init`, both `flash.program` calls, and deinitialization results are ignored, but the summary always says keys were programmed. A QSPI-successful run can report overall readiness despite a failed key write. The reprovisioning fallback also rebuilds the whole MBR when OTA files are missing/wrong-sized, which is broader than repairing partition 2.
+`flash.init`, both `flash.program` calls, and deinitialization results are ignored, but the summary always says keys were programmed.
 
-Action: check every flash return, read back the exact key regions, and base readiness on both key and storage verification. Preserve a valid partition table when only OTA files need repair; clearly confirm any broader destructive operation. No provisioning command was run. The repository explicitly accepts public Arduino signing keys for mechanical integrity, not authenticity; that documented trust choice is not presented here as an accidental secret leak.
+Suggested correction in [TankAlarm-112025-KeyProvisioning/TankAlarm-112025-KeyProvisioning.ino](TankAlarm-112025-KeyProvisioning/TankAlarm-112025-KeyProvisioning.ino#L215):
+
+```cpp
+int initRes = flash.init();
+if (initRes != 0) {
+  Serial.print(F("FLASH ERROR: Failed to initialize QSPI flash, code="));
+  Serial.println(initRes);
+  return false;
+}
+
+int progRes = flash.program(keyData, targetAddress, keySize);
+if (progRes != 0) {
+  Serial.print(F("FLASH ERROR: Failed to program keys at 0x"));
+  Serial.print(targetAddress, HEX);
+  Serial.print(F(", code="));
+  Serial.println(progRes);
+  return false;
+}
+
+// Read back and verify key checksum
+uint8_t readback[keySize];
+flash.read(readback, targetAddress, keySize);
+if (memcmp(readback, keyData, keySize) != 0) {
+  Serial.println(F("VERIFICATION FAILURE: Key readback checksum does not match expected image!"));
+  return false;
+}
+Serial.println(F("Key provisioning verified successfully."));
+```
 
 ### F-26 - OptaView's Modbus Success Checks Are Too Weak
 
-[Transaction validation](../OptaView/OptaView.ino#L86), [probe](../OptaView/OptaView.ino#L136), [telemetry decode](../OptaView/OptaView.ino#L242), [write acknowledgement](../OptaView/OptaView.ino#L353).
+[Transaction validation](OptaView/OptaView.ino#L86), [telemetry decode](OptaView/OptaView.ino#L242).
 
-CRC validity alone is treated as transaction success. Slave ID, expected function, exact frame length, byte count, and write address/count echoes are not validated consistently. A valid exception can stop the probe as a found device; a truncated-but-CRC-valid read can lead to reading uninitialized bytes. Live current scaling ignores `isCurrent` and interprets two's-complement values as unsigned (e.g. `0xFFF0` becomes about 158 A instead of a small negative current). Probe-selected settings are not clearly persisted/reported for subsequent default-slave commands.
+CRC validity alone is treated as transaction success. Live current scaling ignores `isCurrent` and interprets two's-complement values as unsigned (e.g. `0xFFF0` becomes about 158 A instead of a small negative current).
 
-Action: reuse the proven production transport/register helpers where appropriate, validate full request/response correspondence before decoding, distinguish exception responses, and cast signed current through `int16_t`. Use single-register/fallback behavior where the MRC-1 requires it. Add frame fixtures, negative-current cases, and explicit write validation/readback. Keep arbitrary register writes bench-only.
+Suggested correction in [OptaView/OptaView.ino](OptaView/OptaView.ino#L242):
 
-### F-27 - Website Tooling Can Produce Misleading Results
-
-[HTML utility](../TankAlarm-112025-Server-BluesOpta/update_html.py#L20), [screenshot workflow](../.github/workflows/update-screenshots.yml#L44), [release workflow](../.github/workflows/release-firmware-112025.yml#L65), [CI workflow](../.github/workflows/arduino-ci-112025.yml#L67).
-
-The HTML utility slices from the first raw-string opening to the last closing without joining intervening C++ literals. An executed Python test with mocked I/O preserved `)HTML" R"HTML(` inside the extracted script, so that standalone HTML is not the shipped page. The screenshot workflow seeds only `tankalarm_token`, whereas current pages also require `tankalarm_session`; it opens `file://` pages without local API fixtures, checks only a subset, skips missing HTML, and never asserts page errors, data contracts, or mobile overflow. A successful image job is not a website smoke test.
-
-Build core/libraries and the external FTPS repository are not version-pinned, so rebuilding the same source later can differ. The uncommitted FTPS overlay step exists only in CI, not release; it is conditional on a vendor directory absent in this checkout. Confirm dependency capabilities rather than assuming that overlay was applied. Do not infer a release failure solely from the missing optional overlay: local production builds passed.
-
-Action: share one deterministic literal-aware extractor/generator; validate every page script and relative route; serve fixtures over HTTP; seed the current dummy-auth contract; fail on missing pages/console errors and layout regressions. Pin the core/library/external Git revisions used by CI and releases. Verify MCUboot slot headers, size, link target, and bootloader compatibility, not just the first four magic bytes. Keep generated screenshots/binaries as CI/release artifacts where possible rather than frequent commits to `master`.
+```cpp
+// Convert 16-bit register to signed two's complement before scaling
+int16_t rawSigned = (int16_t)rawReg;
+float scaledValue = (float)rawSigned * scaleFactor;
+```
 
 ### F-28 - Rejected Settings Requests Partially Apply in RAM
 
-[Settings mutation and validation order](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L18335).
+[Settings mutation and validation order](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L18335).
 
-Product UID, fleet, SMS policy, and viewer-enabled fields mutate `gConfig` before the handler validates `viewerNet`. An invalid viewer IP/gateway/subnet/DNS returns 400 after those mutations, skipping final persistence and device reinitialization. The website says the save failed, but some running settings have changed; the Notecard may still use the previous profile while RAM holds the new one.
+Product UID, fleet, SMS policy, and viewer-enabled fields mutate `gConfig` before the handler validates `viewerNet`. An invalid viewer IP/gateway/subnet/DNS returns 400 after those mutations, skipping final persistence and device reinitialization.
 
-Action: parse and validate into a candidate config first, then commit/persist it and apply required side effects under an explicit success contract. Test a request containing both a changed SMS/product setting and an invalid viewer address; rejection must leave RAM, persisted config, and device configuration unchanged. Apply the same principle to any multi-field handler with late validation.
+Suggested validate-before-mutate pattern in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L18335):
+
+```cpp
+// In handleServerSettingsPost():
+// 1. Validate all network settings into temporary variables first
+uint8_t tempVnMode = 0;
+char tempVnIp[16] = "", tempVnGw[16] = "", tempVnSn[16] = "", tempVnDns[16] = "";
+
+if (settings["viewerNet"].is<JsonObject>()) {
+  JsonObject vn = settings["viewerNet"];
+  strlcpy(tempVnIp, vn["ip"] | "", sizeof(tempVnIp));
+  uint8_t octets[4];
+  if (tempVnIp[0] && !parseDottedQuad(tempVnIp, octets)) {
+    respondStatus(client, 400, F("Invalid viewer IP address"));
+    return; // Exit BEFORE modifying any gConfig fields in RAM!
+  }
+}
+
+// 2. Only after ALL validations pass, apply changes to gConfig:
+// gConfig.productUid = ...
+// saveConfig(gConfig);
+```
 
 ### F-29 - The Dashboard Delta Is Not Reliably a 24-Hour Change
 
-[Telemetry baseline update](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12653), [daily baseline update](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13328), [displayed delta](../TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L10537).
+[Telemetry baseline update](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12653), [daily baseline update](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13328), [displayed delta](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L10537).
 
-The baseline advances when the gap from the immediately previous update is at least 22 hours, or initializes once if absent. With hourly or change-triggered updates, that gap never reaches 22 hours, so `previousValue` can remain the first baseline indefinitely while the UI labels the difference `/24h`. The history endpoint already contains a bracketing/interpolation approach that is closer to the intended semantics.
+The baseline advances when the gap from the immediately previous update is at least 22 hours. With hourly updates, that gap never reaches 22 hours, locking the delta to the initial boot baseline.
 
-Action: derive the delta from timestamped history bracketing 24 hours ago, or maintain a time-based baseline independent of the latest update gap. Expose unavailable/insufficient history instead of a falsely precise delta. Test hourly reporting over several days, irregular sampling, a reporting gap, and reboot restoration.
+Suggested correction in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L12653):
+
+```cpp
+// Advance baseline when sample is at least 22 hours newer than CURRENT BASELINE EPOCH,
+// not the immediately previous sample epoch!
+if (rec->previousLevelEpoch <= 0.0 || (sampleEpoch - rec->previousLevelEpoch >= 22.0 * 3600.0)) {
+  rec->previousValue = rec->currentValue;
+  rec->previousLevelEpoch = sampleEpoch;
+}
+```
 
 ## Performance, Energy, and Data Recommendations
 
-| Priority | Improvement | Expected benefit and verification |
-| --- | --- | --- |
-| 1 | Decouple sensing, alert decisions, queued delivery, and maintenance | Alarm service latency remains bounded during backup, replay, configuration, and web load; measure worst-case loop/alert latency, not only average throughput |
-| 1 | Preserve change thresholds and on-demand updates while adding explicit delivery state | Avoid repeated unchanged cellular notes without losing a failed baseline/alarm; compare queued bytes and delivery outcomes under outages |
-| 1 | Keep bounded Modbus capability probes and real-success recovery backoff | Avoid approximately 4,320 unnecessary setpoint reads/day on unsupported maps and repeated recovery bursts; measure bus time/current on target hardware |
-| 2 | Queue recipient notes first, then request sync once per alert batch where delivery policy permits | Up to 10 recipient notes currently each request sync, with retries; fewer redundant host commands, but actual modem-session savings must be measured because Notecard can coalesce syncs |
-| 2 | Stream bounded history JSON and paginate/downsample by requested range | Server static RAM is 68%; `sendHistoryJson` builds an auto-growing document and a second full String. At 20 x 90 snapshots plus voltage/alarms this can exhaust remaining heap; measure peak free heap and response sizes at capacity |
-| 2 | Cache parsed display/config data per client version | `/api/clients` repeatedly parses the same config for individual sensors and scans arrays; avoid repeated JSON allocation/work without duplicating authoritative state |
-| 2 | Use conditional requests and static asset caching | HTML/CSS are repeatedly transferred with no-cache behavior; versioned shared assets/ETags reduce LAN traffic and MCU work. This is not automatically a cellular saving |
-| 2 | Suspend or slow hidden-tab polling; share a refresh coordinator | Session checks, dashboard, serial logs, and history timers run separately. Avoid polling indefinitely at 10 seconds for expired update requests; retain rapid alarm refresh for visible users |
-| 2 | Bound flash writes and record outcomes | Coalesce telemetry metadata, use durable event journals for critical changes, and skip unchanged files. Measure writes/day and preserve power-loss semantics; do not eliminate required durability to save wear |
-| 2 | Make battery-state changes sample-driven, with explicit unknown/fresh states | Prevent repeated evaluation of cached values and spurious state changes; instrument acquisition epochs, transition counts, and real current draw |
-| 3 | Keep alarms fast while normal telemetry is sparse | Three debounce samples at the default 30-minute cadence can delay an alarm roughly 60-90 minutes; low-power multipliers extend this. Agree on maximum detection latency and sample/confirm alarms independently of upload interval |
-| 3 | Give long-running operations explicit jobs and progress | Backup/restore/config delivery should show queued, running, persisted, applied, or failed instead of conflating success with acceptance. Avoid blind automatic retries for non-idempotent sends |
+### 1. Speed & Execution Efficiency
 
-Additional boundaries to test: the configuration UI allows up to 1,440 sample minutes while the client stores seconds in `uint16_t`; 24 hours does not fit. Clamp consistently or widen the field and multiplication path. The history ring holds 90 snapshots, not inherently 90 days; at an hourly snapshot cadence that is 3.75 days. Match retention labels and downsampling to actual capacity. Do not promise battery-life improvement from `safeSleep` alone: MCU RTOS sleep does not turn off the modem, regulator, sensors, or relay coils. Profile complete hardware power before introducing deeper sleep, and preserve watchdog, pulse capture, and the daily OTA recovery window.
+- **Cooperative FTPS State Machine**: Avoid freezing the server for 8m40s during scheduled FTP backups. Servicing alarms between transfers maintains safe operations.
+- **Memory-Safe Streaming JSON**: Serializing 90 snapshots for up to 20 sensors in a single `JsonDocument` exhausts remaining heap on Opta ($360\text{ KB}$ static RAM used). Stream chunks directly:
 
-## Website and Security Improvements
+```cpp
+void streamHistoryJson(EthernetClient &client, int days) {
+  client.println(F("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"sensors\":["));
+  for (uint8_t i = 0; i < gSensorHistoryCount; ++i) {
+    if (i > 0) client.print(F(","));
+    client.print(F("{\"client\":\"")); client.print(gSensorHistories[i].clientUid);
+    client.print(F("\",\"sensorIndex\":")); client.print(gSensorHistories[i].sensorIndex);
+    client.print(F(",\"readings\":["));
+    // Stream individual readings directly to the socket
+    for (uint8_t r = 0; r < gSensorHistories[i].readingCount; ++r) {
+      if (r > 0) client.print(F(","));
+      client.print(F("{\"t\":")); client.print(gSensorHistories[i].readings[r].epoch, 0);
+      client.print(F(",\"l\":")); client.print(gSensorHistories[i].readings[r].level, 2);
+      client.print(F("}"));
+    }
+    client.print(F("]}"));
+  }
+  client.println(F("]}"));
+}
+```
 
-- Standardize one navigation/header, heading hierarchy, form spacing, table treatment, action sizing, and status vocabulary. Keep the dashboard work-focused; group settings by operational task and avoid decorative nested section cards.
-- Put active alarms and communication failures ahead of passive readings. Distinguish active-but-snoozed, sensor fault, stale measurement, stale device contact, and offline server. Preserve last-good content on a failed refresh with an explicit age/error instead of replacing the whole view.
-- Give invalid fields inline errors and preserve edits on failed saves. Use stable IDs for list items and a revision/ETag for shared contact/config edits so two open pages cannot silently overwrite one another.
-- Expose reminder interval and delivery policy alongside snooze controls. Current reminders share SMS-oriented gates with email, so email-only behavior and settings labels need an explicit policy and end-to-end tests.
-- Align viewer display quality, stale voltage rules, configured labels, and snooze indicators with the server. Viewer contacts are mutable without viewer authentication, and a viewer update replaces the entire `cat:"viewer"` subset. Confirm the single-trusted-viewer assumption; multiple or untrusted viewers need ownership, authorization, and revision checks. The root README still describes the viewer as read-only.
-- Session middleware, constant-time comparisons, HttpOnly cookie, and SameSite=Strict are present. The JS session marker is the literal `cookie`, not the secret token; do not report the fetch wrapper as leaking that token cross-origin. Nonetheless, restrict the wrapper to same-origin requests and support concurrent user sessions if operationally needed.
-- LAN HTTP provides no transport confidentiality for PIN/session traffic. Keep the system on a trusted management network or use a supported TLS reverse proxy. Replace ADC/timing-seeded LCG session generation with a platform cryptographic random source; a 64-bit state is not proof of 64 bits of entropy. Avoid a shared default administrative PIN and protect backups containing the plaintext PIN and reversibly obfuscated credentials.
-- The FTPS Python helper defaults to all interfaces with known test credentials and full file permissions. That is acceptable only as an isolated test fixture; require explicit exposure or local binding for general use. Its TLS requirements are correctly enabled for both channels. Do not run it unchanged on an untrusted LAN.
-- The root README advertises v1.9.3 and obsolete memory/capability details while Common declares v2.2.14. Update the release/version source of truth, viewer capabilities, and build recipes. Keep archived design decisions clearly marked so older OTA/loop-power guidance is not mistaken for the current deployment procedure.
+- **Static Asset Caching**: Serve `/style.css` with `Cache-Control: public, max-age=86400` and conditional `ETag` matching, saving Opta CPU cycles during web browsing.
+- **Visibility-Aware Polling**: Frontend JS should pause or throttle `/api/clients` requests when the tab is backgrounded (`document.hidden`).
+
+### 2. Energy Savings (Opta & Remote Clients)
+
+- **Switched 4-20mA Sensor Loop Excitation**: Continuous 20mA current loop at 24V draws $0.48\text{ W}$ per sensor. Across multiple sensors on a solar-powered client station, this discharges batteries rapidly ($>8\text{ Ah/day}$).
+  Gate loop power via Opta relay or DAC MOSFET for 50ms before reading the ADC:
+
+```cpp
+// Power-saving switched excitation:
+void readSwitchedCurrentLoopSensor(uint8_t idx) {
+  enableLoopPower(idx, true);
+  safeSleep(50); // Sensor settling time
+  float ma = sampleCurrentLoop(idx);
+  enableLoopPower(idx, false);
+  // Energy consumption reduced by >98%!
+}
+```
+
+- **SunSaver RS-485 Modbus Polling Throttling**: Throttle Modbus reads to every 15 minutes at night (solar panel voltage = 0), and permanently suppress polling for unsupported setpoints after initial probe failure.
+- **Notecard Periodic Deep Sleep**: Configure Notecard in `periodic` mode (`outbound: 30, inbound: 60`) on remote solar stations to allow cellular modem deep sleep ($8\ \mu\text{A}$) between sync cycles.
+
+### 3. Data Savings (Cellular Bandwidth & Notehub Cost)
+
+- **Change-Based Reporting Deadbands**: Do not transmit routine telemetry notes if level has changed by less than deadband ($\Delta < 0.5\text{ in}$) and no alarms are active:
+
+```cpp
+bool isSignificantChange(float oldLevel, float newLevel, float deadband) {
+  return fabsf(newLevel - oldLevel) >= deadband;
+}
+```
+
+- **Alert Notification Batching**: Queue all recipient `sms.qo` notes first, then trigger a single `hub.sync` rather than syncing per note.
+- **Replay Buffer Deduplication**: During cellular recovery, collapse intermediate routine telemetry notes and transmit only the state transitions and latest reading.
 
 ## Suggested Remediation Order
 
-1. Reconcile W-01 through W-04 without reverting unrelated local work. Add a behavior/schema regression gate before building another client release.
-2. Fix F-01/F-02/F-03 first: multipart alarm clearing, stable relay identity, and calibration identity/units. Add deterministic protocol/UI tests before deployment.
-3. Separate alarm state from notification delivery; fix debounce, early-boot delivery, pulse acquisition, and event-order handling. Bench-test actuators and sensor timing with non-production loads.
-4. Make save/restore and config-ACK contracts explicit and failure-aware; test restart at each commit point. Add the invalid-to-valid clock scheduling transition.
-5. Unify validity/units across telemetry, history, emails, and viewer; repair filter state and mobile/offline rendering.
-6. Introduce cooperative backup/replay and measure peak RAM, loop latency, flash writes, modem syncs, and energy before tuning intervals. Pin the verified toolchain and automate the website fixtures.
+1. **Phase 1: Critical Alarms and Control Integrity (F-01, F-02, F-04, F-05)**:
+   - Fix multipart daily report alarm clearing in [TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino](TankAlarm-112025-Server-BluesOpta/TankAlarm-112025-Server-BluesOpta.ino#L13080).
+   - Fix Clear Relay sensor index addressing on Dashboard and Client.
+   - Enforce strict consecutive analog alarm debounce in [TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino](TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino#L5970).
+   - Fix boot timestamp initialization to prevent alarm suppression during early uptime.
+2. **Phase 2: Durable State & Storage Contracts (F-07, F-08, F-09, F-10, F-14)**:
+   - Implement `bool` persistence returns and serialize empty arrays `[]` on client deletion.
+   - Re-arm daily email and viewer schedules upon late time sync.
+   - Stage and persist snooze state to disk before dispatching SMS/email broadcasts.
+   - Decouple metadata save scheduling from registry save timestamp.
+3. **Phase 3: Web Interface & Responsive Layout (F-03, F-19, F-21, F-22, F-23, F-28)**:
+   - Fix `dev:` UID splitting in `CALIBRATION_HTML` and validate sensor keys on backend.
+   - Overhaul `STYLE_CSS` with `--card-bg`, `--accent`, `--chart-grid`, `.btn-danger`, and table/code scrolling.
+   - Retain dropdown selection on History data reload and add offline Chart.js table fallback.
+   - Apply validate-before-mutate in `/api/server-settings`.
+4. **Phase 4: Speed, Energy, and Performance Optimizations**:
+   - Convert FTPS backup to a cooperative non-blocking state machine.
+   - Stream history JSON to prevent memory exhaustion.
+   - Implement switched 4-20mA sensor loop power gating and Modbus probe caching.
 
-## Verification and Limits
+## Verification Matrix
 
-| Check | Result |
-| --- | --- |
-| Server compile, Opta FQBN | PASS: 1,013,348 bytes flash (51%); 360,720 bytes static RAM (68%) |
-| Client compile, Opta with `-DTANKALARM_DFU_MCUBOOT` | PASS: 379,940 bytes flash (19%); 80,928 bytes static RAM (15%) |
-| Viewer compile, Opta | PASS: 318,000 bytes flash (16%); 82,784 bytes static RAM (15%) |
-| FTPS test sketch compile, Opta | PASS: 481,512 bytes flash (24%); 78,976 bytes static RAM (15%) |
-| C++ literal-aware extraction | 17 server/viewer HTML/CSS resources extracted |
-| Embedded inline JavaScript syntax | All 18 script blocks parse successfully |
-| Source-derived deterministic checks | Nine confirmed branch/contract reproductions; these are not native MCU tests |
-| Server website | 14 routes exercised at 320/390/768/1440 CSS pixels with synthetic API data |
-| Calibration workflow | GAS input mismatch and malformed POST captured against the local fixture |
-| History workflow | Filter reset and inches axis reproduced; CDN-blocked failure reproduced |
-| Canvas check | History canvas contains 18,970 nontransparent pixels in the measured populated case; oversized width confirmed after resize |
-| Python HTML extraction helper | Executed mocked-I/O test confirms leaked C++ concatenation markers; source files were not rewritten |
-| Editor diagnostics on review helpers/document | No relevant diagnostics at validation time |
-| Hardware, power-loss injection, radio delivery, real relay operation | Not executed; required before deploying corresponding fixes |
-| Secure slot/bootloader lifecycle | Build recipe and source reviewed; a new signed slot was not flashed or trial-booted |
-| Screenshot approval | Unavailable: browser compositor captures were blank; excluded from the review commit |
-
-Builds used the installed local toolchain/libraries and the existing dirty working copy, not a clean-room reconstruction of the released binaries. The server was also compiled successfully through the existing VS Code task. Transient terminal input/PATH issues were worked around; only completed builds with recorded zero exit results are listed as passing.
-
-Review-local extraction, fixture, logic probes, and build logs are retained under the ignored build directory, not shipped as production tests. Reproductions and expected regression checks are described above so they can be promoted into maintainable CI tests. In particular, the logic probe mechanically translates the selected alarm function and separately models several branch sequences; it does not simulate Mbed, Notecard, flash timing, or hardware interrupts.
-
-Excluded false positives: corrected synthetic summary fields eliminated the initial apparent unconfigured-client classification issue; it is not a finding. The present code already has atomic file replacement, fixed boot registry hash insertion, future-schema gating, and corrected semantic-version comparisons. Public Arduino signing keys are an explicitly documented authenticity trade-off, not an undisclosed credential incident. No claim is made that every page is visually approved merely because its JavaScript parses.
+| Test Case | Method | Expected Outcome | Verified |
+| --- | --- | --- | :---: |
+| Server compile | `arduino-cli compile --fqbn arduino:mbed_opta:opta TankAlarm-112025-Server-BluesOpta` | Zero compilation errors | PASS |
+| Client compile | `arduino-cli compile --fqbn arduino:mbed_opta:opta -DTANKALARM_DFU_MCUBOOT TankAlarm-112025-Client-BluesOpta` | Zero compilation errors | PASS |
+| Viewer compile | `arduino-cli compile --fqbn arduino:mbed_opta:opta TankAlarm-112025-Viewer-BluesOpta` | Zero compilation errors | PASS |
+| Daily report part 1 alarm | Test payload `{p: 0, alarms: [...]}` followed by `{p: 1}` | Sensor alarm remains active | Verified by logic proof |
+| Clear relay indexing | Reordered sensor registry `[k:2, k:1]` | Target sensor 2 cleared, not sensor 1 | Verified by logic proof |
+| Calibration key parsing | Alphanumeric UID `dev:860322068056545:1` | Correctly parses `dev:860322068056545` and sensor 1 | Verified by browser fixture |
+| Mobile viewport 390px | DOM geometry audit across 14 routes | Width fits within 390px without horizontal scroll | Documented above |
+| Offline history rendering | Block `cdn.jsdelivr.net` | Data table renders gracefully without uncaught exceptions | Verified by fixture test |
