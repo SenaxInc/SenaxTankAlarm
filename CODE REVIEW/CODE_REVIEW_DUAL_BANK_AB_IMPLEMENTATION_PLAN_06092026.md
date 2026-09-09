@@ -470,14 +470,14 @@ Bottom line: **do not spend dual-bank effort on the Server now. Put the engineer
 Reviewing the Dual-Bank A/B Implementation Plan, the hardware-level SWAP_BANK strategy introduces severe risks (as identified in Sections 13 and 14). However, there is a fundamental optimization that has not been fully explored: **The Arduino Mbed core (mbed_opta) already utilizes MCUboot as its first-stage bootloader.**
 
 ### 16.1 The Overlooked MCUboot Optimization
-Instead of manually manipulating the STM32H747's option bytes to physically swap banks�and facing the massive complication of duplicating the bootloader�the project can leverage MCUboot's native software-level A/B update mechanisms.
+Instead of manually manipulating the STM32H747's option bytes to physically swap banks—and facing the massive complication of duplicating the bootloader—the project can leverage MCUboot's native software-level A/B update mechanisms.
 
-* **Native Rollback Mechanics:** MCUboot is specifically designed for boot-confirmation rollbacks. When a new firmware image is written to the secondary boot slot, MCUboot inspects it. If marked with a "test" trailer, MCUboot swaps it into the primary slot on reboot. If the running application fails to call oot_set_confirmed() before a watchdog reset, MCUboot automatically swaps the old firmware back unconditionally.
+* **Native Rollback Mechanics:** MCUboot is specifically designed for boot-confirmation rollbacks. When a new firmware image is written to the secondary boot slot, MCUboot inspects it. If marked with a "test" trailer, MCUboot swaps it into the primary slot on reboot. If the running application fails to call boot_set_confirmed() before a watchdog reset, MCUboot automatically swaps the old firmware back unconditionally.
 * **Avoiding Option Bytes:** Software swapping entirely eliminates the risk of interrupting an option-byte write. MCUboot relies on non-volatile trailers mapped to standard flash sectors, which are designed to survive power loss.
-* **Secondary Slot Location:** Depending on the exact mbed_opta core configuration, the secondary slot might reside in Bank 2, or�crucially�it might be mapped to the external QSPI flash. If mapped to QSPI, this bypasses the internal flash limit, potentially bringing the Server sketch (currently ~932 KB) back into scope for A/B updates.
+* **Secondary Slot Location:** Depending on the exact mbed_opta core configuration, the secondary slot might reside in Bank 2, or—crucially—it might be mapped to the external QSPI flash. If mapped to QSPI, this bypasses the internal flash limit, potentially bringing the Server sketch (currently ~932 KB) back into scope for A/B updates.
 
 ### 16.2 Possible Errors & Hardware Pitfalls
-* **MCUboot Magic Trailers:** The stock Opta bootloader expects firmware images at  x08040000 to have an MCUboot header and a terminating magic trailer. Using custom FlashIAP routines to write an update directly to Bank 2 without formatting it as a valid MCUboot image will likely cause the bootloader to reject the update or crash.
+* **MCUboot Magic Trailers:** The stock Opta bootloader expects firmware images at 0x08040000 to have an MCUboot header and a terminating magic trailer. Using custom FlashIAP routines to write an update directly to Bank 2 without formatting it as a valid MCUboot image will likely cause the bootloader to reject the update or crash.
 * **Fighting the Bootloader:** Continuing down the hardware SWAP_BANK path natively collides with the existing bootloader layout. If the stock MCUboot attempts to read data while Bank 2 is mapped over Bank 1, and Bank 2 does not contain the MCUboot vectors cleanly, the unit will be unrecoverably bricked without an external SWD programmer.
 
 ### 16.3 Strengthening Changes & Next Steps
@@ -506,7 +506,7 @@ Building upon the AI analysis in Section 16, this phased plan shifts the brick-p
 **Goal:** Utilize the native MCUboot health check to automatically revert crashing firmware.
 * **3.1 Boot Trial Mode:** When the unit Reboots, MCUboot will see the "test" flag, swap the secondary slot over the primary slot, and boot the new image.
 * **3.2 Health Milestone Hook:** In setup(), define the critical confirmation sequence (relays initialized safely, QSPI LittleFS mounted, Notecard reachable, and an initial health note queued).
-* **3.3 Commit (Locking the Update):** Once the health milestone is reached, fire the Arduino_Portenta_OTA confirmation API or Mbed OS equivalent (e.g., oot_set_confirmed()). This tells MCUboot the firmware is stable. 
+* **3.3 Commit (Locking the Update):** Once the health milestone is reached, fire the Arduino_Portenta_OTA confirmation API or Mbed OS equivalent (e.g., boot_set_confirmed()). This tells MCUboot the firmware is stable. 
 * **3.4 Auto-Rollback Handling:** If the device crashes or the watchdog fires before step 3.3 is reached, MCUboot will natively revert to the backup image on the next boot. We must add a check on early boot to detect if a rollback just occurred and emit proper Notehub telemetry to notify the dashboard.
 
 ### Phase 4: Server Feasibility & Rollout
@@ -695,7 +695,7 @@ Adopt **MCUboot `security.sien` as the unified update mechanism** and **drop the
 
 **Bottom line:** §16–17's instinct is right — delegate rollback to MCUboot instead of hand-rolling option-byte swaps. But it is **not** "call confirm and done": it is a **build-mode change to `security.sien`, a destructive QSPI storage migration, a signed-image release pipeline with custom keys/bootloader, and a Notecard secondary-slot writer**, gated on a **swap-time-vs-watchdog measurement** that earlier sections omit. With backward compatibility waived, the most valuable part is that this *also* delivers signed+encrypted firmware, retiring the authenticity gap in the same effort. The "Server excluded for size" conclusion should be removed — under the real MCUboot slot model, all four artifacts fit.
 
-> Doc hygiene: §16 and §17 contain mojibake/control characters (e.g. `banks�and`, `oot_set_confirmed()`, `x08040000`, `	ankalarm_performIapUpdate`). Clean these before either section is used as an implementation ticket.
+> Doc hygiene: §16 and §17 previously contained mojibake/control characters (e.g. `banks—and`, `boot_set_confirmed()`, `0x08040000`, `tankalarm_performIapUpdate`). Keep those sections UTF-8 clean before either section is used as an implementation ticket.
 
 ### 19.7 Notehub Delivery Compatibility of Signed + Encrypted Images (verified)
 
@@ -739,7 +739,7 @@ After reviewing the deep-dive findings in Sections 18 and 19, the path forward i
 3. **Bootloader Key Management:** You cannot use the default MCUboot .pem keys for production. Once you flash a custom bootloader with Senax keys, updating that bootloader in the future is dangerous and not A/B protected.
 
 ### 20.2 Optimizations to the Update Pipeline
-* **Programmatic Padding:** Do not pad the .bin to 1.875MB before uploading to Notehub. Not only does this violate the ~1.5MB Notehub limit, but it wastes cellular data. **Optimization:** The device firmware should stream the chunked dfu.get payload directly into /fs/update.bin. Once the actual binary bytes are written, the firmware should programmatically append  xFF bytes to reach the required  x1E0000 size before calling MCUboot::applyUpdate(false).
+* **Programmatic Padding:** Do not pad the .bin to 1.875MB before uploading to Notehub. Not only does this violate the ~1.5MB Notehub limit, but it wastes cellular data. **Optimization:** The device firmware should stream the chunked dfu.get payload directly into /fs/update.bin. Once the actual binary bytes are written, the firmware should programmatically append 0xFF bytes to reach the required 0x1E0000 size before calling MCUboot::applyUpdate(false).
 * **Pre-Swap Hash Verification:** Before signaling MCUboot to swap, calculate the SHA-256 of /fs/update.bin in the application layer and compare it against the expected manifest hash. This prevents bricking the primary slot with a corrupted secondary slot that MCUboot might somehow try to process.
 
 ### 20.3 Step-by-Step Execution Strategy
@@ -850,7 +850,7 @@ Reviewing the refinements in Section 21, the tactical shift from requiring a "Cu
 
 ### 22.1 The "Over-The-Air Key Provisioning" Cliff
 Section 21.3.2 suggests proving the Arduino security provisioning flow. This works perfectly on the bench via USB. But for the existing solar-powered fleet currently running security.none, moving them to security.sien requires an Over-The-Air (OTA) bridging firmware.
-*   **The Danger:** An OTA bridge update would have to boot (as security.none), back up the LittleFS config, wipe the QSPI, burn the Senax keys into the MCU's secure zones ( x08000300), restructure the MBR, download the new signed MCUboot image, and reboot into a secure state. A power sag or watchdog reset at *any* millisecond during this sequence results in a permanently bricked unit requiring a truck roll.
+*   **The Danger:** An OTA bridge update would have to boot (as security.none), back up the LittleFS config, wipe the QSPI, burn the Senax keys into the MCU's secure zones (0x08000300), restructure the MBR, download the new signed MCUboot image, and reboot into a secure state. A power sag or watchdog reset at *any* millisecond during this sequence results in a permanently bricked unit requiring a truck roll.
 *   **Recommendation:** Treat MCUboot + security.sien as a **Factory / Net-New Architecture** only, at least initially. Do not attempt to upgrade existing security.none field units to MCUboot via OTA. For the existing live fleet, deploy the **QSPI Staging + Verified In-Place Copy** (Alternative D from Section 14.3) to provide near-term safety.
 
 ### 22.2 Raw QSPI Partition vs. FAT FileBlockDevice
@@ -859,7 +859,7 @@ Section 21.3.4 hits on a critical optimization: abandoning the FAT filesystem fo
 *   **Optimization:** Override the Opta core's MCUboot secondary_bd.cpp. Implement a custom backend that maps directly to MBR Partition 2 as raw bytes (no filesystem overhead). The application streams Notecard payload bytes directly to sector offsets in this partition. This eliminates filesystem fragility, speeds up writes, and solves the "padding" problem natively since the raw partition boundaries are static.
 
 ### 22.3 CI / CD Pipeline Validation
-Section 21.2.6 notes that oards.txt hardcodes version metadata resulting in mismatched headers. 
+Section 21.2.6 notes that boards.txt hardcodes version metadata resulting in mismatched headers. 
 *   **Optimization:** Pull imgtool completely out of the Arduino CLI security.sien internal build process. Let the CI pipeline compile the raw .elf or .bin, and then execute Zephyr's imgtool manually via a GitHub Actions step. This guarantees full CI control over --version (mapped to the actual Git Tag), --align, --pad, and injection of the hardened, out-of-band ECDSA keys without fighting the Arduino IDE's opaque build hooks.
 
 ### 22.4 Final Track Sub-Division
@@ -873,7 +873,7 @@ The architectural investigation is complete and sound. Before opening tickets, d
 Addressing the pivot toward using GitHub Actions to process the encrypted updates, and focusing on a USB-first test deployment: this is **exactly the correct operational sequence.** It decouples the cryptographic complexity from the Arduino core's fragile build hooks and ensures you do not brick the live fleet while verifying the new firmware architecture.
 
 ### 23.1 Why GitHub Actions + imgtool is the Optimal Play
-1. **Total Version Control:** Using Zephyr's imgtool directly in the .github/workflows/release-firmware-112025.yml allows you to dynamically inject the exact ${{ steps.version.outputs.version }} tag into the MCUboot header. The Arduino IDE's security.sien method hardcodes versions or forces you to hack oards.txt on the fly, which breaks builds silently.
+1. **Total Version Control:** Using Zephyr's imgtool directly in the .github/workflows/release-firmware-112025.yml allows you to dynamically inject the exact ${{ steps.version.outputs.version }} tag into the MCUboot header. The Arduino IDE's security.sien method hardcodes versions or forces you to hack boards.txt on the fly, which breaks builds silently.
 2. **Key Security (No Secrets in Code):** By generating Senax-owned ECDSA-P256 keys, you can store the private signing and encryption keys in **GitHub Actions Secrets**. The CI runner injects the keys, produces the signed/encrypted artifact, and leaves no private keys residing on developer laptops or inside the repository.
 3. **Dual Artifact Production:** A single compile (raw .bin) can be post-processed to yield multiple outputs for the GitHub Release page:
     * TankAlarm-Client-raw-vX.Y.Z.bin -> For existing OTA field updates via QSPI Staging (Track A).
@@ -881,7 +881,7 @@ Addressing the pivot toward using GitHub Actions to process the encrypted update
 
 ### 23.2 Creating the MCUboot Artifact in CI
 To integrate this into the current 
-elease-firmware workflow, add a Python-based step after the rduino-cli compile:
+elease-firmware workflow, add a Python-based step after the arduino-cli compile:
 
 `yaml
       - name: Install imgtool
@@ -913,7 +913,7 @@ Testing MCUboot on a single bench client over USB is the safest approach, but be
 * **The "Padding" Caution for Bench Testing:** If you write the imgtool output to QSPI manually via your testing utility, make sure the workflow step omits the --pad flag. Padding the binary forces standard 1.87MB files, which speeds up USB transfers but kills cellular transfers. Keep the .slot.bin unpadded, and perform the padding in the device's update staging loop.
 
 ### 23.4 Final Verdict & Proceeding to Code
-The strategy outlined�**GitHub Actions for cryptographic processing (imgtool) and a USB-first bench deployment**�is flawless. It eliminates the "Over-The-Air Key Provisioning Cliff" (Section 22.1) and aligns perfectly with a safe, iterative CI/CD maturation path. 
+The strategy outlined—**GitHub Actions for cryptographic processing (imgtool) and a USB-first bench deployment**—is flawless. It eliminates the "Over-The-Air Key Provisioning Cliff" (Section 22.1) and aligns perfectly with a safe, iterative CI/CD maturation path. 
 
 **Next Actionable Step:** Start track B by generating the ECDSA keys, saving them as GitHub Secrets, and updating the CI workflow to execute imgtool to generate the secondary secure.slot.bin parallel artifact.
 
@@ -925,13 +925,13 @@ The hardware constraint that the Arduino Opta is a sealed DIN-rail unit with no 
 Relying on the stock bootloader is entirely feasible using standard USB sketches, which dramatically simplifies Track B and removes the deepest risks of modifying bootloaders.
 
 ### 24.1 Key Provisioning via Sketch (The enableSecurity Method)
-You do not need to recompile the bootloader to establish a secure chain of trust. The stock Arduino mbed_opta bootloader dynamically checks reserved flash memory sectors ( x08000300 for the Signing Public Key and  x08000400 for the Encryption Private Key) before falling back to default keys.
+You do not need to recompile the bootloader to establish a secure chain of trust. The stock Arduino mbed_opta bootloader dynamically checks reserved flash memory sectors (0x08000300 for the Signing Public Key and 0x08000400 for the Encryption Private Key) before falling back to default keys.
 
 **The Solution:** 
 Instead of flashing a new bootloader via an inaccessible SWD port, you write a **Key Provisioning Sketch**.
 1.  This sketch hardcodes your newly generated Senax ECDSA-P256 *Public* Key as a byte array.
 2.  You upload this sketch to the test Opta via standard USB (just like normal firmware).
-3.  When the sketch runs, it uses internal FlashIAP or Arduino secure APIs to permanently burn the public key into the  x08000300 sector, and outputs Keys Provisioned over the USB Serial monitor.
+3.  When the sketch runs, it uses internal FlashIAP or Arduino secure APIs to permanently burn the public key into the 0x08000300 sector, and outputs Keys Provisioned over the USB Serial monitor.
 4.  From that moment on, the stock bootloader will automatically reject default keys and only accept your imgtool signed artifacts.
 
 ### 24.2 Watchdog Starvation Debunked (The Software-Start Advantage)
@@ -941,7 +941,7 @@ However, because the Opta's STM32 Independent Watchdog (IWDG) is initialized by 
 
 *   When the device receives a new update and you call NVIC_SystemReset(), the MCU hard-reboots.
 *   Upon waking up, the hardware watchdog is **OFF**.
-*   The stock MCUboot bootloader takes over, sees the "test" flag, and begins the 1�2 minute sector-by-sector copy between QSPI and internal flash.
+*   The stock MCUboot bootloader takes over, sees the "test" flag, and begins the 1–2 minute sector-by-sector copy between QSPI and internal flash.
 *   Because the watchdog is currently OFF, it doesn't matter that MCUBOOT_WATCHDOG_FEED is a no-op. The copy will complete cleanly.
 *   The bootloader then jumps to the new application, your setup() function runs, and the watchdog is safely armed *after* the swap is complete.
 
@@ -984,13 +984,13 @@ This is the final, hardened step-by-step sequence for implementing true A/B Roll
 3. Update the firmware release workflow to install Zephyr's \imgtool\. Use it to sign the compiled \.bin\ and format it into a \.slot.bin\ artifact. Let CI pass the exact GitHub Release tag into the \--version\ parameter.
 
 **Phase 2: The USB "Bench" Provisioning (No Case-Cracking required)**
-1. Write a **Key Provisioning Sketch** that contains the public ECDSA key as a C-array. Upload this to the test Opta via standard USB to permanently burn the public key into the \ x08000300\ sector.
+1. Write a **Key Provisioning Sketch** that contains the public ECDSA key as a C-array. Upload this to the test Opta via standard USB to permanently burn the public key into the \0x08000300\ sector.
 2. Write a **Storage Migration Sketch** that maps the QSPI block device to an MBR layout with a \FATFileSystem\ (for the \update.bin\ slot) and a \LittleFileSystem\ (for the App config).
 3. From this point forward, the Opta will enforce \security.sien\ signatures natively.
 
 **Phase 3: Firmware Application Layer**
 1. Refactor \	ankalarm_performIapUpdate()\ to stream chunked \dfu.get\ payloads natively into the new FAT \/fs/update.bin\. Do this unpadded to preserve cellular data. 
-2. Programmatically pad the file to \ x1E0000\ using \ xFF\ bytes just before completion to satisfy MCUboot's structure.
+2. Programmatically pad the file to \0x1E0000\ using \0xFF\ bytes just before completion to satisfy MCUboot's structure.
 3. Call \MCUboot::applyUpdate(false)\ and trigger \NVIC_SystemReset()\.
 4. Let the stock MCUboot handle the swap while the hardware watchdog is inactive.
 5. In \setup()\, once network and relays are verified safe, execute \MCUboot::confirmSketch()\ to lock in the update. If the app crashes prior to this, the Opta will power-cycle and automatically roll back.
@@ -1082,7 +1082,7 @@ This single gate matters more than swap timing, because a swap-time problem mere
 
 ## 27. AI Response: Validity Check, Workarounds & Final Adjustments
 
-The independent review in Section 26 is exceptionally rigorous and accurate. The concerns raised�specifically the missing `imgtool` flags, the dependency on the bootloader version, and most importantly, the **No-SWD Recovery Cliff**�are completely valid. They highlight the difference between theoretical bench architecture and production-grade field deployment.
+The independent review in Section 26 is exceptionally rigorous and accurate. The concerns raised—specifically the missing `imgtool` flags, the dependency on the bootloader version, and most importantly, the **No-SWD Recovery Cliff**—are completely valid. They highlight the difference between theoretical bench architecture and production-grade field deployment.
 
 Here are the viability validations, direct workarounds, and final optimizations to address those concerns:
 
@@ -1167,7 +1167,7 @@ This is actually a brilliant security feature. It means:
 
 ### 29.3 Recommendation
 To make this seamless for future developers or other users of this repository, we should add a short section to the README.md or Compilation Guide explaining this exact prerequisite:
-> *�If you are forking this repository to manage your own fleet of TankAlarms, you must generate your own MCUboot ECDSA keys using imgtool, add them to your GitHub Secrets, and flash the Key Provisioning Sketch via USB to your hardware before OTA updates will function.�*
+> *“If you are forking this repository to manage your own fleet of TankAlarms, you must generate your own MCUboot ECDSA keys using imgtool, add them to your GitHub Secrets, and flash the Key Provisioning Sketch via USB to your hardware before OTA updates will function.”*
 
 ## 30. AI Response: Utilizing Default Keys for Pure Rollback Utility
 
