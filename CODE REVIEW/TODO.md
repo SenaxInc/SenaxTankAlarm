@@ -75,6 +75,8 @@
 - [ ] **S-T03 (P1) (S)** Config Revision, ACK, and Retry Semantics Can Misreport Success — _FULL/COPILOT F-10; INDEPENDENT R-09; CLAUDE H-01, M-42, M-43_
 - [ ] **S-T04 (P2) (S)** Note Consumption Needs Idempotency and Observable Failure — _FULL/COPILOT F-24; INDEPENDENT R-19; CLAUDE M-47, L-35, L-36_
 - [ ] **S-T05 (P2) (S)** Contacts, Opt-Outs, and Delivery Metadata Need Consistent Rules — _CLAUDE M-50, M-53, L-40, L-41, L-42, L-43, L-44; earlier recipient/persistence recommendations_
+- [ ] **S-T06 (P2) (S)** Dashboard Clear Relay targets the client monitor by dashboard array position — _Copilot review of #315 (2026-09-14)_
+  - `renderDataCard` sends `t.sensorIdx`, the position of the sensor in `/api/clients` `ts[]` (registry order), and the client applies `relay_reset_sensor` as its configured monitor-array index, so a client whose sensors report as `[2, 1]` can clear the wrong monitor. Pre-existing (the inline handler did the same); #315 only moved the value into a data attribute. Fix: send the persistent sensor identity (`sensorIndex`, 1-based) and resolve it to the monitor on the client, or have the server translate it.
 
 ### Server — Persistence, Scheduling, and Maintenance
 
