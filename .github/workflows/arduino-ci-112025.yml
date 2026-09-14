@@ -11,7 +11,6 @@ on:
       - 'TankAlarm-112025-Common/**'
       - '.github/workflows/arduino-ci-112025.yml'
   pull_request:
-    branches: [main, master]
     paths:
       - 'TankAlarm-112025-Client-BluesOpta/**'
       - 'TankAlarm-112025-Server-BluesOpta/**'
@@ -219,6 +218,25 @@ jobs:
           steps.compile-112025-ftps.outcome == 'failure'
         run: exit 1
 
+  check-web-pages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node (the checker runs node --check on every page script)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Checker self-test (synthetic pages covering the scanner rules)
+        run: python3 TankAlarm-112025-Server-BluesOpta/check_web_pages.py --selftest
+
+      - name: Check embedded web pages (script syntax, inline handler reachability)
+        run: python3 TankAlarm-112025-Server-BluesOpta/check_web_pages.py
+
   check-version:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -259,7 +277,7 @@ jobs:
           fi
 
   build-firmware:
-    needs: [compile-check, check-version]
+    needs: [compile-check, check-web-pages, check-version]
     if: github.event_name == 'push' && needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
