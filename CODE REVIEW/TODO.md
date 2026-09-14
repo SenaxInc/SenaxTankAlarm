@@ -1,7 +1,7 @@
 # TankAlarm Master TODO List
 
-> **Current Version:** 1.6.13 (April 23, 2026)  
-> **Last Updated:** April 23, 2026 (v1.6.13: applyConfigUpdate solarCharger parser, vinMonitor+solarOnlyConfig flash save, m-8 stale solar alert ordering)  
+> **Current Version:** 2.2.14 (review baseline `4f30a7f`, September 8, 2026)  
+> **Last Updated:** September 14, 2026 (imported the 2026-09 master review as a tracked section; S-W05 in progress via PR #314; logged all review documents since April)  
 > **Purpose:** Comprehensive tracker for all unimplemented changes identified in code reviews and logic reviews. Update after every new review or commit.
 
 ---
@@ -9,6 +9,7 @@
 ## Table of Contents
 
 - [Legend](#legend)
+- [2026-09 Repository Review (v2.2.14)](#2026-09-repository-review-v2214)
 - [Critical Bugs — Fix Immediately](#critical-bugs--fix-immediately)
 - [High-Priority Issues](#high-priority-issues)
 - [Moderate-Priority Issues](#moderate-priority-issues)
@@ -34,6 +35,89 @@
 | **(C)** | Client component |
 | **(V)** | Viewer component |
 | **(A)** | All / Common |
+
+---
+
+## 2026-09 Repository Review (v2.2.14)
+
+> Imported 2026-09-14 from `CODE_REVIEW_09092026_MASTER_REPOSITORY_REVIEW.md`, which consolidates the four 2026-09-08 reviews (FULL, COPILOT, INDEPENDENT, CLAUDE) against `master` at `4f30a7f` (firmware 2.2.14). IDs and priorities are the master review's; each row lists the source findings it consolidates, and the master review's Source Crosswalk maps every CLAUDE H-/M-/L- row. Status reflects `master` plus open pull requests where noted. P1 = physical/control correctness, missed or false alarms, lost durable state, or a security exposure; P2 = bounded defect or operator-facing error; P3 = documentation.
+
+### Server — Website and Operator Workflows
+
+- [ ] **S-W01 (P1) (S)** Configuration Round-Trips Change Sensor and Alarm Meaning — _CLAUDE H-15, H-16, H-17_
+- [ ] **S-W02 (P1) (S)** Closure-Local Functions Make Six Controls Inoperative — _CLAUDE H-18, H-20, H-21, M-24; FULL/COPILOT F-19; INDEPENDENT R-16_
+- [ ] **S-W03 (P1) (S)** Calibration Identity, Units, and Input Validation — _FULL/COPILOT F-03; INDEPENDENT R-07; CLAUDE H-19, M-60_
+- [ ] **S-W04 (P2) (S)** History Selection, Units, Offline Rendering, and Scope — _FULL/COPILOT F-19, F-20, F-22; INDEPENDENT R-16; CLAUDE M-24, M-25, M-56_
+- [~] **S-W05 (P2) (S)** Responsive Layout, Contacts Grid, and Shared Styling — _FULL/COPILOT F-21; INDEPENDENT R-17; CLAUDE H-14, M-19, M-21, M-22, M-23, M-28, M-29, M-32, L-13, L-15, L-16, L-17, L-26, L-58_
+  - **In progress — PR #314 `website-style-consistency`** (2026-09-14): one header/nav on every page, missing `--card-bg`/`--accent`/`--chart-grid` tokens defined, rules for ~45 unstyled classes, toast hidden by opacity/visibility, wrapping tooltips, tables scroll inside cards on phones, contacts rendered as a real table, boxed checkbox fields matching input height, site-wide checkbox sizing, phone header as a scrolling strip (212px → 112px). Residual: ~60 inline status hex colours still bypass the new `--ok/--warn/--bad` tokens (CLAUDE L-26 partial); viewer stylesheet parity is tracked under V-W01.
+- [ ] **S-W06 (P2) (S)** Operator Status Can Be Misleading — _FULL/COPILOT F-23; INDEPENDENT R-24; CLAUDE M-30, M-31, M-41, L-25, L-51_
+  - PR #314 renders the dashboard stale label from `STALE_MIN` (was a hard-coded ">25h"); the rest is open.
+- [ ] **S-W07 (P2) (S)** Logs, Save Feedback, and Secondary API Usability — _CLAUDE M-26, M-27, M-57, M-58, M-61, L-18, L-19, L-20, L-21, L-22, L-24, L-42, L-49; INDEPENDENT R-23/R-24_
+  - PR #314 gives `/contacts` error toasts the shared `isError` colouring; filters, export scope, save feedback and truncation are open.
+
+### Server — Data Ingestion and History
+
+- [ ] **S-D01 (P1) (S)** Registration Is Dropped Before Client Discovery — _CLAUDE H-25_
+- [ ] **S-D02 (P1) (S)** Freshness, Quality, and Event Ordering Need One Contract — _FULL/COPILOT F-11, F-12, F-29; CLAUDE M-45, M-46, M-48, M-49, L-37, L-38, L-39; related INDEPENDENT R-13_
+- [ ] **S-D03 (P1) (S)** Warm History and Archive Manifests Lose Data at Size Boundaries — _CLAUDE H-23, M-54, M-55, L-29_
+- [ ] **S-D04 (P2) (S)** Retention, Monthly Completeness, and Peak Memory Are Overstated — _CLAUDE H-26, M-39, M-56; FULL/COPILOT F-20 and performance recommendations_
+- [ ] **S-D05 (P2) (S)** Calibration and Weather History Are Not Reliable Reference Data — _CLAUDE M-37, M-38, M-59, L-50_
+
+### Server — Alarms, Delivery, and Remote Commands
+
+- [ ] **S-T01 (P1) (S)** Stable Relay Identity Requires an Explicit Protocol Migration — _FULL/COPILOT F-02; INDEPENDENT R-02; CLAUDE prior F-02/R-02_
+- [ ] **S-T02 (P1) (S)** Notification Eligibility Must Belong to the Current Alarm Episode — _FULL/COPILOT F-09, F-15; INDEPENDENT R-10/R-13; CLAUDE M-51, M-52, L-45, L-47_
+- [ ] **S-T03 (P1) (S)** Config Revision, ACK, and Retry Semantics Can Misreport Success — _FULL/COPILOT F-10; INDEPENDENT R-09; CLAUDE H-01, M-42, M-43_
+- [ ] **S-T04 (P2) (S)** Note Consumption Needs Idempotency and Observable Failure — _FULL/COPILOT F-24; INDEPENDENT R-19; CLAUDE M-47, L-35, L-36_
+- [ ] **S-T05 (P2) (S)** Contacts, Opt-Outs, and Delivery Metadata Need Consistent Rules — _CLAUDE M-50, M-53, L-40, L-41, L-42, L-43, L-44; earlier recipient/persistence recommendations_
+
+### Server — Persistence, Scheduling, and Maintenance
+
+- [ ] **S-O01 (P1) (S)** Save Contracts Lose Empty State and Starve Metadata — _FULL/COPILOT F-08/F-14; INDEPENDENT R-05/R-12; CLAUDE M-35 and prior-item confirmations_
+- [ ] **S-O02 (P1) (S)** Restore Is Partial, Capacity-Mismatched, and Not Coherently Activated — _FULL/COPILOT F-13; INDEPENDENT R-11; CLAUDE H-22, H-24, H-27_
+- [ ] **S-O03 (P2) (S)** Cooperative Maintenance, Scheduling, and HTTP Budgets — _FULL/COPILOT F-07/F-17; INDEPENDENT R-08/R-20; CLAUDE M-34, M-40, M-44, L-27, L-30, L-31, L-32, L-33_
+- [ ] **S-O04 (P2) (S)** Settings Transactions and Administrative Security — _FULL/COPILOT F-28; INDEPENDENT R-18; CLAUDE M-20, M-33, M-36, L-14, L-23, L-28, L-34_
+
+### Client — Sensor Acquisition and Control
+
+- [ ] **C-A01 (P1) (C)** Map Physical Outputs and Input Terminals Explicitly — _CLAUDE H-04, H-11, H-12_
+- [ ] **C-A02 (P1) (C)** Unify Relay Ownership, Modes, and Reconfiguration — _CLAUDE H-02, H-05, H-07; related FULL/COPILOT F-05 and S-T01_
+- [ ] **C-A03 (P1) (C)** Pulse Acquisition Must Observe the Whole Measurement Window — _FULL/COPILOT F-06; INDEPENDENT R-14; CLAUDE M-02 and prior-item evidence_
+- [ ] **C-A04 (P2) (C)** Sensor Failure and Recovery Need Fresh, Sensor-Specific Evidence — _CLAUDE H-03, M-09, M-11, L-06; FULL/COPILOT F-12_
+- [ ] **C-A05 (P2) (C)** Analog Scale, Acquisition Delays, and I2C Timeout Assumptions — _CLAUDE M-10, L-07, L-56_
+
+### Client — Alarm Evaluation and Delivery
+
+- [ ] **C-T01 (P1) (C)** Consecutive Debounce and Durable Notification-Pending State — _FULL/COPILOT F-04/F-05; INDEPENDENT R-03/R-04; CLAUDE H-06, M-12_
+- [ ] **C-T02 (P1) (C)** Remote Commands Need Delivery and Freshness Guarantees — _CLAUDE H-13, M-15, M-16; S-T01_
+- [ ] **C-T03 (P2) (C)** Replay Order and Capacity Must Match the Publisher — _FULL/COPILOT F-11/F-16; CLAUDE M-14; prior July reviews_
+
+### Client — Configuration, Power, and OTA
+
+- [ ] **C-P01 (P1) (C)** Numeric Configuration Must Be Validated Before Narrowing — _CLAUDE H-01, M-06, M-08, M-42, L-19, L-57; FULL/COPILOT F-10_
+- [ ] **C-P02 (P1) (C)** Battery Alerts Can Repeat Without a Bounded Episode Policy — _CLAUDE H-08/H-09 (one issue), M-05, H-29, L-52_
+- [ ] **C-P03 (P2) (C)** Power Transitions Must Use Fresh Voltage and Complete Side Effects — _FULL/COPILOT F-18; INDEPENDENT R-15; CLAUDE H-10, M-13, L-05_
+- [ ] **C-P04 (P1) (C)** Solar State Is Stored on the Wrong Logical Volume — _CLAUDE H-28/M-62 (one issue)_
+- [ ] **C-P05 (P2) (C)** Recovery, Health Polling, and Energy Budgets — _CLAUDE M-03, M-04, M-07, L-02/L-03, L-04, L-08, L-09, L-10; working-tree W-03_
+- [ ] **C-P06 (P2) (C)** OTA Trial State, Health Confirmation, and Build Guarantees — _CLAUDE M-63, L-55; FULL/COPILOT W-04 and provisioning recommendations_
+- [ ] **C-P07 (P1) (C)** Existing Working-Tree Regressions Are a Separate Release Gate — _FULL/COPILOT W-01..W-04; INDEPENDENT R-04/R-06; CLAUDE section 1_
+  - Working tree on the review machine held byte-identical late-June copies of the client sketch, two Common headers, `TankAlarm_Solar.cpp` and the CI workflow; nothing was committed from it. See CLAUDE review section 1.
+
+### Viewer
+
+- [ ] **V-W01 (P2) (V)** Match Measurement Quality, Staleness, Units, and Status — _FULL/COPILOT F-12 and parity suggestions; CLAUDE L-46, L-58, L-59, L-62_
+- [ ] **V-W02 (P2) (V)** Failed Contact Saves Leave Optimistic State Without Recovery — _CLAUDE L-60_
+- [ ] **V-T01 (P1) (V)** Viewer Writes Cross the Administrative Trust Boundary — _CLAUDE H-31/H-32 (one issue); FULL website/security recommendations_
+- [ ] **V-T02 (P2) (V)** Summary Schedules Can Stay Unarmed or Consistently Late — _INDEPENDENT R-08; CLAUDE M-65, M-66, L-61_
+- [ ] **V-T03 (P2) (V)** Network Reconfiguration Needs Explicit Lifecycle and Recovery — _CLAUDE H-30, M-64_
+- [ ] **V-T04 (P2) (V)** GitHub Update Metadata Uses the Wrong Response Shape — _CLAUDE M-67_
+
+### Shared Platform and Repository Tooling
+
+- [ ] **X-R01 (P2) (A)** Reproducible Builds and Regression Tests — _FULL/COPILOT F-27; CLAUDE M-01, M-17, L-01, L-12, L-53, L-63, L-64_
+- [ ] **X-R02 (P3) (A)** Documentation, Published Artifacts, and Trust Model — _INDEPENDENT R-21/R-22; CLAUDE M-18, L-01, L-11, L-12, L-54; FULL documentation/security recommendations_
+- [ ] **X-R03 (P2) (A)** Provisioning and Diagnostic Utilities — _FULL/COPILOT F-25/F-26; CLAUDE prior appendix_
+- [ ] **X-R04 (open) (A)** Suggestions Requiring Measurement or Further Evidence — _CLAUDE section 9 and efficiency sections; other review recommendations_
 
 ---
 
@@ -762,9 +846,81 @@ Items moved here after implementation. Include version number and date.
 
 This TODO was compiled from the following documents, sorted by date:
 
+> Three 2026-07-21 server review documents (`CODE_REVIEW_07212026_SERVER_FULL_REVIEW.md`, its Copilot addendum, and `CODE_REVIEW_07212026_SERVER_INDEPENDENT_COPILOT.md`) exist in the working tree but are not yet committed; they are listed in the 2026-09 master review's sources and should be committed with the next docs pass.
+
 | Date | Document | Type |
-|------|----------|------|| 2026-04-23 | v1.6.13 implementation pass (this conversation) | Closed I-24/I-25/I-26 (applyConfigUpdate solarCharger parser; vinMonitor+solarOnlyConfig flash save) and m-8 (stale solar alert ordering); both client+server compile clean || 2026-04-23 | v1.6.12 self-audit (this conversation) | Bug audit of v1.6.7\u2013v1.6.11 SunSaver/battery work; shipped applyConfigUpdate batteryConfig parser, chemMsg buffer bump; logged I-24/I-25/I-26 applyConfigUpdate parity gaps |
-| 2026-04-22 | v1.6.8\u2013v1.6.10 SunSaver chemistry work | Decoupled battery UI, chemistry verification via Modbus setpoint readback, lithium MISMATCH detection, legacy enum aliases removed |
+|------|----------|------|
+| 2026-09-09 | CODE_REVIEW_09092026_MASTER_REPOSITORY_REVIEW.md | Consolidated master review of the four 2026-09-08 reviews; tracked above |
+| 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_FULL_REVIEW.md | Full repository review |
+| 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_INDEPENDENT_COPILOT.md | Independent repository review (Copilot) |
+| 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_REVIEW_CLAUDE.md | Full repository review, multi-agent verified (163 findings, prior-item status) |
+| 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_REVIEW_COPILOT.md | Full repository review (Copilot) |
+| 2026-08-18 | FEATURE_PLAN_08182026_REMINDER_SNOOZE.md | Feature plan |
+| 2026-07-20 | CODE_REVIEW_07202026_ISSUE_313_SERVER_WEBPAGE_BUGS.md | Server webpage bugs (issue #313) |
+| 2026-07-08 | EMAIL_DELIVERY_OPTIONS_07082026.md | Email delivery options |
+| 2026-07-06 | CODE_REVIEW_07062026_SMS_PIPELINE_END_TO_END.md | SMS pipeline end-to-end review |
+| 2026-07-02 | CODE_REVIEW_07022026_POST_CONFIG_DIAG_BURST_AND_CONFIG_LOSS.md | Post-config diagnostics and config loss |
+| 2026-07-02 | CODE_REVIEW_07022026_RS485_SUNSAVER_MRC1_LINK_INVESTIGATION.md | RS-485 / SunSaver MPPT |
+| 2026-07-01 | CODE_REVIEW_07012026_CURRENT_LOOP_NO_SHUNT_MEASUREMENT_ARCHITECTURE.md | Current-loop sensor |
+| 2026-07-01 | CODE_REVIEW_07012026_DAC_LOOP_POWER_INTEGRATION_PLAN.md | Review |
+| 2026-07-01 | CODE_REVIEW_07012026_MOSFET_GATING_FAILURE_AND_SOFT_RAMP_PROOF.md | Review |
+| 2026-06-30 | CODE_REVIEW_06302026_BENCH_TESTS_AND_STUCK_MA_PROOF.md | Bench tests |
+| 2026-06-30 | CODE_REVIEW_06302026_CURRENT_LOOP_STUCK_MA_ROOT_CAUSE.md | Current-loop sensor |
+| 2026-06-29 | CODE_REVIEW_06292026_CLIENT_TELEMETRY.md | Client telemetry review |
+| 2026-06-29 | FTPSCLIENTOPTA_UPSTREAM_CHANGES_06292026.md | FTPSclientOPTA upstream changes |
+| 2026-06-26 | CODE_REVIEW_06262026_CURRENT_LOOP_SIMPLIFICATION.md | Current-loop sensor |
+| 2026-06-26 | CODE_REVIEW_06262026_DIAGNOSTICS_OPTAVIEW_AND_PRODUCTION_RESTORE.md | Diagnostics |
+| 2026-06-25 | CODE_REVIEW_06252026_BATTERY_VOLTAGE_SAMPLING.md | Battery voltage sampling |
+| 2026-06-25 | CODE_REVIEW_06252026_CURRENT_LOOP_SENSORS.md | Current-loop sensor |
+| 2026-06-25 | CODE_REVIEW_06252026_POST_V2050_REMAINING_ISSUES.md | Post-v2.0.50 remaining issues |
+| 2026-06-25 | CODE_REVIEW_06252026_RS485_SUNSAVER_COMMUNICATION.md | RS-485 / SunSaver MPPT |
+| 2026-06-25 | CODE_REVIEW_06252026_RS485_TELEMETRY_FOLLOWUP.md | Review |
+| 2026-06-24 | A0602_ADDRESSING_FINDINGS_AND_FIX_TEST_PLAN_06242026.md | A0602 expansion |
+| 2026-06-24 | OPTA_A0602_USB_DIAGNOSTIC_PLAN_06242026.md | Diagnostics |
+| 2026-06-24 | OPTA_I2C_BUS_SEPARATION_FEASIBILITY_06242026.md | I2C bus |
+| 2026-06-24 | USB_ONLY_OPTA_CLIENT_COMMANDS_06242026.md | USB-only client diagnostics |
+| 2026-06-24 | USB_ONLY_OPTA_CLIENT_DIAGNOSTIC_TODO_06242026.md | Diagnostics |
+| 2026-06-24 | USB_ONLY_OPTA_CLIENT_RUN_LOG_06242026.md | USB-only client diagnostics |
+| 2026-06-23 | CODE_REVIEW_06232026_FIELD_DIAGNOSTICS.md | Field diagnostics |
+| 2026-06-23 | CODE_REVIEW_06232026_FIELD_DIAGNOSTICSv2.md | Field diagnostics |
+| 2026-06-23 | OPTA_AUX_I2C_CONTENTION_REVIEW_06232026.md | I2C bus |
+| 2026-06-23 | REMAINING_PROBLEMS_AND_ATTEMPTS_06232026.md | Remaining problems log |
+| 2026-06-22 | CODE_REVIEW_06222026_DEFERRED_ITEMS.md | Deferred items |
+| 2026-06-22 | CODE_REVIEW_06222026_VOLTAGE_ALARM.md | Voltage alarm |
+| 2026-06-21 | CODE_REVIEW_06212026_OTA_V1930_TO_V1931_FAILURE.md | OTA update failure analysis |
+| 2026-06-18 | CODE_REVIEW_06182026_OTA_V1934_TO_V1935_SWAP_FAILURE.md | OTA update failure analysis |
+| 2026-06-16 | CODE_REVIEW_06162026_OTA_SILENT_CHECK_FAILURE.md | OTA update failure analysis |
+| 2026-06-15 | CODE_REVIEW_06152026_CURRENT_LOOP_MA_READING.md | Current-loop sensor |
+| 2026-06-15 | CODE_REVIEW_06152026_OPTA_POST_DFU_ETHERNET.md | Review |
+| 2026-06-15 | CODE_REVIEW_06152026_OTA_VS_USB_UPDATE_FAILURE.md | OTA update failure analysis |
+| 2026-06-11 | MCUBOOT_SERVER_VIEWER_SUGGESTIONS_06112026.md | MCUboot |
+| 2026-06-10 | MCUBOOT_QSPI_STORAGE_CONFLICT_06102026.md | MCUboot |
+| 2026-06-09 | CODE_REVIEW_06092026_ODFU_CLIENT_HANDSHAKE_COPILOT.md | ODFU / bootloader |
+| 2026-06-09 | CODE_REVIEW_06092026_UPDATE_SYSTEM_v1.9.0_COPILOT.md | Update system review |
+| 2026-06-09 | CODE_REVIEW_06092026_UPDATE_SYSTEM_v1.9.0_COPILOT_FINAL.md | Update system review |
+| 2026-06-09 | CODE_REVIEW_06092026_UPDATE_SYSTEM_v1.9.0_COPILOT_v2.md | Update system review |
+| 2026-06-09 | CODE_REVIEW_06092026_UPDATE_SYSTEM_v1.9.0_PROPOSED_FIXES.md | Proposed fixes |
+| 2026-06-09 | CODE_REVIEW_DFU_IAP_ANALYSIS_06092026.md | DFU IAP analysis |
+| 2026-06-09 | CODE_REVIEW_DUAL_BANK_AB_IMPLEMENTATION_PLAN_06092026.md | Implementation plan |
+| 2026-06-09 | CODE_REVIEW_ODFU_BRICK_PROOF_IMPLEMENTATION_PLAN_06092026.md | Implementation plan |
+| 2026-06-08 | CODE_REVIEW_06082026_CLIENT_RS485_SUNSAVER_MPPT_IMPLEMENTATION_PLAN.md | Implementation plan |
+| 2026-06-08 | CODE_REVIEW_06082026_CLIENT_RS485_SUNSAVER_MPPT_v1.7.2.md | RS-485 / SunSaver MPPT |
+| 2026-06-08 | CODE_REVIEW_06082026_CLIENT_RS485_SUNSAVER_MPPT_v1.7.2_COPILOT_v1.1.md | RS-485 / SunSaver MPPT |
+| 2026-06-08 | CODE_REVIEW_06082026_CLIENT_RS485_SUNSAVER_MPPT_v1.7.2_COPILOT_v1.2.md | RS-485 / SunSaver MPPT |
+| 2026-06-07 | CODE_REVIEW_06072026_SERVER_CLIENT_WIRELESS_SENSOR_v1.7.2_COPILOT_v1.1.md | Wireless sensor review |
+| 2026-06-07 | CODE_REVIEW_06072026_SERVER_CLIENT_WIRELESS_SENSOR_v1.7.2_COPILOT_v1.2.md | Wireless sensor review |
+| 2026-06-07 | CODE_REVIEW_06072026_SERVER_CLIENT_WIRELESS_SENSOR_v1.7.2_COPILOT_v1.3.md | Wireless sensor review |
+| 2026-06-04 | CODE_REVIEW_06042026_SERVER_CLIENT_WIRELESS_SENSOR_v1.7.2_COPILOT.md | Wireless sensor review |
+| 2026-06-04 | CODE_REVIEW_06042026_v1.6.15_COPILOT.md | Review (Copilot) |
+| 2026-06-03 | CODE_REVIEW_06032026_IMPLEMENTATION_PLAN.md | Implementation plan |
+| 2026-06-03 | CODE_REVIEW_06032026_SERVER_CLIENT_WIRELESS_SENSOR_v1.0_COPILOT.md | Wireless sensor review |
+| 2026-06-03 | CODE_REVIEW_06032026_SERVER_CLIENT_WIRELESS_SENSOR_v1.1_COPILOT.md | Wireless sensor review |
+| 2026-06-03 | CODE_REVIEW_06032026_SERVER_CLIENT_v1.6.14_COPILOT.md | Review (Copilot) |
+| 2026-06-03 | CODE_REVIEW_06032026_v1.6.14_COPILOT.md | Review (Copilot) |
+| 2026-05-14 | CODE_REVIEW_IMPROVEMENTS_ANALYSIS_05142026.md | Improvements analysis |
+| 2026-04-23 | v1.6.13 implementation pass (this conversation) | Closed I-24/I-25/I-26 (applyConfigUpdate solarCharger parser; vinMonitor+solarOnlyConfig flash save) and m-8 (stale solar alert ordering); both client+server compile clean |
+| 2026-04-23 | v1.6.12 self-audit (this conversation) | Bug audit of v1.6.7–v1.6.11 SunSaver/battery work; shipped applyConfigUpdate batteryConfig parser, chemMsg buffer bump; logged I-24/I-25/I-26 applyConfigUpdate parity gaps |
+| 2026-04-22 | v1.6.8–v1.6.10 SunSaver chemistry work | Decoupled battery UI, chemistry verification via Modbus setpoint readback, lithium MISMATCH detection, legacy enum aliases removed |
 | 2026-04-21 | v1.6.7 service window | 30-min service-mode window after boot |
 | 2026-04-15 | FTPS_LIBRARY_INTEGRATION_STUDY_04152026.md | ArduinoOPTA-FTPS library integration feasibility study; server-side FTPS migration tasks F-1 through F-13 |
 | 2026-04-13 | FTPS planning note/checklist update | Narrowed the future secure-transport plan to Explicit TLS FTPS only; left Implicit TLS out of the current implementation scope |
