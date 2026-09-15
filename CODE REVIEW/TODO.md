@@ -1,6 +1,6 @@
 # TankAlarm Master TODO List
 
-> **Current Version:** 2.2.14 (review baseline `4f30a7f`, September 8, 2026)  
+> **Current Version:** 2.2.15 (server web UI release, September 15, 2026; review baseline `4f30a7f` was 2.2.14)  
 > **Last Updated:** September 15, 2026 (website PRs #314 → #315 → #316 → #317 merged into `master` as `1b516d9`, `2aaecf1`, `31a80bd`, `2e2c97c`; S-W01/02/03 done, S-W05/06/07 merged with residuals; see `CODE_REVIEW_09152026_WEBSITE_PRS_314_317_CLAUDE.md`)  
 > **Purpose:** Comprehensive tracker for all unimplemented changes identified in code reviews and logic reviews. Update after every new review or commit.
 
