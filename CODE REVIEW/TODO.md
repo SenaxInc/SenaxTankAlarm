@@ -853,8 +853,6 @@ Items moved here after implementation. Include version number and date.
 
 This TODO was compiled from the following documents, sorted by date:
 
-> Three 2026-07-21 server review documents (`CODE_REVIEW_07212026_SERVER_FULL_REVIEW.md`, its Copilot addendum, and `CODE_REVIEW_07212026_SERVER_INDEPENDENT_COPILOT.md`) exist in the working tree but are not yet committed; they are listed in the 2026-09 master review's sources and should be committed with the next docs pass.
-
 | Date | Document | Type |
 |------|----------|------|
 | 2026-09-15 | CODE_REVIEW_09152026_WEBSITE_PRS_314_317_CLAUDE.md | Website PRs #314-#317: changes, verification, Copilot rounds, residuals |
@@ -864,6 +862,9 @@ This TODO was compiled from the following documents, sorted by date:
 | 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_REVIEW_CLAUDE.md | Full repository review, multi-agent verified (163 findings, prior-item status) |
 | 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_REVIEW_COPILOT.md | Full repository review (Copilot) |
 | 2026-08-18 | FEATURE_PLAN_08182026_REMINDER_SNOOZE.md | Feature plan |
+| 2026-07-21 | CODE_REVIEW_07212026_SERVER_FULL_REVIEW.md | Full server review at v2.2.12 (S-1 to S-17) |
+| 2026-07-21 | CODE_REVIEW_07212026_SERVER_FULL_REVIEW_ADDENDUM_COPILOT.md | Copilot assessment of the full server review |
+| 2026-07-21 | CODE_REVIEW_07212026_SERVER_INDEPENDENT_COPILOT.md | Independent server review at v2.2.12 (Copilot, IR-1 to IR-15) |
 | 2026-07-20 | CODE_REVIEW_07202026_ISSUE_313_SERVER_WEBPAGE_BUGS.md | Server webpage bugs (issue #313) |
 | 2026-07-08 | EMAIL_DELIVERY_OPTIONS_07082026.md | Email delivery options |
 | 2026-07-06 | CODE_REVIEW_07062026_SMS_PIPELINE_END_TO_END.md | SMS pipeline end-to-end review |
