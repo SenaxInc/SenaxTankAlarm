@@ -5595,18 +5595,26 @@ static bool validateSensorReading(uint8_t idx, float reading) {
       // C-T01 (NEW-B): the server treats sensor-recovered as a clear and has already replaced
       // the alarm type with sensor-fault, but the level latch was held through the failure.
       // Queue a publish-only re-assertion of the latched edge; this pass's evaluateAlarms()
-      // sends it after its gates (Phase B on current-loop devices). No I/O here.
+      // sends it after its gates (Phase B on current-loop devices). No I/O here. Skip it when
+      // this reading is already in the latch's release zone (level moved during the outage, or
+      // a stuck float recovered by changing state): that would be a false alarm, and the normal
+      // debounce clears the latch instead. The I2C sensor-only recovery in loop() clears
+      // sensorFailed silently and is not hooked; the server's fresh-telemetry sensor-fault
+      // self-clear still drops the level alarm on that path (C-A04).
       if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
         if (cfg.sensorInterface == SENSOR_DIGITAL) {
-          if (state.highAlarmLatched) {
-            bool triggerOnActivated = true;
-            (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);
+          bool triggerOnActivated = true;
+          if (state.highAlarmLatched && digitalAlarmCondition(cfg, reading, triggerOnActivated)) {
             state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
           }
-        } else if (state.highAlarmLatched) {
-          state.pendingAlarm = ALARM_PENDING_HIGH;
-        } else if (state.lowAlarmLatched) {
-          state.pendingAlarm = ALARM_PENDING_LOW;
+        } else {
+          const AlarmAnalogConditions c = alarmAnalogConditions(reading, cfg.highAlarmThreshold,
+                                                                cfg.lowAlarmThreshold, cfg.hysteresisValue);
+          if (state.highAlarmLatched && !c.highRelease) {
+            state.pendingAlarm = ALARM_PENDING_HIGH;
+          } else if (state.lowAlarmLatched && !c.lowRelease) {
+            state.pendingAlarm = ALARM_PENDING_LOW;
+          }
         }
         if (state.pendingAlarm != ALARM_PENDING_NONE) {
           Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
