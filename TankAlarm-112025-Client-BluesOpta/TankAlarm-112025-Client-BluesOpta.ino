@@ -6417,7 +6417,9 @@ static void evaluateAlarms(uint8_t idx) {
   // reset only by a hysteresis-band sample and a clear counter never, so alternating samples
   // ([90,50,90,50,90] with high=80) latched or cleared. Now any sample that does not qualify
   // resets the evidence. A sample inside both trigger zones (low >= high, a misconfiguration)
-  // counts for neither side, as before. Entering one side unlatches the other, as before.
+  // counts for neither side: it never latches from unlatched, as before, and it now holds an
+  // existing latch (v2.2.15 flipped it between HIGH and LOW every 2-3 such samples). Entering
+  // one side unlatches the other, as before.
   uint8_t highEdge = ALARM_EDGE_NONE;
   uint8_t lowEdge = ALARM_EDGE_NONE;
   alarmAnalogEvaluate(c, ALARM_DEBOUNCE_COUNT, state.highAlarmLatched, state.lowAlarmLatched,

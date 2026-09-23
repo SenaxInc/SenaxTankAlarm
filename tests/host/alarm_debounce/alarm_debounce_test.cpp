@@ -257,18 +257,131 @@ static void testBoundaries() {
 // T13-T16: overlapping zones, inert thresholds, NaN, need 0/1.
 // ---------------------------------------------------------------------------------------------
 
+// Verbatim port of the v2.2.15 analog debounce (client .ino :6339-6412 at 4d2a12a), with
+// sendAlarm() replaced by the returned edges and the first-sample relay restore left out.
+// Used to check the overlap notes (T13) against the old code, not assumed.
+struct LegacyAnalog {
+  bool highAlarmLatched;
+  bool lowAlarmLatched;
+  uint8_t highAlarmDebounceCount;
+  uint8_t lowAlarmDebounceCount;
+  uint8_t highClearDebounceCount;
+  uint8_t lowClearDebounceCount;
+};
+
+static LegacyAnalog makeLegacy(bool highLatched, bool lowLatched) {
+  LegacyAnalog state = {highLatched, lowLatched, 0, 0, 0, 0};
+  return state;
+}
+
+static void legacyAnalogStep(LegacyAnalog &state, float x, float high, float low, float hysteresis,
+                             uint8_t &highEdge, uint8_t &lowEdge) {
+  highEdge = ALARM_EDGE_NONE;
+  lowEdge = ALARM_EDGE_NONE;
+  float hyst = (hysteresis > 0.0f) ? hysteresis : 0.0f;
+  float highTrigger = high;
+  float highClear = high - hyst;
+  float lowTrigger = low;
+  float lowClear = low + hyst;
+
+  bool highCondition = x >= highTrigger;
+  bool lowCondition = x <= lowTrigger;
+  bool highClearCondition = x < highClear;
+  bool lowClearCondition = x > lowClear;
+
+  if (highCondition && !state.highAlarmLatched) {
+    state.highAlarmDebounceCount++;
+    state.lowAlarmDebounceCount = 0;
+    state.highClearDebounceCount = 0;
+    if (state.highAlarmDebounceCount >= kNeed) {
+      state.highAlarmLatched = true;
+      state.lowAlarmLatched = false;
+      state.highAlarmDebounceCount = 0;
+      highEdge = ALARM_EDGE_ENTER;
+    }
+  } else if (state.highAlarmLatched && highClearCondition) {
+    state.highClearDebounceCount++;
+    state.highAlarmDebounceCount = 0;
+    if (state.highClearDebounceCount >= kNeed) {
+      state.highAlarmLatched = false;
+      state.highClearDebounceCount = 0;
+      highEdge = ALARM_EDGE_EXIT;
+    }
+  } else if (!highCondition && !highClearCondition) {
+    state.highAlarmDebounceCount = 0;
+  }
+  if (highCondition) {
+    state.highClearDebounceCount = 0;
+  }
+
+  if (lowCondition && !state.lowAlarmLatched) {
+    state.lowAlarmDebounceCount++;
+    state.highAlarmDebounceCount = 0;
+    state.lowClearDebounceCount = 0;
+    if (state.lowAlarmDebounceCount >= kNeed) {
+      state.lowAlarmLatched = true;
+      state.highAlarmLatched = false;
+      state.lowAlarmDebounceCount = 0;
+      lowEdge = ALARM_EDGE_ENTER;
+    }
+  } else if (state.lowAlarmLatched && lowClearCondition) {
+    state.lowClearDebounceCount++;
+    state.lowAlarmDebounceCount = 0;
+    if (state.lowClearDebounceCount >= kNeed) {
+      state.lowAlarmLatched = false;
+      state.lowClearDebounceCount = 0;
+      lowEdge = ALARM_EDGE_EXIT;
+    }
+  } else if (!lowCondition && !lowClearCondition) {
+    state.lowAlarmDebounceCount = 0;
+  }
+  if (lowCondition) {
+    state.lowClearDebounceCount = 0;
+  }
+}
+
+static RunResult runLegacy(LegacyAnalog &state, float high, float low, float hyst, const float *xs,
+                           size_t n) {
+  RunResult r;
+  r.highEnterAt = -1;
+  r.highExitAt = -1;
+  r.lowEnterAt = -1;
+  r.lowExitAt = -1;
+  r.edges = 0;
+  for (size_t i = 0; i < n; ++i) {
+    uint8_t highEdge = ALARM_EDGE_NONE;
+    uint8_t lowEdge = ALARM_EDGE_NONE;
+    legacyAnalogStep(state, xs[i], high, low, hyst, highEdge, lowEdge);
+    if (highEdge == ALARM_EDGE_ENTER) { r.highEnterAt = (int)i; r.edges++; }
+    if (highEdge == ALARM_EDGE_EXIT) { r.highExitAt = (int)i; r.edges++; }
+    if (lowEdge == ALARM_EDGE_ENTER) { r.lowEnterAt = (int)i; r.edges++; }
+    if (lowEdge == ALARM_EDGE_EXIT) { r.lowExitAt = (int)i; r.edges++; }
+  }
+  return r;
+}
+
 static void testOverlapAndExtremes() {
-  {  // T13a: high=50, low=60 (misconfigured); 55 is in both zones and never latches
+  {  // T13a: high=50, low=60 (misconfigured); 55 is in both zones and never latches, as in
+     // v2.2.15
     AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, false, false, kNeed);
     const float xs[] = {55, 55, 55, 55, 55};
     const RunResult r = RUN(s, xs);
     CHECK(r.edges == 0 && !s.highLatched && !s.lowLatched);
+    LegacyAnalog old = makeLegacy(false, false);
+    const RunResult o = runLegacy(old, 50.0f, 60.0f, 5.0f, xs, COUNT_OF(xs));
+    CHECK(o.edges == 0 && !old.highAlarmLatched && !old.lowAlarmLatched);
   }
-  {  // T13b lL: v2.2.15 latched HIGH here after 3 samples; neither side moves now
+  {  // T13b lL: v2.2.15 switched the latch to HIGH on the 3rd sample and back to LOW on the
+     // 5th (each switch sends only the new side's note, no clear) and kept alternating; the
+     // LOW latch is held now
     AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, false, true, kNeed);
-    const float xs[] = {55, 55, 55, 55, 55};
+    const float xs[] = {55, 55, 55, 55, 55, 55};
     const RunResult r = RUN(s, xs);
     CHECK(r.edges == 0 && !s.highLatched && s.lowLatched);
+    LegacyAnalog old = makeLegacy(false, true);
+    const RunResult o = runLegacy(old, 50.0f, 60.0f, 5.0f, xs, COUNT_OF(xs));
+    CHECK(o.edges == 2 && o.highEnterAt == 2 && o.lowEnterAt == 4);
+    CHECK(!old.highAlarmLatched && old.lowAlarmLatched);
   }
   {  // T13c: outside the overlap each side still works
     AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, false, false, kNeed);
@@ -279,6 +392,17 @@ static void testOverlapAndExtremes() {
     const float highOnly[] = {70, 70, 70};
     r = RUN(s, highOnly);
     CHECK(r.edges == 1 && r.highEnterAt == 2 && s.highLatched);
+  }
+  {  // T13d hL: the mirror of T13b; v2.2.15 switched to LOW on the 3rd sample and back to
+     // HIGH on the 6th; the HIGH latch is held now
+    AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, true, false, kNeed);
+    const float xs[] = {55, 55, 55, 55, 55, 55};
+    const RunResult r = RUN(s, xs);
+    CHECK(r.edges == 0 && s.highLatched && !s.lowLatched);
+    LegacyAnalog old = makeLegacy(true, false);
+    const RunResult o = runLegacy(old, 50.0f, 60.0f, 5.0f, xs, COUNT_OF(xs));
+    CHECK(o.edges == 2 && o.lowEnterAt == 2 && o.highEnterAt == 5);
+    CHECK(old.highAlarmLatched && !old.lowAlarmLatched);
   }
   {  // T14: inert +/-1e9 thresholds never trigger
     AnalogSim s = makeSim(1e9f, -1e9f, 5.0f, false, false, kNeed);
