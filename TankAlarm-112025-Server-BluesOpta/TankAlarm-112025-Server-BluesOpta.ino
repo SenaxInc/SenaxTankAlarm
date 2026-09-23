@@ -10576,8 +10576,11 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       clientObj["at"] = rec.alarmType;
     }
 
+    // Compare at the whole-second resolution "u" is written with (below), so a fractional
+    // lastUpdateEpoch cannot make an older record look newer than the one already chosen.
+    const uint32_t recUpdate = (uint32_t)rec.lastUpdateEpoch;
     double previousUpdate = clientObj["u"].is<double>() ? clientObj["u"].as<double>() : 0.0;
-    if (rec.lastUpdateEpoch > previousUpdate) {
+    if ((double)recUpdate > previousUpdate) {
       if (useCfgName) { clientObj["n"] = cfgDisp.name; } else { clientObj["n"] = rec.label; }
       clientObj["k"] = rec.sensorIndex;
       if (rec.userNumber > 0) {
@@ -10593,7 +10596,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
         clientObj["flt"] = rec.sensorFault;
       }
       // Integer epoch: a double that fits a float would be written with only 7 digits.
-      clientObj["u"] = (uint32_t)rec.lastUpdateEpoch;
+      clientObj["u"] = recUpdate;
       // The client-level alarm type belongs to the sensor in alarm (set above), not to
       // whichever sensor happened to report most recently.
       if (!clientObj["a"].as<bool>()) {
@@ -15985,7 +15988,7 @@ static void saveClientMetadataCache() {
       if (meta.latitude != 0.0f || meta.longitude != 0.0f) {
         obj["lat"] = meta.latitude;
         obj["lon"] = meta.longitude;
-        obj["le"] = meta.locationEpoch;
+        obj["le"] = (uint32_t)meta.locationEpoch;  // integer epoch (see "u")
       }
       if (meta.nwsGridValid) {
         obj["go"] = meta.nwsGridOffice;
@@ -19558,7 +19561,7 @@ static void handleCalibrationGet(EthernetClient &client) {
         JsonObject logObj = logsArr.add<JsonObject>();
         logObj["clientUid"] = uid;
         logObj["sensorIndex"] = sensorIdx;
-        logObj["timestamp"] = timestamp;
+        logObj["timestamp"] = (timestamp > 0.0) ? (uint32_t)timestamp : (uint32_t)0;  // integer epoch
         logObj["sensorReading"] = sensorReading;
         logObj["verifiedLevelInches"] = verifiedLevel;
         if (temperatureF != TEMPERATURE_UNAVAILABLE) {
@@ -19626,7 +19629,7 @@ static void handleCalibrationGet(EthernetClient &client) {
           JsonObject logObj = logsArr.add<JsonObject>();
           logObj["clientUid"] = uid;
           logObj["sensorIndex"] = sensorIdx;
-          logObj["timestamp"] = timestamp;
+          logObj["timestamp"] = (timestamp > 0.0) ? (uint32_t)timestamp : (uint32_t)0;  // integer epoch
           logObj["sensorReading"] = sensorReading;
           logObj["verifiedLevelInches"] = verifiedLevel;
           if (temperatureF != TEMPERATURE_UNAVAILABLE) {
@@ -20479,7 +20482,7 @@ static void handleLocationGet(EthernetClient &client, const String &path) {
     doc["hasLocation"] = true;
     doc["latitude"] = meta->latitude;
     doc["longitude"] = meta->longitude;
-    doc["locationEpoch"] = meta->locationEpoch;
+    doc["locationEpoch"] = (uint32_t)meta->locationEpoch;  // integer epoch: shown as a time
     doc["nwsGridValid"] = meta->nwsGridValid;
     if (meta->nwsGridValid) {
       doc["nwsGridOffice"] = meta->nwsGridOffice;
