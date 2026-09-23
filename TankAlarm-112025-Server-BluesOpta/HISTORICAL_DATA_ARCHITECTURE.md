@@ -141,7 +141,9 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
   it reads completely; otherwise they fall back as if it were missing.
 - **Diagnostics**: `/api/system-status` has a `warmTier` block (last rollup, next day,
   writes, unchanged batches, I/O and memory errors, quarantined files, late-data marks,
-  tick time). Failures are logged to the server serial log (source `history`).
+  tick time). Failures are logged to the server serial log (source `history`). A bench
+  build with `-DTANKALARM_WARM_SELFTEST` times a full 20-sensor month (merge, re-check
+  and scan) once at boot and prints the heap it used; it is not for field units.
 
 Downgrading to v2.2.15 or earlier brings back H-23 (month files of 8 KB or more are
 reset to one day at the next rollup).

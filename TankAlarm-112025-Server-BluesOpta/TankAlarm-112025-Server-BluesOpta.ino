@@ -884,6 +884,9 @@ static void rollupDailySummaries();
 static WarmStatus warmScanMonth(uint16_t year, uint8_t month, WarmRowVisitor visit, void *ctx, uint32_t *rowsOut);
 static void pruneDailySummaryFiles();
 static void refreshWarmTierPresence(uint32_t anchorYmd);
+#ifdef TANKALARM_WARM_SELFTEST
+static void runWarmSelfTest();
+#endif
 // Hot tier persistence (survive reboots)
 static bool saveHotTierSnapshot();
 static void loadHotTierSnapshot();
@@ -892,7 +895,8 @@ static bool loadFtpArchiveCached(uint16_t year, uint8_t month);
 static void populateStatsFromFtpCache(const char *clientUid, uint8_t sensorIndex, JsonObject &statsObj);
 static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uint8_t sensorIndex);
 static void pruneHotTierIfNeeded();
-static bool archiveMonthToFtp(uint16_t year, uint8_t month);
+// S-D03: noinline keeps its warm-summary buffer (~1.4 KB) out of loop()'s stack frame
+static bool archiveMonthToFtp(uint16_t year, uint8_t month) __attribute__((noinline));
 static bool loadArchivedMonth(uint16_t year, uint8_t month, JsonDocument &doc);
 static void populateHistorySettingsJson(JsonDocument &doc);
 static void applyHistorySettingsFromJson(const JsonDocument &doc);
@@ -4526,6 +4530,9 @@ void setup() {
   loadSensorRegistry();     // Restore sensor records from LittleFS
   loadHistorySettings();  // Restore history tier settings from LittleFS
   refreshWarmTierPresence(gLastDailyRollupDate);  // S-D03: warmTierAvailable is true right after boot
+#ifdef TANKALARM_WARM_SELFTEST
+  runWarmSelfTest();  // S-D03 bench build only: warm-tier timing and heap
+#endif
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
   printHardwareRequirements();
@@ -8391,6 +8398,123 @@ static void refreshWarmTierPresence(uint32_t anchorYmd) {
   (void)anchorYmd;
 #endif
 }
+
+#ifdef TANKALARM_WARM_SELFTEST
+// S-D03 bench build only (-DTANKALARM_WARM_SELFTEST, never for field units):
+// runs a full 20-sensor month (~76 KB) through the warm-tier store once at
+// boot and prints the time and heap of each step, for the S-D03 bench targets
+// (daily merge < 1.5 s, heap drop < 16 KB). Uses its own folder and removes
+// it afterwards. Free heap reads 0 unless MBED_HEAP_STATS_ENABLED is set.
+static uint32_t gWarmSelfTestMinFree = 0;
+
+static void warmSelfTestYield() {
+  dfuKickWatchdog();
+  const uint32_t freeNow = tankalarm_freeRam();
+  if (freeNow < gWarmSelfTestMinFree) gWarmSelfTestMinFree = freeNow;
+}
+
+// One row per sensor for days firstDay..lastDay of 2026-01
+static uint16_t warmSelfTestRows(WarmNewRow *rows, char (*uids)[24], uint8_t firstDay, uint8_t lastDay) {
+  uint16_t n = 0;
+  for (uint8_t day = firstDay; day <= lastDay; day++) {
+    for (uint8_t i = 0; i < MAX_HISTORY_SENSORS; i++) {
+      WarmNewRow &r = rows[n++];
+      r.c = uids[i];
+      r.d = 20260100UL + day;
+      r.k = (uint8_t)(1 + i % 4);
+      r.al = 0;
+      r.state = WARM_ROW_ADD;
+      r.mn = 40.0f + i;
+      r.mx = r.mn + 12.3f;
+      r.av = r.mn + 6.1f;
+      r.op = r.mn + 1.2f;
+      r.cl = r.mn + 10.4f;
+      r.vt = 12.45f;
+      r.n = 24;
+    }
+  }
+  return n;
+}
+
+static void warmSelfTestReport(const char *step, WarmStatus st, unsigned long startMs) {
+  Serial.print(F("Warm self-test: "));
+  Serial.print(step);
+  Serial.print(F(": "));
+  Serial.print(warmStatusName(st));
+  Serial.print(F(", "));
+  Serial.print(millis() - startMs);
+  Serial.print(F(" ms, min free heap "));
+  Serial.println((unsigned long)gWarmSelfTestMinFree);
+}
+
+static void runWarmSelfTest() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) return;
+  static const char kDir[] = "/fs/history_selftest";
+  const WarmHooks hooks = {warmSelfTestYield, warmHookLog, nullptr, warmHookNowMs, nullptr};
+  const uint16_t cap = (uint16_t)(WARM_MAX_DAYS_PER_BATCH * MAX_HISTORY_SENSORS);
+  const uint32_t freeBefore = tankalarm_freeRam();
+  gWarmSelfTestMinFree = freeBefore;
+  WarmNewRow *rows = (WarmNewRow *)malloc(sizeof(WarmNewRow) * cap);
+  if (!rows) {
+    Serial.println(F("Warm self-test: no memory for rows"));
+    return;
+  }
+  char uids[MAX_HISTORY_SENSORS][24];
+  for (uint8_t i = 0; i < MAX_HISTORY_SENSORS; i++) {
+    snprintf(uids[i], sizeof(uids[i]), "dev:8644730600%05u", (unsigned)i);
+  }
+  mkdir(kDir, 0777);
+  char path[64];
+  warmMonthPath(path, sizeof(path), kDir, 2026, 1, "");
+  remove(path);
+
+  // Days 1-30 in batches of 8 days, as the boot backfill writes them
+  unsigned long t0 = millis();
+  WarmStatus st = WARM_OK;
+  for (uint8_t first = 1; first <= 30 && st == WARM_OK; first += WARM_MAX_DAYS_PER_BATCH) {
+    const uint8_t last = (first + WARM_MAX_DAYS_PER_BATCH - 1 < 30) ? first + WARM_MAX_DAYS_PER_BATCH - 1 : 30;
+    st = warmMergeMonth(kDir, 2026, 1, rows, warmSelfTestRows(rows, uids, first, last),
+                        DAILY_SUMMARY_MAX_FILE_BYTES, hooks, nullptr);
+  }
+  warmSelfTestReport("backfill days 1-30", st, t0);
+
+  // Day 31 into the 600-row file: the steady-state daily rollup
+  WarmMergeResult res = {};
+  t0 = millis();
+  st = warmMergeMonth(kDir, 2026, 1, rows, warmSelfTestRows(rows, uids, 31, 31),
+                      DAILY_SUMMARY_MAX_FILE_BYTES, hooks, &res);
+  warmSelfTestReport("daily merge (day 31)", st, t0);
+  Serial.print(F("Warm self-test: month file "));
+  Serial.print((unsigned long)res.bytes);
+  Serial.println(F(" bytes"));
+
+  // Days 24-31 again, unchanged: one boot re-check batch (reads only)
+  t0 = millis();
+  st = warmMergeMonth(kDir, 2026, 1, rows, warmSelfTestRows(rows, uids, 24, 31),
+                      DAILY_SUMMARY_MAX_FILE_BYTES, hooks, &res);
+  warmSelfTestReport(res.wrote ? "re-check days 24-31 (unexpected write)" : "re-check days 24-31", st, t0);
+
+  // One reader pass over the month (stats, compare, yoy)
+  uint32_t scanned = 0;
+  t0 = millis();
+  st = warmScanFile(path, false, DAILY_SUMMARY_MAX_FILE_BYTES, 0, nullptr, nullptr, hooks, &scanned, nullptr);
+  warmSelfTestReport("scan", st, t0);
+  Serial.print(F("Warm self-test: rows scanned "));
+  Serial.println((unsigned long)scanned);
+
+  free(rows);
+  remove(path);
+  remove(kDir);
+  Serial.print(F("Warm self-test: free heap before "));
+  Serial.print((unsigned long)freeBefore);
+  Serial.print(F(", minimum "));
+  Serial.print((unsigned long)gWarmSelfTestMinFree);
+  Serial.print(F(", after "));
+  Serial.println((unsigned long)tankalarm_freeRam());
+#endif
+}
+#endif  // TANKALARM_WARM_SELFTEST
 
 // ============================================================================
 // Hot Tier Persistence (survive reboots)
