@@ -14474,6 +14474,25 @@ static uint8_t sendSmsAlert(const char *message, const char *alarmId, const char
   return queued;
 }
 
+// Message ID for an email.qo note: "<server UID>-<epoch seconds>-<per-boot counter>".
+// Notehub retries a route call that answers after the route timeout, and the note.add retry
+// in each sender queues a second note when the first add succeeded but its reply was lost.
+// The Apps Script bridge on /email-setup sends each Notehub event and each message ID only
+// once. The ID is serialized into the note body before the first attempt, so the retry
+// carries the same ID.
+static void buildEmailMessageId(char *out, size_t outLen) {
+  static uint32_t emailCounter = 0;
+  ++emailCounter;
+  const char *uid = (gServerUid[0] != '\0') ? gServerUid : "server";
+  double now = currentEpoch();
+  if (now > 0.0) {
+    snprintf(out, outLen, "%s-%lu-%lu", uid, (unsigned long)now, (unsigned long)emailCounter);
+  } else {
+    // Clock not synced yet: uptime in ms keeps IDs from different boots apart.
+    snprintf(out, outLen, "%s-m%lu-%lu", uid, (unsigned long)millis(), (unsigned long)emailCounter);
+  }
+}
+
 // Email alert channel (07082026): per-contact opt-in via the emailAlertRecipients list
 // (the "Email alerts" checkbox on the /contacts page). Resolves recipient addresses with
 // the same alarmAssociations filtering as SMS, joins them into ONE email.qo note
@@ -14554,6 +14573,9 @@ static uint8_t sendEmailAlert(const char *subject, const char *message, const ch
   doc["subject"] = subject ? subject : "TankAlarm Alert";
   doc["message"] = message;
   doc["type"] = "alarm";  // lets the Route #5 template distinguish alarms from daily reports
+  char messageId[80];
+  buildEmailMessageId(messageId, sizeof(messageId));
+  doc["id"] = messageId;  // char[] assignment copies into the document
 
   static char buffer[1024];
   size_t len = serializeJson(doc, buffer, sizeof(buffer));
@@ -14949,6 +14971,9 @@ static void sendDailyEmail() {
   // ArduinoJson v7: JsonDocument auto-sizes
   JsonDocument doc;
   doc["to"] = emailList;
+  char messageId[80];
+  buildEmailMessageId(messageId, sizeof(messageId));
+  doc["id"] = messageId;  // char[] assignment copies into the document; the retry re-parses buffer
 
   // EMAIL-1 fix (07082026): apply the /email-format settings — previously they were
   // stored and served to the UI but NEVER used, so the whole format page was decorative.
