@@ -1814,6 +1814,223 @@ static void testManifest() {
 }
 
 // ============================================================================
+// Provenance: only fresh readings, on the day they were taken
+// ============================================================================
+static bool closeTo(float a, float b) { return fabsf(a - b) < 0.001f; }
+
+// Row (d, c, k) of a month file, parsed with a whole-document ArduinoJson oracle
+static bool findRow(const std::string &path, uint32_t d, const char *c, unsigned k, JsonDocument &out) {
+  JsonDocument doc;
+  if (deserializeJson(doc, readFile(path)) != DeserializationError::Ok) return false;
+  for (JsonObject row : doc.as<JsonArray>()) {
+    if ((row["d"] | 0UL) == d && strcmp(row["c"] | "", c) == 0 && (row["k"] | 0u) == k) {
+      out.set(row);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void testProvenance() {
+  const std::string dir = makeDir("provenance");
+  const WarmRollupConfig cfg = defaultConfig(dir);
+  const WarmHooks h = makeHooks(nullptr);
+
+  // (1) A day without readings stays blank, and a row uses only its own day's readings.
+  // Sensor A reads on Sep 1-3 and 7-9 (on Sep 9 only in the last minute), sensor B on
+  // Sep 1-9 except Sep 5. The rollup runs each night, as on a server that stays up.
+  {
+    resetHooks();
+    Fleet fleet;
+    fleet.rings.push_back(LegacyRing("dev:864450000000001", 1, 90));
+    fleet.rings.push_back(LegacyRing("dev:864450000000002", 2, 90));
+    WarmRollupState s;
+    for (int day = 1; day <= 10; ++day) {
+      const double d0 = epochOf(2026, 9, day);
+      LegacyRing &a = fleet.rings[0];
+      LegacyRing &b = fleet.rings[1];
+      if (day <= 3 || day == 7 || day == 8) {
+        a.add(d0 + 6 * 3600.0, 30.0f + (float)day, 12.5f);
+        a.add(d0 + 12 * 3600.0, 29.0f + (float)day, 12.6f);
+        a.add(d0 + 18 * 3600.0, 31.0f + (float)day, 12.7f);
+      } else if (day == 9) {
+        a.add(d0 + 86340.0, 20.0f, 0.0f);
+        a.add(d0 + 86399.0, 21.0f, 0.0f);
+      }
+      if (day <= 9 && day != 5) b.add(d0 + 3600.0 * day, 50.0f + (float)day, 0.0f);
+      CHECK(tickUntilIdle(s, fleet, epochOf(2026, 9, day + 1, 1800.0), cfg, h) >= 1);
+    }
+
+    const LegacyRing &a = fleet.rings[0];
+    const LegacyRing &b = fleet.rings[1];
+    const std::string path = monthFile(dir, 2026, 9);
+    const auto keys = fileKeys(path);
+    CHECK(keys.size() == 6 + 8);
+    for (int day = 1; day <= 10; ++day) {
+      const uint32_t ymd = 20260900u + (uint32_t)day;
+      const bool wantA = day <= 3 || (day >= 7 && day <= 9);
+      const bool wantB = day <= 9 && day != 5;
+      CHECK_MSG((keys.count(keyOf(ymd, a.clientUid.c_str(), a.sensorIndex)) == 1) == wantA, "A on %lu",
+                (unsigned long)ymd);
+      CHECK_MSG((keys.count(keyOf(ymd, b.clientUid.c_str(), b.sensorIndex)) == 1) == wantB, "B on %lu",
+                (unsigned long)ymd);
+    }
+
+    // Sep 7, after A's gap: opens at its own first reading; nothing from Sep 3
+    JsonDocument row;
+    CHECK(findRow(path, 20260907u, a.clientUid.c_str(), a.sensorIndex, row));
+    CHECK(row["n"].as<int>() == 3 && closeTo(row["op"].as<float>(), 37.0f) && closeTo(row["mn"].as<float>(), 36.0f) &&
+          closeTo(row["mx"].as<float>(), 38.0f) && closeTo(row["av"].as<float>(), 37.0f) &&
+          closeTo(row["cl"].as<float>(), 38.0f) && closeTo(row["vt"].as<float>(), 12.6f));
+    // Sep 9: readings only in its last minute, and the row is built from those alone
+    CHECK(findRow(path, 20260909u, a.clientUid.c_str(), a.sensorIndex, row));
+    CHECK(row["n"].as<int>() == 2 && closeTo(row["op"].as<float>(), 20.0f) && closeTo(row["cl"].as<float>(), 21.0f) &&
+          closeTo(row["mn"].as<float>(), 20.0f) && closeTo(row["mx"].as<float>(), 21.0f) &&
+          closeTo(row["av"].as<float>(), 20.5f) && row["vt"].as<float>() == 0.0f);
+    // Sep 6, after B's gap: its single reading, not Sep 4's
+    CHECK(findRow(path, 20260906u, b.clientUid.c_str(), b.sensorIndex, row));
+    CHECK(row["n"].as<int>() == 1 && closeTo(row["op"].as<float>(), 56.0f) && closeTo(row["av"].as<float>(), 56.0f));
+
+    // A reboot's re-check of the whole window fills nothing in either
+    const std::string before = readFile(path);
+    s.nextDn = -1;
+    CHECK(tickUntilIdle(s, fleet, epochOf(2026, 9, 11, 1800.0), cfg, h) >= 1);
+    CHECK(readFile(path) == before);
+    clearDir(dir);
+  }
+
+  // (2) Acquisition time: whole seconds, or 0 (left out) when it is not known
+  {
+    const double now = 1790294400.0;  // 2026-09-25 00:00:00Z
+    CHECK(warmAcquisitionEpoch(0.0, now) == 0.0);
+    CHECK(warmAcquisitionEpoch(-5.0, now) == 0.0);
+    CHECK(warmAcquisitionEpoch(NAN, now) == 0.0);
+    CHECK(warmAcquisitionEpoch(INFINITY, 0.0) == 0.0);
+    CHECK(warmAcquisitionEpoch(1577836799.0, now) == 0.0);
+    CHECK(warmAcquisitionEpoch(1577836800.0, now) == 1577836800.0);
+    // server clock not set: any time from 2020 on (up to the 2099 limit of the date helpers)
+    CHECK(warmAcquisitionEpoch(1577836800.0, 0.0) == 1577836800.0);
+    CHECK(warmAcquisitionEpoch(now + 400.0 * 86400.0, 0.0) == now + 400.0 * 86400.0);
+    CHECK(warmAcquisitionEpoch(4102444799.0, 0.0) == 4102444799.0);
+    CHECK(warmAcquisitionEpoch(4102444800.0, 0.0) == 0.0);
+    CHECK(warmAcquisitionEpoch(now + 3600.0, now) == now + 3600.0);
+    CHECK(warmAcquisitionEpoch(now + 3601.0, now) == 0.0);
+    CHECK(warmAcquisitionEpoch(now - 0.5, now) == now - 1.0);  // floored: stays on its own day
+    CHECK(warmEpochToDn(warmAcquisitionEpoch(now - 0.001, now)) == warmEpochToDn(now) - 1);
+    CHECK(warmAcquisitionEpoch(1790207744.75, now) == 1790207744.0);
+  }
+
+  // (3) Older hot-tier files: which reloaded timestamps may be on the wrong day
+  {
+    const double mid = 1790294400.0;  // a UTC midnight, and a multiple of 128
+    CHECK(warmLegacyEpochAmbiguous(mid));
+    CHECK(warmLegacyEpochAmbiguous(mid - 512.0) && warmLegacyEpochAmbiguous(mid + 512.0));
+    CHECK(warmLegacyEpochAmbiguous(mid - 128.0) && warmLegacyEpochAmbiguous(mid + 384.0));
+    CHECK(!warmLegacyEpochAmbiguous(mid - 640.0) && !warmLegacyEpochAmbiguous(mid + 640.0));
+    CHECK(!warmLegacyEpochAmbiguous(mid + 128.0 * 300.0));
+    CHECK(!warmLegacyEpochAmbiguous(mid + 1.0) && !warmLegacyEpochAmbiguous(mid - 1.0) &&
+          !warmLegacyEpochAmbiguous(mid + 100.0) && !warmLegacyEpochAmbiguous(mid + 0.5));
+    CHECK(!warmLegacyEpochAmbiguous(0.0) && !warmLegacyEpochAmbiguous(NAN) && !warmLegacyEpochAmbiguous(INFINITY));
+  }
+
+  // (4) hot_tier.json: saveHotTierSnapshot adds (uint32_t)ts, which round-trips exactly.
+  // Older firmware added the double: ArduinoJson 7.4.3 keeps one that fits a float as a
+  // float and writes 7 digits, which moves both of these onto another day.
+  {
+    const double stamps[] = {1790294400.0, 1790207744.0};  // 2026-09-25 00:00:00Z, 2026-09-23 23:55:44Z
+    JsonDocument saved;
+    JsonArray arr = saved.to<JsonArray>();
+    for (double ts : stamps) {
+      JsonArray entry = arr.add<JsonArray>();
+      entry.add((uint32_t)ts);
+      entry.add(40.25f);
+      entry.add(12.5f);
+    }
+    std::string text;
+    serializeJson(saved, text);
+    JsonDocument loaded;
+    CHECK(deserializeJson(loaded, text) == DeserializationError::Ok);
+    for (size_t i = 0; i < 2; ++i) {
+      CHECK_MSG(loaded[i][0].as<double>() == stamps[i] && loaded[i][0].is<uint32_t>(), "%s", text.c_str());
+    }
+
+    JsonDocument legacySaved;
+    JsonArray legacyArr = legacySaved.to<JsonArray>();
+    for (double ts : stamps) legacyArr.add<JsonArray>().add(ts);
+    std::string legacyText;
+    serializeJson(legacySaved, legacyText);
+    JsonDocument legacyLoaded;
+    CHECK(deserializeJson(legacyLoaded, legacyText) == DeserializationError::Ok);
+    for (size_t i = 0; i < 2; ++i) {
+      const double back = legacyLoaded[i][0].as<double>();
+      CHECK_MSG(back != stamps[i] && warmEpochToDn(back) != warmEpochToDn(stamps[i]), "%s", legacyText.c_str());
+      // what loadHotTierSnapshot drops on the first boot after the update
+      CHECK(!legacyLoaded[i][0].is<uint32_t>() && warmLegacyEpochAmbiguous(floor(back)));
+    }
+  }
+
+  // (5) The same acquisition is found anywhere in the ring, up to 1 s either way
+  {
+    const double t0 = 1790294400.0;
+    LegacyRing r("dev:864450000000003", 1, 4);
+    for (int i = 0; i < 6; ++i) r.add(t0 + 60.0 * i, 10.0f + (float)i, 0.0f);  // wraps: keeps i = 2..5
+    CHECK(r.writeIndex == 2 && r.snapshotCount == 4);
+    auto has = [&r](uint16_t count, uint16_t writeIndex, double ts, float level) {
+      return warmRingHasAcquisition(r.snapshots.data(), r.cap(), count, writeIndex, ts, level);
+    };
+    for (int i = 2; i < 6; ++i) {
+      const double ts = t0 + 60.0 * i;
+      const float level = 10.0f + (float)i;
+      CHECK_MSG(has(4, 2, ts, level) && has(4, 2, ts - 1.0, level) && has(4, 2, ts + 1.0, level) &&
+                    has(4, 2, ts, level + 0.005f),
+                "entry %d", i);
+      CHECK_MSG(!has(4, 2, ts + 2.0, level) && !has(4, 2, ts - 2.0, level) && !has(4, 2, ts, level + 0.02f),
+                "entry %d", i);
+    }
+    CHECK(!has(4, 2, t0, 10.0f) && !has(4, 2, t0 + 60.0, 11.0f));  // overwritten
+    CHECK(has(9, 2, t0 + 300.0, 15.0f));                            // a count above cap is clamped
+    // only the entries in use are scanned
+    CHECK(has(2, 2, t0 + 240.0, 14.0f) && has(2, 2, t0 + 300.0, 15.0f) && !has(2, 2, t0 + 120.0, 12.0f));
+    CHECK(has(4, 0, t0 + 120.0, 12.0f) && has(1, 0, t0 + 180.0, 13.0f) && !has(1, 0, t0 + 300.0, 15.0f));
+    CHECK(!has(0, 2, t0 + 300.0, 15.0f) && !has(4, 2, t0 + 300.0, NAN));
+    CHECK(!warmRingHasAcquisition(nullptr, 4, 4, 0, t0, 10.0f));
+    CHECK(!warmRingHasAcquisition(r.snapshots.data(), 0, 4, 0, t0 + 120.0, 12.0f));
+
+    // Telemetry (t rounded up), then the daily report's copy (t truncated): one snapshot
+    Fleet fleet;
+    fleet.rings.push_back(LegacyRing("dev:864450000000004", 1, 90));
+    LegacyRing &ring = fleet.rings[0];
+    auto record = [&ring](double ts, float level) {
+      if (!warmRingHasAcquisition(ring.snapshots.data(), ring.cap(), ring.snapshotCount, ring.writeIndex, ts, level)) {
+        ring.add(ts, level, 0.0f);
+      }
+    };
+    const double t = epochOf(2026, 9, 21, 50000.0);
+    record(t + 1.0, 40.0f);
+    record(t + 600.0, 41.0f);
+    record(t, 40.0f);
+    CHECK(ring.snapshotCount == 2);
+    std::vector<WarmNewRow> rows(4);
+    const uint16_t n = warmComputeRows(fleet.series(), fleet.count(), dnOf(2026, 9, 21), dnOf(2026, 9, 21), nullptr,
+                                       nullptr, testRoundTo, rows.data(), (uint16_t)rows.size());
+    CHECK(n == 1 && rows[0].n == 2 && closeTo(rows[0].av, 40.5f));
+  }
+
+  // (6) The daily report's voltage goes only with a reading from the same UTC day, within the hour
+  {
+    const double d0 = epochOf(2026, 9, 21);
+    CHECK(warmSameUtcDayWithin(d0 + 3600.0, d0 + 7200.0, 3600.0));
+    CHECK(warmSameUtcDayWithin(d0 + 7200.0, d0 + 3600.0, 3600.0));
+    CHECK(!warmSameUtcDayWithin(d0 + 3600.0, d0 + 7201.0, 3600.0));
+    CHECK(!warmSameUtcDayWithin(d0 - 5.0, d0 + 5.0, 3600.0));        // 10 s apart across midnight
+    CHECK(!warmSameUtcDayWithin(d0 - 1200.0, d0 + 1800.0, 3600.0));  // 23:40 reading, 00:30 report
+    CHECK(warmSameUtcDayWithin(d0 + 5.0, d0 + 5.0, 0.0));
+    CHECK(!warmSameUtcDayWithin(0.0, d0, 1e9) && !warmSameUtcDayWithin(d0, 0.0, 1e9) &&
+          !warmSameUtcDayWithin(NAN, d0, 1e9) && !warmSameUtcDayWithin(d0, -1.0, 1e9));
+  }
+}
+
+// ============================================================================
 int main() {
   // Always under /tmp, not $TMPDIR: the store's path buffers are sized for
   // "/fs/history", and macOS's long $TMPDIR would overflow them (see makeDir)
@@ -1839,6 +2056,7 @@ int main() {
       {"fault injection", testFaultInjection},
       {"H-23 replay", testH23Replay},
       {"manifest", testManifest},
+      {"provenance", testProvenance},
   };
   for (const Test &t : tests) {
     const long before = gFailures;
