@@ -6,6 +6,11 @@
 // The script is read from the sketch, so the test covers exactly what operators paste into
 // Apps Script. It runs in a node `vm` context with stubs for the Apps Script services it
 // uses: ContentService, CacheService, LockService, MailApp, Utilities and console.
+//
+// Two executions overlap by nesting: `duringSend` runs a second call inside the first
+// call's MailApp.sendEmail. The first call cannot move on until the second returns, so
+// while the second call waits (Utilities.sleep), `onSleep` applies the first call's send
+// outcome to the cache the way the script does (see firstCallOutcome).
 
 'use strict';
 
@@ -94,6 +99,8 @@ function makeBridge(source, opts) {
     failSends: 0,           // this many sendEmail calls throw before one succeeds
     duringSend: null,       // run once inside the next sendEmail: a call that arrives meanwhile
     sleeps: [],             // Utilities.sleep arguments
+    onSleep: null,          // run after each Utilities.sleep: what other executions did meanwhile
+    sleptHoldingLock: 0,    // Utilities.sleep calls made while holding the script lock
     logs: [],               // console.log lines
   };
   function maybeFail(method) {
@@ -115,6 +122,7 @@ function makeBridge(source, opts) {
     },
     removeAll(keys) {
       maybeFail('removeAll');
+      if (!env.lockHeld) env.unlockedCacheOps++;
       keys.forEach(k => env.cache.delete(k));
     },
   };
@@ -148,7 +156,13 @@ function makeBridge(source, opts) {
         env.sent.push(msg);
       },
     },
-    Utilities: { sleep: ms => { env.sleeps.push(ms); } },
+    Utilities: {
+      sleep: ms => {
+        env.sleeps.push(ms);
+        if (env.lockHeld) env.sleptHoldingLock++;
+        if (env.onSleep) env.onSleep(ms);
+      },
+    },
     console: { log: line => { env.logs.push(String(line)); } },
   });
   vm.runInContext(source, context, { filename: 'Code.gs' });
@@ -174,6 +188,34 @@ function alarmBody(id) {
   const b = { to: 'ops@example.com', subject: 'TankAlarm Alert', message: 'Silas #1 high alarm 43.8 in', type: 'alarm', _sv: 1 };
   if (id !== undefined) b.id = id;
   return b;
+}
+
+// What the first call's send outcome does to its claim: marks it 'sent', or on failure
+// removes the keys that are still 'sending'.
+function firstCallOutcome(br, keys, sent) {
+  keys.forEach(k => {
+    if (sent) br.cache.set(k, 'sent');
+    else if (br.cache.get(k) === 'sending') br.cache.delete(k);
+  });
+}
+
+// Runs a second call inside the first call's send. Its own send works (failSends is for
+// the first call), and once it has slept `after` times, outcome() runs.
+function repeatDuringSend(br, payload, after, outcome) {
+  const out = {};
+  br.duringSend = () => {
+    const fails = br.failSends;
+    br.failSends = 0;
+    br.onSleep = () => { if (br.sleeps.length === after && outcome) outcome(); };
+    out.answer = br.post(payload);
+    br.onSleep = null;
+    br.failSends = fails;
+  };
+  return out;
+}
+
+function cacheValues(br, keys) {
+  return JSON.stringify(keys.map(k => br.cache.get(k)));
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +259,9 @@ try {
   checkEq('(a) claim is kept 6 hours', br.ttls[0], 21600);
   check('(a) event and message id are both claimed', br.cache.has('ev:ev-0001') && br.cache.has('id:' + id1),
         JSON.stringify([...br.cache.keys()]));
+  checkEq('(a) both marked sent after the send', cacheValues(br, ['ev:ev-0001', 'id:' + id1]), '["sent","sent"]');
+  checkEq('(a) sent mark is kept 6 hours', br.ttls[1], 21600);
+  checkEq('(a) no wait without another call sending', br.sleeps.length, 0);
   checkEq('(a) lock released', br.lockHeld, false);
 
   checkEq('(b) same event again returns duplicate', br.post(routed('ev-0001', alarmBody(id1))), 'duplicate');
@@ -252,6 +297,7 @@ try {
   checkEq('(e) failed send made both attempts', br.failSends, 0);
   checkEq('(e) failed send sent nothing', br.sent.length, 0);
   checkEq('(e) failed send released the claim', br.cache.size, 0);
+  checkEq('(e) claim released under the lock', br.unlockedCacheOps, 0);
   checkEq('(e) failed send released the lock', br.lockHeld, false);
   checkEq('(e) retry of the same event returns ok', br.post(routed('ev-0100', alarmBody(id))), 'ok');
   checkEq('(e) retry of the same event sends', br.sent.length, 1);
@@ -297,12 +343,21 @@ try {
   checkEq(name + ': lock not left held', br.lockHeld, false);
 });
 
-// removeAll throwing after a failed send: the send error is still the one reported
+// removeAll throwing after a failed send: the send error is still the one reported, and
+// the claim left behind does not stop a repeat from sending (it waits 20 s, then sends)
 {
   const br = makeBridge(source, { failing: ['removeAll'] });
   br.failSends = 2;
   checkEq('removeAll throws: send error reported', br.post(routed('ev-0310', alarmBody('x-4'))),
           'error: Error: Service invoked too many times for one day: email.');
+  checkEq('removeAll throws: lock not left held', br.lockHeld, false);
+  checkEq('removeAll throws: claim left behind', cacheValues(br, ['ev:ev-0310', 'id:x-4']), '["sending","sending"]');
+  br.failing = [];
+  br.sleeps = [];
+  checkEq('removeAll throws: repeat sends after waiting', br.post(routed('ev-0310', alarmBody('x-4'))), 'ok');
+  checkEq('removeAll throws: repeat waited 20 x 1 s', JSON.stringify(br.sleeps), JSON.stringify(Array(20).fill(1000)));
+  checkEq('removeAll throws: repeat sent', br.sent.length, 1);
+  checkEq('removeAll throws: then marked sent', cacheValues(br, ['ev:ev-0310', 'id:x-4']), '["sent","sent"]');
 }
 
 // (h) wrong or missing key: forbidden, no send, nothing claimed
@@ -354,30 +409,84 @@ try {
   checkEq('(i) two emails', br.sent.length, 2);
 }
 
-// (k) a repeat that arrives while the first call is still sending is a duplicate
+// (k) a repeat that arrives while the first call is sending waits, and is a duplicate
+// once that send has worked
 {
   const br = makeBridge(source);
   const id = 'dev:864475000000001-1790000360-7';
-  let repeat;
-  br.duringSend = () => { repeat = br.post(routed('ev-0600', alarmBody(id))); };
+  const keys = ['ev:ev-0600', 'id:' + id];
+  const repeat = repeatDuringSend(br, routed('ev-0600', alarmBody(id)), 2, () => firstCallOutcome(br, keys, true));
   checkEq('(k) slow first call returns ok', br.post(routed('ev-0600', alarmBody(id))), 'ok');
-  checkEq('(k) repeat during the send returns duplicate', repeat, 'duplicate');
+  checkEq('(k) repeat during the send returns duplicate', repeat.answer, 'duplicate');
+  checkEq('(k) repeat checked again every second until sent', JSON.stringify(br.sleeps), '[1000,1000]');
+  checkEq('(k) repeat did not hold the lock while waiting', br.sleptHoldingLock, 0);
   checkEq('(k) one email', br.sent.length, 1);
+  checkEq('(k) marked sent', cacheValues(br, keys), '["sent","sent"]');
 }
 
-// (l) a send that fails once is tried again, so a repeat that came in during the failed
-// attempt and was answered 'duplicate' loses nothing
+// (l) a repeat that arrives while the first call is sending, and that send fails twice:
+// the claim goes, so the repeat sends the email
 {
   const br = makeBridge(source);
   const id = 'dev:864475000000001-1790000420-8';
-  let repeat;
-  br.failSends = 1;
-  br.duringSend = () => { repeat = br.post(routed('ev-0700', alarmBody(id))); };
-  checkEq('(l) first call returns ok after a second attempt', br.post(routed('ev-0700', alarmBody(id))), 'ok');
-  checkEq('(l) repeat during the failed attempt returns duplicate', repeat, 'duplicate');
-  checkEq('(l) waited 2 s before the second attempt', JSON.stringify(br.sleeps), '[2000]');
+  const keys = ['ev:ev-0700', 'id:' + id];
+  br.failSends = 2;
+  const repeat = repeatDuringSend(br, routed('ev-0700', alarmBody(id)), 3, () => firstCallOutcome(br, keys, false));
+  const first = br.post(routed('ev-0700', alarmBody(id)));
+  checkEq('(l) repeat sends once the first call has failed', repeat.answer, 'ok');
+  check('(l) first call reports its error', typeof first === 'string' && first.indexOf('error: ') === 0, first);
+  checkEq('(l) waits: 3 checks by the repeat, 2 s before the second attempt',
+          JSON.stringify(br.sleeps), '[1000,1000,1000,2000]');
   checkEq('(l) one email', br.sent.length, 1);
-  checkEq('(l) claim kept after the second attempt sent', br.cache.has('ev:ev-0700'), true);
+  checkEq('(l) failed first call left the repeat\'s sent mark alone', cacheValues(br, keys), '["sent","sent"]');
+  checkEq('(l) later call is a duplicate', br.post(routed('ev-0700', alarmBody(id))), 'duplicate');
+  checkEq('(l) still one email', br.sent.length, 1);
+  checkEq('(l) cache used only under the lock', br.unlockedCacheOps, 0);
+}
+
+// (m) the first call is still sending after the repeat has waited 20 s: the repeat sends
+// anyway (a rare duplicate beats a lost alert). Here the first call then fails twice.
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000480-9';
+  const keys = ['ev:ev-0800', 'id:' + id];
+  br.failSends = 2;
+  const repeat = repeatDuringSend(br, routed('ev-0800', alarmBody(id)));
+  const first = br.post(routed('ev-0800', alarmBody(id)));
+  checkEq('(m) repeat sends after waiting 20 s', repeat.answer, 'ok');
+  checkEq('(m) repeat waited 20 x 1 s', JSON.stringify(br.sleeps.slice(0, 20)), JSON.stringify(Array(20).fill(1000)));
+  checkEq('(m) repeat logs why it sent', br.logs[0], 'still sending elsewhere after 20 s, sent anyway: ' + keys.join(' '));
+  check('(m) first call reports its error', typeof first === 'string' && first.indexOf('error: ') === 0, first);
+  checkEq('(m) one email', br.sent.length, 1);
+  checkEq('(m) failed first call left the repeat\'s sent mark alone', cacheValues(br, keys), '["sent","sent"]');
+  checkEq('(m) later call is a duplicate', br.post(routed('ev-0800', alarmBody(id))), 'duplicate');
+}
+
+// (n) as (m), but the first call's send then works: two emails
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000540-10';
+  const keys = ['ev:ev-0900', 'id:' + id];
+  const repeat = repeatDuringSend(br, routed('ev-0900', alarmBody(id)));
+  checkEq('(n) first call returns ok', br.post(routed('ev-0900', alarmBody(id))), 'ok');
+  checkEq('(n) repeat sends after waiting 20 s', repeat.answer, 'ok');
+  checkEq('(n) two emails', br.sent.length, 2);
+  checkEq('(n) marked sent', cacheValues(br, keys), '["sent","sent"]');
+}
+
+// (o) the server's own retry (new event, same message id) during the first send waits on
+// the message id, and sends if the first send fails
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000600-11';
+  br.failSends = 2;
+  const repeat = repeatDuringSend(br, routed('ev-1001', alarmBody(id)), 1,
+                                  () => firstCallOutcome(br, ['ev:ev-1000', 'id:' + id], false));
+  const first = br.post(routed('ev-1000', alarmBody(id)));
+  checkEq('(o) second note sends once the first has failed', repeat.answer, 'ok');
+  check('(o) first note reports its error', typeof first === 'string' && first.indexOf('error: ') === 0, first);
+  checkEq('(o) one email', br.sent.length, 1);
+  checkEq('(o) retry of the first event is a duplicate', br.post(routed('ev-1000', alarmBody(id))), 'duplicate');
 }
 
 console.log('email_bridge: ' + checks + ' checks, ' + failures + ' failures');

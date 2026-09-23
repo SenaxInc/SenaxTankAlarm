@@ -517,7 +517,7 @@ daily `sensors` array):
 ### Option B — Route configuration (Google Workspace via Apps Script)
 
 Use this option to send alerts **from your real Google Workspace mailbox** (e.g.
-`alerts@yourcompany.com`) with no third-party email account. A ~85-line Google Apps
+`alerts@yourcompany.com`) with no third-party email account. A ~120-line Google Apps
 Script deployed as a Web App receives the routed note and calls `MailApp.sendEmail()`.
 
 > **Interactive version:** the server dashboard has a step-by-step guide with the full
@@ -559,13 +559,16 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
   timeout (30 s by default), even while the script is still sending, and the server retries a
   `note.add` it could not confirm. The bridge remembers each email for 6 hours by Notehub event
   ID and the server's message `id` and ignores repeats; each skipped repeat shows
-  `duplicate, not sent` in its run's log under **Executions**. A script installed before this
-  check (no `CacheService` line) sends every repeat. To update it, paste the current version
-  from `/email-setup` over the old `SECRET` line and `doPost` function (keep any other
-  functions, such as `checkStopReplies`), set `SECRET` back to the `?key=` value in your route
-  URL, save, and publish with Deploy → Manage deployments → edit → **Version: New version** →
-  **Deploy** so the `/exec` URL stays the same. Then send a test email. Raising the route
-  **Timeout** to 60 s avoids most retries.
+  `duplicate, not sent` in its run's log under **Executions**. A repeat that arrives while the
+  email is still being sent waits up to 20 s for that send. If the send fails, the repeat sends
+  the email. If the send is still running after 20 s, the repeat sends it too (its log shows
+  `still sending elsewhere after 20 s, sent anyway`), because a rare duplicate beats a lost
+  alert. A script installed before this check (no `CacheService` line) sends every repeat. To
+  update it, paste the current version from `/email-setup` over the old `SECRET` line and
+  `doPost` function (keep any other functions, such as `checkStopReplies`), set `SECRET` back
+  to the `?key=` value in your route URL, save, and publish with Deploy → Manage deployments →
+  edit → **Version: New version** → **Deploy** so the `/exec` URL stays the same. Then send a
+  test email. Raising the route **Timeout** to 60 s avoids most retries.
 - The daily report's `fmt` object (from the server's `/email-format` page) is available to
   the script if you want to expand the sample renderer.
 
