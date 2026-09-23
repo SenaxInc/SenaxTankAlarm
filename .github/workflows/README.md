@@ -21,9 +21,11 @@ This directory contains automated CI/CD workflows for the SenaxTankAlarm project
 
 **File:** `arduino-ci-112025.yml`
 
-This workflow runs two jobs:
+This workflow runs these jobs:
 - **`compile-check`** — compiles the TankAlarm-112025 (Arduino Opta) sketches on pushes and pull requests, and opens a GitHub issue if any sketch fails to build.
-- **`build-firmware`** — runs only on pushes, and only after `compile-check` succeeds. It builds the `.bin` files (with the `BLUES_PRODUCT_UID` secret baked in) and commits them to `firmware/112025/`. This job is documented under "Build Firmware Binaries" below.
+- **`check-web-pages`** — checks the server and viewer web pages' scripts (`check_web_pages.py`).
+- **`host-tests`** — builds and runs the host unit tests under `tests/host/` with g++ (see `tests/host/README.md`).
+- **`build-firmware`** — runs only on pushes, and only after `compile-check`, `check-web-pages` and `host-tests` succeed. It builds the `.bin` files (with the `BLUES_PRODUCT_UID` secret baked in) and commits them to `firmware/112025/`. This job is documented under "Build Firmware Binaries" below.
 
 ### Purpose
 Automatically compiles the TankAlarm-112025 (Arduino Opta) sketches
