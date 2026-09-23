@@ -5592,6 +5592,27 @@ static bool validateSensorReading(uint8_t idx, float reading) {
         doc["t"] = currentEpoch();
         publishNote(ALARM_FILE, doc, true);
       }
+      // C-T01 (NEW-B): the server treats sensor-recovered as a clear and has already replaced
+      // the alarm type with sensor-fault, but the level latch was held through the failure.
+      // Queue a publish-only re-assertion of the latched edge; this pass's evaluateAlarms()
+      // sends it after its gates (Phase B on current-loop devices). No I/O here.
+      if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
+        if (cfg.sensorInterface == SENSOR_DIGITAL) {
+          if (state.highAlarmLatched) {
+            bool triggerOnActivated = true;
+            (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);
+            state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
+          }
+        } else if (state.highAlarmLatched) {
+          state.pendingAlarm = ALARM_PENDING_HIGH;
+        } else if (state.lowAlarmLatched) {
+          state.pendingAlarm = ALARM_PENDING_LOW;
+        }
+        if (state.pendingAlarm != ALARM_PENDING_NONE) {
+          Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
+          Serial.println(cfg.name);
+        }
+      }
     }
   }
   state.lastValidReading = reading;
