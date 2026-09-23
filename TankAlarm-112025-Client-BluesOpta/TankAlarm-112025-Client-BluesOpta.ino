@@ -5251,6 +5251,8 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           recovDoc["rd"] = 0;
           recovDoc["t"] = currentEpoch();
           publishNote(ALARM_FILE, recovDoc, true);
+          // C-T01: no NEW-B re-assertion here; reinitializeHardware() below clears the latch
+          // and sends a clear (see validateSensorReading())
         }
         gMonitorState[i].sensorFailed = false;
         gMonitorState[i].stuckReadingCount = 0;
@@ -5600,9 +5602,13 @@ static bool validateSensorReading(uint8_t idx, float reading) {
       // only while the sample is in alarm: a reading in the latch's release zone (level moved
       // during the outage, or a stuck float recovered by changing state) holds it, so no
       // false alarm, and the normal debounce's clear then supersedes it; if the level returns
-      // to alarm before the latch clears, it is sent then. The I2C sensor-only recovery in
-      // loop() clears sensorFailed silently and is not hooked; the server's fresh-telemetry
-      // sensor-fault self-clear still drops the level alarm on that path (C-A04).
+      // to alarm before the latch clears, it is sent then. Two other recoveries are not
+      // hooked. A config update that turns stuck detection off publishes sensor-recovered,
+      // but reinitializeHardware() then clears every latch, this pending edge with it, and
+      // sends a clear (NEW-A), so client and server agree and the level re-latches from fresh
+      // samples; C-A02 must re-assert there if it keeps latches across a config save. The I2C
+      // sensor-only recovery in loop() clears sensorFailed silently; the server's
+      // fresh-telemetry sensor-fault self-clear still drops the level alarm on that path (C-A04).
       if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
         if (cfg.sensorInterface == SENSOR_DIGITAL) {
           if (state.highAlarmLatched) {
@@ -6417,9 +6423,10 @@ static void evaluateAlarms(uint8_t idx) {
   // reset only by a hysteresis-band sample and a clear counter never, so alternating samples
   // ([90,50,90,50,90] with high=80) latched or cleared. Now any sample that does not qualify
   // resets the evidence. A sample inside both trigger zones (low >= high, a misconfiguration)
-  // counts for neither side: it never latches from unlatched, as before, and it now holds an
-  // existing latch (v2.2.15 flipped it between HIGH and LOW every 2-3 such samples). Entering
-  // one side unlatches the other, as before.
+  // counts toward neither alarm: it never latches one and it holds an existing latch. In
+  // v2.2.15 the result there depended on the order of the samples: it could latch HIGH or flip
+  // a latch between HIGH and LOW (host test T13). Entering one side unlatches the other, as
+  // before.
   uint8_t highEdge = ALARM_EDGE_NONE;
   uint8_t lowEdge = ALARM_EDGE_NONE;
   alarmAnalogEvaluate(c, ALARM_DEBOUNCE_COUNT, state.highAlarmLatched, state.lowAlarmLatched,

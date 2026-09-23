@@ -361,8 +361,8 @@ static RunResult runLegacy(LegacyAnalog &state, float high, float low, float hys
 }
 
 static void testOverlapAndExtremes() {
-  {  // T13a: high=50, low=60 (misconfigured); 55 is in both zones and never latches, as in
-     // v2.2.15
+  {  // T13a: high=50, low=60 (misconfigured); 55 is in both zones. A run of 55s never
+     // latches, nor did it in v2.2.15 (T13e/f: mixed runs did)
     AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, false, false, kNeed);
     const float xs[] = {55, 55, 55, 55, 55};
     const RunResult r = RUN(s, xs);
@@ -403,6 +403,28 @@ static void testOverlapAndExtremes() {
     const RunResult o = runLegacy(old, 50.0f, 60.0f, 5.0f, xs, COUNT_OF(xs));
     CHECK(o.edges == 2 && o.lowEnterAt == 2 && o.highEnterAt == 5);
     CHECK(old.highAlarmLatched && !old.lowAlarmLatched);
+  }
+  {  // T13e: v2.2.15 counted a sample in both zones toward HIGH first, so the 55 completed a
+     // HIGH run begun by high-only samples and latched on the 3rd sample; nothing latches now
+    AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, false, false, kNeed);
+    const float xs[] = {70, 70, 55};
+    const RunResult r = RUN(s, xs);
+    CHECK(r.edges == 0 && !s.highLatched && !s.lowLatched);
+    LegacyAnalog old = makeLegacy(false, false);
+    const RunResult o = runLegacy(old, 50.0f, 60.0f, 5.0f, xs, COUNT_OF(xs));
+    CHECK(o.edges == 1 && o.highEnterAt == 2);
+    CHECK(old.highAlarmLatched && !old.lowAlarmLatched);
+  }
+  {  // T13f: T13e followed by more 55s; v2.2.15 latched HIGH on the 3rd sample, then flipped
+     // to LOW on the 5th; nothing latches now
+    AnalogSim s = makeSim(50.0f, 60.0f, 5.0f, false, false, kNeed);
+    const float xs[] = {70, 70, 55, 55, 55, 55};
+    const RunResult r = RUN(s, xs);
+    CHECK(r.edges == 0 && !s.highLatched && !s.lowLatched);
+    LegacyAnalog old = makeLegacy(false, false);
+    const RunResult o = runLegacy(old, 50.0f, 60.0f, 5.0f, xs, COUNT_OF(xs));
+    CHECK(o.edges == 2 && o.highEnterAt == 2 && o.lowEnterAt == 4);
+    CHECK(!old.highAlarmLatched && old.lowAlarmLatched);
   }
   {  // T14: inert +/-1e9 thresholds never trigger
     AnalogSim s = makeSim(1e9f, -1e9f, 5.0f, false, false, kNeed);

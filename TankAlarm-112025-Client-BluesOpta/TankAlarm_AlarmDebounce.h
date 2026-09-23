@@ -75,10 +75,11 @@ static inline AlarmAnalogConditions alarmAnalogConditions(float x, float highThr
 // Two-channel (high/low) analog evaluation: updates the latches and counters in place and
 // reports each channel's edge. The caller notifies in the order high edge, then low edge, as
 // v2.2.15 did. A sample inside both trigger zones (low threshold >= high threshold, a
-// misconfiguration) is evidence for neither side: it never latches an alarm from unlatched,
-// as in v2.2.15, and it holds an existing latch, which v2.2.15 flipped between HIGH and LOW
-// every 2-3 such samples, sending each new side's note (host test T13). Entering one side
-// unlatches the other, as v2.2.15 did.
+// misconfiguration) counts toward neither alarm: it never latches one and it holds an
+// existing latch. In v2.2.15 the result there depended on the order of the samples: it could
+// latch HIGH (high=50, low=60: 70, 70, 55 latched on the 55) or flip a latch between HIGH
+// and LOW every 2-3 such samples, sending each new side's note (host test T13). Entering one
+// side unlatches the other, as v2.2.15 did.
 static inline void alarmAnalogEvaluate(const AlarmAnalogConditions &c, uint8_t need,
                                        bool &highLatched, bool &lowLatched,
                                        uint8_t &highEnterCount, uint8_t &highExitCount,
