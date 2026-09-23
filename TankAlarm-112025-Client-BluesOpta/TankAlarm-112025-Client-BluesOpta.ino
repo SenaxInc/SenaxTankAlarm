@@ -283,6 +283,14 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define ALARM_DEBOUNCE_COUNT 3  // Require 3 consecutive samples to trigger/clear alarm
 #endif
 
+// C-T01: latched edge whose alarm.qo note was denied by checkAlarmRateLimit (RAM only).
+// Plain defines (not an enum) so the Arduino auto-prototypes never need the type.
+#define ALARM_PENDING_NONE          0
+#define ALARM_PENDING_HIGH          1
+#define ALARM_PENDING_LOW           2
+#define ALARM_PENDING_TRIGGERED     3
+#define ALARM_PENDING_NOT_TRIGGERED 4
+
 #ifndef SENSOR_STUCK_THRESHOLD
 #define SENSOR_STUCK_THRESHOLD 10  // Same reading 10 times = stuck sensor
 #endif
@@ -826,6 +834,7 @@ struct MonitorRuntime {
   float lastDailySentValue;  // Last value included in a daily report (monitor's own unit)
   bool highAlarmLatched;
   bool lowAlarmLatched;
+  uint8_t pendingAlarm;         // C-T01: ALARM_PENDING_* edge awaiting its note; RAM only
   unsigned long lastSampleMillis;
   unsigned long lastAlarmSendMillis;
   // Debouncing state
@@ -1449,6 +1458,11 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow);
 static float getEffectiveBatteryVoltage();
 static void sendRegistration(const char *reason);
 static void sendAlarm(uint8_t idx, const char *alarmType, float inches);
+static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches);
+static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bool isRetry);
+static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry);
+static uint8_t alarmPendingCodeFor(const char *alarmType);
+static const char *alarmPendingName(uint8_t code);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
 static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
@@ -1769,6 +1783,7 @@ void setup() {
     gMonitorState[i].lastDailySentValue = -9999.0f;
     gMonitorState[i].highAlarmLatched = false;
     gMonitorState[i].lowAlarmLatched = false;
+    gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;
     gMonitorState[i].lastSampleMillis = 0;
     gMonitorState[i].lastAlarmSendMillis = 0;
     gMonitorState[i].highAlarmDebounceCount = 0;
@@ -4848,6 +4863,7 @@ static void reinitializeHardware() {
     gMonitorState[i].lowClearDebounceCount = 0;
     gMonitorState[i].highAlarmLatched = false;
     gMonitorState[i].lowAlarmLatched = false;
+    gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;  // C-T01: latches reset; drop any unsent edge
     gMonitorState[i].consecutiveFailures = 0;
     gMonitorState[i].stuckReadingCount = 0;
     gMonitorState[i].sensorFailed = false;
@@ -5205,6 +5221,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       // Previously, stale highAlarmLatched/lowAlarmLatched persisted and were
       // reported in daily reports, causing phantom alarms on the dashboard.
       if (wasAlarmsEnabled && !gConfig.monitors[i].alarmsEnabled) {
+        gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;  // C-T01: never retry once alarms are off
         if (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched) {
           gMonitorState[i].highAlarmLatched = false;
           gMonitorState[i].lowAlarmLatched = false;
@@ -6267,6 +6284,8 @@ static void evaluateAlarms(uint8_t idx) {
   unsigned long sampleNow = millis();
   bool firstAlarmSample = (state.lastSampleMillis == 0);
   state.lastSampleMillis = sampleNow;
+  // C-T01: edge left pending by an earlier sample; retried after this sample's own edges
+  const uint8_t pendingAtEntry = state.pendingAlarm;
 
   // Handle digital sensors (float switches) differently
   if (cfg.sensorInterface == SENSOR_DIGITAL) {
@@ -6333,6 +6352,7 @@ static void evaluateAlarms(uint8_t idx) {
     } else {
       state.highClearDebounceCount = 0;
     }
+    retryPendingAlarm(idx, pendingAtEntry);
     return;  // Skip the standard analog threshold evaluation
   }
 
@@ -6410,6 +6430,7 @@ static void evaluateAlarms(uint8_t idx) {
   if (lowCondition) {
     state.lowClearDebounceCount = 0;
   }
+  retryPendingAlarm(idx, pendingAtEntry);
 }
 
 // ---- Registration note for unconfigured clients ----
@@ -6755,7 +6776,6 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
   }
 
   const MonitorConfig &cfg = gConfig.monitors[idx];
-  bool allowSmsEscalation = cfg.enableAlarmSms;
 
   // Always activate local alarm regardless of rate limits
   // relay_timeout is an operational notification, not an alarm condition
@@ -6812,12 +6832,38 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
     }
   }
 
-  // Check rate limit before sending remote alarm notification
-  // Note: Rate limiting only gates Notecard message transmission, NOT relay actuation above
-  if (!checkAlarmRateLimit(idx, alarmType)) {
-    return;  // Rate limit exceeded — relay already handled above
+  // Rate limiting only gates the Notecard note, NOT relay actuation above.
+  // C-T01: a rate-limited latch edge is kept pending and re-sent publish-only.
+  notifyAlarmEdge(idx, alarmType, inches, false);
+}
+
+static uint8_t alarmPendingCodeFor(const char *alarmType) {
+  if (strcmp(alarmType, "high") == 0) return ALARM_PENDING_HIGH;
+  if (strcmp(alarmType, "low") == 0) return ALARM_PENDING_LOW;
+  if (strcmp(alarmType, "triggered") == 0) return ALARM_PENDING_TRIGGERED;
+  if (strcmp(alarmType, "not_triggered") == 0) return ALARM_PENDING_NOT_TRIGGERED;
+  return ALARM_PENDING_NONE;
+}
+
+static const char *alarmPendingName(uint8_t code) {
+  switch (code) {
+    case ALARM_PENDING_HIGH: return "high";
+    case ALARM_PENDING_LOW: return "low";
+    case ALARM_PENDING_TRIGGERED: return "triggered";
+    case ALARM_PENDING_NOT_TRIGGERED: return "not_triggered";
+    default: return "";
+  }
+}
+
+// C-T01: builds and publishes one alarm.qo note. Publish-only: never actuates, so a retry
+// never re-drives local outputs or remote relays. Note content is unchanged from v2.2.15.
+static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches) {
+  if (idx >= gConfig.monitorCount) {
+    return;
   }
 
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  bool allowSmsEscalation = cfg.enableAlarmSms;
   MonitorRuntime &state = gMonitorState[idx];
   state.lastAlarmSendMillis = millis();
 
@@ -6855,6 +6901,77 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
   const char *logUnit = (cfg.measurementUnit[0] != '\0') ? cfg.measurementUnit : "in";
   snprintf(logMsg, sizeof(logMsg), "Alarm: %s - %s - %.1f %s", cfg.name, alarmType, inches, logUnit);
   addSerialLog(logMsg);
+}
+
+// C-T01: rate-limit gate plus pending bookkeeping for one alarm note. Never actuates.
+// Previously a denied note was simply dropped, so a latch edge caught by the 300 s per-type
+// interval or the hourly caps (boot window, config-push re-latch, flapping) never reached the
+// server. Now the monitor's single pending slot keeps the newest denied latch edge and
+// retryPendingAlarm() re-sends it, under the same limits, from a later valid sample.
+static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bool isRetry) {
+  if (idx >= gConfig.monitorCount) {
+    return;
+  }
+
+  MonitorRuntime &state = gMonitorState[idx];
+  const uint8_t code = alarmPendingCodeFor(alarmType);
+  char logMsg[96];
+  if (!checkAlarmRateLimit(idx, alarmType)) {
+    // Only latch edges are kept; clear, sensor-recovered and relay_timeout are never limited.
+    if (code != ALARM_PENDING_NONE && state.pendingAlarm != code) {
+      state.pendingAlarm = code;  // newest unsent edge wins; logged once, not on each denied retry
+      snprintf(logMsg, sizeof(logMsg), "Alarm deferred (rate limit): %s - %s", gConfig.monitors[idx].name, alarmType);
+      Serial.println(logMsg);
+      addSerialLog(logMsg);
+    }
+    return;
+  }
+
+  // A published latch edge or clear supersedes the pending edge; relay_timeout leaves it.
+  if (code != ALARM_PENDING_NONE || strcmp(alarmType, "clear") == 0) {
+    state.pendingAlarm = ALARM_PENDING_NONE;
+  }
+  publishAlarmNote(idx, alarmType, inches);
+  if (isRetry) {
+    snprintf(logMsg, sizeof(logMsg), "Pending alarm sent: %s - %s", gConfig.monitors[idx].name, alarmType);
+    Serial.println(logMsg);
+    addSerialLog(logMsg);
+  }
+}
+
+// C-T01: re-sends the edge that was pending when this sample's evaluation began, unless this
+// sample replaced it (newer denied edge) or cleared it (clear / latch edge sent). Called only
+// from evaluateAlarms(), so retries follow the Phase-B rule on current-loop devices. The note
+// carries the current reading and send time, a consistent snapshot for the server.
+static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry) {
+  if (idx >= gConfig.monitorCount) {
+    return;
+  }
+
+  MonitorRuntime &state = gMonitorState[idx];
+  if (pendingAtEntry == ALARM_PENDING_NONE || state.pendingAlarm != pendingAtEntry) {
+    return;
+  }
+
+  const bool digital = (gConfig.monitors[idx].sensorInterface == SENSOR_DIGITAL);
+  bool stillLatched = false;
+  switch (pendingAtEntry) {
+    case ALARM_PENDING_HIGH: stillLatched = !digital && state.highAlarmLatched; break;
+    case ALARM_PENDING_LOW: stillLatched = !digital && state.lowAlarmLatched; break;
+    case ALARM_PENDING_TRIGGERED:
+    case ALARM_PENDING_NOT_TRIGGERED: stillLatched = digital && state.highAlarmLatched; break;
+    default: break;
+  }
+  if (!stillLatched) {
+    char logMsg[96];
+    snprintf(logMsg, sizeof(logMsg), "Pending alarm dropped (latch released): %s - %s",
+             gConfig.monitors[idx].name, alarmPendingName(pendingAtEntry));
+    Serial.println(logMsg);
+    addSerialLog(logMsg);
+    state.pendingAlarm = ALARM_PENDING_NONE;
+    return;
+  }
+  notifyAlarmEdge(idx, alarmPendingName(pendingAtEntry), state.currentValue, true);
 }
 
 // ============================================================================
