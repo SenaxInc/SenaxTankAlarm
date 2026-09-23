@@ -5,7 +5,7 @@
 //
 // The script is read from the sketch, so the test covers exactly what operators paste into
 // Apps Script. It runs in a node `vm` context with stubs for the Apps Script services it
-// uses: ContentService, CacheService, LockService and MailApp.
+// uses: ContentService, CacheService, LockService, MailApp, Utilities and console.
 
 'use strict';
 
@@ -89,49 +89,66 @@ function makeBridge(source, opts) {
     lockHeld: false,
     lockReleases: 0,
     lockOk: opts.lockOk !== false,
-    cacheThrows: !!opts.cacheThrows,
-    throwOnNextSend: false,
+    failing: opts.failing || [],  // service methods that throw, e.g. ['tryLock']
+    unlockedCacheOps: 0,    // getAll/putAll calls made without the script lock
+    failSends: 0,           // this many sendEmail calls throw before one succeeds
+    duringSend: null,       // run once inside the next sendEmail: a call that arrives meanwhile
+    sleeps: [],             // Utilities.sleep arguments
+    logs: [],               // console.log lines
   };
+  function maybeFail(method) {
+    if (env.failing.indexOf(method) >= 0) throw new Error(method + ': service unavailable');
+  }
   const cache = {
     getAll(keys) {
-      if (env.cacheThrows) throw new Error('Cache service unavailable');
+      maybeFail('getAll');
+      if (!env.lockHeld) env.unlockedCacheOps++;
       const found = {};
       keys.forEach(k => { if (env.cache.has(k)) found[k] = env.cache.get(k); });
       return found;
     },
     putAll(values, ttl) {
-      if (env.cacheThrows) throw new Error('Cache service unavailable');
+      maybeFail('putAll');
+      if (!env.lockHeld) env.unlockedCacheOps++;
       env.ttls.push(ttl);
       Object.keys(values).forEach(k => env.cache.set(k, values[k]));
     },
     removeAll(keys) {
+      maybeFail('removeAll');
       keys.forEach(k => env.cache.delete(k));
     },
   };
   const lock = {
     tryLock(ms) {
       env.lockWaits.push(ms);
+      maybeFail('tryLock');
       if (env.lockOk) env.lockHeld = true;
       return env.lockOk;
     },
     releaseLock() {
       env.lockHeld = false;
       env.lockReleases++;
+      maybeFail('releaseLock');
     },
   };
   const context = vm.createContext({
     ContentService: { createTextOutput: t => ({ text: t }) },
-    CacheService: { getScriptCache: () => cache },
-    LockService: { getScriptLock: () => lock },
+    CacheService: { getScriptCache: () => { maybeFail('getScriptCache'); return cache; } },
+    LockService: { getScriptLock: () => { maybeFail('getScriptLock'); return lock; } },
     MailApp: {
       sendEmail(msg) {
-        if (env.throwOnNextSend) {
-          env.throwOnNextSend = false;
+        const during = env.duringSend;
+        env.duringSend = null;
+        if (during) during();
+        if (env.failSends > 0) {
+          env.failSends--;
           throw new Error('Service invoked too many times for one day: email.');
         }
         env.sent.push(msg);
       },
     },
+    Utilities: { sleep: ms => { env.sleeps.push(ms); } },
+    console: { log: line => { env.logs.push(String(line)); } },
   });
   vm.runInContext(source, context, { filename: 'Code.gs' });
   if (typeof context.doPost !== 'function') throw new Error('script does not define doPost');
@@ -204,6 +221,8 @@ try {
   checkEq('(b) same event again returns duplicate', br.post(routed('ev-0001', alarmBody(id1))), 'duplicate');
   checkEq('(b) same event again does not send', br.sent.length, 1);
   checkEq('(b) lock released after a duplicate', br.lockHeld, false);
+  checkEq('(b) duplicate is logged for the Executions view',
+          JSON.stringify(br.logs), JSON.stringify(['duplicate, not sent: ev:ev-0001 id:' + id1]));
 
   checkEq('(c) new event, same message id returns duplicate', br.post(routed('ev-0002', alarmBody(id1))), 'duplicate');
   checkEq('(c) new event, same message id does not send', br.sent.length, 1);
@@ -218,15 +237,18 @@ try {
           br.post(routed(undefined, alarmBody(id2))), 'duplicate');
   checkEq('(d) nothing else sent', br.sent.length, 2);
   checkEq('(d) every lock taken was released', br.lockReleases, br.lockWaits.length);
+  checkEq('(d) cache checked and claimed only under the lock', br.unlockedCacheOps, 0);
 }
 
-// (e) a send that throws releases the claim, so a retry of the same event can send
+// (e) a send that throws twice releases the claim, so a retry of the same event can send
 {
   const br = makeBridge(source);
   const id = 'dev:864475000000001-1790000120-3';
-  br.throwOnNextSend = true;
+  br.failSends = 2;
   const first = br.post(routed('ev-0100', alarmBody(id)));
   check('(e) failed send reports the error', typeof first === 'string' && first.indexOf('error: ') === 0, first);
+  checkEq('(e) failed send was tried again after 2 s', JSON.stringify(br.sleeps), '[2000]');
+  checkEq('(e) failed send made both attempts', br.failSends, 0);
   checkEq('(e) failed send sent nothing', br.sent.length, 0);
   checkEq('(e) failed send released the claim', br.cache.size, 0);
   checkEq('(e) failed send released the lock', br.lockHeld, false);
@@ -257,14 +279,29 @@ try {
   checkEq('(g) lock busy: both sent', br.sent.length, 2);
   checkEq('(g) lock busy: nothing cached', br.cache.size, 0);
   checkEq('(g) lock busy: no release without the lock', br.lockReleases, 0);
+
+  br.cache.set('ev:ev-0201', '1');  // claimed by a concurrent call that holds the lock
+  br.failSends = 2;
+  const failed = br.post(routed('ev-0201', alarmBody('x-0')));
+  check('(g) lock busy: failed send reports the error', typeof failed === 'string' && failed.indexOf('error: ') === 0, failed);
+  checkEq('(g) lock busy: a failed send leaves other claims alone', br.cache.has('ev:ev-0201'), true);
 }
 
-// Cache service failing: send anyway, as when the lock is busy
+// Lock or cache service throwing: send anyway, as when the lock is busy
+[['getScriptCache'], ['getScriptLock'], ['tryLock'], ['releaseLock'], ['getAll', 'putAll']].forEach(failing => {
+  const br = makeBridge(source, { failing: failing });
+  const name = failing.join('/') + ' throws';
+  checkEq(name + ': call ok', br.post(routed('ev-0300', alarmBody('x-1'))), 'ok');
+  checkEq(name + ': sent', br.sent.length, 1);
+  checkEq(name + ': lock not left held', br.lockHeld, false);
+});
+
+// removeAll throwing after a failed send: the send error is still the one reported
 {
-  const br = makeBridge(source, { cacheThrows: true });
-  checkEq('cache failing: call ok', br.post(routed('ev-0300', alarmBody('x-1'))), 'ok');
-  checkEq('cache failing: sent', br.sent.length, 1);
-  checkEq('cache failing: lock released', br.lockHeld, false);
+  const br = makeBridge(source, { failing: ['removeAll'] });
+  br.failSends = 2;
+  checkEq('removeAll throws: send error reported', br.post(routed('ev-0310', alarmBody('x-4'))),
+          'error: Error: Service invoked too many times for one day: email.');
 }
 
 // (h) wrong or missing key: forbidden, no send, nothing claimed
@@ -314,6 +351,32 @@ try {
     'North Tank 2 #2: 10  ** ALARM: high **',
   ].join('\n'));
   checkEq('(i) two emails', br.sent.length, 2);
+}
+
+// (k) a repeat that arrives while the first call is still sending is a duplicate
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000360-7';
+  let repeat;
+  br.duringSend = () => { repeat = br.post(routed('ev-0600', alarmBody(id))); };
+  checkEq('(k) slow first call returns ok', br.post(routed('ev-0600', alarmBody(id))), 'ok');
+  checkEq('(k) repeat during the send returns duplicate', repeat, 'duplicate');
+  checkEq('(k) one email', br.sent.length, 1);
+}
+
+// (l) a send that fails once is tried again, so a repeat that came in during the failed
+// attempt and was answered 'duplicate' loses nothing
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000420-8';
+  let repeat;
+  br.failSends = 1;
+  br.duringSend = () => { repeat = br.post(routed('ev-0700', alarmBody(id))); };
+  checkEq('(l) first call returns ok after a second attempt', br.post(routed('ev-0700', alarmBody(id))), 'ok');
+  checkEq('(l) repeat during the failed attempt returns duplicate', repeat, 'duplicate');
+  checkEq('(l) waited 2 s before the second attempt', JSON.stringify(br.sleeps), '[2000]');
+  checkEq('(l) one email', br.sent.length, 1);
+  checkEq('(l) claim kept after the second attempt sent', br.cache.has('ev:ev-0700'), true);
 }
 
 console.log('email_bridge: ' + checks + ' checks, ' + failures + ' failures');
