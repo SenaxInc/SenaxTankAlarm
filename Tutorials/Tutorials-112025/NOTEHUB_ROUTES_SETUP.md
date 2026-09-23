@@ -467,8 +467,10 @@ page's field/summary toggles ride along in `fmt` so your route template can hono
 Use `body.type = "alarm"` in your template to distinguish the two shapes.
 
 Both shapes carry `id`, a message ID (`<server device UID>-<epoch seconds>-<counter>`) that is
-unique per email and stays the same when the server retries its `note.add`. The Apps Script
-bridge (Option B) uses it to ignore repeats; other templates can ignore the field.
+unique per email and stays the same when the server retries its `note.add`. (`server` replaces
+the UID if it is unknown, and `u<microseconds since boot>` replaces the epoch before the clock
+is set.) The Apps Script bridge (Option B) uses it to ignore repeats; other templates can
+ignore the field.
 
 ### Option A — Route configuration (SendGrid)
 
@@ -515,7 +517,7 @@ daily `sensors` array):
 ### Option B — Route configuration (Google Workspace via Apps Script)
 
 Use this option to send alerts **from your real Google Workspace mailbox** (e.g.
-`alerts@yourcompany.com`) with no third-party email account. A ~60-line Google Apps
+`alerts@yourcompany.com`) with no third-party email account. A ~85-line Google Apps
 Script deployed as a Web App receives the routed note and calls `MailApp.sendEmail()`.
 
 > **Interactive version:** the server dashboard has a step-by-step guide with the full
@@ -556,9 +558,13 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
 - **Retries and duplicates:** Notehub retries a call that has not answered within the route
   timeout (30 s by default), even while the script is still sending, and the server retries a
   `note.add` it could not confirm. The bridge remembers each email for 6 hours by Notehub event
-  ID and the server's message `id` and ignores repeats. A script installed before this check
-  (no `CacheService` line) sends every repeat: paste the current version from `/email-setup`
-  and publish it with Manage deployments → edit → **Version: New**. Raising the route
+  ID and the server's message `id` and ignores repeats; each skipped repeat shows
+  `duplicate, not sent` in its run's log under **Executions**. A script installed before this
+  check (no `CacheService` line) sends every repeat. To update it, paste the current version
+  from `/email-setup` over the old `SECRET` line and `doPost` function (keep any other
+  functions, such as `checkStopReplies`), set `SECRET` back to the `?key=` value in your route
+  URL, save, and publish with Deploy → Manage deployments → edit → **Version: New version** →
+  **Deploy** so the `/exec` URL stays the same. Then send a test email. Raising the route
   **Timeout** to 60 s avoids most retries.
 - The daily report's `fmt` object (from the server's `/email-format` page) is available to
   the script if you want to expand the sample renderer.
@@ -649,8 +655,9 @@ Save the route and re-route a failed event from Route Logs to confirm the fix.
 ### "The same email arrives two or three times"
 
 Notehub retried a Route #5 call that answered after the route timeout. Update the Apps Script
-bridge to the current version (Step 7, Option B, "Retries and duplicates"), which ignores
-those repeats. With SendGrid (Option A) it is rare; a longer route timeout makes it rarer.
+bridge to the current version and put your existing `SECRET` value back (Step 7, Option B,
+"Retries and duplicates"); it ignores those repeats. With SendGrid (Option A) it is rare; a
+longer route timeout makes it rarer.
 
 ### "Notes not appearing on target device"
 
