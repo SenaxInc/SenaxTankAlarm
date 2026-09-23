@@ -1784,15 +1784,12 @@ void setup() {
     gMonitorState[i].alarmCount = 0;
     // BugFix v1.6.2 (M-13): Initialize last-alarm timestamps so the first alarm
     // after boot is NOT suppressed by the per-type minimum-interval check.
-    // Setting them to (now - interval - 1) ensures the very first alarm passes.
+    // C-T01: stamp each one interval + 1 ms in the past. The subtraction wraps when millis()
+    // is small and checkAlarmRateLimit tests (now - last) < interval modulo 2^32, so the first
+    // alarm of each type passes at any uptime. The previous clamp to 0 suppressed high/low/
+    // fault notes for the first 300 s of uptime (F-05/M-12a).
     {
-      unsigned long bootNow = millis();
-      unsigned long expired = bootNow - (MIN_ALARM_INTERVAL_SECONDS * 1000UL + 1);
-      // If millis() is still tiny (< interval), use 0 which also won't suppress
-      // because the unsigned subtraction in the rate-limit check will wrap large.
-      if (bootNow < MIN_ALARM_INTERVAL_SECONDS * 1000UL + 1) {
-        expired = 0;
-      }
+      const unsigned long expired = millis() - (MIN_ALARM_INTERVAL_SECONDS * 1000UL + 1UL);
       gMonitorState[i].lastHighAlarmMillis = expired;
       gMonitorState[i].lastLowAlarmMillis = expired;
       gMonitorState[i].lastClearAlarmMillis = expired;
@@ -6642,13 +6639,13 @@ static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType) {
   }
 
   // Check hourly rate limit - remove timestamps older than 1 hour
-  // BugFix v1.6.2 (I-12): Guard against unsigned underflow when millis() < 1 hour.
-  // When uptime is less than 1 hour, all timestamps are inherently recent — skip pruning.
-  if (now >= 3600000UL) {
-    unsigned long oneHourAgo = now - 3600000UL;
+  // C-T01: wrap-safe; the old ts > now-3600000 test (and its skip in the first hour of
+  // uptime) never pruned stamps taken in the last hour before the 49.7-day wrap (M-12d).
+  // Before the wrap this keeps exactly the entries the old test kept.
+  {
     uint8_t validCount = 0;
     for (uint8_t i = 0; i < state.alarmCount; ++i) {
-      if (state.alarmTimestamps[i] > oneHourAgo) {
+      if (alarmWithinWindow(now, state.alarmTimestamps[i], 3600000UL)) {
         state.alarmTimestamps[validCount++] = state.alarmTimestamps[i];
       }
     }
@@ -6672,17 +6669,15 @@ static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType) {
   // Previously, per-monitor timestamp was added first, so global rejection still consumed
   // the per-monitor budget — accelerating per-monitor rate exhaustion.
   {
-    // BugFix v1.6.2 (I-12): Same unsigned-underflow guard for global alarm budget.
-    if (now >= 3600000UL) {
-      unsigned long oneHourAgo = now - 3600000UL;
-      uint8_t gValid = 0;
-      for (uint8_t g = 0; g < gGlobalAlarmCount; ++g) {
-        if (gGlobalAlarmTimestamps[g] > oneHourAgo) {
-          gGlobalAlarmTimestamps[gValid++] = gGlobalAlarmTimestamps[g];
-        }
+    // C-T01: wrap-safe; the old ts > now-3600000 test never pruned stamps taken in the last
+    // hour before the 49.7-day wrap (M-12d)
+    uint8_t gValid = 0;
+    for (uint8_t g = 0; g < gGlobalAlarmCount; ++g) {
+      if (alarmWithinWindow(now, gGlobalAlarmTimestamps[g], 3600000UL)) {
+        gGlobalAlarmTimestamps[gValid++] = gGlobalAlarmTimestamps[g];
       }
-      gGlobalAlarmCount = gValid;
     }
+    gGlobalAlarmCount = gValid;
 
     if (gGlobalAlarmCount >= MAX_GLOBAL_ALARMS_PER_HOUR) {
       Serial.print(F("Rate limit: Global hourly cap reached ("));
