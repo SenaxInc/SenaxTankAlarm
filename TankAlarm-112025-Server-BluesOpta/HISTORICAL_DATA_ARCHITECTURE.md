@@ -190,20 +190,20 @@ taken (S-D03):
   does not say which, so its value is not recorded; the reading enters history through
   telemetry or the daily report at its own time, and the alarm counts in `al`.
 - **Stamped with the client's acquisition time, never a guessed one.** The time is the
-  note's `t` (the per-sensor `t` in daily reports), in whole seconds. A reading without a
-  valid `t` (before 2020, or more than 1 h ahead of the server clock) is left out rather
-  than stamped with the time it was received. This leaves out readings taken before a
-  client's first time sync, and daily-report readings from clients older than v2.0.56,
-  which send no per-sensor `t`. Telemetry and alarm `t` from clients older than v2.2.16
-  (or from notes without `fv`) arrive rounded to the second, so one of exactly 00:00:00Z
-  may be from the last half second of the day before; that telemetry reading is left out
-  (its daily-report copy, whose `t` is truncated, is not) and that alarm is not counted.
-  From v2.2.16 (#318) the client truncates telemetry and level/float/relay alarm `t` to
-  whole seconds, so their 00:00:00Z is recorded and counted. Its sensor-fault and
-  sensor-stuck notes still send a fractional `t`, so those keep the midnight check.
+  note's `t` (the per-sensor `t` in daily reports), stored in whole seconds. A reading
+  without a valid `t` (before 2020, or more than 1 h ahead of the server clock) is left
+  out rather than stamped with the time it was received. This leaves out readings taken
+  before a client's first time sync, and daily-report readings from clients older than
+  v2.0.56, which send no per-sensor `t`. From v2.2.16 (#318) every note `t` is a whole
+  minute, truncated. An older client's `t` arrives in whole seconds, with telemetry and
+  alarm `t` rounded, so a reading or alarm from the last half second of a UTC day may be
+  filed on the next day.
 - **Counted once.** The same reading arriving again (telemetry, then the daily report's
-  copy, or an on-demand re-send) within 1 s is stored once. Only the time is compared: a
-  current-loop level is recomputed on arrival, with the temperature of that moment.
+  copy, or an on-demand re-send) with the same minute (v2.2.16 and later) or within 1 s
+  (older clients) is stored once. Only the time is compared: a current-loop level is
+  recomputed on arrival, with the temperature of that moment. So from v2.2.16 a second
+  reading of a sensor in the same minute, e.g. an on-demand one right after a sample, is
+  left out of history; the live value still updates.
 - **Voltage only from the reading's day.** `vt` uses the voltage sent in the same
   telemetry note, or the daily report's voltage when the reading was taken within an
   hour of the report on the same UTC day. The client's voltage is not measured with the

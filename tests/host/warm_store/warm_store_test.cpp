@@ -2026,9 +2026,10 @@ static void testProvenance() {
     CHECK(!warmLegacyEpochAmbiguous(0.0) && !warmLegacyEpochAmbiguous(NAN) && !warmLegacyEpochAmbiguous(INFINITY));
   }
 
-  // (4) hot_tier.json: saveHotTierSnapshot adds (uint32_t)ts, which round-trips exactly.
-  // Older firmware added the double: ArduinoJson 7.4.3 keeps one that fits a float as a
-  // float and writes 7 digits, which moves both of these onto another day.
+  // (4) hot_tier.json and client notes: an epoch written as a uint32_t round-trips exactly.
+  // saveHotTierSnapshot adds (uint32_t)ts. Older firmware added the double: ArduinoJson 7.4.3
+  // keeps one that fits a float as a float and writes 7 digits, which moves both of these onto
+  // another day.
   {
     const double stamps[] = {1790294400.0, 1790207744.0};  // 2026-09-25 00:00:00Z, 2026-09-23 23:55:44Z
     JsonDocument saved;
@@ -2059,6 +2060,33 @@ static void testProvenance() {
       CHECK_MSG(back != stamps[i] && warmEpochToDn(back) != warmEpochToDn(stamps[i]), "%s", legacyText.c_str());
       // what loadHotTierSnapshot drops on the first boot after the update
       CHECK(!legacyLoaded[i][0].is<uint32_t>() && warmLegacyEpochAmbiguous(floor(back)));
+    }
+
+    // From v2.2.16 (#318) a client sends every note `t` as a whole minute, truncated, and as a
+    // uint32_t: it comes back exactly, on the day the reading was taken. As a double, a whole
+    // minute that is a multiple of 1920 s (one in 32) would be kept as a float and come back
+    // minutes off.
+    const double taken[] = {1790294399.6, 1790294400.4, 1790332859.9};  // Sep 24 23:59:59.6, Sep 25 00:00:00.4, 10:40:59.9
+    const double minute[] = {1790294340.0, 1790294400.0, 1790332800.0};
+    for (size_t i = 0; i < 3; ++i) {
+      const uint32_t whole = (uint32_t)taken[i];
+      JsonDocument note;
+      note["t"] = whole - whole % 60U;
+      std::string noteText;
+      serializeJson(note, noteText);
+      JsonDocument got;
+      CHECK(deserializeJson(got, noteText) == DeserializationError::Ok);
+      CHECK_MSG(got["t"].as<double>() == minute[i] && got["t"].is<uint32_t>(), "%s", noteText.c_str());
+      CHECK(warmEpochToDn(got["t"].as<double>()) == warmEpochToDn(taken[i]));
+    }
+    for (size_t i = 1; i < 3; ++i) {  // the multiples of 1920 s
+      JsonDocument note;
+      note["t"] = minute[i];
+      std::string noteText;
+      serializeJson(note, noteText);
+      JsonDocument got;
+      CHECK(deserializeJson(got, noteText) == DeserializationError::Ok);
+      CHECK_MSG(got["t"].as<double>() != minute[i], "%s", noteText.c_str());
     }
   }
 
@@ -2104,6 +2132,14 @@ static void testProvenance() {
     const uint16_t n = warmComputeRows(fleet.series(), fleet.count(), dnOf(2026, 9, 21), dnOf(2026, 9, 21), nullptr,
                                        nullptr, testRoundTo, rows.data(), (uint16_t)rows.size());
     CHECK(n == 1 && rows[0].n == 2 && closeTo(rows[0].av, 40.5f));
+
+    // From v2.2.16 (#318) every copy carries the same whole minute: readings a minute apart are
+    // both kept, and a second copy of one is found
+    const double m = epochOf(2026, 9, 21, 60000.0);  // 16:40:00Z
+    record(m, 42.0f);
+    record(m + 60.0, 43.0f);
+    record(m, 42.01f);
+    CHECK(ring.snapshotCount == 4 && ring.snapshots[2].timestamp == m && ring.snapshots[3].timestamp == m + 60.0);
   }
 
   // (6) The daily report's (and an on-demand note's) voltage goes only with a reading from the same
@@ -2190,43 +2226,7 @@ static void testProvenance() {
     clearDir(dir);
   }
 
-  // (8) A telemetry or alarm `t` of exactly 00:00:00Z from a client before v2.2.16 may be from
-  // the day before: ArduinoJson writes the client's double with 10 significant digits, so
-  // 23:59:59.6 arrives as 00:00:00
-  {
-    const double mid = 1790294400.0;  // 2026-09-25 00:00:00Z
-    CHECK(warmRoundedEpochAtMidnight(mid) && warmRoundedEpochAtMidnight(mid - 86400.0));
-    CHECK(!warmRoundedEpochAtMidnight(mid - 1.0) && !warmRoundedEpochAtMidnight(mid + 1.0) &&
-          !warmRoundedEpochAtMidnight(mid + 0.5) && !warmRoundedEpochAtMidnight(mid + 43200.0));
-    CHECK(!warmRoundedEpochAtMidnight(0.0) && !warmRoundedEpochAtMidnight(-86400.0) &&
-          !warmRoundedEpochAtMidnight(NAN));
-    const double sent[] = {mid - 0.6, mid - 0.4};  // 23:59:59.4 and 23:59:59.6 on Sep 24
-    const double received[] = {mid - 1.0, mid};
-    for (size_t i = 0; i < 2; ++i) {
-      JsonDocument note;
-      note["t"] = sent[i];
-      std::string text;
-      serializeJson(note, text);
-      JsonDocument got;
-      CHECK(deserializeJson(got, text) == DeserializationError::Ok);
-      CHECK_MSG(got["t"].as<double>() == received[i], "%s", text.c_str());
-    }
-    // From v2.2.16 (#318) the client sends `t` as a uint32_t: 23:59:59.6 arrives as 23:59:59,
-    // so 00:00:00 is a reading taken at midnight (the sketch skips the check for such a client)
-    const double taken[] = {mid - 0.6, mid - 0.4, mid + 0.4};
-    const double truncated[] = {mid - 1.0, mid - 1.0, mid};
-    for (size_t i = 0; i < 3; ++i) {
-      JsonDocument note;
-      note["t"] = (uint32_t)taken[i];
-      std::string text;
-      serializeJson(note, text);
-      JsonDocument got;
-      CHECK(deserializeJson(got, text) == DeserializationError::Ok);
-      CHECK_MSG(got["t"].as<double>() == truncated[i], "%s", text.c_str());
-    }
-  }
-
-  // (9) A ring's legacyCount oldest entries (saved by older firmware) never enter a row, also
+  // (8) A ring's legacyCount oldest entries (saved by older firmware) never enter a row, also
   // after the ring wraps (the sketch lowers the count when a full ring overwrites one)
   {
     const double d = epochOf(2026, 9, 21);
@@ -2267,7 +2267,7 @@ static void testProvenance() {
           closeTo(rows[0].mx, 46.0f));
   }
 
-  // (10) The first boot after an update from v2.2.15. That firmware rolled Sep 21 (n 2); the
+  // (9) The first boot after an update from v2.2.15. That firmware rolled Sep 21 (n 2); the
   // daily report's copy of a Sep 21 reading, with the report-time voltage, reached its ring
   // afterwards, and it never rolled Sep 22. Its whole ring is loaded as legacy: the boot
   // re-check neither rewrites Sep 21 nor adds Sep 22, and the update day's row (Sep 23)

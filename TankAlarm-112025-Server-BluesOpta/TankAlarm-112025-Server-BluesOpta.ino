@@ -7696,7 +7696,8 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
   }
   
   // Deduplicate: the same acquisition can arrive more than once (telemetry, the
-  // daily report's copy, an on-demand re-send), up to 1 s apart and out of order.
+  // daily report's copy, an on-demand re-send), with the same `t` from v2.2.16 or up
+  // to 1 s apart from an older client, and out of order.
   // S-D03: check the whole ring by time alone (a current-loop level is recomputed on
   // arrival and can differ) and return before the day is marked for a re-roll, so a
   // copy is never counted twice in a daily row.
@@ -12750,12 +12751,10 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
   respondStatus(client, 200, msg);
 }
 
-// S-D03: first client firmware whose telemetry and level/float/relay alarm `t` is exact. #318
-// ships in 2.2.16: such a client sends that `t` in whole seconds (truncated, so exactly
-// 00:00:00Z is that day; its sensor-fault/sensor-stuck notes still send a fractional `t`; an
-// older client's `t` arrives rounded, see warmRoundedEpochAtMidnight), and on-demand
-// telemetry for a sensor it has not sampled since boot omits `t` instead of stamping its boot
-// value with the send time (see handleTelemetry). Every client note carries its "fv".
+// S-D03: first client firmware whose note `t` is exact. #318 ships in 2.2.16: such a client
+// sends every note `t` as a whole minute (truncated, as an integer), and on-demand telemetry
+// for a sensor it has not sampled since boot omits `t` instead of stamping its boot value
+// with the send time (see handleTelemetry). Every client note carries its "fv".
 static const char CLIENT_EXACT_T_SINCE[] = "2.2.16";
 
 static void handleTelemetry(JsonDocument &doc, double epoch) {
@@ -13048,11 +13047,6 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // (top-level `t`), so the chart X-axis reflects when the reading was actually taken.
   // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
   double telemetryEpoch = doc["t"] | 0.0;
-  // S-D03: from a client older than CLIENT_EXACT_T_SINCE (or without "fv"), `t` arrives
-  // rounded to the second, so exactly 00:00:00Z may be a reading from the day before. Leave
-  // it out; the daily report's copy (its `t` is truncated) still enters. A newer client
-  // truncates `t`, so its 00:00:00Z is a reading taken then.
-  if (!exactT && warmRoundedEpochAtMidnight(telemetryEpoch)) return;
   // S-D03: "v" is the client's last voltage poll when the note was built, up to
   // WARM_VIN_MAX_AGE_SEC old, and the note is built within 5 minutes of the reading (seconds
   // later on a current-loop client, whose Phase B runs after every A0602 read). So keep it
@@ -13227,16 +13221,8 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // This is an operational event, NOT a sensor alarm clear — do not clear alarmActive
   bool isRelayTimeout = (strcmp(type, "relay_timeout") == 0);
   // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown), for
-  // the daily alarm count. From a client older than CLIENT_EXACT_T_SINCE (or without "fv"),
-  // "t" arrives rounded to the second, so exactly 00:00:00Z may be an alarm from the day
-  // before; its day is unknown. A newer client truncates "t" on level/float/relay alarms, so
-  // their 00:00:00Z is that day. Its sensor-fault/sensor-stuck notes still send currentEpoch()
-  // as a double, so diagnostic notes keep the midnight check whatever the version.
-  const double alarmNoteT = doc["t"] | 0.0;
-  const bool alarmExactT = !isDiagnostic &&
-      compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
-  const double alarmEventEpoch = (!alarmExactT && warmRoundedEpochAtMidnight(alarmNoteT))
-      ? 0.0 : warmAcquisitionEpoch(alarmNoteT, currentEpoch());
+  // the daily alarm count.
+  const double alarmEventEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
 
   if (strcmp(type, "clear") == 0 || isRecovery) {
     rec->alarmActive = false;

@@ -339,21 +339,12 @@ static inline long warmFileSize(FILE *f) {
 // than WARM_MAX_FUTURE_SKEW_SEC ahead of serverNow (serverNow <= 0: server clock
 // not set). There is deliberately no fallback to a receive time, which would file
 // the reading under a day it was not taken on. Flooring never changes the UTC day.
+// From v2.2.16 (#318) a client's `t` is already a whole minute; seconds stay for
+// older clients, whose two copies of one reading can fall in different minutes.
 static inline double warmAcquisitionEpoch(double eventEpoch, double serverNow) {
   if (!(eventEpoch >= 1577836800.0 && eventEpoch < WARM_MAX_VALID_EPOCH)) return 0.0;  // also NaN
   if (serverNow > 0.0 && eventEpoch > serverNow + WARM_MAX_FUTURE_SKEW_SEC) return 0.0;
   return floor(eventEpoch);
-}
-
-// Clients before v2.2.16 send telemetry and alarm `t` as a double, and it arrives
-// rounded to the nearest second (ArduinoJson writes 10 significant digits). So a `t`
-// of exactly 00:00:00Z may be from the last half second of the day before, and its
-// day is not known. From v2.2.16 (#318) telemetry and level/float/relay alarm `t` is
-// truncated to whole seconds, so the sketch applies this only to older clients
-// (CLIENT_EXACT_T_SINCE) and to sensor-fault/sensor-stuck notes. The daily report's
-// per-sensor `t` is truncated and does not need this.
-static inline bool warmRoundedEpochAtMidnight(double t) {
-  return t > 0.0 && fmod(t, 86400.0) == 0.0;
 }
 
 // Older firmware saved hot-tier timestamps as doubles. ArduinoJson keeps one that
@@ -366,12 +357,15 @@ static inline bool warmLegacyEpochAmbiguous(double ts) {
   return intoDay <= 512.0 || intoDay >= 86400.0 - 512.0;
 }
 
-// True when the ring already holds this acquisition. Telemetry `t` arrives
-// rounded to the second and the daily report's per-sensor `t` truncated, so two
-// copies of one reading can be 1 s apart, and they can arrive out of order. The
-// ring holds one sensor, which is read once per sample pass, so the time decides.
-// The level cannot: a current-loop level is recomputed on arrival, with the
-// temperature of that moment.
+// True when the ring already holds this acquisition. From v2.2.16 (#318) every
+// copy of a reading carries the same whole-minute `t`, so a second reading of the
+// sensor in the same minute is taken as a copy too; readings in different
+// minutes are at least 60 s apart and never match. From an older client,
+// telemetry `t` arrives rounded to the second and the daily report's per-sensor
+// `t` truncated, so two copies of one reading can be 1 s apart. Copies can
+// arrive out of order. The ring holds one sensor, which is read once per sample
+// pass, so the time decides. The level cannot: a current-loop level is
+// recomputed on arrival, with the temperature of that moment.
 static inline bool warmRingHasAcquisition(const TelemetrySnapshot *ring, uint16_t cap, uint16_t count,
                                           uint16_t writeIndex, double ts) {
   if (!ring || cap == 0) return false;
