@@ -15,7 +15,7 @@
 //  - Writes go to <file>.tmp and are renamed over the target. fwrite, fflush
 //    and fclose are all checked, and the target is never removed first.
 //  - The rollup backfills every missed day still in the hot tier, in bounded
-//    batches, and re-rolls days that received late snapshots.
+//    batches, and re-rolls days that received late snapshots or alarms.
 //
 // This header has no Arduino or mbed dependency so tests/host/warm_store can
 // build it with the PC compiler. Tests define WARM_IO_OVERRIDE and supply the
@@ -164,7 +164,7 @@ struct WarmRollupStats {
 // persisted "lastRollup" (latest day rolled up).
 struct WarmRollupState {
   int32_t nextDn = -1;           // next day to roll; -1 = boot, re-check the whole window
-  int32_t dirtyDn = INT32_MAX;   // earliest rolled day that received a late snapshot
+  int32_t dirtyDn = INT32_MAX;   // earliest rolled day that received a late snapshot or alarm
   uint32_t cursorYmd = 0;
   uint8_t failedTicks = 0;       // ticks in a row that stopped on an I/O or memory error
   WarmRollupStats stats = {};
@@ -334,6 +334,14 @@ static inline double warmAcquisitionEpoch(double eventEpoch, double serverNow) {
   if (!(eventEpoch >= 1577836800.0 && eventEpoch < WARM_MAX_VALID_EPOCH)) return 0.0;  // also NaN
   if (serverNow > 0.0 && eventEpoch > serverNow + WARM_MAX_FUTURE_SKEW_SEC) return 0.0;
   return floor(eventEpoch);
+}
+
+// Clients send telemetry and alarm `t` as a double, and it arrives rounded to the
+// nearest second (ArduinoJson writes 10 significant digits). So a `t` of exactly
+// 00:00:00Z may be from the last half second of the day before, and its day is not
+// known. The daily report's per-sensor `t` is truncated and does not need this.
+static inline bool warmRoundedEpochAtMidnight(double t) {
+  return t > 0.0 && fmod(t, 86400.0) == 0.0;
 }
 
 // Older firmware saved hot-tier timestamps as doubles. ArduinoJson keeps one that
@@ -743,8 +751,10 @@ struct WarmMergeCtx {
 };
 
 // Pass 1: decide, per new row, whether the file already holds an equal or
-// better row (n >= new n: SUPERSEDED) or a worse one (REPLACES). Duplicate
-// keys in the file resolve to SUPERSEDED.
+// better row (SUPERSEDED) or a worse one (REPLACES). A row is better with a
+// larger n, or with the same n and a larger al (S-D03: an alarm that arrived
+// after its day was rolled up). Duplicate keys in the file resolve to
+// SUPERSEDED.
 static inline bool warmDecideVisitor(JsonObjectConst row, const char *raw, size_t rawLen, void *ctx) {
   (void)raw;
   (void)rawLen;
@@ -754,10 +764,11 @@ static inline bool warmDecideVisitor(JsonObjectConst row, const char *raw, size_
   const uint8_t k = row["k"] | (uint8_t)0;
   const char *c = row["c"] | "";
   const uint32_t exN = row["n"] | (uint32_t)0;
+  const uint8_t exAl = row["al"] | (uint8_t)0;
   for (uint16_t i = 0; i < m.count; ++i) {
     WarmNewRow &nr = m.rows[i];
     if (nr.d != d || nr.k != k || strcmp(nr.c, c) != 0) continue;
-    if (exN >= nr.n) nr.state = WARM_ROW_SUPERSEDED;
+    if (exN > nr.n || (exN == nr.n && exAl >= nr.al)) nr.state = WARM_ROW_SUPERSEDED;
     else if (nr.state != WARM_ROW_SUPERSEDED) nr.state = WARM_ROW_REPLACES;
   }
   return true;
@@ -766,7 +777,8 @@ static inline bool warmDecideVisitor(JsonObjectConst row, const char *raw, size_
 // Pass 2: copy every existing row byte for byte (unknown keys and number
 // formatting survive), except rows being replaced; a replaced row's alarm
 // count is carried over when it is higher (the 50-entry alarm ring may have
-// forgotten alarms since the first rollup).
+// forgotten alarms since the first rollup; it lives only in RAM, so a reboot
+// forgets them all).
 static inline bool warmCopyVisitor(JsonObjectConst row, const char *raw, size_t rawLen, void *ctx) {
   WarmMergeCtx &m = *static_cast<WarmMergeCtx *>(ctx);
   const uint32_t d = row["d"] | (uint32_t)0;
@@ -798,8 +810,9 @@ static inline bool warmCopyVisitor(JsonObjectConst row, const char *raw, size_t 
 // NO_MEMORY (nothing written; retry later), or TOO_BIG (the result would
 // exceed maxFileBytes; nothing written). Invariants: at most one written row
 // per (d, c, k); rows that are not re-rolled are kept; a stored row is only
-// replaced by one with a larger n; the file is never emptied by a failed read;
-// .bad is only ever created by rename.
+// replaced by one with a larger n, or the same n and a larger al, and its al
+// never goes down; the file is never emptied by a failed read; .bad is only
+// ever created by rename.
 static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, WarmNewRow *rows, uint16_t count,
                                         uint32_t maxFileBytes, const WarmHooks &h, WarmMergeResult *res) {
   WarmMergeResult local = {};
@@ -991,7 +1004,7 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
   if (oldestDn > floorDn) floorDn = oldestDn;
 
   if (s.nextDn < 0 || s.nextDn > yDn + 1) s.nextDn = floorDn;  // boot, or clock went backwards
-  if (s.dirtyDn < s.nextDn) s.nextDn = s.dirtyDn;              // late snapshots
+  if (s.dirtyDn < s.nextDn) s.nextDn = s.dirtyDn;              // late snapshots or alarms
   s.dirtyDn = INT32_MAX;
   if (s.nextDn < floorDn) s.nextDn = floorDn;
   if (s.nextDn > yDn) return sum;  // up to date: no I/O
@@ -1079,10 +1092,11 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
   return sum;
 }
 
-// Called for every snapshot added to the hot tier. A snapshot for a day that
-// was already rolled up marks it for a re-roll on the next tick. O(1); the
-// mark is lost on reboot, which is harmless because the first tick after boot
-// re-checks the whole window anyway.
+// Called for every snapshot added to the hot tier, and for every alarm logged
+// with a known time (S-D03). A snapshot or alarm for a day that was already
+// rolled up marks it for a re-roll on the next tick. O(1); the mark is lost on
+// reboot, which is harmless because the first tick after boot re-checks the
+// whole window anyway.
 static inline void warmNoteSnapshot(WarmRollupState &s, double ts) {
   if (s.nextDn < 0) return;
   const int32_t dn = warmEpochToDn(ts);

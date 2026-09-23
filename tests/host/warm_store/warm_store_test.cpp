@@ -795,6 +795,19 @@ static void testMergeSemantics() {
   expect5.al = 3;
   CHECK(readFile(path) == joinArray({encodeRow(a), encodeRow(expect5)}));
 
+  // (5b) S-D03: the same n and a higher al (an alarm that arrived after the day was rolled
+  // up) also replaces the row; the same n and a lower al does not
+  WarmNewRow moreAl = expect5;
+  moreAl.al = 4;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &moreAl, 1, big, h, &res) == WARM_OK && res.wrote);
+  CHECK(moreAl.state == WARM_ROW_REPLACES && readFile(path) == joinArray({encodeRow(a), encodeRow(moreAl)}));
+  resetHooks();
+  WarmNewRow lessAl = expect5;
+  lessAl.al = 2;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &lessAl, 1, big, h, &res) == WARM_OK && !res.wrote);
+  CHECK(lessAl.state == WARM_ROW_SUPERSEDED && fi::state().perOp[fi::OP_FWRITE] == 0);
+  CHECK(readFile(path) == joinArray({encodeRow(a), encodeRow(moreAl)}));
+
   // (6) duplicate keys in the file: any n >= new n makes it SUPERSEDED ...
   WarmNewRow dupLow = makeRow("dev:d", 20260904, 2, 4, 1.0f, 0);
   WarmNewRow dupHigh = makeRow("dev:d", 20260904, 2, 9, 2.0f, 0);
@@ -2026,6 +2039,76 @@ static void testProvenance() {
     CHECK(warmSameUtcDayWithin(d0 + 5.0, d0 + 5.0, 0.0));
     CHECK(!warmSameUtcDayWithin(0.0, d0, 1e9) && !warmSameUtcDayWithin(d0, 0.0, 1e9) &&
           !warmSameUtcDayWithin(NAN, d0, 1e9) && !warmSameUtcDayWithin(d0, -1.0, 1e9));
+    // A telemetry note's "v" is measured after its reading: kept only when the reading and
+    // 5 minutes after it are on the same UTC day
+    CHECK(warmSameUtcDayWithin(d0 - 301.0, d0 - 1.0, 300.0));
+    CHECK(!warmSameUtcDayWithin(d0 - 300.0, d0, 300.0) && !warmSameUtcDayWithin(d0 - 5.0, d0 + 295.0, 300.0));
+  }
+
+  // (7) An alarm that arrives after its day was rolled up counts on that day. Sep 21 has one
+  // reading and is rolled at 00:40 on Sep 22 with al 0; a high alarm from 23:30 on Sep 21
+  // arrives at 02:00 and marks the day (logAlarmEvent). The re-roll has the same n and al 1,
+  // which replaces the row. A reboot's re-check (the alarm log is RAM only) keeps al 1.
+  {
+    resetHooks();
+    Fleet fleet;
+    fleet.rings.push_back(LegacyRing("dev:864450000000005", 1, 90));
+    fleet.rings[0].add(epochOf(2026, 9, 21, 5 * 3600.0), 40.0f, 12.5f);
+    const std::string uid = fleet.rings[0].clientUid;
+    const std::string path = monthFile(dir, 2026, 9);
+    WarmRollupState s;
+    CHECK(tickUntilIdle(s, fleet, epochOf(2026, 9, 22, 2400.0), cfg, h) >= 1);
+    JsonDocument row;
+    CHECK(findRow(path, 20260921u, uid.c_str(), 1, row) && row["n"].as<int>() == 1 && row["al"].as<int>() == 0);
+
+    const double alarmAt = epochOf(2026, 9, 21, 84600.0);
+    fleet.alarms.push_back(LegacyAlarm{uid, 1, alarmAt});
+    const uint32_t marks = s.stats.lateMarks;
+    warmNoteSnapshot(s, alarmAt);
+    CHECK(s.stats.lateMarks == marks + 1);
+    uint32_t writes = 0;
+    CHECK(tickUntilIdle(s, fleet, epochOf(2026, 9, 22, 7200.0), cfg, h, &writes) >= 1 && writes == 1);
+    const auto keys = fileKeys(path);
+    CHECK(keys.size() == 1 && keys.begin()->second.size() == 1);
+    CHECK(findRow(path, 20260921u, uid.c_str(), 1, row) && row["n"].as<int>() == 1 && row["al"].as<int>() == 1 &&
+          closeTo(row["av"].as<float>(), 40.0f) && closeTo(row["vt"].as<float>(), 12.5f));
+
+    // Marked again with nothing new: re-rolled and read, not written
+    const std::string after = readFile(path);
+    warmNoteSnapshot(s, alarmAt);
+    writes = 0;
+    CHECK(tickUntilIdle(s, fleet, epochOf(2026, 9, 22, 7300.0), cfg, h, &writes) >= 1 && writes == 0);
+    CHECK(readFile(path) == after);
+
+    // A reboot empties the alarm log; the re-check keeps al 1
+    fleet.alarms.clear();
+    s.nextDn = -1;
+    writes = 0;
+    CHECK(tickUntilIdle(s, fleet, epochOf(2026, 9, 22, 10800.0), cfg, h, &writes) >= 1 && writes == 0);
+    CHECK(readFile(path) == after);
+    clearDir(dir);
+  }
+
+  // (8) A telemetry or alarm `t` of exactly 00:00:00Z may be from the day before: ArduinoJson
+  // writes the client's double with 10 significant digits, so 23:59:59.6 arrives as 00:00:00
+  {
+    const double mid = 1790294400.0;  // 2026-09-25 00:00:00Z
+    CHECK(warmRoundedEpochAtMidnight(mid) && warmRoundedEpochAtMidnight(mid - 86400.0));
+    CHECK(!warmRoundedEpochAtMidnight(mid - 1.0) && !warmRoundedEpochAtMidnight(mid + 1.0) &&
+          !warmRoundedEpochAtMidnight(mid + 0.5) && !warmRoundedEpochAtMidnight(mid + 43200.0));
+    CHECK(!warmRoundedEpochAtMidnight(0.0) && !warmRoundedEpochAtMidnight(-86400.0) &&
+          !warmRoundedEpochAtMidnight(NAN));
+    const double sent[] = {mid - 0.6, mid - 0.4};  // 23:59:59.4 and 23:59:59.6 on Sep 24
+    const double received[] = {mid - 1.0, mid};
+    for (size_t i = 0; i < 2; ++i) {
+      JsonDocument note;
+      note["t"] = sent[i];
+      std::string text;
+      serializeJson(note, text);
+      JsonDocument got;
+      CHECK(deserializeJson(got, text) == DeserializationError::Ok);
+      CHECK_MSG(got["t"].as<double>() == received[i], "%s", text.c_str());
+    }
   }
 }
 

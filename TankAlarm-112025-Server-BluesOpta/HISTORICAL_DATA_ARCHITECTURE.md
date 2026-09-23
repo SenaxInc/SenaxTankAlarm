@@ -120,12 +120,14 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
   without readings stay blank.
 - **After a reboot** the first rollup re-checks the whole window. A day whose row is
   missing, or whose recomputed row has a larger `n`, is written; unchanged days are
-  only read. A snapshot that arrives for a day already rolled up marks that day, and
-  the next rollup re-rolls it.
+  only read. A snapshot or alarm that arrives for a day already rolled up marks that
+  day, and the next rollup re-rolls it.
 - **Merge rules**: files are read one row at a time through a small buffer, so memory
   use does not depend on the file size. A stored row is replaced only by a row with a
-  larger `n` (keeping the higher alarm count); all other rows are copied byte for byte,
-  including keys this firmware does not know. If nothing changes, nothing is written.
+  larger `n`, or with the same `n` and a higher alarm count (an alarm that arrived after
+  the day was rolled up); the higher alarm count is always kept. All other rows are
+  copied byte for byte, including keys this firmware does not know. If nothing changes,
+  nothing is written.
 - **Failures never empty a file.** Only a missing file (ENOENT) starts a new one. A
   read, write or allocation failure leaves the file as it was and is retried the next
   hour. After 6 failed hours in a row the rest of that month is skipped until the next
@@ -153,8 +155,10 @@ reset to one day at the next rollup).
 The hot tier, and so every daily row, holds only fresh readings, on the day they were
 taken (S-D03):
 - **Fresh readings only.** A value the client reused (`ru`) or sent for a failed sensor
-  (`sf`), a faulted read (`fault`), and a current-loop note without raw mA update the
-  dashboard but are not recorded.
+  (`sf`), a faulted read (`fault`), and a current-loop note without a raw mA of at least
+  3.5 update the dashboard but are not recorded. The client sends a read below 3.6 mA as
+  a fault, and a client that has not sampled since boot answers an on-demand request
+  with 0.00 mA.
 - **No snapshots from alarm notes.** An alarm note's `t` can be when it was sent rather
   than when its value was read: seconds later on a current-loop client, hours later for a
   `relay_timeout` or for the `clear` sent when a config push turns alarms off. The note
@@ -165,18 +169,25 @@ taken (S-D03):
   valid `t` (before 2020, or more than 1 h ahead of the server clock) is left out rather
   than stamped with the time it was received. This leaves out readings taken before a
   client's first time sync, and daily-report readings from clients older than v2.0.56,
-  which send no per-sensor `t`.
+  which send no per-sensor `t`. Telemetry and alarm `t` arrive rounded to the second, so
+  one of exactly 00:00:00Z may be from the last half second of the day before; that
+  telemetry reading is left out (its daily-report copy, whose `t` is truncated, is not)
+  and that alarm is not counted.
 - **Counted once.** The same reading arriving again (telemetry, then the daily report's
   copy, or an on-demand re-send) within 1 s is stored once. Only the time is compared: a
   current-loop level is recomputed on arrival, with the temperature of that moment.
 - **Voltage only from the same measurement.** `vt` uses the voltage sent in the same
   telemetry note, or the daily report's voltage when the reading was taken within an
-  hour of it on the same UTC day. An on-demand note can re-send an older reading (a
+  hour of it on the same UTC day. A telemetry note's voltage is measured after its
+  reading (seconds later on a current-loop client), so it is not used for a reading from
+  the last 5 minutes of a UTC day. An on-demand note can re-send an older reading (a
   solar-only client may skip the sample), so its voltage is used only when the reading is
   from the same UTC day and within an hour of the note's arrival. A cached voltage is
   never used.
 - **Alarms on the day they happened.** `al` counts alarms by the alarm note's `t`, not by
-  when the server received it; an alarm without a valid `t` is not counted.
+  when the server received it; an alarm without a valid `t` is not counted. An alarm that
+  arrives after its day was rolled up re-rolls that day, which raises its `al` while the
+  hot tier still holds all of that day's readings.
 - **No fill-in.** A day with no readings for a sensor has no row. Nothing is interpolated
   or carried over from another day.
 - **Exact times.** Snapshot timestamps are written as integers in `hot_tier.json`,

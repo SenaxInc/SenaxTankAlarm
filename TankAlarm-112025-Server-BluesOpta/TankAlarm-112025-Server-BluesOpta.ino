@@ -7544,7 +7544,9 @@ static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t s
   if (alarmLogCount < MAX_ALARM_LOG_ENTRIES) {
     alarmLogCount++;
   }
-  
+  // S-D03: an alarm for a day already rolled up re-rolls that day, so it counts in its `al`
+  if (eventEpoch > 0.0) warmNoteSnapshot(gWarmState, eventEpoch);
+
   Serial.print(F("Alarm logged: "));
   Serial.print(siteName);
   Serial.print(F(" Sensor "));
@@ -8219,7 +8221,8 @@ static const WarmHooks kWarmHooks = {warmHookYield, warmHookLog, serverNoteFlash
 
 // Alarms for one sensor and day, counted from the alarm log. S-D03: by when each
 // alarm happened, not when it was received (v2.2.15), so a late note counts on
-// its own day; an alarm with no known time is not counted on any day.
+// its own day (logAlarmEvent marks that day for a re-roll if it was already
+// rolled up); an alarm with no known time is not counted on any day.
 static uint8_t warmAlarmCount(void *ctx, const char *uid, uint8_t k, double dayBegin, double dayEnd) {
   (void)ctx;
   uint8_t alarms = 0;
@@ -8252,9 +8255,10 @@ static uint8_t warmBuildSeries(WarmSeries *out) {
 }
 
 // Rolls hot-tier days into the month files: every missed day the hot tier
-// still holds (L-29), days that received late snapshots, and on the first
-// call after boot a re-check of the whole window, which restores rows that
-// older firmware dropped (H-23). Bounded per call; see warmRollupTick().
+// still holds (L-29), days that received late snapshots or alarms, and on
+// the first call after boot a re-check of the whole window, which restores
+// rows that older firmware dropped (H-23). Bounded per call; see
+// warmRollupTick().
 static void rollupDailySummaries() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -12972,11 +12976,13 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   if (recordHeight <= 0) recordHeight = 48.0f; // Default only if neither cap nor h present
   
   // S-D03: history holds only fresh acquisitions (as handleDaily's trustLevel does). A
-  // reused (ru) or failed (sf) value or a faulted read was not taken at `t`, and a
-  // current-loop note without raw mA resolves to a placeholder 0.0. The live value above
+  // reused (ru) or failed (sf) value or a faulted read was not taken at `t`. The client
+  // sends a current-loop read below 3.6 mA as a fault, so a raw mA (mA above) under 3.5 or
+  // none is a placeholder: e.g. the 0.00 an on-demand request gets, stamped with the send
+  // time, from a solar-only client that has not sampled since boot. The live value above
   // still updates.
   const bool freshReading = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull() &&
-      !(strcmp(rec->sensorType, "currentLoop") == 0 && doc["ma"].isNull() && doc["sensorMa"].isNull());
+      !(strcmp(rec->sensorType, "currentLoop") == 0 && mA < 3.5f);
   if (!freshReading) return;
 
   // Record telemetry snapshot for historical charting at the client's acquisition epoch
@@ -12984,10 +12990,17 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
   // The voltage is this note's own, never a cached one from another time.
   double telemetryEpoch = doc["t"] | 0.0;
-  // S-D03: an on-demand note re-sends the last reading when the client could not sample
-  // (solar-only voltage gate) but measures "v" at send time, so keep that voltage only when
-  // the reading is from the same UTC day and within an hour of the note's arrival.
-  if (strcmp(doc["r"] | "", "ondemand") == 0 && !warmSameUtcDayWithin(telemetryEpoch, epoch, 3600.0)) {
+  // S-D03: `t` arrives rounded to the second, so exactly 00:00:00Z may be a reading from the
+  // day before. Leave it out; the daily report's copy (its `t` is truncated) still enters.
+  if (warmRoundedEpochAtMidnight(telemetryEpoch)) return;
+  // S-D03: "v" is measured after the reading (seconds later on a current-loop client, whose
+  // Phase B runs after every A0602 read), so keep it only when 5 minutes after the reading
+  // is still the same UTC day. An on-demand note re-sends the last reading when the client
+  // could not sample (solar-only voltage gate) but measures "v" at send time, so keep that
+  // voltage only when the reading is from the same UTC day and within an hour of the note's
+  // arrival.
+  if (!warmSameUtcDayWithin(telemetryEpoch, telemetryEpoch + 300.0, 300.0) ||
+      (strcmp(doc["r"] | "", "ondemand") == 0 && !warmSameUtcDayWithin(telemetryEpoch, epoch, 3600.0))) {
     noteVin = 0.0f;
   }
   recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, noteVin, telemetryEpoch);
@@ -13153,8 +13166,11 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // This is an operational event, NOT a sensor alarm clear — do not clear alarmActive
   bool isRelayTimeout = (strcmp(type, "relay_timeout") == 0);
   // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown), for
-  // the daily alarm count.
-  const double alarmEventEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
+  // the daily alarm count. "t" arrives rounded to the second, so exactly 00:00:00Z may be
+  // an alarm from the day before; its day is unknown.
+  const double alarmNoteT = doc["t"] | 0.0;
+  const double alarmEventEpoch =
+      warmRoundedEpochAtMidnight(alarmNoteT) ? 0.0 : warmAcquisitionEpoch(alarmNoteT, currentEpoch());
 
   if (strcmp(type, "clear") == 0 || isRecovery) {
     rec->alarmActive = false;
