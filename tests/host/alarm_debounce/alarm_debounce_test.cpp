@@ -437,6 +437,179 @@ static void testProperties() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// R1-R8: pending-edge retry gate (alarmPendingRetryAction). The harness follows the sketch:
+// evaluateAlarms() applies the sample's own edges, and any edge on that sample supersedes the
+// pending one (a published clear or latch edge empties the slot, a denied latch edge replaces
+// it); otherwise retryPendingAlarm() decides from the latch and whether the sample is in
+// alarm, which for analog is "not in that latch's release zone". Re-sends are assumed to pass
+// the rate limiter unless a test says otherwise.
+// ---------------------------------------------------------------------------------------------
+
+struct RetryResult {
+  int sentAt;        // sample that re-sent the edge (-1 = none)
+  int supersededAt;  // sample whose own edge replaced or emptied the slot (-1 = none)
+  int droppedAt;     // sample that dropped the edge (-1 = none)
+  int holds;         // samples that held the edge
+  int holdLogs;      // holds on the first release sample of a run (the sketch logs only these)
+};
+
+static RetryResult newRetryResult() {
+  RetryResult r;
+  r.sentAt = -1;
+  r.supersededAt = -1;
+  r.droppedAt = -1;
+  r.holds = 0;
+  r.holdLogs = 0;
+  return r;
+}
+
+// Records one retry decision; returns false once the edge has left the slot.
+static bool applyRetry(RetryResult &r, int i, bool latched, bool inAlarm, uint8_t releaseCount) {
+  switch (alarmPendingRetryAction(latched, inAlarm)) {
+    case ALARM_RETRY_SEND: r.sentAt = i; return false;
+    case ALARM_RETRY_DROP: r.droppedAt = i; return false;
+    default:
+      r.holds++;
+      if (releaseCount == 1) r.holdLogs++;
+      return true;
+  }
+}
+
+// Pending analog edge (highSide: HIGH, else LOW), retried after each sample in xs.
+static RetryResult runAnalogRetry(AnalogSim &s, bool highSide, const float *xs, size_t n) {
+  RetryResult r = newRetryResult();
+  for (size_t i = 0; i < n; ++i) {
+    uint8_t highEdge = ALARM_EDGE_NONE;
+    uint8_t lowEdge = ALARM_EDGE_NONE;
+    stepAnalog(s, xs[i], highEdge, lowEdge);
+    if (highEdge != ALARM_EDGE_NONE || lowEdge != ALARM_EDGE_NONE) {
+      r.supersededAt = (int)i;
+      break;
+    }
+    const AlarmAnalogConditions c = alarmAnalogConditions(xs[i], s.high, s.low, s.hyst);
+    const bool latched = highSide ? s.highLatched : s.lowLatched;
+    const bool inAlarm = highSide ? !c.highRelease : !c.lowRelease;
+    const uint8_t releaseCount = highSide ? s.highExit : s.lowExit;
+    if (!applyRetry(r, (int)i, latched, inAlarm, releaseCount)) break;
+  }
+  return r;
+}
+
+#define RUN_RETRY(sim, highSide, arr) runAnalogRetry((sim), (highSide), (arr), COUNT_OF(arr))
+
+// Pending digital edge; xs are the per-sample alarm states (digitalAlarmCondition()).
+static RetryResult runDigitalRetry(bool latched, const bool *xs, size_t n) {
+  RetryResult r = newRetryResult();
+  uint8_t enterCount = 0;
+  uint8_t exitCount = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t edge = alarmDebounceStep(latched, xs[i], !xs[i], kNeed, enterCount, exitCount);
+    if (edge == ALARM_EDGE_ENTER) latched = true;
+    else if (edge == ALARM_EDGE_EXIT) latched = false;
+    if (edge != ALARM_EDGE_NONE) {
+      r.supersededAt = (int)i;
+      break;
+    }
+    if (!applyRetry(r, (int)i, latched, xs[i], exitCount)) break;
+  }
+  return r;
+}
+
+static void testPendingRetry() {
+  {  // R1: the decision table
+    CHECK(alarmPendingRetryAction(false, false) == ALARM_RETRY_DROP);
+    CHECK(alarmPendingRetryAction(false, true) == ALARM_RETRY_DROP);
+    CHECK(alarmPendingRetryAction(true, false) == ALARM_RETRY_HOLD);
+    CHECK(alarmPendingRetryAction(true, true) == ALARM_RETRY_SEND);
+  }
+  {  // R2 (PR #318 review): a HIGH deferred by the rate limiter, one release sample, then a
+     // sensor failure (evaluateAlarms() zeroes the counters; latch and slot kept) and a
+     // recovery at 70. The latch still holds on the recovery sample, so a latch-only check
+     // re-sent HIGH at 70 right after sensor-recovered. Now the edge is held and the clear on
+     // the third release sample supersedes it: no HIGH is sent.
+    AnalogSim s = defaultSim(false, false);
+    const float rise[] = {90, 90, 90};
+    const RunResult latch = RUN(s, rise);
+    CHECK(latch.highEnterAt == 2 && s.highLatched);  // this edge's note was denied
+    const float before[] = {70};
+    RetryResult r = RUN_RETRY(s, true, before);
+    CHECK(r.holds == 1 && r.holdLogs == 1 && r.sentAt == -1);
+    s.highEnter = s.highExit = s.lowEnter = s.lowExit = 0;  // sensorFailed
+    const float recovered[] = {70, 70, 70};
+    r = RUN_RETRY(s, true, recovered);
+    CHECK(r.sentAt == -1 && r.droppedAt == -1);
+    CHECK(r.holds == 2 && r.holdLogs == 1);
+    CHECK(r.supersededAt == 2 && !s.highLatched);  // the clear
+  }
+  {  // R3 hL: a sample still in alarm, or in the hysteresis band (the latch holds there),
+     // re-sends at once, as the NEW-B re-assertion did before
+    const float xs[] = {90, 78, 75};
+    for (size_t k = 0; k < COUNT_OF(xs); ++k) {
+      AnalogSim s = defaultSim(true, false);
+      const float one[] = {xs[k]};
+      const RetryResult r = RUN_RETRY(s, true, one);
+      CHECK(r.sentAt == 0 && r.holds == 0);
+    }
+  }
+  {  // R4 hL: noisy release samples never lose the edge
+    AnalogSim s = defaultSim(true, false);
+    const float xs[] = {70, 90};
+    RetryResult r = RUN_RETRY(s, true, xs);
+    CHECK(r.holds == 1 && r.sentAt == 1);
+    s = defaultSim(true, false);
+    const float twice[] = {70, 74.9f, 78};
+    r = RUN_RETRY(s, true, twice);
+    CHECK(r.holds == 2 && r.holdLogs == 1 && r.sentAt == 2 && s.highLatched);
+  }
+  {  // R5 hL: while the rate limiter keeps denying, each release run logs once, not each sample
+    AnalogSim s = defaultSim(true, false);
+    const float xs[] = {70, 70, 80, 70, 70, 80};
+    int holds = 0;
+    int logs = 0;
+    for (size_t i = 0; i < COUNT_OF(xs); ++i) {
+      const float one[] = {xs[i]};  // one sample per run: a denied SEND keeps the edge
+      const RetryResult r = RUN_RETRY(s, true, one);
+      holds += r.holds;
+      logs += r.holdLogs;
+    }
+    CHECK(holds == 4 && logs == 2 && s.highLatched);
+  }
+  {  // R6 lL: LOW mirror, including a tank refilled during an outage
+    AnalogSim s = defaultSim(false, true);
+    const float refilled[] = {30, 30, 30};
+    RetryResult r = RUN_RETRY(s, false, refilled);
+    CHECK(r.sentAt == -1 && r.holds == 2 && r.holdLogs == 1 && r.supersededAt == 2);
+    CHECK(!s.lowLatched);
+    s = defaultSim(false, true);
+    const float noisy[] = {30, 10};
+    r = RUN_RETRY(s, false, noisy);
+    CHECK(r.holds == 1 && r.sentAt == 1);
+    s = defaultSim(false, true);
+    const float band[] = {22};
+    r = RUN_RETRY(s, false, band);
+    CHECK(r.sentAt == 0);
+  }
+  {  // R7 hL: direct HIGH->LOW; the pending HIGH is held, then superseded by clear + low
+    AnalogSim s = defaultSim(true, false);
+    const float xs[] = {10, 10, 10};
+    const RetryResult r = RUN_RETRY(s, true, xs);
+    CHECK(r.sentAt == -1 && r.holds == 2 && r.supersededAt == 2);
+    CHECK(!s.highLatched && s.lowLatched);
+  }
+  {  // R8: digital, including a stuck float that recovers by changing state
+    const bool back[] = {false, true};
+    RetryResult r = runDigitalRetry(true, back, COUNT_OF(back));
+    CHECK(r.holds == 1 && r.holdLogs == 1 && r.sentAt == 1);
+    const bool changed[] = {false, false, false};
+    r = runDigitalRetry(true, changed, COUNT_OF(changed));
+    CHECK(r.sentAt == -1 && r.holds == 2 && r.holdLogs == 1 && r.supersededAt == 2);
+    const bool still[] = {true};
+    r = runDigitalRetry(true, still, COUNT_OF(still));
+    CHECK(r.sentAt == 0 && r.holds == 0);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Window predicate: wrap-safe hourly prune (M-12d) and the boot stamp (F-05/M-12a).
 // ---------------------------------------------------------------------------------------------
 
@@ -528,6 +701,7 @@ int main() {
   testOverlapAndExtremes();
   testDigitalEquivalence();
   testProperties();
+  testPendingRetry();
   testWindow();
   printf("alarm_debounce: %lu checks, %lu failures\n", gChecks, gFailures);
   return gFailures == 0 ? 0 : 1;

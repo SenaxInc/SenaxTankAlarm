@@ -1460,7 +1460,7 @@ static void sendRegistration(const char *reason);
 static void sendAlarm(uint8_t idx, const char *alarmType, float inches);
 static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches);
 static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bool isRetry);
-static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry);
+static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry, bool highInAlarm, bool lowInAlarm);
 static uint8_t alarmPendingCodeFor(const char *alarmType);
 static const char *alarmPendingName(uint8_t code);
 static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated);
@@ -5595,26 +5595,25 @@ static bool validateSensorReading(uint8_t idx, float reading) {
       // C-T01 (NEW-B): the server treats sensor-recovered as a clear and has already replaced
       // the alarm type with sensor-fault, but the level latch was held through the failure.
       // Queue a publish-only re-assertion of the latched edge; this pass's evaluateAlarms()
-      // sends it after its gates (Phase B on current-loop devices). No I/O here. Skip it when
-      // this reading is already in the latch's release zone (level moved during the outage, or
-      // a stuck float recovered by changing state): that would be a false alarm, and the normal
-      // debounce clears the latch instead. The I2C sensor-only recovery in loop() clears
-      // sensorFailed silently and is not hooked; the server's fresh-telemetry sensor-fault
-      // self-clear still drops the level alarm on that path (C-A04).
+      // sends it after its gates (Phase B on current-loop devices). No I/O here. Like any
+      // pending edge (including one already pending from before the failure), it is sent
+      // only while the sample is in alarm: a reading in the latch's release zone (level moved
+      // during the outage, or a stuck float recovered by changing state) holds it, so no
+      // false alarm, and the normal debounce's clear then supersedes it; if the level returns
+      // to alarm before the latch clears, it is sent then. The I2C sensor-only recovery in
+      // loop() clears sensorFailed silently and is not hooked; the server's fresh-telemetry
+      // sensor-fault self-clear still drops the level alarm on that path (C-A04).
       if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
         if (cfg.sensorInterface == SENSOR_DIGITAL) {
-          bool triggerOnActivated = true;
-          if (state.highAlarmLatched && digitalAlarmCondition(cfg, reading, triggerOnActivated)) {
+          if (state.highAlarmLatched) {
+            bool triggerOnActivated = true;
+            (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);  // resolves the type only
             state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
           }
-        } else {
-          const AlarmAnalogConditions c = alarmAnalogConditions(reading, cfg.highAlarmThreshold,
-                                                                cfg.lowAlarmThreshold, cfg.hysteresisValue);
-          if (state.highAlarmLatched && !c.highRelease) {
-            state.pendingAlarm = ALARM_PENDING_HIGH;
-          } else if (state.lowAlarmLatched && !c.lowRelease) {
-            state.pendingAlarm = ALARM_PENDING_LOW;
-          }
+        } else if (state.highAlarmLatched) {
+          state.pendingAlarm = ALARM_PENDING_HIGH;
+        } else if (state.lowAlarmLatched) {
+          state.pendingAlarm = ALARM_PENDING_LOW;
         }
         if (state.pendingAlarm != ALARM_PENDING_NONE) {
           Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
@@ -6398,7 +6397,7 @@ static void evaluateAlarms(uint8_t idx) {
       state.highAlarmLatched = false;
       sendAlarm(idx, "clear", state.currentValue);
     }
-    retryPendingAlarm(idx, pendingAtEntry);
+    retryPendingAlarm(idx, pendingAtEntry, shouldAlarm, false);
     return;  // Skip the standard analog threshold evaluation
   }
 
@@ -6437,7 +6436,8 @@ static void evaluateAlarms(uint8_t idx) {
   } else if (lowEdge == ALARM_EDGE_EXIT) {
     sendAlarm(idx, "clear", state.currentValue);
   }
-  retryPendingAlarm(idx, pendingAtEntry);
+  // In alarm = not in that latch's release zone, the test that holds the latch
+  retryPendingAlarm(idx, pendingAtEntry, !c.highRelease, !c.lowRelease);
 }
 
 // ---- Registration note for unconfigured clients ----
@@ -6923,7 +6923,8 @@ static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches) {
 // Previously a denied note was simply dropped, so a latch edge caught by the 300 s per-type
 // interval or the hourly caps (boot window, config-push re-latch, flapping) never reached the
 // server. Now the monitor's single pending slot keeps the newest denied latch edge and
-// retryPendingAlarm() re-sends it, under the same limits, from a later valid sample.
+// retryPendingAlarm() re-sends it, under the same limits, from a later valid sample that is
+// still in alarm.
 static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bool isRetry) {
   if (idx >= gConfig.monitorCount) {
     return;
@@ -6959,7 +6960,10 @@ static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bo
 // sample replaced it (newer denied edge) or cleared it (clear / latch edge sent). Called only
 // from evaluateAlarms(), so retries follow the Phase-B rule on current-loop devices. The note
 // carries the current reading and send time, a consistent snapshot for the server.
-static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry) {
+// highInAlarm / lowInAlarm: this valid sample still supports a high / low edge (digital: the
+// alarm state in highInAlarm). A latched edge is re-sent only while its side is in alarm;
+// otherwise it is held (alarmPendingRetryAction in TankAlarm_AlarmDebounce.h).
+static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry, bool highInAlarm, bool lowInAlarm) {
   if (idx >= gConfig.monitorCount) {
     return;
   }
@@ -6971,14 +6975,40 @@ static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry) {
 
   const bool digital = (gConfig.monitors[idx].sensorInterface == SENSOR_DIGITAL);
   bool stillLatched = false;
+  bool inAlarm = false;
+  uint8_t releaseCount = 0;  // consecutive release samples counted against that latch
   switch (pendingAtEntry) {
-    case ALARM_PENDING_HIGH: stillLatched = !digital && state.highAlarmLatched; break;
-    case ALARM_PENDING_LOW: stillLatched = !digital && state.lowAlarmLatched; break;
+    case ALARM_PENDING_HIGH:
+      stillLatched = !digital && state.highAlarmLatched;
+      inAlarm = highInAlarm;
+      releaseCount = state.highClearDebounceCount;
+      break;
+    case ALARM_PENDING_LOW:
+      stillLatched = !digital && state.lowAlarmLatched;
+      inAlarm = lowInAlarm;
+      releaseCount = state.lowClearDebounceCount;
+      break;
     case ALARM_PENDING_TRIGGERED:
-    case ALARM_PENDING_NOT_TRIGGERED: stillLatched = digital && state.highAlarmLatched; break;
+    case ALARM_PENDING_NOT_TRIGGERED:
+      stillLatched = digital && state.highAlarmLatched;
+      inAlarm = highInAlarm;
+      releaseCount = state.highClearDebounceCount;
+      break;
     default: break;
   }
-  if (!stillLatched) {
+  const uint8_t action = alarmPendingRetryAction(stillLatched, inAlarm);
+  if (action == ALARM_RETRY_HOLD) {
+    // Logged on the first release sample of a run only (that latch's clear count is then 1)
+    if (releaseCount == 1) {
+      char logMsg[96];
+      snprintf(logMsg, sizeof(logMsg), "Pending alarm held (reading not in alarm): %s - %s",
+               gConfig.monitors[idx].name, alarmPendingName(pendingAtEntry));
+      Serial.println(logMsg);
+      addSerialLog(logMsg);
+    }
+    return;
+  }
+  if (action == ALARM_RETRY_DROP) {
     char logMsg[96];
     snprintf(logMsg, sizeof(logMsg), "Pending alarm dropped (latch released): %s - %s",
              gConfig.monitors[idx].name, alarmPendingName(pendingAtEntry));

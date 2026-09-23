@@ -100,6 +100,24 @@ static inline void alarmAnalogEvaluate(const AlarmAnalogConditions &c, uint8_t n
   }
 }
 
+// Retry decision for a latch edge whose note the rate limiter denied (the client's pending
+// slot), taken after a valid sample's own edges.
+#define ALARM_RETRY_DROP 0  // the edge's latch was released: forget the edge
+#define ALARM_RETRY_HOLD 1  // still latched, but this sample is not in alarm: keep the edge
+#define ALARM_RETRY_SEND 2  // still latched and this sample is in alarm: re-send the edge
+
+// `latched` is the edge's latch after this sample; `inAlarm` says whether this sample still
+// supports the edge: analog, not in that latch's release zone (the test that holds the latch,
+// so the hysteresis band counts); digital, the alarm state. The latch alone is not enough: it
+// holds through up to need - 1 release samples and its counters restart after a sensor
+// failure, so re-sending from a released sample would be a false alarm (a deferred HIGH sent
+// at 30 in after the tank was pumped down during an outage). HOLD keeps the edge, so one
+// noisy sample never loses a real alarm; if the latch then clears, its clear supersedes it.
+static inline uint8_t alarmPendingRetryAction(bool latched, bool inAlarm) {
+  if (!latched) return ALARM_RETRY_DROP;
+  return inAlarm ? ALARM_RETRY_SEND : ALARM_RETRY_HOLD;
+}
+
 // True when the millis() stamp `ts` lies within the last `windowMs` milliseconds of `now`.
 // Modular subtraction keeps this correct across the 49.7-day millis() wrap.
 static inline bool alarmWithinWindow(uint32_t now, uint32_t ts, uint32_t windowMs) {
