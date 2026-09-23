@@ -1335,6 +1335,8 @@ static void testScheduler() {
 // ============================================================================
 // Fault injection: every I/O operation and every allocation of a tick
 // ============================================================================
+static const char kStaleTmp[] = "[{\"d\":2026";  // a .tmp cut by a power cut mid-write
+
 struct FaultScenario {
   std::string dir;
   WarmRollupConfig cfg;
@@ -1347,7 +1349,7 @@ struct FaultScenario {
   void prepare(bool staleTmp = false) {
     clearDir(dir);
     writeFile(monthFile(dir, 2026, 9), p0);
-    if (staleTmp) writeFile(monthFile(dir, 2026, 9, ".tmp"), "[{\"d\":2026");  // power cut mid-write
+    if (staleTmp) writeFile(monthFile(dir, 2026, 9, ".tmp"), kStaleTmp);
   }
 };
 
@@ -1378,7 +1380,7 @@ static void buildFaultScenario(FaultScenario &sc) {
 }
 
 static void checkFaultOutcome(FaultScenario &sc, const WarmRollupState &s, const char *what, long index,
-                              long *failures, long *successes) {
+                              long *failures, long *successes, const char *staleTmp = nullptr) {
   const std::string p = readFile(monthFile(sc.dir, 2026, 9));
   const bool failed = s.stats.ioErrors + s.stats.noMemory > 0;
   if (failed) {
@@ -1390,7 +1392,11 @@ static void checkFaultOutcome(FaultScenario &sc, const WarmRollupState &s, const
     (*successes)++;
     CHECK_MSG(p == sc.p1 && s.nextDn == dnOf(2026, 9, 17), "%s %ld: wrong result on success", what, index);
   }
-  CHECK_MSG(!anyTmp(sc.dir) && !fileExists(monthFile(sc.dir, 2026, 9, ".bad")), "%s %ld: leftovers", what, index);
+  // S-D03: a tick that fails before it knows whether the month file exists
+  // keeps a stale .tmp (it may be the only copy); the next tick drops it
+  const bool keptStale = failed && staleTmp && readFile(monthFile(sc.dir, 2026, 9, ".tmp")) == staleTmp;
+  CHECK_MSG((keptStale || !anyTmp(sc.dir)) && !fileExists(monthFile(sc.dir, 2026, 9, ".bad")),
+            "%s %ld: leftovers", what, index);
 }
 
 static void testFaultInjection() {
@@ -1428,8 +1434,10 @@ static void testFaultInjection() {
                           fi::OP_RENAME, fi::OP_FSEEK, fi::OP_FTELL};
   for (int op : mustFail) CHECK_MSG(failedKinds[op] > 0, "no failure injected into %s", fi::opName(op));
 
-  // Again with a .tmp left by a power cut, so its remove() is failed too (the
-  // merge then overwrites the .tmp, so that fault alone does not stop it)
+  // Again with a .tmp left by a power cut, so its stat() and remove() are
+  // failed too (the merge then overwrites the .tmp, so those faults alone do
+  // not stop it). A failed stat() of the month file stops the tick before it
+  // can decide, so that tick keeps the .tmp and the next one drops it (S-D03).
   sc.prepare(true);
   resetHooks();
   WarmRollupState probeTmp = sc.s0;
@@ -1444,7 +1452,10 @@ static void testFaultInjection() {
     WarmRollupState s = sc.s0;
     tick(s, sc.fleet, sc.now, sc.cfg, h);
     if (fi::state().failedOp == fi::OP_REMOVE) removeFaults++;
-    checkFaultOutcome(sc, s, fi::opName(fi::state().failedOp), n, &failures, &successes);
+    checkFaultOutcome(sc, s, fi::opName(fi::state().failedOp), n, &failures, &successes, kStaleTmp);
+    resetHooks();
+    tick(s, sc.fleet, sc.now, sc.cfg, h);
+    CHECK_MSG(readFile(monthFile(sc.dir, 2026, 9)) == sc.p1 && !anyTmp(sc.dir), "stale op %ld: no recovery", n);
   }
   CHECK(removeFaults == 1);
 
