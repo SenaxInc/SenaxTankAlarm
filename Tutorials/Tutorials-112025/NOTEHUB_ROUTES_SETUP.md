@@ -232,7 +232,7 @@ This passes the entire event body through to the server's `.qi` notefile.
 Before saving, configure these two settings (they apply to **all 5 TankAlarm routes**):
 
 - **Timeout:** Leave at the default (30 seconds). Routes #1–3 target `api.notefile.net` (Blues' own infrastructure) and respond in under a second. Routes #4–5 (Twilio/SMTP) are equally fast under normal conditions; the Route #5 Apps Script bridge can take longer (see Step 7, Option B).
-- **Automatic reroute on failure:** **Enable this** (check the box). If a route fails transiently (e.g., a brief 5XX from the server), Notehub will retry at 30-second, 1-minute, and 5-minute intervals (3 retries max). This prevents lost telemetry, dropped config pushes, or missed alarm SMS due to momentary glitches. The retry overhead is negligible at TankAlarm's event volume. A call that timed out may still have completed at the endpoint, so its retry repeats it; the Route #5 Apps Script bridge ignores such repeats (Step 7, Option B).
+- **Automatic reroute on failure:** **Enable this** (check the box). If a route fails transiently (e.g., a brief 5XX from the server), Notehub will retry at 30-second, 1-minute, and 5-minute intervals (3 retries max). This prevents lost telemetry, dropped config pushes, or missed alarm SMS due to momentary glitches. The retry overhead is negligible at TankAlarm's event volume. A call that timed out may still have completed at the endpoint, so its retry repeats it; the Route #5 Apps Script bridge skips such a repeat once the email is sent (Step 7, Option B, "Retries and duplicates").
 
 > **Note:** Automatic reroute only helps with transient failures (5XX, timeouts). It will **not** fix 4XX errors (bad API token, wrong device UID, malformed JSON) — those indicate a configuration problem. If you see 401 or 404 in Route Logs, fix the route settings rather than relying on retries.
 
@@ -469,8 +469,10 @@ Use `body.type = "alarm"` in your template to distinguish the two shapes.
 Both shapes carry `id`, a message ID (`<server device UID>-<epoch seconds>-<counter>`) that is
 unique per email and stays the same when the server retries its `note.add`. (`server` replaces
 the UID if it is unknown, and `u<microseconds since boot>` replaces the epoch before the clock
-is set.) The Apps Script bridge (Option B) uses it to ignore repeats; other templates can
-ignore the field.
+is set.) The Apps Script bridge (Option B) uses it to skip repeats; other templates can
+ignore the field. A note that would not fit the server's buffer with `id` (1 KB for an
+alert, 16 KB for a daily report) is sent without it. The bridge then still recognises
+Notehub's retries by event ID, but not the server's own `note.add` retry.
 
 ### Option A — Route configuration (SendGrid)
 
@@ -558,8 +560,8 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
 - **Retries and duplicates:** Notehub retries a call that has not answered within the route
   timeout (30 s by default), even while the script is still sending, and the server retries a
   `note.add` it could not confirm. The bridge remembers each email for 6 hours by Notehub event
-  ID and the server's message `id` and ignores repeats; each skipped repeat shows
-  `duplicate, not sent` in its run's log under **Executions**. A repeat that arrives while the
+  ID and the server's message `id` and skips a repeat of an email it has already sent (its
+  run's log under **Executions** shows `duplicate, not sent`). A repeat that arrives while the
   email is still being sent waits up to 20 s for that send. If the send fails, the repeat sends
   the email. If the send is still running after 20 s, the repeat sends it too (its log shows
   `still sending elsewhere after 20 s, sent anyway`), because a rare duplicate beats a lost
@@ -659,7 +661,10 @@ Save the route and re-route a failed event from Route Logs to confirm the fix.
 
 Notehub retried a Route #5 call that answered after the route timeout. Update the Apps Script
 bridge to the current version and put your existing `SECRET` value back (Step 7, Option B,
-"Retries and duplicates"); it ignores those repeats. With SendGrid (Option A) it is rare; a
+"Retries and duplicates"); it skips a repeat of an email it has already sent. If a run's log
+under **Executions** shows `still sending elsewhere after 20 s, sent anyway`, the repeat
+arrived while the first call was sending and that call was still running 20 s later, so the
+bridge sent the email rather than risk losing it. With SendGrid (Option A) it is rare; a
 longer route timeout makes it rarer.
 
 ### "Notes not appearing on target device"
