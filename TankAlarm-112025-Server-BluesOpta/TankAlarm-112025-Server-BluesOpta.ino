@@ -14580,6 +14580,12 @@ static uint8_t sendEmailAlert(const char *subject, const char *message, const ch
   static char buffer[1024];
   size_t len = serializeJson(doc, buffer, sizeof(buffer));
   if (len == 0 || len >= sizeof(buffer)) {
+    // #320 review: the id must not cost an alert that fits without it. The bridge still
+    // skips Notehub retries by event ID.
+    doc.remove("id");
+    len = serializeJson(doc, buffer, sizeof(buffer));
+  }
+  if (len == 0 || len >= sizeof(buffer)) {
     Serial.println(F("ERROR: email alert payload exceeds buffer - dropped"));
     logTransmission("", "", "email", "error", "Alert payload too large");
     return 0;
