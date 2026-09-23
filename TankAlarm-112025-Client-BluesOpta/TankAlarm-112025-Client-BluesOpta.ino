@@ -6946,8 +6946,16 @@ static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bo
     return;
   }
 
-  // A published latch edge or clear supersedes the pending edge; relay_timeout leaves it.
-  if (code != ALARM_PENDING_NONE || strcmp(alarmType, "clear") == 0) {
+  // A published latch edge or clear supersedes the pending edge; relay_timeout leaves it. A
+  // clear that supersedes an edge that was never sent is logged: the server never gets it.
+  const bool isClear = (strcmp(alarmType, "clear") == 0);
+  if (isClear && state.pendingAlarm != ALARM_PENDING_NONE) {
+    snprintf(logMsg, sizeof(logMsg), "Pending alarm dropped (cleared before it was sent): %s - %s",
+             gConfig.monitors[idx].name, alarmPendingName(state.pendingAlarm));
+    Serial.println(logMsg);
+    addSerialLog(logMsg);
+  }
+  if (code != ALARM_PENDING_NONE || isClear) {
     state.pendingAlarm = ALARM_PENDING_NONE;
   }
   publishAlarmNote(idx, alarmType, inches);
