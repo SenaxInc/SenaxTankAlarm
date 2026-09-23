@@ -777,6 +777,7 @@ struct SensorHourlyHistory {
   TelemetrySnapshot snapshots[MAX_HOURLY_HISTORY_PER_SENSOR];
   uint16_t snapshotCount;
   uint16_t writeIndex;        // Ring buffer write pointer
+  uint16_t legacyCount;       // S-D03: oldest entries saved by older firmware; never rolled up (WarmSeries)
 };
 
 static SensorHourlyHistory gSensorHistory[MAX_HISTORY_SENSORS];
@@ -7635,6 +7636,7 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
     hist.heightInches = 120.0f;
     hist.snapshotCount = 0;
     hist.writeIndex = 0;
+    hist.legacyCount = 0;
     gSensorHistoryCount++;
     return &hist;
   }
@@ -7658,7 +7660,7 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
 // (whole seconds) or not at all: a reading whose acquisition time is missing or
 // implausible, e.g. taken before the client's first time sync, is left out
 // rather than filed under the day the server received it. Callers pass only
-// fresh readings, and a voltage only when it was measured with the reading.
+// fresh readings, and a voltage only when its poll was on the reading's UTC day.
 static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch) {
   SensorHourlyHistory *hist = findOrCreateSensorHistory(clientUid, sensorIndex);
   if (!hist) {
@@ -7703,7 +7705,11 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
     return;
   }
   
-  // Add snapshot to ring buffer
+  // Add snapshot to ring buffer. S-D03: a full ring overwrites its oldest entry, which is
+  // an older firmware's while any are left.
+  if (hist->snapshotCount >= MAX_HOURLY_HISTORY_PER_SENSOR && hist->legacyCount > 0) {
+    hist->legacyCount--;
+  }
   TelemetrySnapshot &snap = hist->snapshots[hist->writeIndex];
   snap.timestamp = snapEpoch;
   snap.level = level;
@@ -7744,9 +7750,11 @@ static void pruneHotTierIfNeeded() {
     // writeIndex keeps the ring buffer correct regardless of timestamp ordering.
     static TelemetrySnapshot survivors[MAX_HOURLY_HISTORY_PER_SENSOR];
     uint16_t newCount = 0;
+    uint16_t newLegacyCount = 0;  // S-D03: older firmware's entries stay the oldest
     for (uint16_t j = 0; j < hist.snapshotCount; j++) {
       uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
       if (hist.snapshots[idx].timestamp >= cutoffEpoch) {
+        if (j < hist.legacyCount) newLegacyCount++;
         survivors[newCount++] = hist.snapshots[idx];
       } else {
         pruned++;
@@ -7760,6 +7768,7 @@ static void pruneHotTierIfNeeded() {
     }
     hist.snapshotCount = newCount;
     hist.writeIndex = newCount % MAX_HOURLY_HISTORY_PER_SENSOR;
+    hist.legacyCount = newLegacyCount;
   }
   
   // Prune old alarms (keep alarms for longer - 30 days)
@@ -8250,6 +8259,7 @@ static uint8_t warmBuildSeries(WarmSeries *out) {
     s.cap = MAX_HOURLY_HISTORY_PER_SENSOR;
     s.count = hist.snapshotCount;
     s.writeIndex = hist.writeIndex;
+    s.legacyCount = hist.legacyCount;
   }
   return n;
 }
@@ -8257,8 +8267,9 @@ static uint8_t warmBuildSeries(WarmSeries *out) {
 // Rolls hot-tier days into the month files: every missed day the hot tier
 // still holds (L-29), days that received late snapshots or alarms, and on
 // the first call after boot a re-check of the whole window, which restores
-// rows that older firmware dropped (H-23). Bounded per call; see
-// warmRollupTick().
+// rows a crash lost. S-D03: snapshots older firmware saved are not rolled up
+// (legacyCount), so rows it dropped (H-23) are not rebuilt from them.
+// Bounded per call; see warmRollupTick().
 static void rollupDailySummaries() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -8544,6 +8555,8 @@ static bool saveHotTierSnapshot() {
     sensorObj["s"] = hist.siteName;
     sensorObj["k"] = hist.sensorIndex;
     sensorObj["h"] = hist.heightInches;
+    // S-D03: how many of the oldest entries (written first below) older firmware saved
+    if (hist.legacyCount > 0) sensorObj["lg"] = hist.legacyCount;
     
     JsonArray snaps = sensorObj["d"].to<JsonArray>();
     // Write snapshots in chronological order
@@ -8648,10 +8661,21 @@ static void loadHotTierSnapshot() {
     hist.heightInches = sensorObj["h"] | 120.0f;
     hist.snapshotCount = 0;
     hist.writeIndex = 0;
+    hist.legacyCount = 0;
+    // S-D03: entries older firmware saved (non-integer timestamps, or the first "lg" of a
+    // file this firmware saved) may be reused, placeholder or receive-time values. They are
+    // kept for the charts but never enter a daily row, so the first boot after the update
+    // does not rewrite the rows that firmware wrote from them.
+    const uint16_t savedLegacy = sensorObj["lg"] | (uint16_t)0;
+    uint16_t entryPos = 0;
+    uint16_t savedLegacyKept = 0;
+    bool olderFormat = false;
     
     JsonArray snaps = sensorObj["d"].as<JsonArray>();
     for (JsonArray entry : snaps) {
       if (hist.snapshotCount >= MAX_HOURLY_HISTORY_PER_SENSOR) break;
+      const uint16_t pos = entryPos++;
+      if (!entry[0].is<uint32_t>()) olderFormat = true;
       
       // S-D03: keep the ring to whole-second acquisition times. A non-integer timestamp
       // comes from older firmware; near a UTC midnight its true day is unknown, so drop it.
@@ -8660,6 +8684,7 @@ static void loadHotTierSnapshot() {
         untimedSkipped++;
         continue;
       }
+      if (pos < savedLegacy) savedLegacyKept++;
       TelemetrySnapshot &snap = hist.snapshots[hist.writeIndex];
       snap.timestamp = ts;
       snap.level = entry[1].as<float>();
@@ -8668,6 +8693,7 @@ static void loadHotTierSnapshot() {
       hist.writeIndex = (hist.writeIndex + 1) % MAX_HOURLY_HISTORY_PER_SENSOR;
       hist.snapshotCount++;
     }
+    hist.legacyCount = olderFormat ? hist.snapshotCount : savedLegacyKept;
     
     if (hist.clientUid[0] != '\0') {
       gSensorHistoryCount++;
@@ -12707,6 +12733,11 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
   respondStatus(client, 200, msg);
 }
 
+// S-D03: first client firmware whose on-demand telemetry carries a real acquisition `t`.
+// #318 ships in 2.2.16: a client that has not sampled a sensor since boot then omits `t`
+// instead of stamping its boot value with the send time (see handleTelemetry).
+static const char CLIENT_ONDEMAND_T_TRUSTED_SINCE[] = "2.2.16";
+
 static void handleTelemetry(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   // Fix #313-1a: reject notes that do not identify a sensor. Client sensor
@@ -12976,30 +13007,38 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   if (recordHeight <= 0) recordHeight = 48.0f; // Default only if neither cap nor h present
   
   // S-D03: history holds only fresh acquisitions (as handleDaily's trustLevel does). A
-  // reused (ru) or failed (sf) value or a faulted read was not taken at `t`. The client
-  // sends a current-loop read below 3.6 mA as a fault, so a raw mA (mA above) under 3.5 or
-  // none is a placeholder: e.g. the 0.00 an on-demand request gets, stamped with the send
-  // time, from a solar-only client that has not sampled since boot. The live value above
-  // still updates.
+  // reused (ru) or failed (sf) value or a faulted read was not taken at `t`. A current-loop
+  // level is converted only from 4-20 mA (mA above); for any other raw mA, or none, newLevel
+  // is resolveLevel's 0.0 default, not the reading (the client sends 3.6-21 mA as valid).
+  // The live value above still updates.
   const bool freshReading = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull() &&
-      !(strcmp(rec->sensorType, "currentLoop") == 0 && mA < 3.5f);
+      !(strcmp(rec->sensorType, "currentLoop") == 0 && !(mA >= 4.0f && mA <= 20.0f));
   if (!freshReading) return;
+  // S-D03: a client older than CLIENT_ONDEMAND_T_TRUSTED_SINCE answers an on-demand request
+  // for a sensor it has not sampled since boot (solar-only voltage gate closed) with its
+  // boot value, 0.0 with no ru/sf, stamped with the send time. The note cannot be told
+  // apart from a real reading, so no on-demand note from such a client (or one without
+  // "fv") enters history.
+  if (strcmp(doc["r"] | "", "ondemand") == 0 &&
+      compareFirmwareVersions(doc["fv"] | "", CLIENT_ONDEMAND_T_TRUSTED_SINCE) < 0) {
+    return;
+  }
 
   // Record telemetry snapshot for historical charting at the client's acquisition epoch
   // (top-level `t`), so the chart X-axis reflects when the reading was actually taken.
   // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
-  // The voltage is this note's own, never a cached one from another time.
   double telemetryEpoch = doc["t"] | 0.0;
   // S-D03: `t` arrives rounded to the second, so exactly 00:00:00Z may be a reading from the
   // day before. Leave it out; the daily report's copy (its `t` is truncated) still enters.
   if (warmRoundedEpochAtMidnight(telemetryEpoch)) return;
-  // S-D03: "v" is measured after the reading (seconds later on a current-loop client, whose
-  // Phase B runs after every A0602 read), so keep it only when 5 minutes after the reading
-  // is still the same UTC day. An on-demand note re-sends the last reading when the client
-  // could not sample (solar-only voltage gate) but measures "v" at send time, so keep that
-  // voltage only when the reading is from the same UTC day and within an hour of the note's
-  // arrival.
-  if (!warmSameUtcDayWithin(telemetryEpoch, telemetryEpoch + 300.0, 300.0) ||
+  // S-D03: "v" is the client's last voltage poll when the note was built, up to
+  // WARM_VIN_MAX_AGE_SEC old, and the note is built within 5 minutes of the reading (seconds
+  // later on a current-loop client, whose Phase B runs after every A0602 read). So keep it
+  // only when all of that is on the reading's UTC day. An on-demand note re-sends the last
+  // reading when the client could not sample (solar-only voltage gate) and is built at send
+  // time, so also keep its voltage only when the reading is from the same UTC day and
+  // within an hour of the note's arrival.
+  if (!warmVinOnReadingDay(telemetryEpoch, telemetryEpoch, telemetryEpoch + 300.0) ||
       (strcmp(doc["r"] | "", "ondemand") == 0 && !warmSameUtcDayWithin(telemetryEpoch, epoch, 3600.0))) {
     noteVin = 0.0f;
   }
@@ -13193,7 +13232,11 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     strlcpy(rec->alarmType, type, sizeof(rec->alarmType));
     const char *siteName = doc["s"] | "";
     bool isHigh = (strcmp(type, "high") == 0 || strcmp(type, "triggered") == 0);
-    logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh, alarmEventEpoch);
+    // S-D03: a v2.2.15 client can raise an edge on a reused (ru) or failed (sf) value or a
+    // faulted read, which says nothing about the day it is sent on. It is logged, latched
+    // and alerted as before, but eventEpoch 0 keeps it out of the daily `al`.
+    const bool alarmOnFreshValue = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull();
+    logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh, alarmOnFreshValue ? alarmEventEpoch : 0.0);
   }
   rec->currentValue = level;
   // S-D03: an alarm note adds no history snapshot. Its "t" can be when the note was sent,
@@ -13355,7 +13398,8 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   // Reject an untagged, implausible reading (e.g. the Notecard ~5V rail) so it cannot poison the
   // dashboard; a tagged or MPPT reading is accepted at any plausible battery level.
   const bool vinAccepted = isFirstPart && vinVoltage > 0.0f && (vTrusted || vinVoltage >= 6.0f);
-  // S-D03: the report measures its voltage when it is built, at its own "t" (0 = unknown).
+  // S-D03: the report's voltage is the client's last poll when the report was built, at its
+  // own "t" (0 = unknown), up to WARM_VIN_MAX_AGE_SEC before it.
   const double reportVinEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
   if (vinAccepted) {
     ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
@@ -13615,9 +13659,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       // Per-sensor acquisition epoch (v2.0.56+). S-D03: no fallback to the report's
       // transmission time; a reading without its own `t` stays out of history. The
       // report's voltage goes with it only when the reading was taken within an hour
-      // of that measurement on the same UTC day.
+      // of the report on the same UTC day, and the voltage poll (up to
+      // WARM_VIN_MAX_AGE_SEC before the report) was on that day too.
       double dailySensorEpoch = t["t"] | 0.0;
-      const float dailyVin = (vinAccepted && warmSameUtcDayWithin(dailySensorEpoch, reportVinEpoch, 3600.0))
+      const float dailyVin = (vinAccepted && warmSameUtcDayWithin(dailySensorEpoch, reportVinEpoch, 3600.0) &&
+                              warmVinOnReadingDay(dailySensorEpoch, reportVinEpoch, reportVinEpoch))
                                  ? vinVoltage : 0.0f;
       recordTelemetrySnapshot(clientUid, siteName, sensorIndex,
                               dailyCap, newLevel, dailyVin, dailySensorEpoch);

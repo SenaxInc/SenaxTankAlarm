@@ -19,9 +19,10 @@ struct LegacyRing {
   std::vector<TelemetrySnapshot> snapshots;  // size = capacity
   uint16_t snapshotCount;
   uint16_t writeIndex;
+  uint16_t legacyCount;  // S-D03 (not in v2.2.15): oldest entries an older firmware saved
 
   LegacyRing(const std::string &uid, uint8_t k, uint16_t capacity)
-      : clientUid(uid), sensorIndex(k), snapshots(capacity), snapshotCount(0), writeIndex(0) {}
+      : clientUid(uid), sensorIndex(k), snapshots(capacity), snapshotCount(0), writeIndex(0), legacyCount(0) {}
 
   uint16_t cap() const { return (uint16_t)snapshots.size(); }
 
@@ -36,7 +37,7 @@ struct LegacyRing {
   }
 
   WarmSeries series() const {
-    WarmSeries s = {clientUid.c_str(), sensorIndex, snapshots.data(), cap(), snapshotCount, writeIndex};
+    WarmSeries s = {clientUid.c_str(), sensorIndex, snapshots.data(), cap(), snapshotCount, writeIndex, legacyCount};
     return s;
   }
 };

@@ -85,6 +85,9 @@
 #ifndef WARM_MAX_FUTURE_SKEW_SEC
 #define WARM_MAX_FUTURE_SKEW_SEC 3600.0    // A reading's time may lead the server clock by this much (both are network time)
 #endif
+#ifndef WARM_VIN_MAX_AGE_SEC
+#define WARM_VIN_MAX_AGE_SEC 3600.0        // How old a client's cached "v" may be when its note is built (warmVinOnReadingDay)
+#endif
 
 static_assert(WARM_READ_BUF > 0 && WARM_READ_BUF <= 65535, "WARM_READ_BUF must fit uint16_t");
 static_assert(WARM_MAX_FAILED_TICKS >= 1 && WARM_MAX_FAILED_TICKS <= 255, "WARM_MAX_FAILED_TICKS must fit uint8_t");
@@ -136,6 +139,10 @@ struct WarmSeries {
   uint8_t k;
   const TelemetrySnapshot *ring;
   uint16_t cap, count, writeIndex;
+  // S-D03: the oldest legacyCount entries were saved by older firmware, whose snapshots
+  // may be reused, placeholder or receive-time values. They stay in the hot tier (charts)
+  // but never enter a daily row.
+  uint16_t legacyCount;
 };
 
 enum WarmRowState : uint8_t { WARM_ROW_ADD = 0, WARM_ROW_SUPERSEDED = 1, WARM_ROW_REPLACES = 2 };
@@ -363,7 +370,7 @@ static inline bool warmLegacyEpochAmbiguous(double ts) {
 static inline bool warmRingHasAcquisition(const TelemetrySnapshot *ring, uint16_t cap, uint16_t count,
                                           uint16_t writeIndex, double ts) {
   if (!ring || cap == 0) return false;
-  const WarmSeries s = {nullptr, 0, ring, cap, count, writeIndex};
+  const WarmSeries s = {nullptr, 0, ring, cap, count, writeIndex, 0};
   const uint16_t cnt = (count > cap) ? cap : count;
   for (uint16_t j = 0; j < cnt; ++j) {
     if (fabs(ring[warmRingIndex(s, cnt, j)].timestamp - ts) <= 1.0) return true;
@@ -376,6 +383,18 @@ static inline bool warmRingHasAcquisition(const TelemetrySnapshot *ring, uint16_
 static inline bool warmSameUtcDayWithin(double a, double b, double maxDiffSec) {
   if (!(a > 0.0) || !(b > 0.0)) return false;
   return fabs(a - b) <= maxDiffSec && warmEpochToDn(a) == warmEpochToDn(b);
+}
+
+// A client's "v" is not measured with the reading. It is the last poll of the Vin divider
+// (every 300 s by default, 600 s in low power) or of the MPPT (every 60 s, keeping its last
+// good value through up to 4 failed polls), so it was measured up to WARM_VIN_MAX_AGE_SEC
+// before the note was built, and the note was built between builtFrom and builtTo. The
+// voltage belongs to the reading's UTC day only when that whole span is on it. Longer poll
+// intervals configured on a client are not covered.
+static inline bool warmVinOnReadingDay(double readingEpoch, double builtFrom, double builtTo) {
+  if (!(readingEpoch > 0.0) || !(builtFrom > 0.0) || !(builtTo >= builtFrom)) return false;
+  const int32_t dn = warmEpochToDn(readingEpoch);
+  return warmEpochToDn(builtFrom - WARM_VIN_MAX_AGE_SEC) == dn && warmEpochToDn(builtTo) == dn;
 }
 
 // ============================================================================
@@ -570,7 +589,8 @@ static inline WarmStatus warmScanFile(const char *path, bool salvage, uint32_t m
 // Computes rows for days firstDn..lastDn (same month, at most
 // WARM_MAX_DAYS_PER_BATCH days), ordered by day and then by series, which is
 // the order repeated single-day rollups would have appended them in.
-// Snapshots with a non-finite level are skipped (they would serialize as null).
+// Snapshots with a non-finite level are skipped (they would serialize as null),
+// and so are a series' legacyCount oldest entries (S-D03).
 static inline uint16_t warmComputeRows(const WarmSeries *series, uint8_t ns, int32_t firstDn, int32_t lastDn,
                                        WarmAlarmCountFn alarmFn, void *actx, WarmRoundFn roundFn,
                                        WarmNewRow *out, uint16_t cap) {
@@ -594,7 +614,7 @@ static inline uint16_t warmComputeRows(const WarmSeries *series, uint8_t ns, int
       float openingLevel = 0.0f, closingLevel = 0.0f;
       double oldestTs = 1e18, newestTs = 0.0;
       uint16_t n = 0, voltCount = 0;
-      for (uint16_t j = 0; j < cnt; ++j) {
+      for (uint16_t j = s.legacyCount; j < cnt; ++j) {  // S-D03: older firmware's entries never enter a row
         const TelemetrySnapshot &snap = s.ring[warmRingIndex(s, cnt, j)];
         if (!(snap.timestamp >= dayBegin && snap.timestamp < dayEnd)) continue;
         if (!isfinite(snap.level)) continue;
@@ -956,9 +976,10 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
 // to yesterday in batches of at most WARM_MAX_DAYS_PER_BATCH days inside one
 // month. On the first call after boot it re-checks the whole window the hot
 // tier still covers (floor: maxBackfillDays, retained months, oldest
-// snapshot), which restores days a crash or an older firmware lost; re-rolls
-// of unchanged days cost reads only. IO_ERROR/NO_MEMORY stop the step
-// without moving the position; the next call retries. After
+// snapshot), which restores days a crash lost (not from entries an older
+// firmware saved, see WarmSeries::legacyCount); re-rolls of unchanged days
+// cost reads only. IO_ERROR/NO_MEMORY stop the step without moving the
+// position; the next call retries. After
 // WARM_MAX_FAILED_TICKS calls in a row stop that way, the rest of the failing
 // month is skipped (until the next boot's re-check) so one bad file cannot
 // hold up the days after it.
@@ -1094,9 +1115,11 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
 
 // Called for every snapshot added to the hot tier, and for every alarm logged
 // with a known time (S-D03). A snapshot or alarm for a day that was already
-// rolled up marks it for a re-roll on the next tick. O(1); the mark is lost on
-// reboot, which is harmless because the first tick after boot re-checks the
-// whole window anyway.
+// rolled up marks it for a re-roll on the next tick. O(1); the mark lives in
+// RAM. Losing it on reboot is harmless for a snapshot that reached the saved
+// hot tier (the first tick after boot re-checks the whole window), but the
+// alarm log is RAM only too: an alarm marked and not yet rolled up when the
+// server restarts is lost, and its day keeps the al it had.
 static inline void warmNoteSnapshot(WarmRollupState &s, double ts) {
   if (s.nextDn < 0) return;
   const int32_t dn = warmEpochToDn(ts);
