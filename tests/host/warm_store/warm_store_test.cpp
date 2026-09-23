@@ -2039,10 +2039,31 @@ static void testProvenance() {
     CHECK(warmSameUtcDayWithin(d0 + 5.0, d0 + 5.0, 0.0));
     CHECK(!warmSameUtcDayWithin(0.0, d0, 1e9) && !warmSameUtcDayWithin(d0, 0.0, 1e9) &&
           !warmSameUtcDayWithin(NAN, d0, 1e9) && !warmSameUtcDayWithin(d0, -1.0, 1e9));
-    // A telemetry note's "v" is measured after its reading: kept only when the reading and
-    // 5 minutes after it are on the same UTC day
-    CHECK(warmSameUtcDayWithin(d0 - 301.0, d0 - 1.0, 300.0));
-    CHECK(!warmSameUtcDayWithin(d0 - 300.0, d0, 300.0) && !warmSameUtcDayWithin(d0 - 5.0, d0 + 295.0, 300.0));
+    // A note's "v" is the client's last voltage poll, up to WARM_VIN_MAX_AGE_SEC (1 h) before
+    // the note was built. A telemetry note is built within 5 minutes of its reading, so its
+    // voltage is kept only for a reading from 01:00:00 to 23:54:59
+    CHECK(WARM_VIN_MAX_AGE_SEC == 3600.0);
+    auto telemetryVin = [](double t) { return warmVinOnReadingDay(t, t, t + 300.0); };
+    CHECK(telemetryVin(d0 + 3600.0) && telemetryVin(d0 + 43200.0) && telemetryVin(d0 + 86099.0));
+    CHECK(!telemetryVin(d0 + 3599.0) && !telemetryVin(d0 + 1.0) && !telemetryVin(d0 + 86100.0) &&
+          !telemetryVin(d0 - 1.0) && !telemetryVin(d0 - 300.0));
+    // Vin polled at 23:57:10, sampled at 00:00:40: the voltage is from the day before
+    CHECK(!telemetryVin(d0 + 40.0));
+    // The daily report's voltage: polled up to 1 h before the report was built
+    CHECK(warmVinOnReadingDay(d0 + 18000.0, d0 + 18600.0, d0 + 18600.0));  // 05:00 reading, 05:10 report
+    CHECK(warmVinOnReadingDay(d0 + 3540.0, d0 + 3600.0, d0 + 3600.0));     // 00:59 reading, 01:00 report
+    CHECK(!warmVinOnReadingDay(d0 + 1200.0, d0 + 1800.0, d0 + 1800.0));    // 00:20 reading, 00:30 report
+    CHECK(!warmVinOnReadingDay(d0 - 600.0, d0 + 600.0, d0 + 600.0));       // reading and report days differ
+    CHECK(!warmVinOnReadingDay(d0 + 43200.0, d0 + 86400.0, d0 + 86400.0));
+    // An on-demand note built at arrival, up to an hour after its reading
+    CHECK(warmVinOnReadingDay(d0 + 7200.0, d0 + 7200.0, d0 + 10800.0));
+    CHECK(!warmVinOnReadingDay(d0 + 82800.0, d0 + 82800.0, d0 + 86400.0));
+    // Not a time, or a build span that ends before it starts
+    CHECK(!warmVinOnReadingDay(0.0, d0 + 7200.0, d0 + 7200.0) && !warmVinOnReadingDay(d0 + 7200.0, 0.0, 0.0) &&
+          !warmVinOnReadingDay(NAN, d0 + 7200.0, d0 + 7200.0) && !warmVinOnReadingDay(d0 + 7200.0, NAN, NAN) &&
+          !warmVinOnReadingDay(d0 + 7200.0, d0 + 7200.0, NAN) &&
+          !warmVinOnReadingDay(d0 + 7200.0, d0 + 7300.0, d0 + 7200.0) &&
+          !warmVinOnReadingDay(d0 + 7200.0, d0 + 7200.0, INFINITY));
   }
 
   // (7) An alarm that arrives after its day was rolled up counts on that day. Sep 21 has one
@@ -2109,6 +2130,90 @@ static void testProvenance() {
       CHECK(deserializeJson(got, text) == DeserializationError::Ok);
       CHECK_MSG(got["t"].as<double>() == received[i], "%s", text.c_str());
     }
+  }
+
+  // (9) A ring's legacyCount oldest entries (saved by older firmware) never enter a row, also
+  // after the ring wraps (the sketch lowers the count when a full ring overwrites one)
+  {
+    const double d = epochOf(2026, 9, 21);
+    LegacyRing r("dev:864450000000006", 1, 6);
+    auto append = [&r](double ts, float level, float volts) {  // recordTelemetrySnapshot's append
+      if (r.snapshotCount >= r.cap() && r.legacyCount > 0) r.legacyCount--;
+      r.add(ts, level, volts);
+    };
+    append(d + 3600.0, 0.0f, 11.0f);   // older firmware: e.g. a boot placeholder
+    append(d + 7200.0, 99.0f, 13.0f);  // older firmware: e.g. an alarm value
+    append(d + 10800.0, 40.0f, 12.4f);
+    append(d + 14400.0, 42.0f, 12.6f);
+    std::vector<WarmNewRow> rows(4);
+    auto compute = [&rows](const WarmSeries &sr) {
+      return warmComputeRows(&sr, 1, dnOf(2026, 9, 21), dnOf(2026, 9, 21), nullptr, nullptr, testRoundTo,
+                             rows.data(), (uint16_t)rows.size());
+    };
+    CHECK(compute(r.series()) == 1 && rows[0].n == 4);
+    r.legacyCount = 2;
+    CHECK(compute(r.series()) == 1 && rows[0].n == 2 && closeTo(rows[0].mn, 40.0f) && closeTo(rows[0].mx, 42.0f) &&
+          closeTo(rows[0].av, 41.0f) && closeTo(rows[0].op, 40.0f) && closeTo(rows[0].cl, 42.0f) &&
+          closeTo(rows[0].vt, 12.5f));
+    WarmSeries all = r.series();
+    all.legacyCount = 4;
+    CHECK(compute(all) == 0);
+    all.legacyCount = 200;  // more than the ring holds
+    CHECK(compute(all) == 0);
+
+    append(d + 18000.0, 43.0f, 12.5f);
+    append(d + 21600.0, 44.0f, 12.5f);
+    CHECK(r.legacyCount == 2 && r.snapshotCount == 6);
+    append(d + 25200.0, 45.0f, 12.5f);  // overwrites the placeholder
+    CHECK(r.legacyCount == 1 && r.writeIndex == 1);
+    CHECK(compute(r.series()) == 1 && rows[0].n == 5 && closeTo(rows[0].mn, 40.0f) && closeTo(rows[0].mx, 45.0f) &&
+          closeTo(rows[0].op, 40.0f) && closeTo(rows[0].cl, 45.0f));
+    append(d + 28800.0, 46.0f, 12.5f);  // overwrites the alarm value: nothing is legacy any more
+    CHECK(r.legacyCount == 0 && compute(r.series()) == 1 && rows[0].n == 6 && closeTo(rows[0].mn, 40.0f) &&
+          closeTo(rows[0].mx, 46.0f));
+  }
+
+  // (10) The first boot after an update from v2.2.15. That firmware rolled Sep 21 (n 2); the
+  // daily report's copy of a Sep 21 reading, with the report-time voltage, reached its ring
+  // afterwards, and it never rolled Sep 22. Its whole ring is loaded as legacy: the boot
+  // re-check neither rewrites Sep 21 nor adds Sep 22, and the update day's row (Sep 23)
+  // holds only the reading recorded after the update. Without the mark it would do both.
+  {
+    resetHooks();
+    Fleet fleet;
+    fleet.rings.push_back(LegacyRing("dev:864450000000007", 1, 90));
+    LegacyRing &ring = fleet.rings[0];
+    const std::string uid = ring.clientUid;
+    const std::string path = monthFile(dir, 2026, 9);
+    ring.add(epochOf(2026, 9, 21, 3600.0), 40.0f, 12.5f);
+    ring.add(epochOf(2026, 9, 21, 7200.0), 42.0f, 12.5f);
+    WarmRollupState old;
+    CHECK(tickUntilIdle(old, fleet, epochOf(2026, 9, 22, 1800.0), cfg, h) >= 1);
+    JsonDocument row;
+    CHECK(findRow(path, 20260921u, uid.c_str(), 1, row) && row["n"].as<int>() == 2);
+    ring.add(epochOf(2026, 9, 21, 79200.0), 41.0f, 12.9f);
+    ring.add(epochOf(2026, 9, 22, 3600.0), 43.0f, 12.5f);
+    ring.add(epochOf(2026, 9, 23, 3600.0), 44.0f, 12.5f);
+    const std::string before = readFile(path);
+
+    ring.legacyCount = ring.snapshotCount;  // loadHotTierSnapshot: an older hot_tier.json
+    ring.add(epochOf(2026, 9, 23, 43200.0), 45.0f, 12.6f);
+    WarmRollupState booted;
+    uint32_t writes = 0;
+    CHECK(tickUntilIdle(booted, fleet, epochOf(2026, 9, 23, 50000.0), cfg, h, &writes) >= 1 && writes == 0);
+    CHECK(readFile(path) == before);
+    CHECK(tickUntilIdle(booted, fleet, epochOf(2026, 9, 24, 1800.0), cfg, h, &writes) >= 1 && writes == 1);
+    CHECK(findRow(path, 20260921u, uid.c_str(), 1, row) && row["n"].as<int>() == 2);
+    CHECK(!findRow(path, 20260922u, uid.c_str(), 1, row));
+    CHECK(findRow(path, 20260923u, uid.c_str(), 1, row) && row["n"].as<int>() == 1 &&
+          closeTo(row["av"].as<float>(), 45.0f) && closeTo(row["vt"].as<float>(), 12.6f));
+
+    ring.legacyCount = 0;
+    WarmRollupState unmarked;
+    CHECK(tickUntilIdle(unmarked, fleet, epochOf(2026, 9, 24, 3600.0), cfg, h) >= 1);
+    CHECK(findRow(path, 20260921u, uid.c_str(), 1, row) && row["n"].as<int>() == 3);
+    CHECK(findRow(path, 20260922u, uid.c_str(), 1, row) && row["n"].as<int>() == 1);
+    clearDir(dir);
   }
 }
 
