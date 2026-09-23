@@ -1304,6 +1304,45 @@ static void testScheduler() {
     clearDir(dir);
   }
 
+  // (10c) a batch that gets through ends the streak: a month that starts failing after
+  // another month's failures still gets its own WARM_MAX_FAILED_TICKS tries
+  {
+    resetHooks();
+    Fleet fleet;
+    fleet.addSensors(2, 90);
+    const int32_t today = dnOf(2026, 9, 5);
+    fleet.fill(dnOf(2026, 8, 25), today - 1, 2, 10.0f);
+    const std::string aug = monthFile(dir, 2026, 8);
+    const std::string sep = monthFile(dir, 2026, 9);
+    writeFile(aug, "[]");
+    writeFile(sep, "[]");
+    fi::state().failReadsOf = aug;
+    WarmRollupState s;
+    const double now = (double)today * 86400.0 + 3600.0;
+    for (int i = 1; i < WARM_MAX_FAILED_TICKS; ++i) {
+      CHECK(tick(s, fleet, now, cfg, h).batches == 0 && s.nextDn == dnOf(2026, 8, 25) && s.failedTicks == i);
+    }
+    // August gets through, then September fails for the first time in the same tick
+    fi::state().failReadsOf = sep;
+    gLogLines.clear();
+    const WarmTickSummary sum = tick(s, fleet, now, cfg, h);
+    CHECK(sum.firstYmd == 20260825u && sum.lastYmd == 20260831u && sum.batches == 1 && sum.writes == 1);
+    CHECK(s.failedTicks == 1 && s.nextDn == dnOf(2026, 9, 1) && s.stats.skippedDays == 0);
+    CHECK(countLogs("will retry next hour") == 1 && countLogs("until restart") == 0);
+    CHECK(fileKeys(aug).size() == 7 * 2 && readFile(sep) == "[]");
+    for (int i = 2; i < WARM_MAX_FAILED_TICKS; ++i) {
+      CHECK(tick(s, fleet, now, cfg, h).batches == 0 && s.nextDn == dnOf(2026, 9, 1) && s.failedTicks == i);
+    }
+    CHECK(s.stats.skippedDays == 0 && countLogs("until restart") == 0);
+    // September's own WARM_MAX_FAILED_TICKS-th failure skips it
+    const WarmTickSummary skip = tick(s, fleet, now, cfg, h);
+    CHECK(skip.firstYmd == 20260901u && skip.lastYmd == 20260904u && skip.batches == 1 && skip.writes == 0);
+    CHECK(s.failedTicks == 0 && s.stats.skippedDays == 4 && s.nextDn == today && s.cursorYmd == 20260904u);
+    CHECK(countLogs("skipped 20260901-20260904 until restart") == 1 && readFile(sep) == "[]");
+    CHECK(s.stats.ioErrors == (uint32_t)(2 * WARM_MAX_FAILED_TICKS - 1));
+    clearDir(dir);
+  }
+
   // (11) a clock before 2024 does nothing
   {
     resetHooks();
@@ -2151,8 +2190,9 @@ static void testProvenance() {
     clearDir(dir);
   }
 
-  // (8) A telemetry or alarm `t` of exactly 00:00:00Z may be from the day before: ArduinoJson
-  // writes the client's double with 10 significant digits, so 23:59:59.6 arrives as 00:00:00
+  // (8) A telemetry or alarm `t` of exactly 00:00:00Z from a client before v2.2.16 may be from
+  // the day before: ArduinoJson writes the client's double with 10 significant digits, so
+  // 23:59:59.6 arrives as 00:00:00
   {
     const double mid = 1790294400.0;  // 2026-09-25 00:00:00Z
     CHECK(warmRoundedEpochAtMidnight(mid) && warmRoundedEpochAtMidnight(mid - 86400.0));
@@ -2170,6 +2210,19 @@ static void testProvenance() {
       JsonDocument got;
       CHECK(deserializeJson(got, text) == DeserializationError::Ok);
       CHECK_MSG(got["t"].as<double>() == received[i], "%s", text.c_str());
+    }
+    // From v2.2.16 (#318) the client sends `t` as a uint32_t: 23:59:59.6 arrives as 23:59:59,
+    // so 00:00:00 is a reading taken at midnight (the sketch skips the check for such a client)
+    const double taken[] = {mid - 0.6, mid - 0.4, mid + 0.4};
+    const double truncated[] = {mid - 1.0, mid - 1.0, mid};
+    for (size_t i = 0; i < 3; ++i) {
+      JsonDocument note;
+      note["t"] = (uint32_t)taken[i];
+      std::string text;
+      serializeJson(note, text);
+      JsonDocument got;
+      CHECK(deserializeJson(got, text) == DeserializationError::Ok);
+      CHECK_MSG(got["t"].as<double>() == truncated[i], "%s", text.c_str());
     }
   }
 
