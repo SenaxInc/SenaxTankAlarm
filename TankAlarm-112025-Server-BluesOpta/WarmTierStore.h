@@ -175,7 +175,7 @@ struct WarmRollupState {
   int32_t nextDn = -1;           // next day to roll; -1 = boot, re-check the whole window
   int32_t dirtyDn = INT32_MAX;   // earliest rolled day that received a late snapshot or alarm
   uint32_t cursorYmd = 0;
-  uint8_t failedTicks = 0;       // ticks in a row that stopped on an I/O or memory error
+  uint8_t failedTicks = 0;       // failed ticks since a batch last got through (I/O or memory error)
   WarmRollupStats stats = {};
 };
 
@@ -345,10 +345,12 @@ static inline double warmAcquisitionEpoch(double eventEpoch, double serverNow) {
   return floor(eventEpoch);
 }
 
-// Clients send telemetry and alarm `t` as a double, and it arrives rounded to the
-// nearest second (ArduinoJson writes 10 significant digits). So a `t` of exactly
-// 00:00:00Z may be from the last half second of the day before, and its day is not
-// known. The daily report's per-sensor `t` is truncated and does not need this.
+// Clients before v2.2.16 send telemetry and alarm `t` as a double, and it arrives
+// rounded to the nearest second (ArduinoJson writes 10 significant digits). So a `t`
+// of exactly 00:00:00Z may be from the last half second of the day before, and its
+// day is not known. From v2.2.16 (#318) that `t` is truncated to whole seconds, so the
+// sketch applies this only to older clients (CLIENT_EXACT_T_SINCE). The daily report's
+// per-sensor `t` is truncated and does not need this.
 static inline bool warmRoundedEpochAtMidnight(double t) {
   return t > 0.0 && fmod(t, 86400.0) == 0.0;
 }
@@ -1030,9 +1032,9 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
 // firmware saved, see WarmSeries::legacyCount); re-rolls of unchanged days
 // cost reads only. IO_ERROR/NO_MEMORY stop the step without moving the
 // position; the next call retries. After
-// WARM_MAX_FAILED_TICKS calls in a row stop that way, the rest of the failing
-// month is skipped (until the next boot's re-check) so one bad file cannot
-// hold up the days after it.
+// WARM_MAX_FAILED_TICKS calls in a row stop that way, with no batch getting
+// through in between, the rest of the failing month is skipped (until the next
+// boot's re-check) so one bad file cannot hold up the days after it.
 static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, const WarmSeries *series, uint8_t ns,
                                              WarmAlarmCountFn alarmFn, void *actx, WarmRoundFn roundFn,
                                              const WarmRollupConfig &cfg, const WarmHooks &h) {
@@ -1092,7 +1094,6 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
     return sum;
   }
 
-  bool failed = false;
   while (s.nextDn <= yDn && sum.batches < cfg.maxBatches && sum.writes < cfg.maxWrites) {
     if (h.nowMs && (uint32_t)(h.nowMs() - t0) >= cfg.budgetMs) break;
     const int32_t st = s.nextDn;
@@ -1117,7 +1118,6 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
       if (status == WARM_NO_MEMORY) s.stats.noMemory++; else s.stats.ioErrors++;
       s.stats.lastError = status;
       s.stats.lastErrorYmd = warmDnToYmd(st);
-      failed = true;
       char path[96];
       if (!warmMonthPath(path, sizeof(path), cfg.dir, year, month, "")) path[0] = '\0';
       if (++s.failedTicks < WARM_MAX_FAILED_TICKS) {
@@ -1142,6 +1142,9 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
     } else if (n > 0) {
       s.stats.noChange++;
     }
+    // S-D03: a batch that got through (written, unchanged, empty or too big) ends the
+    // streak, so a later failure (e.g. the next month) gets its own WARM_MAX_FAILED_TICKS tries
+    if (status == WARM_OK || status == WARM_TOO_BIG) s.failedTicks = 0;
     if (sum.batches == 0) sum.firstYmd = warmDnToYmd(st);
     sum.lastYmd = warmDnToYmd(en);
     sum.batches++;
@@ -1155,7 +1158,6 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
     }
   }
   WARM_FREE(rows);
-  if (!failed) s.failedTicks = 0;
 
   const uint32_t elapsed = h.nowMs ? (uint32_t)(h.nowMs() - t0) : 0;
   s.stats.lastTickMs = elapsed;

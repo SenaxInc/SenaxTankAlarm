@@ -141,7 +141,8 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
   long client UID) is left out with an error and never replaces the stored row.
 - **Failures never empty a file.** Only a missing file (ENOENT) starts a new one. A
   read, write or allocation failure leaves the file as it was and is retried the next
-  hour. After 6 failed hours in a row the rest of that month is skipped until the next
+  hour. After 6 failed hours in a row (a batch that gets through, e.g. the month
+  before, starts the count again) the rest of that month is skipped until the next
   restart (counted in `skippedDays`), so one bad file cannot hold up the days after
   it. A file that cannot be parsed is rebuilt from its readable rows plus the new
   rows, and the original is kept as `daily_YYYYMM.json.bad`. Writes go to
@@ -193,10 +194,12 @@ taken (S-D03):
   valid `t` (before 2020, or more than 1 h ahead of the server clock) is left out rather
   than stamped with the time it was received. This leaves out readings taken before a
   client's first time sync, and daily-report readings from clients older than v2.0.56,
-  which send no per-sensor `t`. Telemetry and alarm `t` arrive rounded to the second, so
-  one of exactly 00:00:00Z may be from the last half second of the day before; that
-  telemetry reading is left out (its daily-report copy, whose `t` is truncated, is not)
-  and that alarm is not counted.
+  which send no per-sensor `t`. Telemetry and alarm `t` from clients older than v2.2.16
+  (or from notes without `fv`) arrive rounded to the second, so one of exactly 00:00:00Z
+  may be from the last half second of the day before; that telemetry reading is left out
+  (its daily-report copy, whose `t` is truncated, is not) and that alarm is not counted.
+  From v2.2.16 (#318) the client truncates that `t` to whole seconds, so its 00:00:00Z is
+  recorded and counted.
 - **Counted once.** The same reading arriving again (telemetry, then the daily report's
   copy, or an on-demand re-send) within 1 s is stored once. Only the time is compared: a
   current-loop level is recomputed on arrival, with the temperature of that moment.

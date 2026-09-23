@@ -12750,10 +12750,12 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
   respondStatus(client, 200, msg);
 }
 
-// S-D03: first client firmware whose on-demand telemetry carries a real acquisition `t`.
-// #318 ships in 2.2.16: a client that has not sampled a sensor since boot then omits `t`
-// instead of stamping its boot value with the send time (see handleTelemetry).
-static const char CLIENT_ONDEMAND_T_TRUSTED_SINCE[] = "2.2.16";
+// S-D03: first client firmware whose telemetry and alarm `t` is exact. #318 ships in 2.2.16:
+// such a client sends `t` in whole seconds (truncated, so exactly 00:00:00Z is that day; an
+// older client's `t` arrives rounded, see warmRoundedEpochAtMidnight), and on-demand
+// telemetry for a sensor it has not sampled since boot omits `t` instead of stamping its boot
+// value with the send time (see handleTelemetry). Every client note carries its "fv".
+static const char CLIENT_EXACT_T_SINCE[] = "2.2.16";
 
 static void handleTelemetry(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
@@ -13031,13 +13033,13 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   const bool freshReading = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull() &&
       !(strcmp(rec->sensorType, "currentLoop") == 0 && !(mA >= 4.0f && mA <= 20.0f));
   if (!freshReading) return;
-  // S-D03: a client older than CLIENT_ONDEMAND_T_TRUSTED_SINCE answers an on-demand request
-  // for a sensor it has not sampled since boot (solar-only voltage gate closed) with its
-  // boot value, 0.0 with no ru/sf, stamped with the send time. The note cannot be told
-  // apart from a real reading, so no on-demand note from such a client (or one without
-  // "fv") enters history.
-  if (strcmp(doc["r"] | "", "ondemand") == 0 &&
-      compareFirmwareVersions(doc["fv"] | "", CLIENT_ONDEMAND_T_TRUSTED_SINCE) < 0) {
+  // S-D03: a client older than CLIENT_EXACT_T_SINCE answers an on-demand request for a
+  // sensor it has not sampled since boot (solar-only voltage gate closed) with its boot
+  // value, 0.0 with no ru/sf, stamped with the send time. The note cannot be told apart
+  // from a real reading, so no on-demand note from such a client (or one without "fv")
+  // enters history.
+  const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
+  if (strcmp(doc["r"] | "", "ondemand") == 0 && !exactT) {
     return;
   }
 
@@ -13045,9 +13047,11 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // (top-level `t`), so the chart X-axis reflects when the reading was actually taken.
   // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
   double telemetryEpoch = doc["t"] | 0.0;
-  // S-D03: `t` arrives rounded to the second, so exactly 00:00:00Z may be a reading from the
-  // day before. Leave it out; the daily report's copy (its `t` is truncated) still enters.
-  if (warmRoundedEpochAtMidnight(telemetryEpoch)) return;
+  // S-D03: from a client older than CLIENT_EXACT_T_SINCE (or without "fv"), `t` arrives
+  // rounded to the second, so exactly 00:00:00Z may be a reading from the day before. Leave
+  // it out; the daily report's copy (its `t` is truncated) still enters. A newer client
+  // truncates `t`, so its 00:00:00Z is a reading taken then.
+  if (!exactT && warmRoundedEpochAtMidnight(telemetryEpoch)) return;
   // S-D03: "v" is the client's last voltage poll when the note was built, up to
   // WARM_VIN_MAX_AGE_SEC old, and the note is built within 5 minutes of the reading (seconds
   // later on a current-loop client, whose Phase B runs after every A0602 read). So keep it
@@ -13222,11 +13226,13 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // This is an operational event, NOT a sensor alarm clear — do not clear alarmActive
   bool isRelayTimeout = (strcmp(type, "relay_timeout") == 0);
   // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown), for
-  // the daily alarm count. "t" arrives rounded to the second, so exactly 00:00:00Z may be
-  // an alarm from the day before; its day is unknown.
+  // the daily alarm count. From a client older than CLIENT_EXACT_T_SINCE (or without "fv"),
+  // "t" arrives rounded to the second, so exactly 00:00:00Z may be an alarm from the day
+  // before; its day is unknown. A newer client truncates "t", so its 00:00:00Z is that day.
   const double alarmNoteT = doc["t"] | 0.0;
-  const double alarmEventEpoch =
-      warmRoundedEpochAtMidnight(alarmNoteT) ? 0.0 : warmAcquisitionEpoch(alarmNoteT, currentEpoch());
+  const bool alarmExactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
+  const double alarmEventEpoch = (!alarmExactT && warmRoundedEpochAtMidnight(alarmNoteT))
+      ? 0.0 : warmAcquisitionEpoch(alarmNoteT, currentEpoch());
 
   if (strcmp(type, "clear") == 0 || isRecovery) {
     rec->alarmActive = false;
