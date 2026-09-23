@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
+#include "WarmTierStore.h"  // S-D03: warm-tier daily summary storage (host-tested in tests/host/warm_store)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4)
   #include <PortentaEthernet.h>
   #include <Ethernet.h>
@@ -765,11 +766,7 @@ static void sendUnloadEmail(const UnloadLogEntry &entry);
 #define MAX_HISTORY_SENSORS 20
 #endif
 
-struct TelemetrySnapshot {
-  double timestamp;           // Epoch timestamp
-  float level;                // Level in inches
-  float voltage;              // VIN voltage (0 if not available)
-};
+// struct TelemetrySnapshot (one ring entry) is defined in WarmTierStore.h.
 
 struct SensorHourlyHistory {
   char clientUid[48];
