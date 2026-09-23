@@ -5,7 +5,11 @@
 //
 // The script is read from the sketch, so the test covers exactly what operators paste into
 // Apps Script. It runs in a node `vm` context with stubs for the Apps Script services it
-// uses: ContentService, CacheService, LockService, MailApp, Utilities and console.
+// uses: ContentService, CacheService, LockService, MailApp, Utilities, console and Date.now.
+//
+// Time is a fake clock (env.clock, read by the script's Date.now()). Utilities.sleep moves
+// it on, a busy lock makes tryLock wait, and env.serviceMs makes cache calls and taking the
+// lock cost time. By default those cost nothing.
 //
 // Two executions overlap by nesting: `duringSend` runs a second call inside the first
 // call's MailApp.sendEmail. The first call cannot move on until the second returns, so
@@ -102,27 +106,33 @@ function makeBridge(source, opts) {
     onSleep: null,          // run after each Utilities.sleep: what other executions did meanwhile
     sleptHoldingLock: 0,    // Utilities.sleep calls made while holding the script lock
     logs: [],               // console.log lines
+    clock: 1790000000000,   // Date.now() in the script, ms
+    serviceMs: 0,           // time each cache call, and taking a free lock, takes
+    lockFreeAt: 0,          // another execution holds the script lock until this time
+    busyAfterSleep: 0,      // after each Utilities.sleep, another execution holds the lock this long
   };
   function maybeFail(method) {
     if (env.failing.indexOf(method) >= 0) throw new Error(method + ': service unavailable');
   }
+  function cacheCall(method) {
+    maybeFail(method);
+    if (!env.lockHeld) env.unlockedCacheOps++;
+    env.clock += env.serviceMs;
+  }
   const cache = {
     getAll(keys) {
-      maybeFail('getAll');
-      if (!env.lockHeld) env.unlockedCacheOps++;
+      cacheCall('getAll');
       const found = {};
       keys.forEach(k => { if (env.cache.has(k)) found[k] = env.cache.get(k); });
       return found;
     },
     putAll(values, ttl) {
-      maybeFail('putAll');
-      if (!env.lockHeld) env.unlockedCacheOps++;
+      cacheCall('putAll');
       env.ttls.push(ttl);
       Object.keys(values).forEach(k => env.cache.set(k, values[k]));
     },
     removeAll(keys) {
-      maybeFail('removeAll');
-      if (!env.lockHeld) env.unlockedCacheOps++;
+      cacheCall('removeAll');
       keys.forEach(k => env.cache.delete(k));
     },
   };
@@ -130,7 +140,13 @@ function makeBridge(source, opts) {
     tryLock(ms) {
       env.lockWaits.push(ms);
       maybeFail('tryLock');
-      if (!env.lockOk || env.lockHeld) return false;  // busy, or held by another execution
+      // How long another execution still holds the lock; always, when !lockOk
+      const busy = env.lockOk ? Math.max(0, env.lockFreeAt - env.clock) : Infinity;
+      if (env.lockHeld || busy >= ms) {
+        env.clock += ms;  // gives up after waiting the whole timeout
+        return false;
+      }
+      env.clock += busy + env.serviceMs;
       env.lockHeld = true;
       return true;
     },
@@ -160,9 +176,12 @@ function makeBridge(source, opts) {
       sleep: ms => {
         env.sleeps.push(ms);
         if (env.lockHeld) env.sleptHoldingLock++;
+        env.clock += ms;
+        if (env.busyAfterSleep) env.lockFreeAt = env.clock + env.busyAfterSleep;
         if (env.onSleep) env.onSleep(ms);
       },
     },
+    Date: { now: () => env.clock },
     console: { log: line => { env.logs.push(String(line)); } },
   });
   vm.runInContext(source, context, { filename: 'Code.gs' });
@@ -344,7 +363,8 @@ try {
 });
 
 // removeAll throwing after a failed send: the send error is still the one reported, and
-// the claim left behind does not stop a repeat from sending (it waits 20 s, then sends)
+// the claim left behind does not stop a repeat from sending (it waits 20 s, then sends).
+// The services take no time here, so the wait is 20 sleeps of 1 s.
 {
   const br = makeBridge(source, { failing: ['removeAll'] });
   br.failSends = 2;
@@ -419,6 +439,8 @@ try {
   checkEq('(k) slow first call returns ok', br.post(routed('ev-0600', alarmBody(id))), 'ok');
   checkEq('(k) repeat during the send returns duplicate', repeat.answer, 'duplicate');
   checkEq('(k) repeat checked again every second until sent', JSON.stringify(br.sleeps), '[1000,1000]');
+  checkEq('(k) lock waits: 10 s to claim or check, 2 s per check while waiting',
+          JSON.stringify(br.lockWaits), '[10000,10000,2000,2000,10000]');
   checkEq('(k) repeat did not hold the lock while waiting', br.sleptHoldingLock, 0);
   checkEq('(k) one email', br.sent.length, 1);
   checkEq('(k) marked sent', cacheValues(br, keys), '["sent","sent"]');
@@ -487,6 +509,67 @@ try {
   check('(o) first note reports its error', typeof first === 'string' && first.indexOf('error: ') === 0, first);
   checkEq('(o) one email', br.sent.length, 1);
   checkEq('(o) retry of the first event is a duplicate', br.post(routed('ev-1000', alarmBody(id))), 'duplicate');
+}
+
+const STILL_SENDING = 'still sending elsewhere after 20 s, sent anyway: ';
+
+// (p) the wait is timed by the clock from before the first check, not by counting checks:
+// the first check waits 9 s for the lock and the services take 300 ms a call, and the
+// repeat stops checking once 20 s have passed, and still sends
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000660-12';
+  const keys = ['ev:ev-1100', 'id:' + id];
+  keys.forEach(k => br.cache.set(k, 'sending'));  // left behind by a call whose cleanup failed
+  br.serviceMs = 300;
+  const start = br.clock;
+  br.lockFreeAt = start + 9000;
+  checkEq('(p) slow start: repeat sends after waiting', br.post(routed('ev-1100', alarmBody(id))), 'ok');
+  const took = br.clock - start;
+  checkEq('(p) slow start: first check allows 10 s for the lock', br.lockWaits[0], 10000);
+  check('(p) slow start: fewer than 20 checks', br.sleeps.length < 20, br.sleeps.length);
+  check('(p) slow start: waited 20 s and answered within 23 s', took >= 20000 && took <= 23000, took);
+  checkEq('(p) slow start: logs why it sent', br.logs[0], STILL_SENDING + keys.join(' '));
+  checkEq('(p) slow start: sent', br.sent.length, 1);
+  checkEq('(p) slow start: then marked sent', cacheValues(br, keys), '["sent","sent"]');
+}
+
+// (q) other executions hold the lock for the whole wait: each check gives up after 2 s and
+// counts as still sending, so the repeat still answers within about 23 s, and sends
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000720-13';
+  const keys = ['ev:ev-1200', 'id:' + id];
+  keys.forEach(k => br.cache.set(k, 'sending'));
+  br.busyAfterSleep = Infinity;
+  const start = br.clock;
+  checkEq('(q) busy lock: repeat sends after waiting', br.post(routed('ev-1200', alarmBody(id))), 'ok');
+  const took = br.clock - start;
+  check('(q) busy lock: waited 20 s and answered within 23 s', took >= 20000 && took <= 23000, took);
+  checkEq('(q) busy lock: 10 s for the first check, then 2 s for each later lock',
+          JSON.stringify(br.lockWaits), JSON.stringify([10000].concat(Array(8).fill(2000))));
+  checkEq('(q) busy lock: logs why it sent', br.logs[0], STILL_SENDING + keys.join(' '));
+  checkEq('(q) busy lock: sent', br.sent.length, 1);
+  checkEq('(q) busy lock: lock not left held', br.lockHeld, false);
+}
+
+// (r) the lock is busy for 1.5 s at each check: the check still gets it within its 2 s, and
+// the repeat is a duplicate once the first call's send has worked
+{
+  const br = makeBridge(source);
+  const id = 'dev:864475000000001-1790000780-14';
+  const keys = ['ev:ev-1300', 'id:' + id];
+  br.busyAfterSleep = 1500;
+  const repeat = repeatDuringSend(br, routed('ev-1300', alarmBody(id)), 3, () => firstCallOutcome(br, keys, true));
+  const start = br.clock;
+  checkEq('(r) slow lock: first call returns ok', br.post(routed('ev-1300', alarmBody(id))), 'ok');
+  checkEq('(r) slow lock: repeat returns duplicate', repeat.answer, 'duplicate');
+  checkEq('(r) slow lock: repeat checked 3 times', JSON.stringify(br.sleeps), '[1000,1000,1000]');
+  checkEq('(r) slow lock: each check got the lock after 1.5 s', br.clock - start, 3 * 2500);
+  checkEq('(r) slow lock: lock waits of 2 s while waiting', JSON.stringify(br.lockWaits),
+          '[10000,10000,2000,2000,2000,10000]');
+  checkEq('(r) slow lock: one email', br.sent.length, 1);
+  checkEq('(r) slow lock: marked sent', cacheValues(br, keys), '["sent","sent"]');
 }
 
 console.log('email_bridge: ' + checks + ' checks, ' + failures + ' failures');
