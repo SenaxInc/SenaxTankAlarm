@@ -10284,11 +10284,13 @@ static void sendSensorJson(EthernetClient &client) {
     if (gSensorRecords[i].previousLevelEpoch > 0.0) {
       float delta = gSensorRecords[i].currentValue - gSensorRecords[i].previousValue;
       obj["d"] = delta;  // 24hr delta in inches
-      obj["pe"] = gSensorRecords[i].previousLevelEpoch;  // when previous reading was taken
+      obj["pe"] = (uint32_t)gSensorRecords[i].previousLevelEpoch;  // when previous reading was taken
     }
     obj["a"] = gSensorRecords[i].alarmActive;
     obj["at"] = gSensorRecords[i].alarmType;
-    obj["u"] = gSensorRecords[i].lastUpdateEpoch;
+    // Epochs ("u" and "pe") go out as integers: ArduinoJson writes a double that fits a
+    // float with only 7 significant digits, up to ~500 s off.
+    obj["u"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;
   }
 
   // Detect if we ran out of memory while building the document
@@ -10317,8 +10319,9 @@ static void sendUnloadLogJson(EthernetClient &client) {
     const UnloadLogEntry &entry = gUnloadLog[idx];
     
     JsonObject obj = arr.add<JsonObject>();
-    obj["t"] = entry.eventTimestamp;        // Event timestamp
-    obj["pt"] = entry.peakTimestamp;         // Peak timestamp
+    // Integer epochs: a double that fits a float would be written with only 7 digits.
+    obj["t"] = (uint32_t)entry.eventTimestamp;  // Event timestamp
+    obj["pt"] = (uint32_t)entry.peakTimestamp;  // Peak timestamp
     obj["s"] = entry.siteName;               // Site name
     obj["c"] = entry.clientUid;              // Client UID
     obj["n"] = entry.tankLabel;              // Tank label
@@ -10589,7 +10592,8 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       if (rec.sensorFault[0] != '\0') {
         clientObj["flt"] = rec.sensorFault;
       }
-      clientObj["u"] = rec.lastUpdateEpoch;
+      // Integer epoch: a double that fits a float would be written with only 7 digits.
+      clientObj["u"] = (uint32_t)rec.lastUpdateEpoch;
       // The client-level alarm type belongs to the sensor in alarm (set above), not to
       // whichever sensor happened to report most recently.
       if (!clientObj["a"].as<bool>()) {
@@ -10660,7 +10664,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
     if (rec.reminderSnoozeEpoch > 0.0) {
       sensorObj["sz"] = rec.reminderSnoozeEpoch;
     }
-    sensorObj["u"] = rec.lastUpdateEpoch;
+    sensorObj["u"] = (uint32_t)rec.lastUpdateEpoch;
 
     clientObj["tc"] = sensorList.size();
   }
@@ -15182,7 +15186,8 @@ static void publishViewerSummary() {
     }
     obj["a"] = gSensorRecords[i].alarmActive;
     obj["at"] = gSensorRecords[i].alarmType;
-    obj["u"] = gSensorRecords[i].lastUpdateEpoch;
+    // Integer epoch: a double that fits a float would be written with only 7 digits.
+    obj["u"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;
     
     // Add VIN voltage from client metadata if available
     ClientMetadata *meta = findClientMetadata(gSensorRecords[i].clientUid);
@@ -15784,11 +15789,12 @@ static void saveSensorRegistry() {
       if (rec.sensorVoltage > 0.0f) obj["vt"] = rec.sensorVoltage;
       obj["a"] = rec.alarmActive;
       if (rec.alarmType[0] != '\0') obj["at"] = rec.alarmType;
-      obj["u"] = rec.lastUpdateEpoch;
+      // Integer epochs: a double that fits a float would be written with only 7 digits.
+      obj["u"] = (uint32_t)rec.lastUpdateEpoch;
       if (rec.firstSeenEpoch > 0.0) obj["fs"] = rec.firstSeenEpoch;
       if (rec.previousLevelEpoch > 0.0) {
         obj["pl"] = rec.previousValue;
-        obj["pe"] = rec.previousLevelEpoch;
+        obj["pe"] = (uint32_t)rec.previousLevelEpoch;
       }
       // Persist SMS rate-limit state to survive reboots
       if (rec.lastSmsAlertEpoch > 0.0) {

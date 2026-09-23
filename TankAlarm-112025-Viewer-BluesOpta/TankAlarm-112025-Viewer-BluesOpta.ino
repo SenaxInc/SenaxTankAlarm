@@ -1198,7 +1198,8 @@ static void sendSensorJson(EthernetClient &client) {
     obj["l"] = gSensorRecords[i].currentValue;
     obj["a"] = gSensorRecords[i].alarmActive;
     obj["at"] = gSensorRecords[i].alarmType;
-    obj["u"] = gSensorRecords[i].lastUpdateEpoch;
+    // Integer epoch: a double that fits a float would be written with only 7 digits.
+    obj["u"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;
     if (gSensorRecords[i].vinVoltage > 0.0f) {
       obj["v"] = gSensorRecords[i].vinVoltage;
     }
