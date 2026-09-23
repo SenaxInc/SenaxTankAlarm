@@ -247,7 +247,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Fetch ArduinoJson 7.4.3 headers (pinned to the version the firmware is built with)
+      - name: Fetch ArduinoJson 7.4.3 headers (pinned for the host tests; the firmware jobs install the latest release)
         run: git clone --quiet --depth 1 --branch v7.4.3 https://github.com/bblanchon/ArduinoJson.git "$RUNNER_TEMP/ArduinoJson"
 
       - name: Build and run host unit tests (each tests/host/<suite>/Makefile)

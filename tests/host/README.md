@@ -4,7 +4,7 @@ These tests compile hardware-free firmware logic with the PC's C++ compiler and 
 
 Each suite lives in its own folder, `tests/host/<suite>/`, with a `Makefile` that has a `test` target. The `host-tests` job in `.github/workflows/arduino-ci-112025.yml` runs `make -C tests/host/<suite> test` for every suite and fails the workflow if any test fails. `build-firmware` waits for this job.
 
-Suites that need ArduinoJson receive its `src` folder as `ARDUINOJSON_DIR`. CI clones ArduinoJson v7.4.3, the version the firmware is built with.
+Suites that need ArduinoJson receive its `src` folder as `ARDUINOJSON_DIR`. The host tests pin ArduinoJson v7.4.3, which CI clones; the firmware jobs install the latest release.
 
 To run a suite locally (Linux, macOS or WSL, with g++ or clang++):
 
