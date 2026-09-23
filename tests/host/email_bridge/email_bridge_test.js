@@ -122,8 +122,9 @@ function makeBridge(source, opts) {
     tryLock(ms) {
       env.lockWaits.push(ms);
       maybeFail('tryLock');
-      if (env.lockOk) env.lockHeld = true;
-      return env.lockOk;
+      if (!env.lockOk || env.lockHeld) return false;  // busy, or held by another execution
+      env.lockHeld = true;
+      return true;
     },
     releaseLock() {
       env.lockHeld = false;
