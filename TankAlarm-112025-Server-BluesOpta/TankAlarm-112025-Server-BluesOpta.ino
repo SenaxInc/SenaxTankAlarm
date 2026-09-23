@@ -4882,7 +4882,7 @@ void loop() {
     double epoch = currentEpoch();
     
     // Roll hot tier days into LittleFS daily summaries (warm tier). S-D03: before
-    // the hot-tier prune, so no day is pruned before it has been rolled up.
+    // the hot-tier prune, which keeps every day the rollup has not processed yet.
     rollupDailySummaries();
 
     // Prune hot tier data older than retention period
@@ -7734,8 +7734,9 @@ static void pruneHotTierIfNeeded() {
     return;  // Prune at most once per day
   }
   
-  // Calculate hot tier retention threshold
-  double cutoffEpoch = now - (gHistorySettings.hotTierRetentionDays * 86400.0);
+  // Calculate hot tier retention threshold. S-D03: never past a day the rollup has not
+  // processed yet (a backfill after an outage takes several hourly ticks)
+  double cutoffEpoch = warmPruneCutoff(gWarmState, now - (gHistorySettings.hotTierRetentionDays * 86400.0));
   uint32_t pruned = 0;
   
   // Prune old telemetry snapshots from each sensor
@@ -8346,7 +8347,8 @@ static WarmStatus warmScanMonth(uint16_t year, uint8_t month, WarmRowVisitor vis
 }
 
 // Prune old daily summary files beyond MAX_DAILY_SUMMARY_MONTHS. S-D03: also
-// removes .tmp/.bad leftovers and sets gWarmTierDataExists from what is on disk.
+// removes .tmp/.bad leftovers (restoring a retained month's .tmp that is its only
+// complete copy) and sets gWarmTierDataExists from what is on disk.
 static void pruneDailySummaryFiles() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -8368,9 +8370,15 @@ static void pruneDailySummaryFiles() {
     char sidePath[72];
     if (!warmMonthPath(filePath, sizeof(filePath), DAILY_SUMMARY_DIR, year, month, "")) continue;
     if (delta <= MAX_DAILY_SUMMARY_MONTHS) {
-      // Retained month: a .tmp can only be left by a power cut mid-write
-      if (warmMonthPath(sidePath, sizeof(sidePath), DAILY_SUMMARY_DIR, year, month, ".tmp")) remove(sidePath);
-      if (warmStat(filePath) == 1) present = true;
+      // Retained month: a leftover .tmp is dropped, or restored when it is the only
+      // complete copy (S-D03: warmRecoverMonthTmp; on an error it is kept for the next try)
+      int state = 0;
+      if (warmMonthPath(sidePath, sizeof(sidePath), DAILY_SUMMARY_DIR, year, month, ".tmp")) {
+        (void)warmRecoverMonthTmp(filePath, sidePath, DAILY_SUMMARY_MAX_FILE_BYTES, kWarmHooks, &state);
+      } else {
+        state = warmStat(filePath);
+      }
+      if (state == 1) present = true;
       continue;
     }
     if (remove(filePath) == 0) {
@@ -8387,13 +8395,22 @@ static void pruneDailySummaryFiles() {
 
 // Boot: /api/history's warmTierAvailable should not wait for the first hourly
 // maintenance. Probes the month after the last rollup and the months before it.
+// S-D03: without a valid last rollup (none yet, or history settings lost), from
+// today's month, or the last heartbeat's while the clock is not set (boot).
 static void refreshWarmTierPresence(uint32_t anchorYmd) {
 #if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
   if (!mbedFS) return;
   int32_t anchorDn = 0;
-  if (!warmYmdToDn(anchorYmd, &anchorDn)) return;
+  if (warmYmdToDn(anchorYmd, &anchorDn)) {
+    anchorDn += 1;
+  } else {
+    double ref = currentEpoch();
+    if (!(ref >= WARM_MIN_VALID_EPOCH && ref < WARM_MAX_VALID_EPOCH)) ref = gLastHeartbeatFileEpoch;
+    if (!(ref >= WARM_MIN_VALID_EPOCH && ref < WARM_MAX_VALID_EPOCH)) return;
+    anchorDn = warmEpochToDn(ref);
+  }
   int year, month, day;
-  warmDnToCivil(anchorDn + 1, &year, &month, &day);
+  warmDnToCivil(anchorDn, &year, &month, &day);
   for (int delta = 0; delta <= MAX_DAILY_SUMMARY_MONTHS; delta++) {
     int y = year;
     int m = month - delta;
@@ -13651,8 +13668,13 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
-    // even when change-based telemetry is disabled (levelChangeThreshold = 0)
-    if (trustLevel && newLevel > 0.0f) {
+    // even when change-based telemetry is disabled (levelChangeThreshold = 0).
+    // S-D03: the per-sensor `t` is when the sensor's last valid reading was taken and
+    // the value is that reading (ru/sf mean no newer one, not a value from another
+    // time), so it is filed at `t` and the ring's dedupe drops a copy telemetry already
+    // brought. A current-loop value enters only from 4-20 mA, as in handleTelemetry.
+    const bool dailyMaInRange = !isCurrentLoopSensor || (mA >= 4.0f && mA <= 20.0f);
+    if (trustLevel && dailyMaInRange && newLevel > 0.0f) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;
@@ -16681,6 +16703,8 @@ static bool appendArchiveManifestEntry(const char *clientUid, const char *site, 
 // and date range (first seen → last update) so archived entries are uniquely
 // identifiable even if a new client with the same name is created later.
 // File path: {ftpPath}/archived_clients/{Site}_{YYYYMM}-{YYYYMM}_{uid_suffix}.json
+// Returns true when the archive is on FTP and listed in the manifest. Removal
+// does not depend on it (a client can be removed with FTP off or failing).
 
 static bool archiveClientToFtp(const char *clientUid) {
   if (!gConfig.ftpEnabled) return false;
@@ -16904,10 +16928,12 @@ static bool archiveClientToFtp(const char *clientUid) {
     }
   }
 
-  // Record the archive in the local manifest (S-D03: M-54, M-55)
+  // Record the archive in the local manifest (S-D03: M-54, M-55). The History page can
+  // open only listed archives, so an unlisted one counts as failed; the file stays on
+  // FTP and the manifest's log line gives its path.
   if (ok) {
-    appendArchiveManifestEntry(clientUid, siteName, rangeLabel, earliestSeen, latestUpdate,
-                               remotePath, sensorCount);
+    ok = appendArchiveManifestEntry(clientUid, siteName, rangeLabel, earliestSeen, latestUpdate,
+                                    remotePath, sensorCount);
   }
 
   return ok;

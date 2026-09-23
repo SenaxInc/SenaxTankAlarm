@@ -117,7 +117,9 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
   Days that have readings in the hot tier but were not rolled up yet (server off, or
   clock not set, at midnight) are rolled up later; days before the oldest hot-tier
   snapshot, before the retained months, or more than 92 days back are not. Days
-  without readings stay blank.
+  without readings stay blank. The hot-tier prune does not remove snapshots from a
+  day the rollup has not processed yet (a backfill that takes several hours, or a
+  month retried after errors); it removes them once the rollup has moved past it.
 - **After a reboot** the first rollup re-checks the whole window. A day whose row is
   missing, or whose recomputed row has a larger `n`, is written; unchanged days are
   only read. A snapshot or alarm that arrives for a day already rolled up marks that
@@ -135,18 +137,22 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
   larger `n`, or with the same `n` and a higher alarm count (an alarm that arrived after
   the day was rolled up); the higher alarm count is always kept. All other rows are
   copied byte for byte, including keys this firmware does not know. If nothing changes,
-  nothing is written.
+  nothing is written. A row too long to store (over 256 bytes, e.g. from an absurdly
+  long client UID) is left out with an error and never replaces the stored row.
 - **Failures never empty a file.** Only a missing file (ENOENT) starts a new one. A
   read, write or allocation failure leaves the file as it was and is retried the next
   hour. After 6 failed hours in a row the rest of that month is skipped until the next
   restart (counted in `skippedDays`), so one bad file cannot hold up the days after
   it. A file that cannot be parsed is rebuilt from its readable rows plus the new
   rows, and the original is kept as `daily_YYYYMM.json.bad`. Writes go to
-  `daily_YYYYMM.json.tmp` and are renamed over the file.
+  `daily_YYYYMM.json.tmp` and are renamed over the file. A `.tmp` left by a power cut
+  is dropped when the month file exists; when it does not (the month's first write, or
+  a rebuild cut between moving the original to `.bad` and the rename), the `.tmp` is
+  the only complete copy and is renamed into place if it reads completely.
 - **Retention**: the current month and the 3 months before it
   (`MAX_DAILY_SUMMARY_MONTHS`). The hourly prune removes older month files with their
-  `.tmp`/`.bad` files, removes orphan `.tmp` files, and sets `warmTierAvailable`
-  (also checked at boot).
+  `.tmp`/`.bad` files, handles a retained month's leftover `.tmp` as above, and sets
+  `warmTierAvailable` (also checked at boot).
 - **Readers** (`/api/history/compare`, `/api/history/yoy`, and the monthly FTP archive
   when the hot tier has no data for the month) stream the file and use a month only if
   it reads completely; otherwise they fall back as if it were missing.
@@ -162,10 +168,14 @@ reset to one day at the next rollup).
 #### What Enters History
 The hot tier, and so every daily row, holds only fresh readings, on the day they were
 taken (S-D03):
-- **Fresh readings only.** A value the client reused (`ru`) or sent for a failed sensor
-  (`sf`), a faulted read (`fault`), and a current-loop note without a raw mA from 4 to 20
-  update the dashboard but are not recorded. The server has no level for a current-loop
-  read outside 4-20 mA (the client sends 3.6-21 mA as valid) and would record 0.
+- **Fresh readings only.** A telemetry value the client reused (`ru`) or sent for a
+  failed sensor (`sf`), a faulted read (`fault`), and a current-loop value without a raw
+  mA from 4 to 20 (telemetry or daily report) update the dashboard but are not recorded.
+  The server has no level for a current-loop read outside 4-20 mA (the client sends
+  3.6-21 mA as valid) and would record 0. The daily report is different: each sensor's
+  value is its last valid reading and its `t` that reading's time (no `t` when there is
+  none), so a sensor flagged `ru` or `sf` there brings that reading, which is recorded at
+  its own time and only once (see below). A current-loop sensor flagged `ru` sends no mA.
 - **No on-demand notes from clients older than v2.2.16.** Such a client answers an
   on-demand request (the dashboard's Update) for a sensor it has not sampled since boot,
   e.g. a solar-only client whose sensor voltage gate is closed, with its boot value (0,
@@ -229,8 +239,10 @@ first/last seen, archive time, FTP path, sensor count) is added to
 - An unreadable manifest is salvaged entry by entry: the list endpoint returns the
   readable entries with `"manifestStatus":"degraded"`, and the next archive rewrites
   the manifest and keeps the original as `archived_clients.json.bad`.
-- Failures to update it are logged (source `archive`) and counted in
-  `/api/system-status` (`warmTier.manifestAppendFailures`, `warmTier.manifestSalvages`).
+- Failures to update it are logged (source `archive`) with the archive's FTP path and
+  counted in `/api/system-status` (`warmTier.manifestAppendFailures`,
+  `warmTier.manifestSalvages`); the archive then counts as failed. Removing a client
+  does not depend on the archive (it works with FTP off or failing).
 
 ### Optional: FTP Server Backup
 When FTP is enabled, historical data can be backed up to the FTP server:

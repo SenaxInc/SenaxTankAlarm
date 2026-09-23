@@ -145,7 +145,9 @@ struct WarmSeries {
   uint16_t legacyCount;
 };
 
-enum WarmRowState : uint8_t { WARM_ROW_ADD = 0, WARM_ROW_SUPERSEDED = 1, WARM_ROW_REPLACES = 2 };
+// WARM_ROW_TOO_LONG: over WARM_ROW_MAX_WRITE once encoded; never written and never
+// replaces a stored row (S-D03)
+enum WarmRowState : uint8_t { WARM_ROW_ADD = 0, WARM_ROW_SUPERSEDED = 1, WARM_ROW_REPLACES = 2, WARM_ROW_TOO_LONG = 3 };
 
 // A freshly computed daily row, before it is merged into the month file
 struct WarmNewRow {
@@ -465,7 +467,9 @@ static inline int warmSkipSpace(WarmFileReader &r) {
 // Returns the next element of a JSON array (after the '[' was consumed) as
 // raw bytes in out (NUL-terminated). Only objects are accepted. Tracks
 // strings, escapes and nesting at the byte level, so it does not depend on
-// how far ArduinoJson reads ahead. Bytes after the closing ']' are ignored.
+// how far ArduinoJson reads ahead. Bytes after the closing ']' are ignored, as
+// deserializeJson (and so v2.2.15's readers) ignores them: the array before
+// them is complete, and no writer here puts anything after it.
 static inline WarmElem warmNextElement(WarmFileReader &r, bool &first, char *out, size_t cap, size_t &len) {
   len = 0;
   int c = warmSkipSpace(r);
@@ -774,7 +778,7 @@ struct WarmMergeCtx {
 // better row (SUPERSEDED) or a worse one (REPLACES). A row is better with a
 // larger n, or with the same n and a larger al (S-D03: an alarm that arrived
 // after its day was rolled up). Duplicate keys in the file resolve to
-// SUPERSEDED.
+// SUPERSEDED. TOO_LONG rows are left as they are.
 static inline bool warmDecideVisitor(JsonObjectConst row, const char *raw, size_t rawLen, void *ctx) {
   (void)raw;
   (void)rawLen;
@@ -787,7 +791,7 @@ static inline bool warmDecideVisitor(JsonObjectConst row, const char *raw, size_
   const uint8_t exAl = row["al"] | (uint8_t)0;
   for (uint16_t i = 0; i < m.count; ++i) {
     WarmNewRow &nr = m.rows[i];
-    if (nr.d != d || nr.k != k || strcmp(nr.c, c) != 0) continue;
+    if (nr.state == WARM_ROW_TOO_LONG || nr.d != d || nr.k != k || strcmp(nr.c, c) != 0) continue;
     if (exN > nr.n || (exN == nr.n && exAl >= nr.al)) nr.state = WARM_ROW_SUPERSEDED;
     else if (nr.state != WARM_ROW_SUPERSEDED) nr.state = WARM_ROW_REPLACES;
   }
@@ -825,6 +829,41 @@ static inline bool warmCopyVisitor(JsonObjectConst row, const char *raw, size_t 
   return !m.out->failed;
 }
 
+// S-D03: a month's .tmp is left by a power cut before its rename (or by a
+// commit() that could not put the original back). Beside the month file it is
+// dropped: the file is the committed copy. Without the month file it may be
+// the only complete copy: the month's first write, or a rebuild cut between
+// its renames (file -> .bad, .tmp -> file), whose .tmp already holds the rows
+// salvaged from the .bad. A .tmp that passes a strict scan is then renamed
+// into place; one that does not was cut mid-write and is dropped. Returns
+// IO_ERROR or NO_MEMORY when that cannot be decided or the rename fails (the
+// .tmp is kept for the next try); otherwise OK with *pathState = warmStat of
+// the month file afterwards (1 or 0).
+static inline WarmStatus warmRecoverMonthTmp(const char *path, const char *tmpPath, uint32_t maxFileBytes,
+                                             const WarmHooks &h, int *pathState) {
+  *pathState = warmStat(path);
+  if (*pathState < 0) return WARM_IO_ERROR;
+  if (*pathState == 1) {
+    if (warmStat(tmpPath) == 1) WARM_REMOVE(tmpPath);  // a failed remove is overwritten by the next write
+    return WARM_OK;
+  }
+  const int tmpState = warmStat(tmpPath);
+  if (tmpState < 0) return WARM_IO_ERROR;
+  if (tmpState == 0) return WARM_OK;
+
+  uint32_t rows = 0;
+  const WarmStatus st = warmScanFile(tmpPath, false, maxFileBytes, 0, nullptr, nullptr, h, &rows, nullptr);
+  if (st == WARM_IO_ERROR || st == WARM_NO_MEMORY) return st;
+  if (st != WARM_OK) {  // CORRUPT or TOO_BIG: cut mid-write (ABSENT: already gone)
+    if (st != WARM_ABSENT) WARM_REMOVE(tmpPath);
+    return WARM_OK;
+  }
+  if (WARM_RENAME(tmpPath, path) != 0) return WARM_IO_ERROR;
+  *pathState = 1;
+  warmLogf(h, "warn", "Warm tier: %s restored from its .tmp (%lu rows)", path, (unsigned long)rows);
+  return WARM_OK;
+}
+
 // Merges rows (all in year/month) into dir/daily_YYYYMM.json.
 // Returns OK (res->wrote says whether the file changed), IO_ERROR or
 // NO_MEMORY (nothing written; retry later), or TOO_BIG (the result would
@@ -832,7 +871,9 @@ static inline bool warmCopyVisitor(JsonObjectConst row, const char *raw, size_t 
 // per (d, c, k); rows that are not re-rolled are kept; a stored row is only
 // replaced by one with a larger n, or the same n and a larger al, and its al
 // never goes down; the file is never emptied by a failed read; .bad is only
-// ever created by rename.
+// ever created by rename; a complete .tmp is never dropped while it is the
+// only copy (warmRecoverMonthTmp); a row too long to encode is not stored and
+// leaves the stored row in place.
 static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, WarmNewRow *rows, uint16_t count,
                                         uint32_t maxFileBytes, const WarmHooks &h, WarmMergeResult *res) {
   WarmMergeResult local = {};
@@ -846,12 +887,12 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
     return WARM_IO_ERROR;
   }
 
-  // A leftover .tmp can only come from a power cut mid-write; drop it.
-  if (warmStat(tmpPath) == 1) WARM_REMOVE(tmpPath);
+  // A leftover .tmp is dropped, or restored when it is the only complete copy (S-D03)
+  int pathState = 0;
+  const WarmStatus tmpSt = warmRecoverMonthTmp(path, tmpPath, maxFileBytes, h, &pathState);
+  if (tmpSt != WARM_OK) return tmpSt;
 
   // Choose the source. Only ENOENT means "start a new file".
-  const int pathState = warmStat(path);
-  if (pathState < 0) return WARM_IO_ERROR;
   const char *src = nullptr;
   bool salvage = false;
   bool moveAside = false;
@@ -875,10 +916,23 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
   mc.maxBytes = maxFileBytes;
   mc.wroteAny = false;
   mc.tooBig = false;
+  // S-D03: a row too long to encode is left out before pass 1, so it never
+  // replaces (drops) the stored row. Measured with the largest al pass 2 can
+  // carry over, so a row that fits here fits there too.
+  char enc[WARM_ROW_MAX_WRITE];
   for (uint16_t i = 0; i < count; ++i) {
     rows[i].state = WARM_ROW_ADD;
     if (rows[i].d < mc.minD) mc.minD = rows[i].d;
     if (rows[i].d > mc.maxD) mc.maxD = rows[i].d;
+    WarmNewRow widest = rows[i];
+    widest.al = UINT8_MAX;
+    bool noMemory = false;
+    if (warmEncodeRow(widest, enc, sizeof(enc), h, &noMemory) == 0) {
+      if (noMemory) return WARM_NO_MEMORY;
+      rows[i].state = WARM_ROW_TOO_LONG;
+      warmLogf(h, "error", "Warm tier: row %lu for sensor %u over %u bytes; not stored (%.48s)",
+               (unsigned long)rows[i].d, (unsigned)rows[i].k, (unsigned)WARM_ROW_MAX_WRITE, rows[i].c);
+    }
   }
 
   // Pass 1 (read only)
@@ -892,7 +946,9 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
       r.failOffset = off;
       salvage = true;
       moveAside = true;
-      for (uint16_t i = 0; i < count; ++i) rows[i].state = WARM_ROW_ADD;
+      for (uint16_t i = 0; i < count; ++i) {
+        if (rows[i].state != WARM_ROW_TOO_LONG) rows[i].state = WARM_ROW_ADD;
+      }
       st = warmScanFile(src, true, maxFileBytes, 0, warmDecideVisitor, &mc, h, &seen, &off);
     }
     if (st == WARM_ABSENT) st = WARM_IO_ERROR;  // stat() said it was there
@@ -903,7 +959,7 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
   // Nothing new or better: no flash write at all.
   uint16_t pending = 0;
   for (uint16_t i = 0; i < count; ++i) {
-    if (rows[i].state != WARM_ROW_SUPERSEDED) pending++;
+    if (rows[i].state == WARM_ROW_ADD || rows[i].state == WARM_ROW_REPLACES) pending++;
   }
   if (pending == 0 && !salvage) return WARM_OK;
 
@@ -926,19 +982,13 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
     }
   }
   if (!mc.tooBig && !w.failed) {
-    char enc[WARM_ROW_MAX_WRITE];
     for (uint16_t i = 0; i < count && !mc.tooBig && !w.failed; ++i) {
-      if (rows[i].state == WARM_ROW_SUPERSEDED) continue;
+      if (rows[i].state != WARM_ROW_ADD && rows[i].state != WARM_ROW_REPLACES) continue;
       bool noMemory = false;
       const size_t len = warmEncodeRow(rows[i], enc, sizeof(enc), h, &noMemory);
-      if (len == 0) {
-        if (noMemory) {
-          w.abort();
-          return WARM_NO_MEMORY;
-        }
-        warmLogf(h, "error", "Warm tier: row %lu for sensor %u over %u bytes; not stored (%.48s)",
-                 (unsigned long)rows[i].d, (unsigned)rows[i].k, (unsigned)WARM_ROW_MAX_WRITE, rows[i].c);
-        continue;
+      if (len == 0) {  // not for its length (measured above): a replaced row must not be lost
+        w.abort();
+        return noMemory ? WARM_NO_MEMORY : WARM_IO_ERROR;
       }
       if (w.bytes + (mc.wroteAny ? 1u : 0u) + len + 1u > maxFileBytes) {
         mc.tooBig = true;
@@ -1127,6 +1177,19 @@ static inline void warmNoteSnapshot(WarmRollupState &s, double ts) {
     s.dirtyDn = dn;
     s.stats.lateMarks++;
   }
+}
+
+// S-D03: the hot-tier prune removes snapshots older than cutoffEpoch, but not
+// from a day the rollup has yet to process: a backfill in progress (bounded
+// per tick), a month retried after I/O errors, or a day marked for a re-roll.
+// So the cutoff is at most the start of the first such day. The rings are
+// bounded, so this only delays the prune. Before the first tick (nextDn < 0)
+// the cutoff is unchanged.
+static inline double warmPruneCutoff(const WarmRollupState &s, double cutoffEpoch) {
+  if (s.nextDn < 0) return cutoffEpoch;
+  const int32_t dn = (s.dirtyDn < s.nextDn) ? s.dirtyDn : s.nextDn;
+  const double dayBegin = (double)dn * 86400.0;
+  return (dayBegin < cutoffEpoch) ? dayBegin : cutoffEpoch;
 }
 
 // ============================================================================
