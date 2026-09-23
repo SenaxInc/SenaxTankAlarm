@@ -1738,17 +1738,16 @@ static void testManifest() {
   CHECK(readFile(bad) == truncated && readFile(path) == manifestText({five[0], five[1], five[2], added}));
   CHECK(countLogs("salvaged 3 entries, original saved as archived_clients.json.bad") == 1);
 
-  // A failed move to .bad refuses to write: the unreadable file stays, no .bad, no .tmp
-  long moveIdx = -1;
-  for (long probe = 0; probe < 400 && moveIdx < 0; ++probe) {
-    clearDir(dir);
-    writeFile(path, truncated);
-    resetHooks();
-    fi::state().failAt = probe;
-    warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res);
-    if (fi::state().failedOp == fi::OP_RENAME) moveIdx = probe;
-  }
-  CHECK(moveIdx >= 0);
+  // A failed move to .bad refuses to write: the unreadable file stays, no .bad, no .tmp.
+  // The move is the first rename of a successful salvage (the manifest is written one
+  // fwrite per byte first, so it comes hundreds of operations in; take it from the trace).
+  clearDir(dir);
+  writeFile(path, truncated);
+  resetHooks();
+  CHECK(warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res) == WARM_OK);
+  const std::vector<long> salvageRenames = opIndices(fi::OP_RENAME);
+  CHECK(!salvageRenames.empty());
+  const long moveIdx = salvageRenames.empty() ? -1 : salvageRenames[0];
   clearDir(dir);
   writeFile(path, truncated);
   resetHooks();
