@@ -6566,8 +6566,13 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   buildSensorObject(doc.as<JsonObject>(), idx);
 
   doc["r"] = reason;
-  // Use acquisition time so stale/reused values do not get a fresh timestamp.
-  doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
+  // Use acquisition time so stale/reused values do not get a fresh timestamp. Whole seconds,
+  // truncated like the daily report's per-sensor t: ArduinoJson rounds a fractional epoch to
+  // 10 digits, which put a 23:59:59.5+ reading on the next day. No valid reading since boot
+  // (e.g. an on-demand request before the first sample): send no t rather than a guessed one.
+  if (state.lastReadingEpoch > 0.0) {
+    doc["t"] = (uint32_t)state.lastReadingEpoch;
+  }
 
   // TEMPORARY (2026-06-15): include system voltage in every telemetry note so the dashboard
   // VIN reflects the live battery/MPPT reading instead of waiting for the once-daily report.
@@ -6896,7 +6901,8 @@ static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches) {
   // Acquisition time of the reading this note carries, as sendTelemetry() does, so the server
   // files the level under the day it was measured (a relay_timeout or config-push note can go
   // out hours after the last sample). Every latch edge and retry is sent on a fresh sample.
-  doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
+  // Whole seconds, truncated, as in sendTelemetry().
+  doc["t"] = (uint32_t)((state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch());
 
   publishNote(ALARM_FILE, doc, true);
   Serial.print(F("Alarm sent for monitor "));
