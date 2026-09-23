@@ -1210,6 +1210,17 @@ static inline WarmManifestStatus warmLoadManifest(const char *path, JsonDocument
   return st;
 }
 
+// True when the manifest lists exactly this ftpFile: the only archive paths
+// /api/history/archived?file= fetches from FTP.
+static inline bool warmManifestHasFile(const JsonDocument &man, const char *ftpFile) {
+  if (!ftpFile || !ftpFile[0]) return false;
+  for (JsonObjectConst entry : man["archives"].as<JsonArrayConst>()) {
+    const char *listed = entry["ftpFile"] | "";
+    if (strcmp(listed, ftpFile) == 0) return true;
+  }
+  return false;
+}
+
 struct WarmManifestEntry {
   const char *clientUid, *site, *displayLabel, *ftpFile;
   double firstSeenEpoch, lastUpdateEpoch, archiveEpoch;

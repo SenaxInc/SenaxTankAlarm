@@ -1652,6 +1652,27 @@ static void testManifest() {
   fi::state().failAt = moveIdx;
   CHECK(warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res) == WARM_IO_ERROR);
   CHECK(readFile(path) == truncated && !fileExists(bad) && !anyTmp(dir) && countLogs("write failed") == 1);
+
+  // ?file= accepts only exact ftpFile values from the manifest, including 'dev:' paths
+  clearDir(dir);
+  resetHooks();
+  writeFile(path, manifestText({five[0], five[1]}));
+  {
+    JsonDocument doc;
+    CHECK(warmLoadManifest(path.c_str(), doc, maxBytes, true, &salvaged, h) == WARM_MAN_OK);
+    const std::string listed = five[1].ftpFile;
+    CHECK(listed.find("dev:") != std::string::npos);
+    CHECK(warmManifestHasFile(doc, listed.c_str()) && warmManifestHasFile(doc, five[0].ftpFile));
+    CHECK(!warmManifestHasFile(doc, (listed + "x").c_str()));
+    CHECK(!warmManifestHasFile(doc, listed.substr(1).c_str()));
+    CHECK(!warmManifestHasFile(doc, listed.substr(0, listed.size() - 1).c_str()));
+    CHECK(!warmManifestHasFile(doc, manifestEntry(300, store).ftpFile));
+    CHECK(!warmManifestHasFile(doc, "") && !warmManifestHasFile(doc, nullptr));
+    JsonDocument empty;
+    CHECK(warmLoadManifest(joinPath(dir, "missing.json").c_str(), empty, maxBytes, true, &salvaged, h) ==
+          WARM_MAN_ABSENT);
+    CHECK(!warmManifestHasFile(empty, listed.c_str()));
+  }
   clearDir(dir);
 }
 

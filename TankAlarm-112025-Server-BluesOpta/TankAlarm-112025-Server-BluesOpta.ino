@@ -17854,20 +17854,31 @@ static void handleArchivedClients(EthernetClient &client, const String &query) {
       return;
     }
 
-    // Validate filename: only allow alphanumeric, dash, underscore, dot, slash
-    for (unsigned int i = 0; i < fileParam.length(); ++i) {
-      char ch = fileParam.charAt(i);
-      if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
-            ch == '.' || ch == '/')) {
-        respondStatus(client, 400, F("Invalid filename"));
-        return;
-      }
-    }
-    // Block path traversal
-    if (fileParam.indexOf("..") >= 0) {
+    // S-D03: only archives listed in the manifest can be fetched, by their exact
+    // ftpFile. Archive paths contain the server's 'dev:' UID, which the old
+    // character whitelist rejected, so every "Load Data" returned 400.
+    // CR/LF/NUL (FTP command injection) and ".." are still refused outright.
+    if (fileParam.length() > 255 || strlen(fileParam.c_str()) != fileParam.length() ||
+        fileParam.indexOf('\r') >= 0 || fileParam.indexOf('\n') >= 0 || fileParam.indexOf("..") >= 0) {
       respondStatus(client, 400, F("Invalid filename"));
       return;
+    }
+    {
+      bool listed = false;
+      #ifdef FILESYSTEM_AVAILABLE
+      JsonDocument manifest;  // freed before the FTP session starts
+      const WarmManifestStatus st = warmLoadManifest(ARCHIVE_MANIFEST_PATH, manifest, MAX_ARCHIVE_MANIFEST_BYTES,
+                                                     true, nullptr, kArchiveManifestHooks);
+      if (st == WARM_MAN_IO_ERROR || st == WARM_MAN_NO_MEMORY) {
+        respondStatus(client, 500, F("Archive manifest unreadable"));
+        return;
+      }
+      listed = warmManifestHasFile(manifest, fileParam.c_str());
+      #endif
+      if (!listed) {
+        respondStatus(client, 404, F("Archive not in manifest"));
+        return;
+      }
     }
 
     // Use FTPS when configured, plain FTP otherwise — must match the protocol
