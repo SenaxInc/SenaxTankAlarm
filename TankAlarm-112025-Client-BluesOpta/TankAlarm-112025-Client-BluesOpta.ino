@@ -6893,7 +6893,10 @@ static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches) {
   if (allowSmsEscalation) {
     doc["se"] = true;  // Only include when true (false is default)
   }
-  doc["t"] = currentEpoch();
+  // Acquisition time of the reading this note carries, as sendTelemetry() does, so the server
+  // files the level under the day it was measured (a relay_timeout or config-push note can go
+  // out hours after the last sample). Every latch edge and retry is sent on a fresh sample.
+  doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
 
   publishNote(ALARM_FILE, doc, true);
   Serial.print(F("Alarm sent for monitor "));
