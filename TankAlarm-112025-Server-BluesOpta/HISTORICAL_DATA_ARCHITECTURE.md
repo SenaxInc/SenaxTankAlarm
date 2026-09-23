@@ -144,6 +144,20 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
 Downgrading to v2.2.15 or earlier brings back H-23 (month files of 8 KB or more are
 reset to one day at the next rollup).
 
+### Archived Clients Manifest
+When a client is removed and archived to FTP, an entry (client UID, site, display label,
+first/last seen, archive time, FTP path, sensor count) is added to
+`/fs/archived_clients.json`, which the History page lists (`/api/history/archived`).
+- The manifest is read without a size-limited buffer and rewritten through `.tmp` +
+  rename. A re-archive of the same FTP path replaces its entry.
+- It keeps at most 48 entries and stays under 32 KB; the oldest entries are dropped
+  first, with a log line each. Their archive files stay on FTP.
+- An unreadable manifest is salvaged entry by entry: the list endpoint returns the
+  readable entries with `"manifestStatus":"degraded"`, and the next archive rewrites
+  the manifest and keeps the original as `archived_clients.json.bad`.
+- Failures to update it are logged (source `archive`) and counted in
+  `/api/system-status` (`warmTier.manifestAppendFailures`, `warmTier.manifestSalvages`).
+
 ### Optional: FTP Server Backup
 When FTP is enabled, historical data can be backed up to the FTP server:
 - **Path**: `{ftpPath}/history/`

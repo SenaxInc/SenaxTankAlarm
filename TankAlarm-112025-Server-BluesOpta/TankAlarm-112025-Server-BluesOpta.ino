@@ -841,6 +841,22 @@ static bool gWarmTierDataExists = false;  // Set true when warm tier data is act
 static uint32_t gLastDailyRollupDate = 0;  // YYYYMMDD of the latest day rolled up
 static WarmRollupState gWarmState;         // S-D03: backfill position, late-data mark, counters (RAM only)
 
+// Archived-client manifest (S-D03: M-54, M-55)
+#ifndef ARCHIVE_MANIFEST_PATH
+#define ARCHIVE_MANIFEST_PATH "/fs/archived_clients.json"
+#endif
+#ifndef ARCHIVE_MANIFEST_BAD_PATH
+#define ARCHIVE_MANIFEST_BAD_PATH "/fs/archived_clients.json.bad"  // unreadable manifest kept here
+#endif
+#ifndef MAX_ARCHIVE_MANIFEST_BYTES
+#define MAX_ARCHIVE_MANIFEST_BYTES 32768UL  // oldest entries are dropped to stay below this
+#endif
+#ifndef MAX_ARCHIVE_MANIFEST_ENTRIES
+#define MAX_ARCHIVE_MANIFEST_ENTRIES 48     // ~0.5 KB of heap each while the list is loaded
+#endif
+static uint32_t gManifestAppendFailures = 0;
+static uint32_t gManifestSalvages = 0;
+
 // FTP archive month cache — avoids re-downloading during a single web session
 struct FtpArchiveCache {
   uint16_t cachedYear;
@@ -6394,6 +6410,8 @@ static void handleSystemStatusGet(EthernetClient &client) {
   warm["lastErrorYmd"] = gWarmState.stats.lastErrorYmd;
   warm["lastTickMs"] = gWarmState.stats.lastTickMs;
   warm["maxTickMs"] = gWarmState.stats.maxTickMs;
+  warm["manifestAppendFailures"] = gManifestAppendFailures;
+  warm["manifestSalvages"] = gManifestSalvages;
 
   JsonObject pools = doc["pools"].to<JsonObject>();
   pools["sensorHistoryBytes"] = (uint32_t)sizeof(gSensorHistory);
@@ -16401,6 +16419,62 @@ static void handleConfigAck(JsonDocument &doc, double epoch) {
 // ============================================================================
 // Client Data FTP Archive
 // ============================================================================
+// Archived-client manifest (/fs/archived_clients.json)
+// ============================================================================
+// S-D03 (M-54, M-55): the manifest used to be read through a 2 KB buffer, so
+// every entry past ~2 KB was dropped on the next append, and it was rewritten
+// with an unchecked write and remove-before-rename. The store now reads it
+// without a text buffer, rewrites it through .tmp + rename, keeps at most
+// MAX_ARCHIVE_MANIFEST_ENTRIES entries under MAX_ARCHIVE_MANIFEST_BYTES (the
+// oldest entries are dropped, their files stay on FTP), and salvages an
+// unreadable manifest entry by entry, keeping the original as .bad.
+
+static void archiveManifestLog(const char *level, const char *msg) {
+  Serial.println(msg);
+  addServerSerialLog(msg, level, "archive");
+}
+
+static const WarmHooks kArchiveManifestHooks = {warmHookYield, archiveManifestLog, serverNoteFlashWrite,
+                                                 warmHookNowMs, nullptr};
+
+// Adds this archive to the manifest, replacing an entry for the same ftpFile.
+// Failures are logged; the archive itself is already on FTP.
+static bool appendArchiveManifestEntry(const char *clientUid, const char *site, const char *displayLabel,
+                                       double firstSeen, double lastUpdate, const char *ftpFile,
+                                       uint8_t sensorCount) {
+#ifdef FILESYSTEM_AVAILABLE
+  WarmManifestEntry entry;
+  entry.clientUid = clientUid;
+  entry.site = site;
+  entry.displayLabel = displayLabel;
+  entry.ftpFile = ftpFile;
+  entry.firstSeenEpoch = firstSeen;
+  entry.lastUpdateEpoch = lastUpdate;
+  entry.archiveEpoch = currentEpoch();
+  entry.sensorCount = sensorCount;
+  WarmManifestAppendResult result;
+  const WarmStatus st = warmManifestAppend(ARCHIVE_MANIFEST_PATH, ARCHIVE_MANIFEST_BAD_PATH, entry,
+                                           MAX_ARCHIVE_MANIFEST_ENTRIES, MAX_ARCHIVE_MANIFEST_BYTES,
+                                           kArchiveManifestHooks, &result);
+  if (result.quarantined) gManifestSalvages++;
+  if (st != WARM_OK) {
+    gManifestAppendFailures++;
+    return false;
+  }
+  return true;
+#else
+  (void)clientUid;
+  (void)site;
+  (void)displayLabel;
+  (void)firstSeen;
+  (void)lastUpdate;
+  (void)ftpFile;
+  (void)sensorCount;
+  return false;
+#endif
+}
+
+// ============================================================================
 // Archives a client's sensor records and hot-tier history to FTP before removal.
 // Only archives if: FTP is enabled, client has been active for >30 days, and
 // has at least one sensor record. The archive filename includes the site name
@@ -16454,214 +16528,186 @@ static bool archiveClientToFtp(const char *clientUid) {
   size_t uidLen = strlen(clientUid);
   if (uidLen > 8) uidSuffix = clientUid + uidLen - 8;
 
-  // Build JSON archive document
-  JsonDocument doc;
-  doc["clientUid"] = clientUid;
-  doc["site"] = siteName;
-  doc["archiveEpoch"] = currentEpoch();
-
-  // Human-readable date range label: "Site (Mar 2025 - Mar 2026)"
-  {
-    const char *monthNames[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-    time_t startT = (time_t)earliestSeen;
-    time_t endT = (time_t)latestUpdate;
-    struct tm *tsStart = gmtime(&startT);
-    int sy = tsStart->tm_year + 1900, sm = tsStart->tm_mon;
-    struct tm *tsEnd = gmtime(&endT);
-    int ey = tsEnd->tm_year + 1900, em = tsEnd->tm_mon;
-    char rangeLabel[64];
-    snprintf(rangeLabel, sizeof(rangeLabel), "%s (%s %d - %s %d)",
-             siteName, monthNames[sm], sy, monthNames[em], ey);
-    doc["displayLabel"] = rangeLabel;
-  }
-  doc["firstSeenEpoch"] = earliestSeen;
-  doc["lastUpdateEpoch"] = latestUpdate;
-
-  // Archive all sensor records
-  JsonArray sensorsArr = doc["sensors"].to<JsonArray>();
-  for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
-    if (strcmp(gSensorRecords[i].clientUid, clientUid) != 0) continue;
-    const SensorRecord &rec = gSensorRecords[i];
-    JsonObject obj = sensorsArr.add<JsonObject>();
-    obj["sensorIndex"] = rec.sensorIndex;
-    if (rec.userNumber > 0) obj["userNumber"] = rec.userNumber;
-    obj["site"] = rec.site;
-    obj["label"] = rec.label;
-    if (rec.contents[0] != '\0') obj["contents"] = rec.contents;
-    if (rec.objectType[0] != '\0') obj["objectType"] = rec.objectType;
-    if (rec.sensorType[0] != '\0') obj["sensorType"] = rec.sensorType;
-    if (rec.measurementUnit[0] != '\0') obj["measurementUnit"] = rec.measurementUnit;
-    obj["lastLevel"] = roundTo(rec.currentValue, 1);
-    // Fix 13 (v2.0.52): gate dropped from >=4.0 to >0.0 for consistency with the
-    // live API. Archived records still reflect whatever the live record held at
-    // serialization time.
-    if (rec.sensorMa > 0.0f) obj["lastSensorMa"] = roundTo(rec.sensorMa, 2);
-    if (rec.sensorVoltage > 0.0f) obj["lastSensorVoltage"] = roundTo(rec.sensorVoltage, 3);
-    obj["lastUpdateEpoch"] = rec.lastUpdateEpoch;
-    double fs = rec.firstSeenEpoch > 0.0 ? rec.firstSeenEpoch : rec.lastUpdateEpoch;
-    obj["firstSeenEpoch"] = fs;
-  }
-
-  // Archive hot-tier history snapshots for this client
-  JsonArray historyArr = doc["history"].to<JsonArray>();
-  for (uint8_t h = 0; h < gSensorHistoryCount; ++h) {
-    SensorHourlyHistory &hist = gSensorHistory[h];
-    if (strcmp(hist.clientUid, clientUid) != 0) continue;
-    if (hist.snapshotCount == 0) continue;
-
-    JsonObject hObj = historyArr.add<JsonObject>();
-    hObj["sensorIndex"] = hist.sensorIndex;
-    hObj["heightInches"] = hist.heightInches;
-    JsonArray readings = hObj["readings"].to<JsonArray>();
-    for (uint16_t j = 0; j < hist.snapshotCount; ++j) {
-      uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
-      TelemetrySnapshot &snap = hist.snapshots[idx];
-      JsonArray pt = readings.add<JsonArray>();
-      pt.add(snap.timestamp);
-      pt.add(roundTo(snap.level, 1));
-      pt.add(roundTo(snap.voltage, 2));
-    }
-  }
-
-  // Archive client metadata if available
-  ClientMetadata *meta = findClientMetadata(clientUid);
-  if (meta) {
-    JsonObject metaObj = doc["metadata"].to<JsonObject>();
-    if (meta->vinVoltage > 0.0f) metaObj["vinVoltage"] = roundTo(meta->vinVoltage, 2);
-    if (meta->firmwareVersion[0] != '\0') metaObj["firmwareVersion"] = meta->firmwareVersion;
-    if (meta->latitude != 0.0f) metaObj["latitude"] = meta->latitude;
-    if (meta->longitude != 0.0f) metaObj["longitude"] = meta->longitude;
-    if (meta->signalBars >= 0) metaObj["signalBars"] = meta->signalBars;
-  }
-
-  // Serialize to string
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-
-  // Build sanitized site name for filename (replace spaces/special chars)
-  char safeSite[24];
-  {
-    size_t si = 0;
-    for (size_t c = 0; siteName[c] != '\0' && si < sizeof(safeSite) - 1; ++c) {
-      char ch = siteName[c];
-      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-          (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
-        safeSite[si++] = ch;
-      } else if (ch == ' ') {
-        safeSite[si++] = '_';
-      }
-    }
-    safeSite[si] = '\0';
-    if (si == 0) strlcpy(safeSite, "unknown", sizeof(safeSite));
-  }
-
-  // Upload to FTP: {ftpPath}/{serverUid}/archived_clients/{safeSite}_{startYM}-{endYM}_{uidSuffix}.json
+  // S-D03: the label and remote path outlive the block below, which frees the
+  // archive document and its upload buffer before the manifest is updated
+  char rangeLabel[64];
   char remotePath[256];
-  const char *base = (strlen(gConfig.ftpPath) > 0) ? gConfig.ftpPath : FTP_PATH_DEFAULT;
-  const char *uid = (strlen(gServerUid) > 0) ? gServerUid : "server";
-  snprintf(remotePath, sizeof(remotePath), "%s/%s/archived_clients/%s_%s-%s_%s.json",
-           base, uid, safeSite, startYM, endYM, uidSuffix);
-
-  const bool useFtps = gConfig.ftpsEnabled;
-  FtpSession session;
-  char err[128];
-  bool connected = useFtps ? ftpsConnectAndLogin(err, sizeof(err))
-                           : ftpConnectAndLogin(session, err, sizeof(err));
-  if (!connected) {
-    Serial.print(F("FTP archive client failed (login): "));
-    Serial.println(err);
-    return false;
-  }
-
-  // Ensure {ftpPath}/{uid}/archived_clients/ exists. The per-server
-  // {ftpPath}/{uid} directory should already exist (created by the regular
-  // backup), but MKD on it is idempotent (550 = exists = non-fatal) so we
-  // still issue it for robustness in case archive runs before any backup.
+  bool ok = false;
   {
-    char serverDir[192];
-    snprintf(serverDir, sizeof(serverDir), "%s/%s", base, uid);
-    char archDir[224];
-    snprintf(archDir, sizeof(archDir), "%s/%s/archived_clients", base, uid);
-    char mkdErr[128];
-    mkdErr[0] = '\0';
-    bool mkdParent = useFtps
-        ? gFtpsClient.mkd(serverDir, mkdErr, sizeof(mkdErr))
-        : ftpMakeDir(session, serverDir, mkdErr, sizeof(mkdErr));
-    if (!mkdParent) {
-      Serial.print(F("FTP archive: MKD parent warning (non-fatal): "));
-      Serial.println(mkdErr);
-    }
-    mkdErr[0] = '\0';
-    bool mkdSub = useFtps
-        ? gFtpsClient.mkd(archDir, mkdErr, sizeof(mkdErr))
-        : ftpMakeDir(session, archDir, mkdErr, sizeof(mkdErr));
-    if (!mkdSub) {
-      Serial.print(F("FTP archive: MKD archived_clients warning (non-fatal): "));
-      Serial.println(mkdErr);
-    }
-  }
+    // Build JSON archive document
+    JsonDocument doc;
+    doc["clientUid"] = clientUid;
+    doc["site"] = siteName;
+    doc["archiveEpoch"] = currentEpoch();
 
-  bool ok = useFtps
-              ? ftpsStoreBuffer(remotePath,
-                                (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
-                                err, sizeof(err))
-              : ftpStoreBuffer(session, remotePath,
-                               (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
-                               err, sizeof(err));
-  if (useFtps) {
-    ftpsQuit();
-  } else {
-    ftpQuit(session);
-  }
-
-  if (ok) {
-    char detail[128];
-    snprintf(detail, sizeof(detail), "Archived client %s to FTP: %s", clientUid, remotePath);
-    Serial.println(detail);
-    addServerSerialLog(detail, "info", "archive");
-    logTransmission(clientUid, siteName, "archive", "sent", detail);
-
-    // Append entry to local archive manifest (/fs/archived_clients.json)
-    #ifdef FILESYSTEM_AVAILABLE
+    // Human-readable date range label: "Site (Mar 2025 - Mar 2026)"
     {
-      // Read existing manifest
-      JsonDocument manifest;
-      FILE *mf = fopen("/fs/archived_clients.json", "r");
-      if (mf) {
-        char buf[2048];
-        size_t nRead = fread(buf, 1, sizeof(buf) - 1, mf);
-        fclose(mf);
-        buf[nRead] = '\0';
-        deserializeJson(manifest, buf);
-      }
-      JsonArray entries = manifest["archives"].is<JsonArray>()
-                            ? manifest["archives"].as<JsonArray>()
-                            : manifest["archives"].to<JsonArray>();
-      JsonObject entry = entries.add<JsonObject>();
-      entry["clientUid"] = clientUid;
-      entry["site"] = siteName;
-      entry["displayLabel"] = doc["displayLabel"];
-      entry["firstSeenEpoch"] = earliestSeen;
-      entry["lastUpdateEpoch"] = latestUpdate;
-      entry["archiveEpoch"] = currentEpoch();
-      entry["ftpFile"] = remotePath;
-      entry["sensorCount"] = sensorCount;
+      const char *monthNames[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+      time_t startT = (time_t)earliestSeen;
+      time_t endT = (time_t)latestUpdate;
+      struct tm *tsStart = gmtime(&startT);
+      int sy = tsStart->tm_year + 1900, sm = tsStart->tm_mon;
+      struct tm *tsEnd = gmtime(&endT);
+      int ey = tsEnd->tm_year + 1900, em = tsEnd->tm_mon;
+      snprintf(rangeLabel, sizeof(rangeLabel), "%s (%s %d - %s %d)",
+               siteName, monthNames[sm], sy, monthNames[em], ey);
+      doc["displayLabel"] = rangeLabel;
+    }
+    doc["firstSeenEpoch"] = earliestSeen;
+    doc["lastUpdateEpoch"] = latestUpdate;
 
-      // Write updated manifest atomically (write to temp, rename)
-      mf = fopen("/fs/archived_clients.json.tmp", "w");
-      if (mf) {
-        String manifestJson;
-        serializeJson(manifest, manifestJson);
-        fwrite(manifestJson.c_str(), 1, manifestJson.length(), mf);
-        fclose(mf);
-        remove("/fs/archived_clients.json");
-        rename("/fs/archived_clients.json.tmp", "/fs/archived_clients.json");
+    // Archive all sensor records
+    JsonArray sensorsArr = doc["sensors"].to<JsonArray>();
+    for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
+      if (strcmp(gSensorRecords[i].clientUid, clientUid) != 0) continue;
+      const SensorRecord &rec = gSensorRecords[i];
+      JsonObject obj = sensorsArr.add<JsonObject>();
+      obj["sensorIndex"] = rec.sensorIndex;
+      if (rec.userNumber > 0) obj["userNumber"] = rec.userNumber;
+      obj["site"] = rec.site;
+      obj["label"] = rec.label;
+      if (rec.contents[0] != '\0') obj["contents"] = rec.contents;
+      if (rec.objectType[0] != '\0') obj["objectType"] = rec.objectType;
+      if (rec.sensorType[0] != '\0') obj["sensorType"] = rec.sensorType;
+      if (rec.measurementUnit[0] != '\0') obj["measurementUnit"] = rec.measurementUnit;
+      obj["lastLevel"] = roundTo(rec.currentValue, 1);
+      // Fix 13 (v2.0.52): gate dropped from >=4.0 to >0.0 for consistency with the
+      // live API. Archived records still reflect whatever the live record held at
+      // serialization time.
+      if (rec.sensorMa > 0.0f) obj["lastSensorMa"] = roundTo(rec.sensorMa, 2);
+      if (rec.sensorVoltage > 0.0f) obj["lastSensorVoltage"] = roundTo(rec.sensorVoltage, 3);
+      obj["lastUpdateEpoch"] = rec.lastUpdateEpoch;
+      double fs = rec.firstSeenEpoch > 0.0 ? rec.firstSeenEpoch : rec.lastUpdateEpoch;
+      obj["firstSeenEpoch"] = fs;
+    }
+
+    // Archive hot-tier history snapshots for this client
+    JsonArray historyArr = doc["history"].to<JsonArray>();
+    for (uint8_t h = 0; h < gSensorHistoryCount; ++h) {
+      SensorHourlyHistory &hist = gSensorHistory[h];
+      if (strcmp(hist.clientUid, clientUid) != 0) continue;
+      if (hist.snapshotCount == 0) continue;
+
+      JsonObject hObj = historyArr.add<JsonObject>();
+      hObj["sensorIndex"] = hist.sensorIndex;
+      hObj["heightInches"] = hist.heightInches;
+      JsonArray readings = hObj["readings"].to<JsonArray>();
+      for (uint16_t j = 0; j < hist.snapshotCount; ++j) {
+        uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
+        TelemetrySnapshot &snap = hist.snapshots[idx];
+        JsonArray pt = readings.add<JsonArray>();
+        pt.add(snap.timestamp);
+        pt.add(roundTo(snap.level, 1));
+        pt.add(roundTo(snap.voltage, 2));
       }
     }
-    #endif
-  } else {
-    Serial.print(F("FTP archive client failed (store): "));
-    Serial.println(err);
+
+    // Archive client metadata if available
+    ClientMetadata *meta = findClientMetadata(clientUid);
+    if (meta) {
+      JsonObject metaObj = doc["metadata"].to<JsonObject>();
+      if (meta->vinVoltage > 0.0f) metaObj["vinVoltage"] = roundTo(meta->vinVoltage, 2);
+      if (meta->firmwareVersion[0] != '\0') metaObj["firmwareVersion"] = meta->firmwareVersion;
+      if (meta->latitude != 0.0f) metaObj["latitude"] = meta->latitude;
+      if (meta->longitude != 0.0f) metaObj["longitude"] = meta->longitude;
+      if (meta->signalBars >= 0) metaObj["signalBars"] = meta->signalBars;
+    }
+
+    // Serialize to string
+    String jsonOut;
+    serializeJson(doc, jsonOut);
+
+    // Build sanitized site name for filename (replace spaces/special chars)
+    char safeSite[24];
+    {
+      size_t si = 0;
+      for (size_t c = 0; siteName[c] != '\0' && si < sizeof(safeSite) - 1; ++c) {
+        char ch = siteName[c];
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+          safeSite[si++] = ch;
+        } else if (ch == ' ') {
+          safeSite[si++] = '_';
+        }
+      }
+      safeSite[si] = '\0';
+      if (si == 0) strlcpy(safeSite, "unknown", sizeof(safeSite));
+    }
+
+    // Upload to FTP: {ftpPath}/{serverUid}/archived_clients/{safeSite}_{startYM}-{endYM}_{uidSuffix}.json
+    const char *base = (strlen(gConfig.ftpPath) > 0) ? gConfig.ftpPath : FTP_PATH_DEFAULT;
+    const char *uid = (strlen(gServerUid) > 0) ? gServerUid : "server";
+    snprintf(remotePath, sizeof(remotePath), "%s/%s/archived_clients/%s_%s-%s_%s.json",
+             base, uid, safeSite, startYM, endYM, uidSuffix);
+
+    const bool useFtps = gConfig.ftpsEnabled;
+    FtpSession session;
+    char err[128];
+    bool connected = useFtps ? ftpsConnectAndLogin(err, sizeof(err))
+                             : ftpConnectAndLogin(session, err, sizeof(err));
+    if (!connected) {
+      Serial.print(F("FTP archive client failed (login): "));
+      Serial.println(err);
+      return false;
+    }
+
+    // Ensure {ftpPath}/{uid}/archived_clients/ exists. The per-server
+    // {ftpPath}/{uid} directory should already exist (created by the regular
+    // backup), but MKD on it is idempotent (550 = exists = non-fatal) so we
+    // still issue it for robustness in case archive runs before any backup.
+    {
+      char serverDir[192];
+      snprintf(serverDir, sizeof(serverDir), "%s/%s", base, uid);
+      char archDir[224];
+      snprintf(archDir, sizeof(archDir), "%s/%s/archived_clients", base, uid);
+      char mkdErr[128];
+      mkdErr[0] = '\0';
+      bool mkdParent = useFtps
+          ? gFtpsClient.mkd(serverDir, mkdErr, sizeof(mkdErr))
+          : ftpMakeDir(session, serverDir, mkdErr, sizeof(mkdErr));
+      if (!mkdParent) {
+        Serial.print(F("FTP archive: MKD parent warning (non-fatal): "));
+        Serial.println(mkdErr);
+      }
+      mkdErr[0] = '\0';
+      bool mkdSub = useFtps
+          ? gFtpsClient.mkd(archDir, mkdErr, sizeof(mkdErr))
+          : ftpMakeDir(session, archDir, mkdErr, sizeof(mkdErr));
+      if (!mkdSub) {
+        Serial.print(F("FTP archive: MKD archived_clients warning (non-fatal): "));
+        Serial.println(mkdErr);
+      }
+    }
+
+    ok = useFtps
+           ? ftpsStoreBuffer(remotePath,
+                             (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
+                             err, sizeof(err))
+           : ftpStoreBuffer(session, remotePath,
+                            (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
+                            err, sizeof(err));
+    if (useFtps) {
+      ftpsQuit();
+    } else {
+      ftpQuit(session);
+    }
+
+    if (ok) {
+      char detail[128];
+      snprintf(detail, sizeof(detail), "Archived client %s to FTP: %s", clientUid, remotePath);
+      Serial.println(detail);
+      addServerSerialLog(detail, "info", "archive");
+      logTransmission(clientUid, siteName, "archive", "sent", detail);
+    } else {
+      Serial.print(F("FTP archive client failed (store): "));
+      Serial.println(err);
+    }
+  }
+
+  // Record the archive in the local manifest (S-D03: M-54, M-55)
+  if (ok) {
+    appendArchiveManifestEntry(clientUid, siteName, rangeLabel, earliestSeen, latestUpdate,
+                               remotePath, sensorCount);
   }
 
   return ok;
@@ -17866,41 +17912,35 @@ static void handleArchivedClients(EthernetClient &client, const String &query) {
     return;
   }
 
-  // Return manifest of archived clients from LittleFS
+  // Return manifest of archived clients from LittleFS. S-D03: read without a
+  // 2 KB buffer; an unreadable manifest still lists the entries that could be
+  // read (manifestStatus "degraded"). Read-only: nothing is renamed here.
   JsonDocument doc;
-  doc["ftpEnabled"] = gConfig.ftpEnabled;
-
+  WarmManifestStatus manifestStatus = WARM_MAN_ABSENT;
   #ifdef FILESYSTEM_AVAILABLE
-  {
-    FILE *mf = fopen("/fs/archived_clients.json", "r");
-    if (mf) {
-      char buf[2048];
-      size_t nRead = fread(buf, 1, sizeof(buf) - 1, mf);
-      fclose(mf);
-      buf[nRead] = '\0';
-      JsonDocument manifest;
-      if (!deserializeJson(manifest, buf) && manifest["archives"].is<JsonArray>()) {
-        doc["archives"] = manifest["archives"];
-      }
-    }
+  manifestStatus = warmLoadManifest(ARCHIVE_MANIFEST_PATH, doc, MAX_ARCHIVE_MANIFEST_BYTES, true, nullptr,
+                                    kArchiveManifestHooks);
+  if (manifestStatus != WARM_MAN_OK && manifestStatus != WARM_MAN_ABSENT && manifestStatus != WARM_MAN_SALVAGED) {
+    respondStatus(client, 500, F("Archive manifest unreadable"));
+    return;
   }
   #endif
 
   if (!doc["archives"].is<JsonArray>()) {
     doc["archives"].to<JsonArray>();  // Empty array
   }
+  doc["ftpEnabled"] = gConfig.ftpEnabled;
+  doc["manifestStatus"] = (manifestStatus == WARM_MAN_SALVAGED) ? "degraded" : "ok";
 
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-
+  // Serialized straight to the socket (no String copy of the manifest)
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: application/json"));
   client.println(F("Connection: close"));
   client.print(F("Content-Length: "));
-  client.println(jsonOut.length());
+  client.println(measureJson(doc));
   client.println(F("Cache-Control: no-cache"));
   client.println();
-  client.print(jsonOut);
+  serializeJson(doc, client);
 }
 
 static bool loadContactsConfig(JsonDocument &doc) {
