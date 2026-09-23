@@ -850,12 +850,41 @@ static void testMergeSemantics() {
   WarmNewRow rowsLong[] = {tooLong, fine};
   CHECK(warmMergeMonth(dir.c_str(), 2026, 9, rowsLong, 2, big, h, &res) == WARM_OK && res.wrote);
   CHECK(readFile(path) == joinArray({encodeRow(fine)}) && countLogs("not stored") == 1);
+  CHECK(rowsLong[0].state == WARM_ROW_TOO_LONG);
 
-  // A leftover .tmp from a power cut is removed by the next merge
+  // A leftover .tmp from a power cut is removed by the next merge (see testTmpRecovery)
   writeFile(path + ".tmp", "[{\"partial\":");
   WarmNewRow again = makeRow("dev:fine", 20260907, 1, 3, 1.0f, 0);
   CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &again, 1, big, h, &res) == WARM_OK && !res.wrote);
   CHECK(!anyTmp(dir));
+
+  // S-D03: a row too long to encode that would replace a stored row (larger n) leaves
+  // the stored row in place; it used to drop it and write neither. The stored row can
+  // be longer than we write (rows are read up to WARM_ELEM_MAX).
+  resetHooks();
+  const std::string storedLong = fmtStr("{\"d\":20260908,\"c\":\"%s\",\"k\":1,\"mn\":1,\"n\":3}", longUid.c_str());
+  writeFile(path, joinArray({storedLong, encodeRow(fine)}));
+  const std::string beforeLong = readFile(path);
+  WarmNewRow longer = makeRow(longUid.c_str(), 20260908, 1, 9, 2.0f, 0);
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &longer, 1, big, h, &res) == WARM_OK && !res.wrote);
+  CHECK(longer.state == WARM_ROW_TOO_LONG && readFile(path) == beforeLong && countLogs("not stored") == 1);
+  CHECK(fi::state().writeOpens.empty());
+  // ... also when the same batch rewrites the file
+  WarmNewRow pair[] = {longer, makeRow("dev:fine2", 20260908, 1, 3, 1.0f, 0)};
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, pair, 2, big, h, &res) == WARM_OK && res.wrote);
+  CHECK(readFile(path) == joinArray({storedLong, encodeRow(fine), encodeRow(pair[1])}));
+  // ... and when it fits only without the stored row's al, which a replacement carries
+  // over: it is measured with the largest al (so a row this close to the limit is not
+  // stored even when nothing is replaced)
+  resetHooks();
+  const size_t baseLen = encodeRow(makeRow("", 20260909, 1, 3, 1.0f, 0)).size();
+  const std::string edgeUid(WARM_ROW_MAX_WRITE - 1 - baseLen, 'E');
+  WarmNewRow edge = makeRow(edgeUid.c_str(), 20260909, 1, 3, 1.0f, 0);
+  CHECK(encodeRow(edge).size() == WARM_ROW_MAX_WRITE - 1);  // fits with al 0
+  const std::string storedEdge = fmtStr("{\"d\":20260909,\"c\":\"%s\",\"k\":1,\"al\":200,\"n\":2}", edgeUid.c_str());
+  writeFile(path, joinArray({storedEdge}));
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &edge, 1, big, h, &res) == WARM_OK && !res.wrote);
+  CHECK(edge.state == WARM_ROW_TOO_LONG && readFile(path) == joinArray({storedEdge}) && countLogs("not stored") == 1);
   clearDir(dir);
 }
 
@@ -958,7 +987,7 @@ static void testQuarantine() {
 
     // ... and when putting it back fails too, the complete .tmp is kept beside
     // the .bad (the state a power cut between the renames leaves), and the next
-    // merge rebuilds the file from the .bad
+    // merge restores it: it already holds the rows salvaged from the .bad (S-D03)
     clearDir(dir);
     writeFile(path, corrupt);
     resetHooks();
@@ -971,8 +1000,9 @@ static void testQuarantine() {
     CHECK(!fileExists(path) && readFile(bad) == corrupt && readFile(path + ".tmp") == rebuilt);
     resetHooks();
     WarmNewRow add12 = add5;
-    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add12, 1, big, h, &res) == WARM_OK && res.wrote);
+    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add12, 1, big, h, &res) == WARM_OK && !res.wrote);
     CHECK(readFile(path) == rebuilt && readFile(bad) == corrupt && !anyTmp(dir));
+    CHECK(countLogs("restored from its .tmp (4 rows)") == 1 && fi::state().writeOpens.empty());
   }
 
   // A file over the size cap is quarantined and its first maxBytes salvaged
@@ -2218,6 +2248,245 @@ static void testProvenance() {
 }
 
 // ============================================================================
+// Leftover .tmp (S-D03): dropped beside its month file, restored without it
+// ============================================================================
+static void testTmpRecovery() {
+  const std::string dir = makeDir("tmprecovery");
+  const std::string path = monthFile(dir, 2026, 9);
+  const std::string tmp = path + ".tmp";
+  const std::string bad = monthFile(dir, 2026, 9, ".bad");
+  const uint32_t big = 1u << 20;
+  const WarmHooks h = makeHooks(nullptr);
+  WarmMergeResult res = {};
+
+  const WarmNewRow r1 = makeRow("dev:t", 20260901, 1, 5, 1.0f, 0);
+  const WarmNewRow r2 = makeRow("dev:t", 20260902, 1, 5, 2.0f, 0);
+  const WarmNewRow r3 = makeRow("dev:t", 20260903, 1, 5, 3.0f, 0);
+  const std::string complete = joinArray({encodeRow(r1), encodeRow(r2)});
+
+  // (1) the month's first write, cut before its rename: the complete .tmp is restored
+  // and then merged into like the file it is
+  resetHooks();
+  writeFile(tmp, complete);
+  WarmNewRow add1 = r3;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add1, 1, big, h, &res) == WARM_OK && res.wrote);
+  CHECK(readFile(path) == joinArray({encodeRow(r1), encodeRow(r2), encodeRow(r3)}) && !anyTmp(dir));
+  CHECK(countLogs("restored from its .tmp (2 rows)") == 1);
+  // ... also when the merge has nothing to add
+  clearDir(dir);
+  resetHooks();
+  writeFile(tmp, complete);
+  WarmNewRow same = r2;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &same, 1, big, h, &res) == WARM_OK && !res.wrote);
+  CHECK(readFile(path) == complete && !anyTmp(dir) && fi::state().writeOpens.empty());
+
+  // (2) a rebuild cut between its renames (file -> .bad done, .tmp -> file not): the
+  // .tmp holds the rows salvaged from the .bad plus that merge's rows, some of which the
+  // hot tier may no longer have, so it is restored rather than salvaged again
+  clearDir(dir);
+  resetHooks();
+  const std::string corrupt = "[" + encodeRow(r1) + "," + encodeRow(r2) + ",{\"d\":2026";
+  const WarmNewRow gone = makeRow("dev:gone", 20260904, 1, 5, 4.0f, 0);
+  writeFile(bad, corrupt);
+  writeFile(tmp, joinArray({encodeRow(r1), encodeRow(r2), encodeRow(gone)}));
+  WarmNewRow add2 = r3;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add2, 1, big, h, &res) == WARM_OK && res.wrote);
+  CHECK(!res.quarantined && res.salvagedRows == 0);
+  CHECK(readFile(path) == joinArray({encodeRow(r1), encodeRow(r2), encodeRow(gone), encodeRow(r3)}));
+  CHECK(readFile(bad) == corrupt && !anyTmp(dir));
+
+  // (3) a .tmp cut mid-write (or empty) is dropped ...
+  const std::string partials[] = {"", "[", complete.substr(0, complete.size() - 1),
+                                  complete.substr(0, complete.size() / 2)};
+  for (const std::string &partial : partials) {
+    clearDir(dir);
+    resetHooks();
+    writeFile(tmp, partial);
+    WarmNewRow add3 = r3;
+    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add3, 1, big, h, &res) == WARM_OK && res.wrote);
+    CHECK_MSG(readFile(path) == joinArray({encodeRow(r3)}) && !anyTmp(dir) && countLogs("restored") == 0,
+              "partial .tmp of %zu bytes", partial.size());
+  }
+  // ... and with a .bad beside it, the rows are salvaged from the .bad again
+  clearDir(dir);
+  resetHooks();
+  writeFile(bad, corrupt);
+  writeFile(tmp, "[" + encodeRow(r1));
+  WarmNewRow add4 = r3;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add4, 1, big, h, &res) == WARM_OK && res.wrote);
+  CHECK(readFile(path) == joinArray({encodeRow(r1), encodeRow(r2), encodeRow(r3)}) && readFile(bad) == corrupt);
+  CHECK(!anyTmp(dir) && countLogs("restored") == 0);
+
+  // (4) beside its month file a .tmp is dropped, even a complete one: the file is the
+  // committed copy
+  clearDir(dir);
+  resetHooks();
+  writeFile(path, complete);
+  writeFile(tmp, joinArray({encodeRow(r3)}));
+  WarmNewRow add5 = r2;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add5, 1, big, h, &res) == WARM_OK && !res.wrote);
+  CHECK(readFile(path) == complete && !anyTmp(dir));
+
+  // (5) a .tmp over the size cap is not one the merge wrote: dropped
+  clearDir(dir);
+  resetHooks();
+  writeFile(tmp, complete);
+  WarmNewRow add6 = r3;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add6, 1, (uint32_t)complete.size() - 1, h, &res) == WARM_OK);
+  CHECK(readFile(path) == joinArray({encodeRow(r3)}) && !anyTmp(dir));
+
+  // (6) when the .tmp cannot be checked or renamed, nothing is written and it is kept
+  // for the next merge: a failed stat of it, a failed read of it, a failed rename
+  clearDir(dir);
+  resetHooks();
+  writeFile(tmp, complete);
+  WarmNewRow probe = r3;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &probe, 1, big, h, &res) == WARM_OK);
+  const std::vector<long> stats = opIndices(fi::OP_STAT);
+  const std::vector<long> reads = opIndices(fi::OP_FREAD);
+  const std::vector<long> renames = opIndices(fi::OP_RENAME);
+  CHECK(stats.size() >= 2 && !reads.empty() && !renames.empty());
+  if (stats.size() >= 2 && !reads.empty() && !renames.empty()) {
+    const long faults[] = {stats[1], reads[0], renames[0]};
+    for (long at : faults) {
+      clearDir(dir);
+      resetHooks();
+      writeFile(tmp, complete);
+      fi::state().failAt = at;
+      WarmNewRow add7 = r3;
+      CHECK_MSG(warmMergeMonth(dir.c_str(), 2026, 9, &add7, 1, big, h, &res) == WARM_IO_ERROR, "fault at op %ld", at);
+      CHECK_MSG(!fileExists(path) && readFile(tmp) == complete && fi::state().writeOpens.empty(), "fault at op %ld",
+                at);
+      resetHooks();
+      WarmNewRow add8 = r3;
+      CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add8, 1, big, h, &res) == WARM_OK && res.wrote);
+      CHECK(readFile(path) == joinArray({encodeRow(r1), encodeRow(r2), encodeRow(r3)}) && !anyTmp(dir));
+    }
+  }
+  // ... and no memory to read it
+  {
+    TestAllocator alloc;
+    alloc.failAt = 0;
+    const WarmHooks ha = makeHooks(&alloc);
+    clearDir(dir);
+    resetHooks();
+    writeFile(tmp, complete);
+    WarmNewRow add9 = r3;
+    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add9, 1, big, ha, &res) == WARM_NO_MEMORY);
+    CHECK(!fileExists(path) && readFile(tmp) == complete && alloc.live() == 0);
+  }
+
+  // (7) warmRecoverMonthTmp alone (pruneDailySummaryFiles) reports the month file's state
+  clearDir(dir);
+  resetHooks();
+  int state = -2;
+  CHECK(warmRecoverMonthTmp(path.c_str(), tmp.c_str(), big, h, &state) == WARM_OK && state == 0);
+  writeFile(tmp, complete);
+  CHECK(warmRecoverMonthTmp(path.c_str(), tmp.c_str(), big, h, &state) == WARM_OK && state == 1);
+  CHECK(readFile(path) == complete && !fileExists(tmp));
+  writeFile(tmp, "[");
+  CHECK(warmRecoverMonthTmp(path.c_str(), tmp.c_str(), big, h, &state) == WARM_OK && state == 1);
+  CHECK(readFile(path) == complete && !fileExists(tmp));
+  removeFile(path);
+  writeFile(tmp, "[");
+  CHECK(warmRecoverMonthTmp(path.c_str(), tmp.c_str(), big, h, &state) == WARM_OK && state == 0);
+  CHECK(!fileExists(path) && !fileExists(tmp));
+  clearDir(dir);
+}
+
+// ============================================================================
+// Hot-tier prune cutoff (S-D03): no day is pruned before the rollup processed it
+// ============================================================================
+
+// pruneHotTierIfNeeded()'s compaction: keeps the snapshots at or after cutoff
+static void pruneRing(LegacyRing &r, double cutoff) {
+  std::vector<TelemetrySnapshot> kept;
+  const WarmSeries s = r.series();
+  for (uint16_t j = 0; j < r.snapshotCount; ++j) {
+    const TelemetrySnapshot &snap = r.snapshots[warmRingIndex(s, r.snapshotCount, j)];
+    if (snap.timestamp >= cutoff) kept.push_back(snap);
+  }
+  for (size_t j = 0; j < kept.size(); ++j) r.snapshots[j] = kept[j];
+  r.snapshotCount = (uint16_t)kept.size();
+  r.writeIndex = (uint16_t)(kept.size() % r.cap());
+}
+
+static void testPruneCutoff() {
+  // The cutoff is at most the start of the first day the rollup has not processed
+  {
+    WarmRollupState s;
+    const double cutoff = epochOf(2026, 6, 22, 3600.0);
+    CHECK(warmPruneCutoff(s, cutoff) == cutoff);  // before the first tick
+    s.nextDn = dnOf(2026, 9, 20);                  // up to date
+    CHECK(warmPruneCutoff(s, cutoff) == cutoff);
+    s.nextDn = dnOf(2026, 6, 1);                   // a backfill at June 1
+    CHECK(warmPruneCutoff(s, cutoff) == epochOf(2026, 6, 1));
+    s.nextDn = dnOf(2026, 9, 20);
+    s.dirtyDn = dnOf(2026, 5, 30);                 // a late snapshot marked May 30
+    CHECK(warmPruneCutoff(s, cutoff) == epochOf(2026, 5, 30));
+  }
+
+  // A 30-day backfill takes several ticks (2 rewrites each). Pruning a 7-day hot tier
+  // after every tick, as the sketch does after each hourly rollup, loses no day with
+  // the clamped cutoff; with the plain one, Sep 1..12 are pruned before they are rolled.
+  const std::string dir = makeDir("prunecut");
+  const WarmRollupConfig cfg = defaultConfig(dir);
+  const WarmHooks h = makeHooks(nullptr);
+  const int32_t today = dnOf(2026, 9, 20);
+  const double now = (double)today * 86400.0 + 3600.0;
+  const double retention = now - 7.0 * 86400.0;
+  for (int clamp = 1; clamp >= 0; --clamp) {
+    clearDir(dir);
+    resetHooks();
+    Fleet fleet;
+    fleet.addSensors(2, 90);
+    fleet.fill(today - 30, today - 1, 2, 30.0f);
+    WarmRollupState s;
+    int ticks = 0;
+    for (; ticks < 20; ++ticks) {
+      const WarmTickSummary sum = tick(s, fleet, now, cfg, h);
+      const double cutoff = clamp ? warmPruneCutoff(s, retention) : retention;
+      for (LegacyRing &r : fleet.rings) pruneRing(r, cutoff);
+      if (sum.batches == 0) break;
+    }
+    CHECK_MSG(ticks == (clamp ? 3 : 2) && s.nextDn == today, "clamp %d: %d ticks", clamp, ticks);
+    const auto aug = fileKeys(monthFile(dir, 2026, 8));
+    const auto sep = fileKeys(monthFile(dir, 2026, 9));
+    long missing = 0;
+    for (int32_t dn = today - 30; dn <= today - 1; ++dn) {
+      int y, m, d;
+      warmDnToCivil(dn, &y, &m, &d);
+      const auto &keys = (m == 8) ? aug : sep;
+      for (const LegacyRing &r : fleet.rings) {
+        auto it = keys.find(keyOf(warmDnToYmd(dn), r.clientUid.c_str(), r.sensorIndex));
+        if (it == keys.end() || it->second.size() != 1 || it->second[0] != 2) missing++;
+      }
+    }
+    CHECK_MSG(missing == (clamp ? 0 : 24), "clamp %d: %ld rows missing", clamp, missing);
+    // once the rollup is idle the plain cutoff applies again
+    CHECK(warmPruneCutoff(s, retention) == retention);
+  }
+
+  // A month retried after an I/O error keeps its days in the hot tier too
+  {
+    clearDir(dir);
+    resetHooks();
+    Fleet fleet;
+    fleet.addSensors(1, 90);
+    fleet.fill(today - 30, today - 1, 2, 30.0f);
+    WarmRollupState s;
+    tick(s, fleet, now, cfg, h);
+    const int32_t at = s.nextDn;
+    CHECK(at == dnOf(2026, 9, 1));
+    resetHooks();
+    fi::state().failAt = 0;
+    tick(s, fleet, now, cfg, h);
+    CHECK(s.stats.ioErrors == 1 && s.nextDn == at && warmPruneCutoff(s, retention) == (double)at * 86400.0);
+  }
+  clearDir(dir);
+}
+
+// ============================================================================
 int main() {
   // Always under /tmp, not $TMPDIR: the store's path buffers are sized for
   // "/fs/history", and macOS's long $TMPDIR would overflow them (see makeDir)
@@ -2244,6 +2513,8 @@ int main() {
       {"H-23 replay", testH23Replay},
       {"manifest", testManifest},
       {"provenance", testProvenance},
+      {"tmp recovery", testTmpRecovery},
+      {"prune cutoff", testPruneCutoff},
   };
   for (const Test &t : tests) {
     const long before = gFailures;
