@@ -153,9 +153,13 @@ reset to one day at the next rollup).
 The hot tier, and so every daily row, holds only fresh readings, on the day they were
 taken (S-D03):
 - **Fresh readings only.** A value the client reused (`ru`) or sent for a failed sensor
-  (`sf`), a faulted read (`fault`), a current-loop note without raw mA, and a
-  `relay_timeout` alarm (which re-sends the last value) update the dashboard but are not
-  recorded.
+  (`sf`), a faulted read (`fault`), and a current-loop note without raw mA update the
+  dashboard but are not recorded.
+- **No snapshots from alarm notes.** An alarm note's `t` can be when it was sent rather
+  than when its value was read: seconds later on a current-loop client, hours later for a
+  `relay_timeout` or for the `clear` sent when a config push turns alarms off. The note
+  does not say which, so its value is not recorded; the reading enters history through
+  telemetry or the daily report at its own time, and the alarm counts in `al`.
 - **Stamped with the client's acquisition time, never a guessed one.** The time is the
   note's `t` (the per-sensor `t` in daily reports), in whole seconds. A reading without a
   valid `t` (before 2020, or more than 1 h ahead of the server clock) is left out rather
@@ -163,18 +167,22 @@ taken (S-D03):
   client's first time sync, and daily-report readings from clients older than v2.0.56,
   which send no per-sensor `t`.
 - **Counted once.** The same reading arriving again (telemetry, then the daily report's
-  copy, or an alarm) at the same level within 1 s is stored once.
+  copy, or an on-demand re-send) within 1 s is stored once. Only the time is compared: a
+  current-loop level is recomputed on arrival, with the temperature of that moment.
 - **Voltage only from the same measurement.** `vt` uses the voltage sent in the same
   telemetry note, or the daily report's voltage when the reading was taken within an
-  hour of it on the same UTC day. Alarm notes carry no voltage, and a cached voltage is
+  hour of it on the same UTC day. An on-demand note can re-send an older reading (a
+  solar-only client may skip the sample), so its voltage is used only when the reading is
+  from the same UTC day and within an hour of the note's arrival. A cached voltage is
   never used.
 - **Alarms on the day they happened.** `al` counts alarms by the alarm note's `t`, not by
   when the server received it; an alarm without a valid `t` is not counted.
 - **No fill-in.** A day with no readings for a sensor has no row. Nothing is interpolated
   or carried over from another day.
-- **Exact times in `hot_tier.json`.** Timestamps are saved as integers. Older firmware
-  saved doubles, which could reload up to 512 s off; on the first boot after the update,
-  such a snapshot within 512 s of a UTC midnight is dropped, since its day is not known.
+- **Exact times.** Snapshot timestamps are written as integers in `hot_tier.json`,
+  `/api/history` and the client FTP archive. Older firmware saved doubles, which could
+  reload up to 512 s off; on the first boot after the update, such a snapshot within
+  512 s of a UTC midnight is dropped, since its day is not known.
 
 ### Archived Clients Manifest
 When a client is removed and archived to FTP, an entry (client UID, site, display label,

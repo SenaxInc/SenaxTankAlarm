@@ -7643,8 +7643,8 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
 // Record a telemetry snapshot for the per-sensor history ring buffer.
 //
 // `eventEpoch` is the caller's best estimate of when the *sensor reading was
-// actually acquired* (NOT when the note was received). For telemetry/alarm
-// notes this is the client's top-level `t`; for daily notes it is the per-sensor
+// actually acquired* (NOT when the note was received). For telemetry notes
+// this is the client's top-level `t`; for daily notes it is the per-sensor
 // nested `t["t"]` added in v2.0.56. Using sensor time as the chart X-axis keeps
 // trends accurate when Notecard queues drain after a network gap, when daily
 // reports package a reading taken 30+ minutes earlier, or when a stuck/reused
@@ -7692,11 +7692,12 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
   }
   
   // Deduplicate: the same acquisition can arrive more than once (telemetry, the
-  // daily report's copy, a republished stuck/reused reading), up to 1 s apart and
-  // out of order. S-D03: check the whole ring and return before the day is marked
-  // for a re-roll, so a copy is never counted twice in a daily row.
+  // daily report's copy, an on-demand re-send), up to 1 s apart and out of order.
+  // S-D03: check the whole ring by time alone (a current-loop level is recomputed on
+  // arrival and can differ) and return before the day is marked for a re-roll, so a
+  // copy is never counted twice in a daily row.
   if (warmRingHasAcquisition(hist->snapshots, MAX_HOURLY_HISTORY_PER_SENSOR, hist->snapshotCount,
-                             hist->writeIndex, snapEpoch, level)) {
+                             hist->writeIndex, snapEpoch)) {
     return;
   }
   
@@ -12983,6 +12984,12 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
   // The voltage is this note's own, never a cached one from another time.
   double telemetryEpoch = doc["t"] | 0.0;
+  // S-D03: an on-demand note re-sends the last reading when the client could not sample
+  // (solar-only voltage gate) but measures "v" at send time, so keep that voltage only when
+  // the reading is from the same UTC day and within an hour of the note's arrival.
+  if (strcmp(doc["r"] | "", "ondemand") == 0 && !warmSameUtcDayWithin(telemetryEpoch, epoch, 3600.0)) {
+    noteVin = 0.0f;
+  }
   recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, noteVin, telemetryEpoch);
 }
 
@@ -13145,8 +13152,8 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // Relay safety timeout — relay was forced off after exceeding max ON duration
   // This is an operational event, NOT a sensor alarm clear — do not clear alarmActive
   bool isRelayTimeout = (strcmp(type, "relay_timeout") == 0);
-  // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown). The
-  // daily alarm count and the level snapshot both use it, so they land on the same day.
+  // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown), for
+  // the daily alarm count.
   const double alarmEventEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
 
   if (strcmp(type, "clear") == 0 || isRecovery) {
@@ -13173,22 +13180,10 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh, alarmEventEpoch);
   }
   rec->currentValue = level;
-  // Record historical snapshot from alarm so trend data captures alarm events.
-  // S-D03: only a fresh reading. relay_timeout re-sends the last value at send time, and
-  // ru/sf/fault mark a reused or failed value.
-  const bool freshReading = !isRelayTimeout && ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) &&
-                            doc["fault"].isNull();
-  if (freshReading && level > 0.0f) {
-    const char *alarmSiteName = doc["s"] | rec->site;
-    // Use the client-reported capacity (cap) as the immutable tank height, never the
-    // current level. Falls back to 48 in only if the note predates self-describing payloads.
-    float alarmCap = doc["cap"] | 0.0f;
-    if (alarmCap <= 0.0f) alarmCap = 48.0f;
-    // S-D03: at the alarm's own time (no fallback), with no voltage: alarm notes carry no "v",
-    // and a cached one may be from another day.
-    recordTelemetrySnapshot(clientUid, alarmSiteName, sensorIndex,
-                            alarmCap, level, 0.0f, alarmEventEpoch);
-  }
+  // S-D03: an alarm note adds no history snapshot. Its "t" can be when the note was sent,
+  // not when the value was read (seconds later on a current-loop client, hours later for a
+  // config-push clear), and the note does not say which. The reading enters history from
+  // telemetry or the daily report at its own time.
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   gSensorRegistryDirty = true;
 
@@ -16739,7 +16734,7 @@ static bool archiveClientToFtp(const char *clientUid) {
         uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
         TelemetrySnapshot &snap = hist.snapshots[idx];
         JsonArray pt = readings.add<JsonArray>();
-        pt.add(snap.timestamp);
+        pt.add((uint32_t)snap.timestamp);  // S-D03: whole seconds, exact (see saveHotTierSnapshot)
         pt.add(roundTo(snap.level, 1));
         pt.add(roundTo(snap.voltage, 2));
       }
@@ -17396,7 +17391,7 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
       if (cutoffEpoch > 0.0 && snap.timestamp < cutoffEpoch) continue;
       
       JsonObject reading = readings.add<JsonObject>();
-      reading["timestamp"] = snap.timestamp;
+      reading["timestamp"] = (uint32_t)snap.timestamp;  // S-D03: exact (see saveHotTierSnapshot)
       reading["level"] = snap.level;
     }
     
@@ -17449,7 +17444,7 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
       if (cutoffEpoch > 0.0 && snap.timestamp < cutoffEpoch) continue;
       if (snap.voltage > 0) {
         JsonObject voltObj = voltageArray.add<JsonObject>();
-        voltObj["timestamp"] = snap.timestamp;
+        voltObj["timestamp"] = (uint32_t)snap.timestamp;  // S-D03: exact (see saveHotTierSnapshot)
         voltObj["voltage"] = snap.voltage;
         voltObj["client"] = hist.clientUid;
       }

@@ -348,15 +348,17 @@ static inline bool warmLegacyEpochAmbiguous(double ts) {
 
 // True when the ring already holds this acquisition. Telemetry `t` arrives
 // rounded to the second and the daily report's per-sensor `t` truncated, so two
-// copies of one reading can be 1 s apart, and they can arrive out of order.
+// copies of one reading can be 1 s apart, and they can arrive out of order. The
+// ring holds one sensor, which is read once per sample pass, so the time decides.
+// The level cannot: a current-loop level is recomputed on arrival, with the
+// temperature of that moment.
 static inline bool warmRingHasAcquisition(const TelemetrySnapshot *ring, uint16_t cap, uint16_t count,
-                                          uint16_t writeIndex, double ts, float level) {
+                                          uint16_t writeIndex, double ts) {
   if (!ring || cap == 0) return false;
   const WarmSeries s = {nullptr, 0, ring, cap, count, writeIndex};
   const uint16_t cnt = (count > cap) ? cap : count;
   for (uint16_t j = 0; j < cnt; ++j) {
-    const TelemetrySnapshot &e = ring[warmRingIndex(s, cnt, j)];
-    if (fabs(e.timestamp - ts) <= 1.0 && fabsf(e.level - level) < 0.01f) return true;
+    if (fabs(ring[warmRingIndex(s, cnt, j)].timestamp - ts) <= 1.0) return true;
   }
   return false;
 }

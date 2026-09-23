@@ -1969,46 +1969,43 @@ static void testProvenance() {
     }
   }
 
-  // (5) The same acquisition is found anywhere in the ring, up to 1 s either way
+  // (5) The same acquisition is found anywhere in the ring, up to 1 s either way, by time alone
   {
     const double t0 = 1790294400.0;
     LegacyRing r("dev:864450000000003", 1, 4);
     for (int i = 0; i < 6; ++i) r.add(t0 + 60.0 * i, 10.0f + (float)i, 0.0f);  // wraps: keeps i = 2..5
     CHECK(r.writeIndex == 2 && r.snapshotCount == 4);
-    auto has = [&r](uint16_t count, uint16_t writeIndex, double ts, float level) {
-      return warmRingHasAcquisition(r.snapshots.data(), r.cap(), count, writeIndex, ts, level);
+    auto has = [&r](uint16_t count, uint16_t writeIndex, double ts) {
+      return warmRingHasAcquisition(r.snapshots.data(), r.cap(), count, writeIndex, ts);
     };
     for (int i = 2; i < 6; ++i) {
       const double ts = t0 + 60.0 * i;
-      const float level = 10.0f + (float)i;
-      CHECK_MSG(has(4, 2, ts, level) && has(4, 2, ts - 1.0, level) && has(4, 2, ts + 1.0, level) &&
-                    has(4, 2, ts, level + 0.005f),
-                "entry %d", i);
-      CHECK_MSG(!has(4, 2, ts + 2.0, level) && !has(4, 2, ts - 2.0, level) && !has(4, 2, ts, level + 0.02f),
-                "entry %d", i);
+      CHECK_MSG(has(4, 2, ts) && has(4, 2, ts - 1.0) && has(4, 2, ts + 1.0), "entry %d", i);
+      CHECK_MSG(!has(4, 2, ts + 2.0) && !has(4, 2, ts - 2.0), "entry %d", i);
     }
-    CHECK(!has(4, 2, t0, 10.0f) && !has(4, 2, t0 + 60.0, 11.0f));  // overwritten
-    CHECK(has(9, 2, t0 + 300.0, 15.0f));                            // a count above cap is clamped
+    CHECK(!has(4, 2, t0) && !has(4, 2, t0 + 60.0));  // overwritten
+    CHECK(has(9, 2, t0 + 300.0));                     // a count above cap is clamped
     // only the entries in use are scanned
-    CHECK(has(2, 2, t0 + 240.0, 14.0f) && has(2, 2, t0 + 300.0, 15.0f) && !has(2, 2, t0 + 120.0, 12.0f));
-    CHECK(has(4, 0, t0 + 120.0, 12.0f) && has(1, 0, t0 + 180.0, 13.0f) && !has(1, 0, t0 + 300.0, 15.0f));
-    CHECK(!has(0, 2, t0 + 300.0, 15.0f) && !has(4, 2, t0 + 300.0, NAN));
-    CHECK(!warmRingHasAcquisition(nullptr, 4, 4, 0, t0, 10.0f));
-    CHECK(!warmRingHasAcquisition(r.snapshots.data(), 0, 4, 0, t0 + 120.0, 12.0f));
+    CHECK(has(2, 2, t0 + 240.0) && has(2, 2, t0 + 300.0) && !has(2, 2, t0 + 120.0));
+    CHECK(has(4, 0, t0 + 120.0) && has(1, 0, t0 + 180.0) && !has(1, 0, t0 + 300.0));
+    CHECK(!has(0, 2, t0 + 300.0) && !has(4, 2, NAN));
+    CHECK(!warmRingHasAcquisition(nullptr, 4, 4, 0, t0));
+    CHECK(!warmRingHasAcquisition(r.snapshots.data(), 0, 4, 0, t0 + 120.0));
 
-    // Telemetry (t rounded up), then the daily report's copy (t truncated): one snapshot
+    // Telemetry (t rounded up), then the daily report's copy (t truncated): one snapshot, also
+    // when the server recomputed the current-loop level with a newer temperature in between
     Fleet fleet;
     fleet.rings.push_back(LegacyRing("dev:864450000000004", 1, 90));
     LegacyRing &ring = fleet.rings[0];
     auto record = [&ring](double ts, float level) {
-      if (!warmRingHasAcquisition(ring.snapshots.data(), ring.cap(), ring.snapshotCount, ring.writeIndex, ts, level)) {
+      if (!warmRingHasAcquisition(ring.snapshots.data(), ring.cap(), ring.snapshotCount, ring.writeIndex, ts)) {
         ring.add(ts, level, 0.0f);
       }
     };
     const double t = epochOf(2026, 9, 21, 50000.0);
     record(t + 1.0, 40.0f);
     record(t + 600.0, 41.0f);
-    record(t, 40.0f);
+    record(t, 40.02f);
     CHECK(ring.snapshotCount == 2);
     std::vector<WarmNewRow> rows(4);
     const uint16_t n = warmComputeRows(fleet.series(), fleet.count(), dnOf(2026, 9, 21), dnOf(2026, 9, 21), nullptr,
@@ -2016,7 +2013,8 @@ static void testProvenance() {
     CHECK(n == 1 && rows[0].n == 2 && closeTo(rows[0].av, 40.5f));
   }
 
-  // (6) The daily report's voltage goes only with a reading from the same UTC day, within the hour
+  // (6) The daily report's (and an on-demand note's) voltage goes only with a reading from the same
+  // UTC day, within the hour
   {
     const double d0 = epochOf(2026, 9, 21);
     CHECK(warmSameUtcDayWithin(d0 + 3600.0, d0 + 7200.0, 3600.0));
@@ -2024,6 +2022,7 @@ static void testProvenance() {
     CHECK(!warmSameUtcDayWithin(d0 + 3600.0, d0 + 7201.0, 3600.0));
     CHECK(!warmSameUtcDayWithin(d0 - 5.0, d0 + 5.0, 3600.0));        // 10 s apart across midnight
     CHECK(!warmSameUtcDayWithin(d0 - 1200.0, d0 + 1800.0, 3600.0));  // 23:40 reading, 00:30 report
+    CHECK(!warmSameUtcDayWithin(d0 - 1200.0, d0 + 1200.0, 3600.0));  // 23:40 reading re-sent at 00:20
     CHECK(warmSameUtcDayWithin(d0 + 5.0, d0 + 5.0, 0.0));
     CHECK(!warmSameUtcDayWithin(0.0, d0, 1e9) && !warmSameUtcDayWithin(d0, 0.0, 1e9) &&
           !warmSameUtcDayWithin(NAN, d0, 1e9) && !warmSameUtcDayWithin(d0, -1.0, 1e9));
