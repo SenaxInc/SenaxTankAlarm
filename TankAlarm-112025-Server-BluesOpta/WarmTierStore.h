@@ -74,7 +74,7 @@
 #define WARM_YIELD_EVERY 32           // Rows between yield() (watchdog) calls
 #endif
 #ifndef WARM_MAX_FAILED_TICKS
-#define WARM_MAX_FAILED_TICKS 6       // Ticks in a row a failing month is retried before it is skipped
+#define WARM_MAX_FAILED_TICKS 6       // Failed tries, with no batch getting through in between, before a month is skipped
 #endif
 #ifndef WARM_MIN_VALID_EPOCH
 #define WARM_MIN_VALID_EPOCH 1704067200.0  // 2024-01-01Z: below this the clock is not set
@@ -348,8 +348,9 @@ static inline double warmAcquisitionEpoch(double eventEpoch, double serverNow) {
 // Clients before v2.2.16 send telemetry and alarm `t` as a double, and it arrives
 // rounded to the nearest second (ArduinoJson writes 10 significant digits). So a `t`
 // of exactly 00:00:00Z may be from the last half second of the day before, and its
-// day is not known. From v2.2.16 (#318) that `t` is truncated to whole seconds, so the
-// sketch applies this only to older clients (CLIENT_EXACT_T_SINCE). The daily report's
+// day is not known. From v2.2.16 (#318) telemetry and level/float/relay alarm `t` is
+// truncated to whole seconds, so the sketch applies this only to older clients
+// (CLIENT_EXACT_T_SINCE) and to sensor-fault/sensor-stuck notes. The daily report's
 // per-sensor `t` is truncated and does not need this.
 static inline bool warmRoundedEpochAtMidnight(double t) {
   return t > 0.0 && fmod(t, 86400.0) == 0.0;

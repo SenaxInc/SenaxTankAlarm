@@ -198,8 +198,9 @@ taken (S-D03):
   (or from notes without `fv`) arrive rounded to the second, so one of exactly 00:00:00Z
   may be from the last half second of the day before; that telemetry reading is left out
   (its daily-report copy, whose `t` is truncated, is not) and that alarm is not counted.
-  From v2.2.16 (#318) the client truncates that `t` to whole seconds, so its 00:00:00Z is
-  recorded and counted.
+  From v2.2.16 (#318) the client truncates telemetry and level/float/relay alarm `t` to
+  whole seconds, so their 00:00:00Z is recorded and counted. Its sensor-fault and
+  sensor-stuck notes still send a fractional `t`, so those keep the midnight check.
 - **Counted once.** The same reading arriving again (telemetry, then the daily report's
   copy, or an on-demand re-send) within 1 s is stored once. Only the time is compared: a
   current-loop level is recomputed on arrival, with the temperature of that moment.
