@@ -194,8 +194,8 @@ taken (S-D03):
   without a valid `t` (before 2020, or more than 1 h ahead of the server clock) is left
   out rather than stamped with the time it was received. This leaves out readings taken
   before a client's first time sync, and daily-report readings from clients older than
-  v2.0.56, which send no per-sensor `t`. From v2.2.16 (#318) every note `t` is a whole
-  minute, truncated. An older client's `t` arrives in whole seconds, with telemetry and
+  v2.0.56, which send no per-sensor `t`. From v2.2.16 (#318) every telemetry, daily-report
+  and alarm `t` is a whole minute, truncated. An older client's `t` arrives in whole seconds, with telemetry and
   alarm `t` rounded, so a reading or alarm from the last half second of a UTC day may be
   filed on the next day.
 - **Counted once.** The same reading arriving again (telemetry, then the daily report's

@@ -12752,9 +12752,10 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
 }
 
 // S-D03: first client firmware whose note `t` is exact. #318 ships in 2.2.16: such a client
-// sends every note `t` as a whole minute (truncated, as an integer), and on-demand telemetry
-// for a sensor it has not sampled since boot omits `t` instead of stamping its boot value
-// with the send time (see handleTelemetry). Every client note carries its "fv".
+// sends every telemetry, daily-report and alarm `t` as a whole minute (truncated, as an
+// integer), and on-demand telemetry for a sensor it has not sampled since boot omits `t`
+// instead of stamping its boot value with the send time (see handleTelemetry). Every client
+// note carries its "fv".
 static const char CLIENT_EXACT_T_SINCE[] = "2.2.16";
 
 static void handleTelemetry(JsonDocument &doc, double epoch) {
