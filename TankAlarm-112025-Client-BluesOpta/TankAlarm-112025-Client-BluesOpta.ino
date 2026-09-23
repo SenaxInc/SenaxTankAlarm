@@ -25,6 +25,9 @@
 // Shared library - common constants and utilities
 #include <TankAlarm_Common.h>
 
+// C-T01: pure alarm debounce / rate-window helpers (no Arduino deps; host-tested in tests/host)
+#include "TankAlarm_AlarmDebounce.h"
+
 #include <Arduino.h>
 #include <Wire.h>
 
