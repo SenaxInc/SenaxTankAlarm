@@ -4378,6 +4378,18 @@ static double currentEpoch() {
   return gLastSyncedEpoch + (double)deltaMs / 1000.0;
 }
 
+// Note times: whole minutes, truncated, so a reading never moves to another UTC day. Always
+// written as an integer, never as a double: ArduinoJson stores a double that fits a float as a
+// float and prints 7 significant digits (up to ~500 s off). currentEpoch() itself stays precise
+// for schedules. 0 = clock not set.
+static uint32_t noteEpochMinute(double epoch) {
+  if (!(epoch > 0.0)) {
+    return 0;
+  }
+  uint32_t seconds = (uint32_t)epoch;
+  return seconds - (seconds % 60U);
+}
+
 static void ensureTimeSync() {
   if (millis() - gLastTimeSyncMillis > 6UL * 60UL * 60UL * 1000UL || gLastSyncedEpoch <= 0.0) {
     syncTimeFromNotecard();
@@ -4838,7 +4850,7 @@ static void reinitializeHardware() {
         recovDoc["k"] = cfg.sensorIndex;
         recovDoc["y"] = "sensor-recovered";
         recovDoc["rd"] = 0;
-        recovDoc["t"] = currentEpoch();
+        recovDoc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, recovDoc, true);
       }
     }
@@ -4853,7 +4865,7 @@ static void reinitializeHardware() {
       clearDoc["k"] = cfg.sensorIndex;
       clearDoc["y"] = "clear";
       clearDoc["rd"] = 0;
-      clearDoc["t"] = currentEpoch();
+      clearDoc["t"] = noteEpochMinute(currentEpoch());
       publishNote(ALARM_FILE, clearDoc, true);
     }
 
@@ -5188,7 +5200,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
         recovDoc["k"] = gConfig.monitors[i].sensorIndex;
         recovDoc["y"] = "sensor-recovered";
         recovDoc["rd"] = 0;
-        recovDoc["t"] = currentEpoch();
+        recovDoc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, recovDoc, true);
       }
       if (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched) {
@@ -5198,7 +5210,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
         clearDoc["k"] = gConfig.monitors[i].sensorIndex;
         clearDoc["y"] = "clear";
         clearDoc["rd"] = 0;
-        clearDoc["t"] = currentEpoch();
+        clearDoc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, clearDoc, true);
       }
       // Zero out stale runtime state so it's clean if monitor is re-added later
@@ -5249,7 +5261,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           recovDoc["k"] = gConfig.monitors[i].sensorIndex;
           recovDoc["y"] = "sensor-recovered";
           recovDoc["rd"] = 0;
-          recovDoc["t"] = currentEpoch();
+          recovDoc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, recovDoc, true);
           // C-T01: no NEW-B re-assertion here; reinitializeHardware() below clears the latch
           // and sends a clear (see validateSensorReading())
@@ -5474,7 +5486,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
         doc["s"] = gConfig.siteName;
         doc["k"] = gConfig.monitors[idx].sensorIndex;
         doc["y"] = "sensor-fault";
-        doc["t"] = currentEpoch();
+        doc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, doc, true);
       }
     }
@@ -5535,7 +5547,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
           doc["k"] = cfg.sensorIndex;
           doc["y"] = "sensor-fault";
           doc["rd"] = reading;
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, doc, true);
         }
       }
@@ -5563,7 +5575,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
           doc["k"] = cfg.sensorIndex;
           doc["y"] = "sensor-stuck";
           doc["rd"] = reading;
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, doc, true);
         }
       }
@@ -5591,7 +5603,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
         doc["k"] = cfg.sensorIndex;
         doc["y"] = "sensor-recovered";
         doc["rd"] = reading;
-        doc["t"] = currentEpoch();
+        doc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, doc, true);
       }
       // C-T01 (NEW-B): the server treats sensor-recovered as a clear and has already replaced
@@ -6457,7 +6469,7 @@ static void sendRegistration(const char *reason) {
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["r"] = reason;
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   doc["mc"] = 0;  // Signals server: no monitors configured
   doc["fv"] = FIRMWARE_VERSION;
 
@@ -6575,12 +6587,13 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   buildSensorObject(doc.as<JsonObject>(), idx);
 
   doc["r"] = reason;
-  // Use acquisition time so stale/reused values do not get a fresh timestamp. Whole seconds,
-  // truncated like the daily report's per-sensor t: ArduinoJson rounds a fractional epoch to
-  // 10 digits, which put a 23:59:59.5+ reading on the next day. No valid reading since boot
-  // (e.g. an on-demand request before the first sample): send no t rather than a guessed one.
+  // Use acquisition time so stale/reused values do not get a fresh timestamp. Whole minutes,
+  // truncated (noteEpochMinute()), like the alarm note's t and the daily report's per-sensor t,
+  // so every copy of a reading carries the same t and stays on the day it was measured. No
+  // valid reading since boot (e.g. an on-demand request before the first sample): send no t
+  // rather than a guessed one.
   if (state.lastReadingEpoch > 0.0) {
-    doc["t"] = (uint32_t)state.lastReadingEpoch;
+    doc["t"] = noteEpochMinute(state.lastReadingEpoch);
   }
 
   // TEMPORARY (2026-06-15): include system voltage in every telemetry note so the dashboard
@@ -6910,8 +6923,8 @@ static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches) {
   // Acquisition time of the reading this note carries, as sendTelemetry() does, so the server
   // files the level under the day it was measured (a relay_timeout or config-push note can go
   // out hours after the last sample). Every latch edge and retry is sent on a fresh sample.
-  // Whole seconds, truncated, as in sendTelemetry().
-  doc["t"] = (uint32_t)((state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch());
+  // Whole minutes, truncated, as in sendTelemetry().
+  doc["t"] = noteEpochMinute((state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch());
 
   publishNote(ALARM_FILE, doc, true);
   Serial.print(F("Alarm sent for monitor "));
@@ -7171,8 +7184,8 @@ static void sendUnloadEvent(uint8_t idx, float peakInches, float currentValue, d
   // Note: "type" = "unload" omitted — routing is by file (unload.qi)
   doc["pk"] = roundTo(peakInches, 1);      // Peak height
   doc["em"] = roundTo(currentValue, 1);   // Empty/low height
-  doc["pt"] = peakEpoch;                    // Peak timestamp
-  doc["t"] = currentEpoch();               // Event timestamp
+  doc["pt"] = noteEpochMinute(peakEpoch);         // Peak timestamp
+  doc["t"] = noteEpochMinute(currentEpoch());     // Event timestamp
 
   // Include raw sensor readings only if available
   if (state.unloadPeakSensorMa >= 4.0f) {
@@ -7302,7 +7315,7 @@ static void sendSolarAlarm(SolarAlertType alertType) {
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["y"] = "solar";
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   
   // Alert type ("desc" omitted — derivable from alert enum on server)
   switch (alertType) {
@@ -7614,7 +7627,7 @@ static void sendBatteryAlarm(BatteryAlertType alertType, float voltage) {
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["y"] = "battery";
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   
   // Alert type ("desc" and "state" omitted — derivable from alert + voltage on server)
   switch (alertType) {
@@ -7753,7 +7766,7 @@ static void sendPowerStateChange(PowerState oldState, PowerState newState, float
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["y"] = "power";
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   
   // State transition (compact: "from"/"to" encode direction, no need for "recovering" or "desc")
   doc["from"] = oldDesc;
@@ -8123,7 +8136,7 @@ static void checkSolarOnlySunsetProtocol(unsigned long now) {
           doc["c"] = gDeviceUID;
           doc["s"] = gConfig.siteName;
           doc["y"] = "solar_sunset";
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           doc["v"] = roundTo(gVinVoltage, 2);
           doc["bootCount"] = gSolarOnlyBootCount;
           doc["uptime"] = millis() / 1000UL;
@@ -8374,7 +8387,7 @@ static void updatePowerState() {
           doc["c"] = gDeviceUID;
           doc["s"] = gConfig.siteName;
           doc["y"] = "battery_failure";
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           doc["v"] = roundTo(voltage, 2);
           doc["failCount"] = gSolarOnlyBatFailCount;
           doc["se"] = true;  // Escalate via SMS
@@ -8421,7 +8434,7 @@ static void sendDailyReport() {
     return;
   }
 
-  double reportEpoch = currentEpoch();
+  const uint32_t reportEpoch = noteEpochMinute(currentEpoch());
   size_t monitorCursor = 0;
   uint8_t part = 0;
   bool queuedAny = false;
@@ -8559,7 +8572,7 @@ static void sendDailyReport() {
     doc["recs"] = gI2cBusRecoveryCount;
     doc["ok"] = gCurrentLoopReadsOk;
     doc["or"] = gCurrentLoopOverRange;
-    doc["t"] = currentEpoch();
+    doc["t"] = noteEpochMinute(currentEpoch());
     publishNote(ALARM_FILE, doc, true);
   }
 
@@ -8596,9 +8609,10 @@ static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t moni
   // Per-sensor acquisition epoch. Mirrors telemetry.qo's top-level `t` so the
   // server can distinguish report transmission time from the time the reading
   // was actually acquired — critical when `ru`/`sf` indicate the daily is
-  // republishing a stale cached value (orphaned-epoch fix).
+  // republishing a stale cached value (orphaned-epoch fix). Whole minutes,
+  // truncated, as in sendTelemetry().
   if (state.lastReadingEpoch > 0.0) {
-    t["t"] = (uint32_t)state.lastReadingEpoch;
+    t["t"] = noteEpochMinute(state.lastReadingEpoch);
   }
 
   if (measureJson(doc) > payloadLimit) {

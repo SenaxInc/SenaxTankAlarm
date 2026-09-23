@@ -116,8 +116,8 @@ The client sends unload events via the `unload.qo` notefile (delivered as `unloa
   "type": "unload",        // Event type
   "pk": 90.0,              // Peak height
   "em": 4.5,               // Empty height
-  "pt": 1735056000,        // Peak timestamp
-  "t": 1735142400,         // Event timestamp
+  "pt": 1735056000,        // Peak timestamp (epoch, whole minute)
+  "t": 1735142400,         // Event timestamp (epoch, whole minute)
   "pma": 19.2,             // Peak sensor mA
   "ema": 4.3,              // Empty sensor mA
   "sms": true,             // Request SMS notification
