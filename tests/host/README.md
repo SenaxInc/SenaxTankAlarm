@@ -15,4 +15,4 @@ git clone --depth 1 --branch v7.4.3 https://github.com/bblanchon/ArduinoJson.git
 make -C tests/host/<suite> test ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 ```
 
-Only headers with no Arduino or mbed dependencies can be tested here. Code under test lives in small sketch-local headers that the sketch includes, so the tests exercise the same source the firmware compiles.
+C++ suites can test only headers with no Arduino or mbed dependencies: the code under test lives in small sketch-local headers that the sketch includes, so the tests exercise the same source the firmware compiles. Other suites test code embedded in the sketch directly; `email_bridge` extracts the Apps Script from the `/email-setup` page in the server sketch.
