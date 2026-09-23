@@ -14582,6 +14582,7 @@ static uint8_t sendEmailAlert(const char *subject, const char *message, const ch
   if (len == 0 || len >= sizeof(buffer)) {
     // #320 review: the id must not cost an alert that fits without it. The bridge still
     // skips Notehub retries by event ID.
+    Serial.println(F("Email alert too large with its message id - retrying without it"));
     doc.remove("id");
     len = serializeJson(doc, buffer, sizeof(buffer));
   }
@@ -15052,6 +15053,13 @@ static void sendDailyEmail() {
   // Use static buffer to avoid 16KB stack allocation (Mbed OS stack is only 4-8KB)
   static char buffer[MAX_EMAIL_BUFFER];
   size_t len = serializeJson(doc, buffer, sizeof(buffer));
+  if (len == 0 || len >= sizeof(buffer)) {
+    // #320 review: as for alerts, the id must not cost a report that fits without it.
+    // The bridge still skips Notehub retries by event ID.
+    Serial.println(F("Daily email too large with its message id - retrying without it"));
+    doc.remove("id");
+    len = serializeJson(doc, buffer, sizeof(buffer));
+  }
   if (len == 0 || len >= sizeof(buffer)) {
     Serial.println(F("Daily email payload too large"));
     return;
