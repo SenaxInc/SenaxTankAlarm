@@ -231,8 +231,8 @@ This passes the entire event body through to the server's `.qi` notefile.
 
 Before saving, configure these two settings (they apply to **all 5 TankAlarm routes**):
 
-- **Timeout:** Leave at the default (30 seconds). Routes #1–3 target `api.notefile.net` (Blues' own infrastructure) and respond in under a second. Routes #4–5 (Twilio/SMTP) are equally fast under normal conditions.
-- **Automatic reroute on failure:** **Enable this** (check the box). If a route fails transiently (e.g., a brief 5XX from the server), Notehub will retry at 5-second, 1-minute, and 5-minute intervals (3 retries max). This prevents lost telemetry, dropped config pushes, or missed alarm SMS due to momentary glitches. The retry overhead is negligible at TankAlarm's event volume.
+- **Timeout:** Leave at the default (30 seconds). Routes #1–3 target `api.notefile.net` (Blues' own infrastructure) and respond in under a second. Routes #4–5 (Twilio/SMTP) are equally fast under normal conditions; the Route #5 Apps Script bridge can take longer (see Step 7, Option B).
+- **Automatic reroute on failure:** **Enable this** (check the box). If a route fails transiently (e.g., a brief 5XX from the server), Notehub will retry at 30-second, 1-minute, and 5-minute intervals (3 retries max). This prevents lost telemetry, dropped config pushes, or missed alarm SMS due to momentary glitches. The retry overhead is negligible at TankAlarm's event volume. A call that timed out may still have completed at the endpoint, so its retry repeats it; the Route #5 Apps Script bridge ignores such repeats (Step 7, Option B).
 
 > **Note:** Automatic reroute only helps with transient failures (5XX, timeouts). It will **not** fix 4XX errors (bad API token, wrong device UID, malformed JSON) — those indicate a configuration problem. If you see 401 or 404 in Route Logs, fix the route settings rather than relying on retries.
 
@@ -385,7 +385,7 @@ per-recipient routes are needed.
 | **To Number** | `[.body.to]` — pulls the recipient from each note. **Required, and the leading dot matters:** `[body.to]` (no dot) is not a valid placeholder, so Notehub sends the literal text to Twilio, which fails with error 21265 ("'To' number cannot be a Short Code"). |
 | **Message** | `[.body.message]` — pulls the alert text from each note. **Required.** |
 | **Notefiles** | Selected Notefiles → `sms.qo` |
-| **Automatic reroute on failure** | Enable (retries at 5 s / 1 min / 5 min) |
+| **Automatic reroute on failure** | Enable (retries at 30 s / 1 min / 5 min) |
 
 > **Twilio trial accounts:** every recipient number must be a Verified Caller ID in Twilio,
 > and all numbers must be E.164 formatted (`+1...`).
@@ -442,6 +442,7 @@ The server publishes **two body shapes** to `email.qo`:
 ```json
 {
   "to": "ops@example.com,owner@example.com",
+  "id": "dev:860000000000000-1783497600-3",
   "subject": "Daily Sensor Summary - 2026-07-08",
   "serverName": "Tank Alarm Server",
   "sensors": [ { "client": "dev:...", "site": "Silas", "label": "Cox Wellhead",
@@ -459,10 +460,15 @@ page's field/summary toggles ride along in `fmt` so your route template can hono
 
 ```json
 { "to": "ops@example.com", "subject": "TankAlarm Alert",
-  "message": "Silas #1 high alarm 43.8 psi", "type": "alarm" }
+  "message": "Silas #1 high alarm 43.8 psi", "type": "alarm",
+  "id": "dev:860000000000000-1783501234-4" }
 ```
 
 Use `body.type = "alarm"` in your template to distinguish the two shapes.
+
+Both shapes carry `id`, a message ID (`<server device UID>-<epoch seconds>-<counter>`) that is
+unique per email and stays the same when the server retries its `note.add`. The Apps Script
+bridge (Option B) uses it to ignore repeats; other templates can ignore the field.
 
 ### Option A — Route configuration (SendGrid)
 
@@ -502,10 +508,14 @@ daily `sensors` array):
 > toggles. Any other HTTP email API (Mailgun `/v3/<domain>/messages`, Postmark
 > `/email`, etc.) works with the same pattern — swap the URL, auth header, and JSONata shape.
 
+> **Retries:** SendGrid has no duplicate protection. If a call times out after SendGrid has
+> accepted it, automatic reroute sends the email again. This is rare, because SendGrid
+> answers well within the 30-second route timeout.
+
 ### Option B — Route configuration (Google Workspace via Apps Script)
 
 Use this option to send alerts **from your real Google Workspace mailbox** (e.g.
-`alerts@yourcompany.com`) with no third-party email account. A ~40-line Google Apps
+`alerts@yourcompany.com`) with no third-party email account. A ~60-line Google Apps
 Script deployed as a Web App receives the routed note and calls `MailApp.sendEmail()`.
 
 > **Interactive version:** the server dashboard has a step-by-step guide with the full
@@ -516,7 +526,8 @@ Script deployed as a Web App receives the routed note and calls `MailApp.sendEma
 with the sending account, create a new project, and paste the bridge script (shown on the
 server's `/email-setup` page). It authenticates requests with a `SECRET` query parameter,
 parses the note `body`, handles both body shapes above (alarm `message` vs daily
-`sensors[]`), and sends via `MailApp.sendEmail()`. Set `SECRET` to a long random string.
+`sensors[]`), skips Notehub retries of an email it has already sent, and sends via
+`MailApp.sendEmail()`. Set `SECRET` to a long random string.
 
 **2. Deploy as Web App** — Deploy → New deployment → type **Web app**, **Execute as: Me**,
 **Who has access: Anyone**, authorize, and copy the `/exec` URL.
@@ -542,6 +553,13 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
   (Apps Script answers POSTs with a redirect). Real send results are in the Apps Script
   editor under **Executions**.
 - Quotas: Workspace accounts ≈ 1,500 recipients/day via Apps Script (consumer Gmail: 100/day).
+- **Retries and duplicates:** Notehub retries a call that has not answered within the route
+  timeout (30 s by default), even while the script is still sending, and the server retries a
+  `note.add` it could not confirm. The bridge remembers each email for 6 hours by Notehub event
+  ID and the server's message `id` and ignores repeats. A script installed before this check
+  (no `CacheService` line) sends every repeat: paste the current version from `/email-setup`
+  and publish it with Manage deployments → edit → **Version: New**. Raising the route
+  **Timeout** to 60 s avoids most retries.
 - The daily report's `fmt` object (from the server's `/email-format` page) is available to
   the script if you want to expand the sample renderer.
 
@@ -627,6 +645,12 @@ Save the route and re-route a failed event from Route Logs to confirm the fix.
 | 401 | Unauthorized | Check your Personal Access Token is correct and not expired. Create PATs from your profile menu → API Access. Do **not** use OAuth tokens from Programmatic API Access (they expire every 30 minutes). For `X-SESSION-TOKEN`, paste the raw PAT only — **do not prefix with `Bearer `**. Also check that the header value has no extra whitespace. |
 | 404 | Device not found | Verify the device UID is correct and the device exists in the project. Device UIDs are **case-sensitive** — `Dev:` ≠ `dev:` (must be lowercase). Also check that the URL placeholder is `[filebase]` (not `{{notefile_base}}`). |
 | 400 | Bad request | Check the request body format — must be valid JSON with a `body` field |
+
+### "The same email arrives two or three times"
+
+Notehub retried a Route #5 call that answered after the route timeout. Update the Apps Script
+bridge to the current version (Step 7, Option B, "Retries and duplicates"), which ignores
+those repeats. With SendGrid (Option A) it is rare; a longer route timeout makes it rarer.
 
 ### "Notes not appearing on target device"
 
