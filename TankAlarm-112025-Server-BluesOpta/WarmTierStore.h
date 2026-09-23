@@ -82,6 +82,9 @@
 #ifndef WARM_MAX_VALID_EPOCH
 #define WARM_MAX_VALID_EPOCH 4102444800.0  // 2100-01-01Z: the date helpers stop at 2099
 #endif
+#ifndef WARM_MAX_FUTURE_SKEW_SEC
+#define WARM_MAX_FUTURE_SKEW_SEC 3600.0    // A reading's time may lead the server clock by this much (both are network time)
+#endif
 
 static_assert(WARM_READ_BUF > 0 && WARM_READ_BUF <= 65535, "WARM_READ_BUF must fit uint16_t");
 static_assert(WARM_MAX_FAILED_TICKS >= 1 && WARM_MAX_FAILED_TICKS <= 255, "WARM_MAX_FAILED_TICKS must fit uint8_t");
@@ -316,6 +319,53 @@ static inline long warmFileSize(FILE *f) {
   const long size = WARM_FTELL(f);
   if (size < 0 || WARM_FSEEK(f, 0, SEEK_SET) != 0) return -1;
   return size;
+}
+
+// ============================================================================
+// S-D03: what enters the hot tier: fresh readings, at the time they were taken
+// ============================================================================
+
+// A reading's acquisition time in whole seconds, or 0 when it is unknown: before
+// 2020 (0 = the client clock was not set yet), not finite, from 2100 on, or more
+// than WARM_MAX_FUTURE_SKEW_SEC ahead of serverNow (serverNow <= 0: server clock
+// not set). There is deliberately no fallback to a receive time, which would file
+// the reading under a day it was not taken on. Flooring never changes the UTC day.
+static inline double warmAcquisitionEpoch(double eventEpoch, double serverNow) {
+  if (!(eventEpoch >= 1577836800.0 && eventEpoch < WARM_MAX_VALID_EPOCH)) return 0.0;  // also NaN
+  if (serverNow > 0.0 && eventEpoch > serverNow + WARM_MAX_FUTURE_SKEW_SEC) return 0.0;
+  return floor(eventEpoch);
+}
+
+// Older firmware saved hot-tier timestamps as doubles. ArduinoJson keeps one that
+// fits a float (a multiple of 128 s) as a float and writes 7 digits, so it reloads
+// up to 512 s off, again as a multiple of 128. Near a UTC midnight such a value
+// may belong to the other day.
+static inline bool warmLegacyEpochAmbiguous(double ts) {
+  if (!(ts > 0.0) || fmod(ts, 128.0) != 0.0) return false;
+  const double intoDay = ts - floor(ts / 86400.0) * 86400.0;
+  return intoDay <= 512.0 || intoDay >= 86400.0 - 512.0;
+}
+
+// True when the ring already holds this acquisition. Telemetry `t` arrives
+// rounded to the second and the daily report's per-sensor `t` truncated, so two
+// copies of one reading can be 1 s apart, and they can arrive out of order.
+static inline bool warmRingHasAcquisition(const TelemetrySnapshot *ring, uint16_t cap, uint16_t count,
+                                          uint16_t writeIndex, double ts, float level) {
+  if (!ring || cap == 0) return false;
+  const WarmSeries s = {nullptr, 0, ring, cap, count, writeIndex};
+  const uint16_t cnt = (count > cap) ? cap : count;
+  for (uint16_t j = 0; j < cnt; ++j) {
+    const TelemetrySnapshot &e = ring[warmRingIndex(s, cnt, j)];
+    if (fabs(e.timestamp - ts) <= 1.0 && fabsf(e.level - level) < 0.01f) return true;
+  }
+  return false;
+}
+
+// True when a and b are on the same UTC day and at most maxDiffSec apart; false
+// when either is not a time (<= 0).
+static inline bool warmSameUtcDayWithin(double a, double b, double maxDiffSec) {
+  if (!(a > 0.0) || !(b > 0.0)) return false;
+  return fabs(a - b) <= maxDiffSec && warmEpochToDn(a) == warmEpochToDn(b);
 }
 
 // ============================================================================

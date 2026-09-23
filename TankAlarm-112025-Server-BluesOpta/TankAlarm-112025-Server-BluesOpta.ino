@@ -682,7 +682,8 @@ static uint8_t gSensorCalibrationCount = 0;
 #endif
 
 struct AlarmLogEntry {
-  double timestamp;           // Epoch timestamp
+  double timestamp;           // Epoch timestamp (server receive time; the log UI, FTP filter and prune use it)
+  double eventEpoch;          // S-D03: when the alarm happened (note "t"), 0 = unknown; the daily count uses it
   char siteName[32];          // Site name
   char clientUid[48];         // Client UID
   uint8_t sensorIndex;         // Internal sensor index
@@ -876,7 +877,7 @@ struct FtpArchiveCache {
 static FtpArchiveCache gFtpArchiveCache = {0, 0, false, {}, 0};
 
 // Forward declarations for history functions
-static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh);
+static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh, double eventEpoch);
 static void clearAlarmEvent(const char *clientUid, uint8_t sensorIndex);
 static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch);
 // Daily summary warm tier functions (storage logic in WarmTierStore.h)
@@ -7519,7 +7520,7 @@ static bool performFtpRestore(char *errorOut, size_t errorSize) {
 // ============================================================================
 
 // Log an alarm event to the ring buffer
-static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh) {
+static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh, double eventEpoch) {
   AlarmLogEntry &entry = alarmLog[alarmLogWriteIndex];
   
   // Get current time from Notecard
@@ -7529,6 +7530,7 @@ static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t s
   }
   
   entry.timestamp = now;
+  entry.eventEpoch = eventEpoch;
   strlcpy(entry.siteName, siteName ? siteName : "Unknown", sizeof(entry.siteName));
   strlcpy(entry.clientUid, clientUid ? clientUid : "", sizeof(entry.clientUid));
   entry.sensorIndex = sensorIndex;
@@ -7650,9 +7652,11 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
 // cluster at the original acquisition time instead of marching forward with
 // every retransmission.
 //
-// Fallback chain: sane `eventEpoch` -> server's `currentEpoch()` -> drop note
-// (refuse to record with timestamp=0, which the chart's time-window cutoff
-// would silently filter out anyway).
+// S-D03: no fallback. The snapshot is stored at warmAcquisitionEpoch(eventEpoch)
+// (whole seconds) or not at all: a reading whose acquisition time is missing or
+// implausible, e.g. taken before the client's first time sync, is left out
+// rather than filed under the day the server received it. Callers pass only
+// fresh readings, and a voltage only when it was measured with the reading.
 static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch) {
   SensorHourlyHistory *hist = findOrCreateSensorHistory(clientUid, sensorIndex);
   if (!hist) {
@@ -7675,38 +7679,25 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
   }
   hist->heightInches = heightInches;
   
-  // Resolve the snapshot timestamp. Prefer the caller-supplied sensor acquisition
-  // epoch when it is in a sane window (2020-01-01 .. server-now + 24h); otherwise
-  // fall back to server-now; otherwise refuse to record.
-  const double MIN_VALID_EPOCH = 1577836800.0;  // 2020-01-01 UTC
-  double serverNow = currentEpoch();
-  double maxAllowed = (serverNow > 0.0) ? (serverNow + 86400.0) : 0.0;  // tolerate up to 24h client clock skew
-  double snapEpoch = 0.0;
-  if (eventEpoch >= MIN_VALID_EPOCH && (maxAllowed <= 0.0 || eventEpoch <= maxAllowed)) {
-    snapEpoch = eventEpoch;
-  } else if (serverNow > 0.0) {
-    snapEpoch = serverNow;
-  }
+  // S-D03: the reading's own acquisition time (2020 .. server-now + 1 h), whole seconds, or drop
+  const double snapEpoch = warmAcquisitionEpoch(eventEpoch, currentEpoch());
   if (snapEpoch <= 0.0) {
     static unsigned long lastNoTimeWarn = 0;
     if (millis() - lastNoTimeWarn > 300000UL) {
       lastNoTimeWarn = millis();
-      Serial.println(F("WARNING: Snapshot dropped — no valid timestamp (clock unsynced and no event epoch)"));
-      addServerSerialLog("Snapshot dropped — no valid timestamp", "warn", "history");
+      Serial.println(F("WARNING: Snapshot dropped — no valid acquisition time"));
+      addServerSerialLog("Snapshot dropped — no valid acquisition time", "warn", "history");
     }
     return;
   }
   
-  // Deduplicate: if the most recent snapshot for this sensor has the same
-  // timestamp AND the same level, the client is republishing a stuck/reused
-  // reading. Skip — adding it would waste ring-buffer slots and stack points
-  // at the same chart X coordinate without conveying any new information.
-  if (hist->snapshotCount > 0) {
-    uint16_t lastIdx = (hist->writeIndex - 1 + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
-    const TelemetrySnapshot &last = hist->snapshots[lastIdx];
-    if (last.timestamp == snapEpoch && fabsf(last.level - level) < 0.01f) {
-      return;
-    }
+  // Deduplicate: the same acquisition can arrive more than once (telemetry, the
+  // daily report's copy, a republished stuck/reused reading), up to 1 s apart and
+  // out of order. S-D03: check the whole ring and return before the day is marked
+  // for a re-roll, so a copy is never counted twice in a daily row.
+  if (warmRingHasAcquisition(hist->snapshots, MAX_HOURLY_HISTORY_PER_SENSOR, hist->snapshotCount,
+                             hist->writeIndex, snapEpoch, level)) {
+    return;
   }
   
   // Add snapshot to ring buffer
@@ -8225,15 +8216,18 @@ static void warmHookLog(const char *level, const char *msg) {
 
 static const WarmHooks kWarmHooks = {warmHookYield, warmHookLog, serverNoteFlashWrite, warmHookNowMs, nullptr};
 
-// Alarms for one sensor and day, counted from the alarm log as v2.2.15 did
+// Alarms for one sensor and day, counted from the alarm log. S-D03: by when each
+// alarm happened, not when it was received (v2.2.15), so a late note counts on
+// its own day; an alarm with no known time is not counted on any day.
 static uint8_t warmAlarmCount(void *ctx, const char *uid, uint8_t k, double dayBegin, double dayEnd) {
   (void)ctx;
   uint8_t alarms = 0;
   for (uint8_t a = 0; a < alarmLogCount; a++) {
     int aIdx = (alarmLogWriteIndex - alarmLogCount + a + MAX_ALARM_LOG_ENTRIES) % MAX_ALARM_LOG_ENTRIES;
+    const double ev = alarmLog[aIdx].eventEpoch;
     if (strcmp(alarmLog[aIdx].clientUid, uid) == 0 &&
         alarmLog[aIdx].sensorIndex == k &&
-        alarmLog[aIdx].timestamp >= dayBegin && alarmLog[aIdx].timestamp < dayEnd) {
+        ev > 0.0 && ev >= dayBegin && ev < dayEnd) {
       alarms++;
     }
   }
@@ -8552,7 +8546,9 @@ static bool saveHotTierSnapshot() {
       uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
       TelemetrySnapshot &snap = hist.snapshots[idx];
       JsonArray entry = snaps.add<JsonArray>();
-      entry.add(snap.timestamp);
+      // S-D03: an integer round-trips exactly. A double that fits a float (e.g. any UTC
+      // midnight) is written with 7 digits and reloads up to 512 s off, on another day.
+      entry.add((uint32_t)snap.timestamp);
       entry.add(roundTo(snap.level, 2));
       entry.add(roundTo(snap.voltage, 2));
     }
@@ -8629,6 +8625,7 @@ static void loadHotTierSnapshot() {
   
   JsonArray arr = doc.as<JsonArray>();
   gSensorHistoryCount = 0;
+  uint16_t untimedSkipped = 0;
   
   for (JsonObject sensorObj : arr) {
     if (gSensorHistoryCount >= MAX_HISTORY_SENSORS) break;
@@ -8651,8 +8648,15 @@ static void loadHotTierSnapshot() {
     for (JsonArray entry : snaps) {
       if (hist.snapshotCount >= MAX_HOURLY_HISTORY_PER_SENSOR) break;
       
+      // S-D03: keep the ring to whole-second acquisition times. A non-integer timestamp
+      // comes from older firmware; near a UTC midnight its true day is unknown, so drop it.
+      const double ts = warmAcquisitionEpoch(entry[0].as<double>(), 0.0);
+      if (ts <= 0.0 || (!entry[0].is<uint32_t>() && warmLegacyEpochAmbiguous(ts))) {
+        untimedSkipped++;
+        continue;
+      }
       TelemetrySnapshot &snap = hist.snapshots[hist.writeIndex];
-      snap.timestamp = entry[0].as<double>();
+      snap.timestamp = ts;
       snap.level = entry[1].as<float>();
       snap.voltage = entry[2].as<float>();
       
@@ -8668,6 +8672,11 @@ static void loadHotTierSnapshot() {
   Serial.print(F("Hot tier restored: "));
   Serial.print(gSensorHistoryCount);
   Serial.println(F(" sensors from flash"));
+  if (untimedSkipped > 0) {
+    Serial.print(F("Hot tier: skipped "));
+    Serial.print(untimedSkipped);
+    Serial.println(F(" snapshots whose time is not reliable (older file format)"));
+  }
   #endif
 #endif
 }
@@ -12719,6 +12728,7 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // TEMPORARY (2026-06-15): clients now include live system voltage "v" in telemetry (not just
   // the daily report) so the dashboard VIN updates in near-real-time. May be REMOVED later if we
   // revert to daily-only voltage reporting on the client.
+  float noteVin = 0.0f;  // S-D03: this note's accepted "v", measured in the same pass as the reading
   {
     float telemetryVin = doc["v"] | 0.0f;
     // Fix 6/7: only accept a battery voltage that is either tagged with a real measurement
@@ -12727,6 +12737,7 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
     const char *vsrc = doc["vs"] | "";
     bool vTagged = (strcmp(vsrc, "mppt") == 0 || strcmp(vsrc, "vin-divider") == 0);
     if (telemetryVin > 0.0f && (vTagged || telemetryVin >= 6.0f)) {
+      noteVin = telemetryVin;
       ClientMetadata *vmeta = findOrCreateClientMetadata(clientUid);
       if (vmeta) {
         vmeta->vinVoltage = telemetryVin;
@@ -12959,19 +12970,20 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   float recordHeight = doc["cap"] | (doc["h"] | 0.0f);
   if (recordHeight <= 0) recordHeight = 48.0f; // Default only if neither cap nor h present
   
-  // Get voltage from client metadata if available
-  float vinVoltage = 0.0f;
-  ClientMetadata *meta = findClientMetadata(clientUid);
-  if (meta && meta->vinVoltage > 0) {
-    vinVoltage = meta->vinVoltage;
-  }
-  
-  // Record telemetry snapshot for historical charting. Use the client's
-  // acquisition epoch (top-level `t`) so the chart X-axis reflects when the
-  // reading was actually taken, not when the server happened to receive the note.
+  // S-D03: history holds only fresh acquisitions (as handleDaily's trustLevel does). A
+  // reused (ru) or failed (sf) value or a faulted read was not taken at `t`, and a
+  // current-loop note without raw mA resolves to a placeholder 0.0. The live value above
+  // still updates.
+  const bool freshReading = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull() &&
+      !(strcmp(rec->sensorType, "currentLoop") == 0 && doc["ma"].isNull() && doc["sensorMa"].isNull());
+  if (!freshReading) return;
+
+  // Record telemetry snapshot for historical charting at the client's acquisition epoch
+  // (top-level `t`), so the chart X-axis reflects when the reading was actually taken.
+  // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
+  // The voltage is this note's own, never a cached one from another time.
   double telemetryEpoch = doc["t"] | 0.0;
-  if (telemetryEpoch <= 0.0) telemetryEpoch = epoch;
-  recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, vinVoltage, telemetryEpoch);
+  recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, noteVin, telemetryEpoch);
 }
 
 static void handleAlarm(JsonDocument &doc, double epoch) {
@@ -13133,6 +13145,9 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // Relay safety timeout — relay was forced off after exceeding max ON duration
   // This is an operational event, NOT a sensor alarm clear — do not clear alarmActive
   bool isRelayTimeout = (strcmp(type, "relay_timeout") == 0);
+  // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown). The
+  // daily alarm count and the level snapshot both use it, so they land on the same day.
+  const double alarmEventEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
 
   if (strcmp(type, "clear") == 0 || isRecovery) {
     rec->alarmActive = false;
@@ -13155,25 +13170,24 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     strlcpy(rec->alarmType, type, sizeof(rec->alarmType));
     const char *siteName = doc["s"] | "";
     bool isHigh = (strcmp(type, "high") == 0 || strcmp(type, "triggered") == 0);
-    logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh);
+    logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh, alarmEventEpoch);
   }
   rec->currentValue = level;
-  // Record historical snapshot from alarm so trend data captures alarm events
-  if (level > 0.0f) {
+  // Record historical snapshot from alarm so trend data captures alarm events.
+  // S-D03: only a fresh reading. relay_timeout re-sends the last value at send time, and
+  // ru/sf/fault mark a reused or failed value.
+  const bool freshReading = !isRelayTimeout && ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) &&
+                            doc["fault"].isNull();
+  if (freshReading && level > 0.0f) {
     const char *alarmSiteName = doc["s"] | rec->site;
-    float alarmVin = 0.0f;
-    ClientMetadata *alarmMeta = findOrCreateClientMetadata(clientUid);
-    if (alarmMeta) alarmVin = alarmMeta->vinVoltage;
     // Use the client-reported capacity (cap) as the immutable tank height, never the
     // current level. Falls back to 48 in only if the note predates self-describing payloads.
     float alarmCap = doc["cap"] | 0.0f;
     if (alarmCap <= 0.0f) alarmCap = 48.0f;
-    // Acquisition time from the alarm note's top-level `t`, falling back to the
-    // processNotefile epoch if the note predates the acquisition-time fix.
-    double alarmEventEpoch = doc["t"] | 0.0;
-    if (alarmEventEpoch <= 0.0) alarmEventEpoch = epoch;
+    // S-D03: at the alarm's own time (no fallback), with no voltage: alarm notes carry no "v",
+    // and a cached one may be from another day.
     recordTelemetrySnapshot(clientUid, alarmSiteName, sensorIndex,
-                            alarmCap, level, alarmVin, alarmEventEpoch);
+                            alarmCap, level, 0.0f, alarmEventEpoch);
   }
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   gSensorRegistryDirty = true;
@@ -13329,7 +13343,10 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   }
   // Reject an untagged, implausible reading (e.g. the Notecard ~5V rail) so it cannot poison the
   // dashboard; a tagged or MPPT reading is accepted at any plausible battery level.
-  if (isFirstPart && vinVoltage > 0.0f && (vTrusted || vinVoltage >= 6.0f)) {
+  const bool vinAccepted = isFirstPart && vinVoltage > 0.0f && (vTrusted || vinVoltage >= 6.0f);
+  // S-D03: the report measures its voltage when it is built, at its own "t" (0 = unknown).
+  const double reportVinEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
+  if (vinAccepted) {
     ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
     if (meta) {
       meta->vinVoltage = vinVoltage;
@@ -13584,13 +13601,15 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;
-      // Per-sensor acquisition epoch (v2.0.56+). Falls back to the daily report's
-      // top-level epoch (transmission time) and then to server-now in the
-      // recordTelemetrySnapshot fallback chain.
+      // Per-sensor acquisition epoch (v2.0.56+). S-D03: no fallback to the report's
+      // transmission time; a reading without its own `t` stays out of history. The
+      // report's voltage goes with it only when the reading was taken within an hour
+      // of that measurement on the same UTC day.
       double dailySensorEpoch = t["t"] | 0.0;
-      if (dailySensorEpoch <= 0.0) dailySensorEpoch = epoch;
+      const float dailyVin = (vinAccepted && warmSameUtcDayWithin(dailySensorEpoch, reportVinEpoch, 3600.0))
+                                 ? vinVoltage : 0.0f;
       recordTelemetrySnapshot(clientUid, siteName, sensorIndex,
-                              dailyCap, newLevel, vinVoltage, dailySensorEpoch);
+                              dailyCap, newLevel, dailyVin, dailySensorEpoch);
     }
   }
 

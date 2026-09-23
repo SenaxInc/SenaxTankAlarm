@@ -114,9 +114,10 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
 - **Hourly rollup**, run before the hot-tier prune. It rolls every day the hot tier
   still holds that has not been rolled yet, up to yesterday, in batches of at most
   8 days within one month: at most 16 batches, 2 file rewrites and 8 s per hour.
-  Missed days (outage, reboot, clock not yet set) are caught up; days before the
-  oldest hot-tier snapshot, before the retained months, or more than 92 days back
-  are not.
+  Days that have readings in the hot tier but were not rolled up yet (server off, or
+  clock not set, at midnight) are rolled up later; days before the oldest hot-tier
+  snapshot, before the retained months, or more than 92 days back are not. Days
+  without readings stay blank.
 - **After a reboot** the first rollup re-checks the whole window. A day whose row is
   missing, or whose recomputed row has a larger `n`, is written; unchanged days are
   only read. A snapshot that arrives for a day already rolled up marks that day, and
@@ -147,6 +148,33 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
 
 Downgrading to v2.2.15 or earlier brings back H-23 (month files of 8 KB or more are
 reset to one day at the next rollup).
+
+#### What Enters History
+The hot tier, and so every daily row, holds only fresh readings, on the day they were
+taken (S-D03):
+- **Fresh readings only.** A value the client reused (`ru`) or sent for a failed sensor
+  (`sf`), a faulted read (`fault`), a current-loop note without raw mA, and a
+  `relay_timeout` alarm (which re-sends the last value) update the dashboard but are not
+  recorded.
+- **Stamped with the client's acquisition time, never a guessed one.** The time is the
+  note's `t` (the per-sensor `t` in daily reports), in whole seconds. A reading without a
+  valid `t` (before 2020, or more than 1 h ahead of the server clock) is left out rather
+  than stamped with the time it was received. This leaves out readings taken before a
+  client's first time sync, and daily-report readings from clients older than v2.0.56,
+  which send no per-sensor `t`.
+- **Counted once.** The same reading arriving again (telemetry, then the daily report's
+  copy, or an alarm) at the same level within 1 s is stored once.
+- **Voltage only from the same measurement.** `vt` uses the voltage sent in the same
+  telemetry note, or the daily report's voltage when the reading was taken within an
+  hour of it on the same UTC day. Alarm notes carry no voltage, and a cached voltage is
+  never used.
+- **Alarms on the day they happened.** `al` counts alarms by the alarm note's `t`, not by
+  when the server received it; an alarm without a valid `t` is not counted.
+- **No fill-in.** A day with no readings for a sensor has no row. Nothing is interpolated
+  or carried over from another day.
+- **Exact times in `hot_tier.json`.** Timestamps are saved as integers. Older firmware
+  saved doubles, which could reload up to 512 s off; on the first boot after the update,
+  such a snapshot within 512 s of a UTC midnight is dropped, since its day is not known.
 
 ### Archived Clients Manifest
 When a client is removed and archived to FTP, an entry (client UID, site, display label,
