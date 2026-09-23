@@ -93,9 +93,56 @@ The Historical Data page provides charts and graphs for visualizing collected te
 ## Data Storage Strategy
 
 ### Primary: Local LittleFS Storage
-- **Telemetry Log**: `/history/telemetry_YYYYMM.log` - Daily level readings
-- **Alarm Log**: `/history/alarms.log` - Alarm events with timestamps
-- **Daily Summary**: `/history/daily_YYYYMM.json` - Aggregated daily min/max/avg
+- **Hot tier**: RAM ring of 90 snapshots per sensor (20 sensors fleet-wide), saved hourly to `/fs/history/hot_tier.json`
+- **Daily Summary (warm tier)**: `/fs/history/daily_YYYYMM.json` - one row per sensor per day, see below
+- *Not implemented*: the `/history/telemetry_YYYYMM.log` and `/history/alarms.log` files described in earlier drafts
+
+### Warm Tier: Daily Summaries on Flash
+Each month is one JSON array in `/fs/history/daily_YYYYMM.json` (UTC days). Each
+row summarizes one sensor for one day, about 120 bytes:
+
+```json
+{"d":20260921,"c":"dev:864475...","k":1,"mn":41.2,"mx":44.0,"av":42.7,"op":41.2,"cl":44.0,"al":0,"vt":12.4,"n":24}
+```
+
+`d` date (YYYYMMDD), `c` client UID, `k` sensor index, `mn`/`mx`/`av` min/max/mean
+level, `op`/`cl` level of the earliest/latest snapshot, `al` alarm count, `vt` mean
+voltage (0 = none), `n` snapshots summarized. A row is identified by (`d`, `c`, `k`).
+A full 20-sensor month is about 76 KB.
+
+How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_store`):
+- **Hourly rollup**, run before the hot-tier prune. It rolls every day the hot tier
+  still holds that has not been rolled yet, up to yesterday, in batches of at most
+  8 days within one month: at most 16 batches, 2 file rewrites and 8 s per hour.
+  Missed days (outage, reboot, clock not yet set) are caught up; days before the
+  oldest hot-tier snapshot, before the retained months, or more than 92 days back
+  are not.
+- **After a reboot** the first rollup re-checks the whole window. A day whose row is
+  missing, or whose recomputed row has a larger `n`, is written; unchanged days are
+  only read. A snapshot that arrives for a day already rolled up marks that day, and
+  the next rollup re-rolls it.
+- **Merge rules**: files are read one row at a time through a small buffer, so memory
+  use does not depend on the file size. A stored row is replaced only by a row with a
+  larger `n` (keeping the higher alarm count); all other rows are copied byte for byte,
+  including keys this firmware does not know. If nothing changes, nothing is written.
+- **Failures never empty a file.** Only a missing file (ENOENT) starts a new one. A
+  read, write or allocation failure leaves the file as it was and is retried the next
+  hour. A file that cannot be parsed is rebuilt from its readable rows plus the new
+  rows, and the original is kept as `daily_YYYYMM.json.bad`. Writes go to
+  `daily_YYYYMM.json.tmp` and are renamed over the file.
+- **Retention**: the current month and the 3 months before it
+  (`MAX_DAILY_SUMMARY_MONTHS`). The hourly prune removes older month files with their
+  `.tmp`/`.bad` files, removes orphan `.tmp` files, and sets `warmTierAvailable`
+  (also checked at boot).
+- **Readers** (`/api/history/compare`, `/api/history/yoy`, and the monthly FTP archive
+  when the hot tier has no data for the month) stream the file and use a month only if
+  it reads completely; otherwise they fall back as if it were missing.
+- **Diagnostics**: `/api/system-status` has a `warmTier` block (last rollup, next day,
+  writes, unchanged batches, I/O and memory errors, quarantined files, late-data marks,
+  tick time). Failures are logged to the server serial log (source `history`).
+
+Downgrading to v2.2.15 or earlier brings back H-23 (month files of 8 KB or more are
+reset to one day at the next rollup).
 
 ### Optional: FTP Server Backup
 When FTP is enabled, historical data can be backed up to the FTP server:
