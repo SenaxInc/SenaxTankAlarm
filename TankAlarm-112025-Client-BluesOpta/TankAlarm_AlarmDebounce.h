@@ -50,8 +50,10 @@ static inline uint8_t alarmDebounceStep(bool latched, bool trigger, bool release
 }
 
 // Per-sample analog comparisons, identical to v2.2.15 evaluateAlarms(). A negative hysteresis
-// is clamped to 0 (it would invert the clear bands). A NaN reading makes every flag false, so
-// callers must not pass invalid samples here (the client skips sampleReused samples).
+// is clamped to 0 (it would invert the clear bands). Each alarm clears on its own side of its
+// own threshold: a shared mid-band clear condition was empty when (high - low) <= 2*hysteresis,
+// so a latched alarm could never clear. A NaN reading makes every flag false, so callers must
+// not pass invalid samples here (the client skips sampleReused samples).
 struct AlarmAnalogConditions {
   bool high;         // x >= high threshold
   bool low;          // x <= low threshold

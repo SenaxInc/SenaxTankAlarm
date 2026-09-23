@@ -1463,6 +1463,7 @@ static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bo
 static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry);
 static uint8_t alarmPendingCodeFor(const char *alarmType);
 static const char *alarmPendingName(uint8_t code);
+static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
 static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
@@ -6267,6 +6268,47 @@ static bool restorePersistentRelayAfterBoot(uint8_t idx, bool highAlarmActive, b
   return true;
 }
 
+// C-T01: digital (float switch) trigger resolution, moved verbatim out of evaluateAlarms() so
+// the sensor-recovered re-assertion resolves the alarm type the same way. Returns true when
+// `value` is the alarm state; triggerOnActivated tells "triggered" from "not_triggered".
+static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated) {
+  // For digital sensors, value is either DIGITAL_SENSOR_ACTIVATED_VALUE (1.0) or DIGITAL_SENSOR_NOT_ACTIVATED_VALUE (0.0)
+  bool isActivated = (value > DIGITAL_SWITCH_THRESHOLD);
+  bool shouldAlarm = false;
+  triggerOnActivated = true;  // Track what condition triggers the alarm
+
+  // Determine if we should alarm based on trigger configuration
+  if (cfg.digitalTrigger[0] != '\0') {
+    if (strcmp(cfg.digitalTrigger, "activated") == 0) {
+      shouldAlarm = isActivated;  // Alarm when switch is activated
+      triggerOnActivated = true;
+    } else if (strcmp(cfg.digitalTrigger, "not_activated") == 0) {
+      shouldAlarm = !isActivated;  // Alarm when switch is NOT activated
+      triggerOnActivated = false;
+    }
+  } else {
+    // Legacy behavior: use highAlarm/lowAlarm thresholds
+    // Only one of these should be configured for a digital sensor
+    // highAlarm = 1 means trigger when reading is 1.0 (switch activated)
+    // lowAlarm = 0 means trigger when reading is 0.0 (switch not activated)
+    bool hasHighAlarm = (cfg.highAlarmThreshold >= DIGITAL_SENSOR_ACTIVATED_VALUE);
+    bool hasLowAlarm = (cfg.lowAlarmThreshold == DIGITAL_SENSOR_NOT_ACTIVATED_VALUE);
+
+    if (hasHighAlarm && !hasLowAlarm) {
+      shouldAlarm = isActivated;
+      triggerOnActivated = true;
+    } else if (hasLowAlarm && !hasHighAlarm) {
+      shouldAlarm = !isActivated;
+      triggerOnActivated = false;
+    } else if (hasHighAlarm) {
+      // Default to high alarm behavior if both are set
+      shouldAlarm = isActivated;
+      triggerOnActivated = true;
+    }
+  }
+  return shouldAlarm;
+}
+
 static void evaluateAlarms(uint8_t idx) {
   const MonitorConfig &cfg = gConfig.monitors[idx];
   MonitorRuntime &state = gMonitorState[idx];
@@ -6276,8 +6318,23 @@ static void evaluateAlarms(uint8_t idx) {
     return;
   }
 
-  // Skip alarm evaluation if sensor has failed
+  // Skip alarm evaluation if sensor has failed.
+  // C-T01: also discard the debounce evidence, so samples from before a failure never combine
+  // with samples after recovery. The latches and the pending edge are kept.
   if (state.sensorFailed) {
+    state.highAlarmDebounceCount = 0;
+    state.lowAlarmDebounceCount = 0;
+    state.highClearDebounceCount = 0;
+    state.lowClearDebounceCount = 0;
+    return;
+  }
+
+  // C-T01: an invalid sample (validation failed, so sampleMonitors() reused the previous
+  // value) is not evidence. Previously it counted towards latching and clearing. HOLD the
+  // counters (neither count nor reset them) and do not consume the first-sample relay
+  // restore, so the boot placeholder currentValue = 0.0 is never evaluated (an open loop at
+  // boot gave a false LOW, or a LOW relay restore on its first failed read).
+  if (state.sampleReused) {
     return;
   }
 
@@ -6289,146 +6346,67 @@ static void evaluateAlarms(uint8_t idx) {
 
   // Handle digital sensors (float switches) differently
   if (cfg.sensorInterface == SENSOR_DIGITAL) {
-    // For digital sensors, currentValue is either DIGITAL_SENSOR_ACTIVATED_VALUE (1.0) or DIGITAL_SENSOR_NOT_ACTIVATED_VALUE (0.0)
-    bool isActivated = (state.currentValue > DIGITAL_SWITCH_THRESHOLD);
-    bool shouldAlarm = false;
     bool triggerOnActivated = true;  // Track what condition triggers the alarm
-    
-    // Determine if we should alarm based on trigger configuration
-    if (cfg.digitalTrigger[0] != '\0') {
-      if (strcmp(cfg.digitalTrigger, "activated") == 0) {
-        shouldAlarm = isActivated;  // Alarm when switch is activated
-        triggerOnActivated = true;
-      } else if (strcmp(cfg.digitalTrigger, "not_activated") == 0) {
-        shouldAlarm = !isActivated;  // Alarm when switch is NOT activated
-        triggerOnActivated = false;
-      }
-    } else {
-      // Legacy behavior: use highAlarm/lowAlarm thresholds
-      // Only one of these should be configured for a digital sensor
-      // highAlarm = 1 means trigger when reading is 1.0 (switch activated)
-      // lowAlarm = 0 means trigger when reading is 0.0 (switch not activated)
-      bool hasHighAlarm = (cfg.highAlarmThreshold >= DIGITAL_SENSOR_ACTIVATED_VALUE);
-      bool hasLowAlarm = (cfg.lowAlarmThreshold == DIGITAL_SENSOR_NOT_ACTIVATED_VALUE);
-      
-      if (hasHighAlarm && !hasLowAlarm) {
-        shouldAlarm = isActivated;
-        triggerOnActivated = true;
-      } else if (hasLowAlarm && !hasHighAlarm) {
-        shouldAlarm = !isActivated;
-        triggerOnActivated = false;
-      } else if (hasHighAlarm) {
-        // Default to high alarm behavior if both are set
-        shouldAlarm = isActivated;
-        triggerOnActivated = true;
-      }
-    }
+    const bool shouldAlarm = digitalAlarmCondition(cfg, state.currentValue, triggerOnActivated);
+    // Send alarm with descriptive type based on configured trigger condition
+    const char *alarmType = triggerOnActivated ? "triggered" : "not_triggered";
 
     if (firstAlarmSample && shouldAlarm && restorePersistentRelayAfterBoot(idx, true, false, sampleNow)) {
+      // C-T01: the restore has already actuated; also tell the server (publish-only)
+      notifyAlarmEdge(idx, alarmType, state.currentValue, false);
       return;
     }
-    
-    // Handle alarm state with debouncing
-    if (shouldAlarm && !state.highAlarmLatched) {
-      state.highAlarmDebounceCount++;
-      state.highClearDebounceCount = 0;
-      if (state.highAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-        state.highAlarmLatched = true;
-        state.highAlarmDebounceCount = 0;
-        // Send alarm with descriptive type based on configured trigger condition
-        const char *alarmType = triggerOnActivated ? "triggered" : "not_triggered";
-        sendAlarm(idx, alarmType, state.currentValue);
-      }
-    } else if (!shouldAlarm && state.highAlarmLatched) {
-      state.highClearDebounceCount++;
-      state.highAlarmDebounceCount = 0;
-      if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-        state.highAlarmLatched = false;
-        state.highClearDebounceCount = 0;
-        sendAlarm(idx, "clear", state.currentValue);
-      }
-    } else if (!shouldAlarm) {
-      state.highAlarmDebounceCount = 0;
-    } else {
-      state.highClearDebounceCount = 0;
+
+    // Handle alarm state with debouncing. C-T01: same step as the analog channels; the edges
+    // are identical to v2.2.15 for every on/off sequence (host test).
+    const uint8_t edge = alarmDebounceStep(state.highAlarmLatched, shouldAlarm, !shouldAlarm,
+                                           ALARM_DEBOUNCE_COUNT, state.highAlarmDebounceCount,
+                                           state.highClearDebounceCount);
+    if (edge == ALARM_EDGE_ENTER) {
+      state.highAlarmLatched = true;
+      sendAlarm(idx, alarmType, state.currentValue);
+    } else if (edge == ALARM_EDGE_EXIT) {
+      state.highAlarmLatched = false;
+      sendAlarm(idx, "clear", state.currentValue);
     }
     retryPendingAlarm(idx, pendingAtEntry);
     return;  // Skip the standard analog threshold evaluation
   }
 
-  // Standard analog/current loop sensor alarm evaluation with hysteresis
-  // Clamp hysteresis to be non-negative; a negative value would invert the clear bands.
-  float hyst = (cfg.hysteresisValue > 0.0f) ? cfg.hysteresisValue : 0.0f;
-  float highTrigger = cfg.highAlarmThreshold;
-  float highClear = cfg.highAlarmThreshold - hyst;
-  float lowTrigger = cfg.lowAlarmThreshold;
-  float lowClear = cfg.lowAlarmThreshold + hyst;
+  // Standard analog/current loop sensor alarm evaluation with hysteresis. The comparisons are
+  // unchanged (hysteresis clamped to >= 0; each alarm clears on its own side of its own
+  // threshold, see alarmAnalogConditions in TankAlarm_AlarmDebounce.h).
+  const AlarmAnalogConditions c = alarmAnalogConditions(state.currentValue, cfg.highAlarmThreshold,
+                                                        cfg.lowAlarmThreshold, cfg.hysteresisValue);
 
-  bool highCondition = state.currentValue >= highTrigger;
-  bool lowCondition = state.currentValue <= lowTrigger;
-  // Decoupled clear conditions: the high alarm clears once the level falls below the high
-  // threshold minus hysteresis; the low alarm clears once the level rises above the low
-  // threshold plus hysteresis. Previously both alarms shared a single mid-band clearCondition
-  // ((x < highClear) && (x > lowClear)); when (highThreshold - lowThreshold) <= 2*hysteresis
-  // that band was empty/inverted and a latched alarm could NEVER clear, and high-alarm
-  // clearing was incorrectly coupled to the (possibly unused) low threshold.
-  bool highClearCondition = state.currentValue < highClear;
-  bool lowClearCondition = state.currentValue > lowClear;
-
-  if (firstAlarmSample && restorePersistentRelayAfterBoot(idx, highCondition, !highCondition && lowCondition, sampleNow)) {
+  if (firstAlarmSample && restorePersistentRelayAfterBoot(idx, c.high, !c.high && c.low, sampleNow)) {
+    // C-T01: the restore has already actuated; also tell the server (publish-only)
+    notifyAlarmEdge(idx, c.high ? "high" : "low", state.currentValue, false);
     return;
   }
 
-  // Handle high alarm with debouncing
-  if (highCondition && !state.highAlarmLatched) {
-    state.highAlarmDebounceCount++;
-    state.lowAlarmDebounceCount = 0;
-    state.highClearDebounceCount = 0;
-    if (state.highAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.highAlarmLatched = true;
-      state.lowAlarmLatched = false;
-      state.highAlarmDebounceCount = 0;
-      sendAlarm(idx, "high", state.currentValue);
-    }
-  } else if (state.highAlarmLatched && highClearCondition) {
-    state.highClearDebounceCount++;
-    state.highAlarmDebounceCount = 0;
-    if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.highAlarmLatched = false;
-      state.highClearDebounceCount = 0;
-      sendAlarm(idx, "clear", state.currentValue);
-    }
-  } else if (!highCondition && !highClearCondition) {
-    state.highAlarmDebounceCount = 0;
-  }
-  if (highCondition) {
-    state.highClearDebounceCount = 0;
-  }
+  // C-T01: strictly consecutive debounce (F-04/R-03/H-06). Previously a trigger counter was
+  // reset only by a hysteresis-band sample and a clear counter never, so alternating samples
+  // ([90,50,90,50,90] with high=80) latched or cleared. Now any sample that does not qualify
+  // resets the evidence. A sample inside both trigger zones (low >= high, a misconfiguration)
+  // counts for neither side, as before. Entering one side unlatches the other, as before.
+  uint8_t highEdge = ALARM_EDGE_NONE;
+  uint8_t lowEdge = ALARM_EDGE_NONE;
+  alarmAnalogEvaluate(c, ALARM_DEBOUNCE_COUNT, state.highAlarmLatched, state.lowAlarmLatched,
+                      state.highAlarmDebounceCount, state.highClearDebounceCount,
+                      state.lowAlarmDebounceCount, state.lowClearDebounceCount, highEdge, lowEdge);
 
-  // Handle low alarm with debouncing
-  if (lowCondition && !state.lowAlarmLatched) {
-    state.lowAlarmDebounceCount++;
-    state.highAlarmDebounceCount = 0;
-    state.lowClearDebounceCount = 0;
-    if (state.lowAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.lowAlarmLatched = true;
-      state.highAlarmLatched = false;
-      state.lowAlarmDebounceCount = 0;
-      sendAlarm(idx, "low", state.currentValue);
-    }
-  } else if (state.lowAlarmLatched && lowClearCondition) {
-    state.lowClearDebounceCount++;
-    state.lowAlarmDebounceCount = 0;
-    if (state.lowClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.lowAlarmLatched = false;
-      state.lowClearDebounceCount = 0;
-      sendAlarm(idx, "clear", state.currentValue);
-    }
-  } else if (!lowCondition && !lowClearCondition) {
-    state.lowAlarmDebounceCount = 0;
+  // Notes and actuation in v2.2.15 order: high edge, then low edge. sendAlarm() reads neither
+  // the latches nor the counters, so acting after both channels are updated is equivalent.
+  if (highEdge == ALARM_EDGE_ENTER) {
+    sendAlarm(idx, "high", state.currentValue);
+  } else if (highEdge == ALARM_EDGE_EXIT) {
+    sendAlarm(idx, "clear", state.currentValue);
   }
-  if (lowCondition) {
-    state.lowClearDebounceCount = 0;
+  if (lowEdge == ALARM_EDGE_ENTER) {
+    sendAlarm(idx, "low", state.currentValue);
+  } else if (lowEdge == ALARM_EDGE_EXIT) {
+    sendAlarm(idx, "clear", state.currentValue);
   }
   retryPendingAlarm(idx, pendingAtEntry);
 }
