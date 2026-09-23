@@ -1,6 +1,7 @@
 // Fault-injecting I/O for the WarmTierStore.h host tests. Include this before
 // WarmTierStore.h: it defines WARM_IO_OVERRIDE and routes every WARM_* call
-// through wrappers that count operations and can fail the Nth one.
+// through wrappers that count operations and can fail the Nth one (or two),
+// or every read of one file.
 #ifndef WARM_TEST_IO_H
 #define WARM_TEST_IO_H
 
@@ -30,11 +31,15 @@ inline const char *opName(int op) {
 struct State {
   long ops = 0;            // operations since reset()
   long failAt = -1;        // index of the operation to fail (-1 = none)
-  int failedOp = -1;       // kind of the operation that was failed
+  long failAt2 = -1;       // a second index to fail (double faults)
+  int failedOp = -1;       // kind of the last operation that was failed
   long perOp[OP_COUNT] = {};
+  std::vector<int> trace;  // kind of every operation, in order
   long readBudget = -1;    // bytes fread may still return, then a silent EOF (-1 = unlimited)
   long mallocs = 0;
   long mallocFailAt = -1;
+  std::string failReadsOf;               // every fread of this file fails
+  std::vector<FILE *> failReadFiles;     // open handles of failReadsOf
   std::vector<FILE *> errFiles;          // files with an injected error flag
   std::vector<std::string> writeOpens;   // paths opened for writing
 };
@@ -49,29 +54,33 @@ inline void reset() { state() = State(); }
 inline bool hit(Op op) {
   State &s = state();
   s.perOp[op]++;
+  s.trace.push_back(op);
   const long index = s.ops++;
-  if (index == s.failAt) {
+  if (index == s.failAt || index == s.failAt2) {
     s.failedOp = op;
     return true;
   }
   return false;
 }
 
-inline void markErr(FILE *f) { state().errFiles.push_back(f); }
-
-inline bool hasErr(FILE *f) {
-  for (FILE *e : state().errFiles) {
+inline bool hasFile(const std::vector<FILE *> &v, FILE *f) {
+  for (FILE *e : v) {
     if (e == f) return true;
   }
   return false;
 }
 
-inline void clearErr(FILE *f) {
-  std::vector<FILE *> &v = state().errFiles;
+inline void dropFile(std::vector<FILE *> &v, FILE *f) {
   for (size_t i = v.size(); i > 0; --i) {
     if (v[i - 1] == f) v.erase(v.begin() + (long)(i - 1));
   }
 }
+
+inline void markErr(FILE *f) { state().errFiles.push_back(f); }
+
+inline bool hasErr(FILE *f) { return hasFile(state().errFiles, f); }
+
+inline void clearErr(FILE *f) { dropFile(state().errFiles, f); }
 
 }  // namespace fi
 
@@ -79,11 +88,12 @@ inline FILE *t_fopen(const char *path, const char *mode) {
   if (fi::hit(fi::OP_FOPEN)) { errno = EIO; return nullptr; }
   FILE *f = fopen(path, mode);
   if (f && mode[0] == 'w') fi::state().writeOpens.push_back(path);
+  if (f && fi::state().failReadsOf == path) fi::state().failReadFiles.push_back(f);
   return f;
 }
 
 inline size_t t_fread(void *buf, size_t size, size_t n, FILE *f) {
-  if (fi::hit(fi::OP_FREAD)) { fi::markErr(f); return 0; }
+  if (fi::hit(fi::OP_FREAD) || fi::hasFile(fi::state().failReadFiles, f)) { fi::markErr(f); return 0; }
   long &budget = fi::state().readBudget;
   if (budget == 0) return 0;  // pretend the file ended early, without an error
   if (budget > 0 && (long)(size * n) > budget) n = (size_t)budget / size;
@@ -105,6 +115,7 @@ inline int t_fflush(FILE *f) {
 inline int t_fclose(FILE *f) {
   const bool fail = fi::hit(fi::OP_FCLOSE);
   fi::clearErr(f);
+  fi::dropFile(fi::state().failReadFiles, f);
   const int rc = fclose(f);
   return fail ? EOF : rc;
 }

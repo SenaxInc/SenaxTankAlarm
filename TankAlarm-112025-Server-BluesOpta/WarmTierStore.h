@@ -73,6 +73,9 @@
 #ifndef WARM_YIELD_EVERY
 #define WARM_YIELD_EVERY 32           // Rows between yield() (watchdog) calls
 #endif
+#ifndef WARM_MAX_FAILED_TICKS
+#define WARM_MAX_FAILED_TICKS 6       // Ticks in a row a failing month is retried before it is skipped
+#endif
 #ifndef WARM_MIN_VALID_EPOCH
 #define WARM_MIN_VALID_EPOCH 1704067200.0  // 2024-01-01Z: below this the clock is not set
 #endif
@@ -81,6 +84,7 @@
 #endif
 
 static_assert(WARM_READ_BUF > 0 && WARM_READ_BUF <= 65535, "WARM_READ_BUF must fit uint16_t");
+static_assert(WARM_MAX_FAILED_TICKS >= 1 && WARM_MAX_FAILED_TICKS <= 255, "WARM_MAX_FAILED_TICKS must fit uint8_t");
 
 // ============================================================================
 // Types
@@ -159,6 +163,7 @@ struct WarmRollupState {
   int32_t nextDn = -1;           // next day to roll; -1 = boot, re-check the whole window
   int32_t dirtyDn = INT32_MAX;   // earliest rolled day that received a late snapshot
   uint32_t cursorYmd = 0;
+  uint8_t failedTicks = 0;       // ticks in a row that stopped on an I/O or memory error
   WarmRollupStats stats = {};
 };
 
@@ -185,8 +190,9 @@ struct WarmTickSummary {
 // Small helpers
 // ============================================================================
 
-static inline ArduinoJson::Allocator *warmJsonAlloc(const WarmHooks &h) {
-  return h.jsonAlloc ? h.jsonAlloc : ArduinoJson::detail::DefaultAllocator::instance();
+// Public API only: the firmware builds against whatever ArduinoJson is current
+static inline JsonDocument warmMakeDoc(const WarmHooks &h) {
+  return h.jsonAlloc ? JsonDocument(h.jsonAlloc) : JsonDocument();
 }
 
 static inline void warmLogf(const WarmHooks &h, const char *level, const char *fmt, ...)
@@ -435,7 +441,7 @@ static inline WarmStatus warmScanElements(WarmFileReader &r, uint32_t maxRows, W
   if (c != '[') return WARM_CORRUPT;
 
   char elem[WARM_ELEM_MAX + 1];
-  JsonDocument rowDoc(warmJsonAlloc(h));
+  JsonDocument rowDoc = warmMakeDoc(h);
   bool first = true;
   uint32_t rows = 0;
   for (;;) {
@@ -569,7 +575,7 @@ static inline uint16_t warmComputeRows(const WarmSeries *series, uint8_t ns, int
 // ArduinoJson could not allocate).
 static inline size_t warmEncodeRow(const WarmNewRow &r, char *out, size_t cap, const WarmHooks &h, bool *noMemory) {
   if (noMemory) *noMemory = false;
-  JsonDocument doc(warmJsonAlloc(h));
+  JsonDocument doc = warmMakeDoc(h);
   doc["d"] = r.d;
   doc["c"] = r.c;
   doc["k"] = r.k;
@@ -635,7 +641,9 @@ struct WarmAtomicWriter {
   // moveAsideTo, the current target is renamed there first (to keep an
   // unreadable original); a power cut between the two renames leaves a
   // complete .tmp beside a missing target. Any failure removes the .tmp and
-  // leaves the target as it was. The target is never removed before the rename.
+  // leaves the target as it was, except when the original cannot be put back:
+  // then the .tmp is the only complete copy and is kept, which is the same
+  // state as that power cut. The target is never removed before the rename.
   bool commit(const WarmHooks &h, const char *moveAsideTo = nullptr) {
     if (!f) failed = true;
     if (f) {
@@ -644,14 +652,15 @@ struct WarmAtomicWriter {
       f = nullptr;
     }
     bool ok = !failed && path[0] != '\0';
+    bool keepTmp = false;
     if (ok && moveAsideTo && WARM_RENAME(path, moveAsideTo) != 0) ok = false;
     if (ok && WARM_RENAME(tmp, path) != 0) {
-      if (moveAsideTo) WARM_RENAME(moveAsideTo, path);  // put the original back
+      if (moveAsideTo && WARM_RENAME(moveAsideTo, path) != 0) keepTmp = true;  // put the original back
       ok = false;
     }
     if (!ok) {
       failed = true;
-      if (tmp[0]) WARM_REMOVE(tmp);  // the data is regenerable; the target is untouched
+      if (tmp[0] && !keepTmp) WARM_REMOVE(tmp);  // the data is regenerable; the target is untouched
     }
     if (h.noteWrite) h.noteWrite(path, ok ? bytes : 0, ok);
     return ok;
@@ -792,7 +801,8 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
     uint32_t seen = 0, off = 0;
     WarmStatus st = warmScanFile(src, salvage, maxFileBytes, 0, warmDecideVisitor, &mc, h, &seen, &off);
     if (!salvage && (st == WARM_CORRUPT || st == WARM_TOO_BIG)) {
-      warmLogf(h, "error", "Warm tier: %s unreadable (%s at byte %lu); salvaging, original kept as .bad",
+      // The original becomes .bad only when the rebuild commits (logged there)
+      warmLogf(h, "error", "Warm tier: %s unreadable (%s at byte %lu); rebuilding from its readable rows",
                path, warmStatusName(st), (unsigned long)off);
       r.failOffset = off;
       salvage = true;
@@ -883,7 +893,10 @@ static inline WarmStatus warmMergeMonth(const char *dir, int year, int month, Wa
 // tier still covers (floor: maxBackfillDays, retained months, oldest
 // snapshot), which restores days a crash or an older firmware lost; re-rolls
 // of unchanged days cost reads only. IO_ERROR/NO_MEMORY stop the step
-// without moving the position; the next call retries.
+// without moving the position; the next call retries. After
+// WARM_MAX_FAILED_TICKS calls in a row stop that way, the rest of the failing
+// month is skipped (until the next boot's re-check) so one bad file cannot
+// hold up the days after it.
 static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, const WarmSeries *series, uint8_t ns,
                                              WarmAlarmCountFn alarmFn, void *actx, WarmRoundFn roundFn,
                                              const WarmRollupConfig &cfg, const WarmHooks &h) {
@@ -943,6 +956,7 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
     return sum;
   }
 
+  bool failed = false;
   while (s.nextDn <= yDn && sum.batches < cfg.maxBatches && sum.writes < cfg.maxWrites) {
     if (h.nowMs && (uint32_t)(h.nowMs() - t0) >= cfg.budgetMs) break;
     const int32_t st = s.nextDn;
@@ -967,12 +981,21 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
       if (status == WARM_NO_MEMORY) s.stats.noMemory++; else s.stats.ioErrors++;
       s.stats.lastError = status;
       s.stats.lastErrorYmd = warmDnToYmd(st);
+      failed = true;
       char path[96];
       if (!warmMonthPath(path, sizeof(path), cfg.dir, year, month, "")) path[0] = '\0';
-      warmLogf(h, "warn", "Warm tier: %s not written (%s); will retry next hour", path, warmStatusName(status));
-      break;
-    }
-    if (status == WARM_TOO_BIG) {  // already logged by the merge; move on
+      if (++s.failedTicks < WARM_MAX_FAILED_TICKS) {
+        warmLogf(h, "warn", "Warm tier: %s not written (%s); will retry next hour", path, warmStatusName(status));
+        break;
+      }
+      // Still failing: skip the rest of this month so later months are rolled
+      en = (monthEnd < yDn) ? monthEnd : yDn;
+      s.failedTicks = 0;
+      s.stats.skippedDays += (uint32_t)(en - st + 1);
+      warmLogf(h, "error", "Warm tier: %s not written (%s) in %u tries; skipped %lu-%lu until restart", path,
+               warmStatusName(status), (unsigned)WARM_MAX_FAILED_TICKS, (unsigned long)warmDnToYmd(st),
+               (unsigned long)warmDnToYmd(en));
+    } else if (status == WARM_TOO_BIG) {  // already logged by the merge; move on
       s.stats.tooBig++;
       s.stats.skippedDays += (uint32_t)(en - st + 1);
       s.stats.lastError = status;
@@ -996,6 +1019,7 @@ static inline WarmTickSummary warmRollupTick(WarmRollupState &s, double now, con
     }
   }
   WARM_FREE(rows);
+  if (!failed) s.failedTicks = 0;
 
   const uint32_t elapsed = h.nowMs ? (uint32_t)(h.nowMs() - t0) : 0;
   s.stats.lastTickMs = elapsed;
@@ -1151,7 +1175,7 @@ static inline WarmManifestStatus warmManifestSalvage(FILE *f, uint32_t size, uin
   }
 
   char elem[WARM_ELEM_MAX + 1];
-  JsonDocument entry(warmJsonAlloc(h));
+  JsonDocument entry = warmMakeDoc(h);
   bool first = true;
   uint32_t n = 0;
   for (;;) {
@@ -1244,7 +1268,8 @@ static inline const char *warmBaseName(const char *path) {
 // dropping the oldest (the archive files stay on FTP). An unreadable manifest
 // is salvaged and moved to badPath, but only once its replacement is fully
 // written. Returns OK, IO_ERROR or NO_MEMORY; on failure the manifest on disk
-// is unchanged. Logs every failure and every dropped entry.
+// is unchanged (see WarmAtomicWriter::commit for the one exception). Logs
+// every failure and every dropped entry.
 static inline WarmStatus warmManifestAppend(const char *path, const char *badPath, const WarmManifestEntry &e,
                                             uint16_t maxEntries, uint32_t maxBytes, const WarmHooks &h,
                                             WarmManifestAppendResult *out) {
@@ -1253,7 +1278,18 @@ static inline WarmStatus warmManifestAppend(const char *path, const char *badPat
   res = WarmManifestAppendResult();
   const char *ftpFile = e.ftpFile ? e.ftpFile : "";
 
-  JsonDocument man(warmJsonAlloc(h));
+  // A commit() that could not put the moved-aside manifest back left the
+  // complete new manifest in .tmp; finish that rename first, as
+  // recoverOrphanedTmpFiles() would at boot, instead of overwriting it.
+  char tmpPath[116];
+  const int tn = snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+  if (tn > 0 && (size_t)tn < sizeof(tmpPath) && warmStat(path) == 0 && warmStat(tmpPath) == 1 &&
+      WARM_RENAME(tmpPath, path) != 0) {
+    warmLogf(h, "warn", "Archive manifest not updated (io_error); archive is on FTP at %s", ftpFile);
+    return WARM_IO_ERROR;
+  }
+
+  JsonDocument man = warmMakeDoc(h);
   res.loaded = warmLoadManifest(path, man, maxBytes, true, &res.salvaged, h);
   if (res.loaded != WARM_MAN_OK && res.loaded != WARM_MAN_ABSENT && res.loaded != WARM_MAN_SALVAGED) {
     warmLogf(h, "warn", "Archive manifest not updated (%s); archive is on FTP at %s",

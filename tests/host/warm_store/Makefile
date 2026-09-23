@@ -5,16 +5,18 @@
 # Builds the suite twice and runs both: with AddressSanitizer and
 # UndefinedBehaviorSanitizer at -O1, and plain at -O2 (the optimizer finds
 # different warnings, and the plain build runs the full truncation sweep).
+# Only the plain build uses -Werror: GCC advises against combining it with the
+# sanitizers, whose instrumentation causes false-positive warnings.
 
 CXX ?= g++
 SERVER_DIR := ../../../TankAlarm-112025-Server-BluesOpta
 BUILD := build
 
-WARNINGS := -std=gnu++17 -Wall -Wextra -Werror
+WARNINGS := -std=gnu++17 -Wall -Wextra
 INCLUDES = -isystem $(ARDUINOJSON_DIR) -I$(SERVER_DIR)
 SAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
              -D_GLIBCXX_ASSERTIONS -DWARM_TEST_EDGE_STRIDE=4
-OPT_FLAGS := -O2
+OPT_FLAGS := -O2 -Werror
 
 SOURCES := warm_store_test.cpp
 HEADERS := warm_test_io.h legacy_v2215.h $(SERVER_DIR)/WarmTierStore.h

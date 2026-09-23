@@ -127,7 +127,9 @@ How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_s
   including keys this firmware does not know. If nothing changes, nothing is written.
 - **Failures never empty a file.** Only a missing file (ENOENT) starts a new one. A
   read, write or allocation failure leaves the file as it was and is retried the next
-  hour. A file that cannot be parsed is rebuilt from its readable rows plus the new
+  hour. After 6 failed hours in a row the rest of that month is skipped until the next
+  restart (counted in `skippedDays`), so one bad file cannot hold up the days after
+  it. A file that cannot be parsed is rebuilt from its readable rows plus the new
   rows, and the original is kept as `daily_YYYYMM.json.bad`. Writes go to
   `daily_YYYYMM.json.tmp` and are renamed over the file.
 - **Retention**: the current month and the 3 months before it

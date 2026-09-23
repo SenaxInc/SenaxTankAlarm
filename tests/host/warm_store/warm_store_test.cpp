@@ -113,6 +113,16 @@ static size_t countLogs(const char *needle) {
   return n;
 }
 
+// Operation indices of one kind since the last fi::reset()
+static std::vector<long> opIndices(int op) {
+  std::vector<long> out;
+  const std::vector<int> &trace = fi::state().trace;
+  for (size_t i = 0; i < trace.size(); ++i) {
+    if (trace[i] == op) out.push_back((long)i);
+  }
+  return out;
+}
+
 // v2.2.15's roundTo() (TankAlarm_Utils.h tankalarm_roundTo)
 static float testRoundTo(float val, int decimals) {
   float multiplier = pow(10, decimals);
@@ -179,10 +189,19 @@ static void clearDir(const std::string &dir) {
   for (const std::string &n : listDir(dir)) removeFile(joinPath(dir, n));
 }
 
+static std::string monthFile(const std::string &dir, int y, int m, const char *suffix = "") {
+  char buf[256];
+  if (!warmMonthPath(buf, sizeof(buf), dir.c_str(), y, m, suffix)) return std::string();
+  return buf;
+}
+
 static std::string makeDir(const std::string &name) {
   const std::string p = joinPath(gRoot, name);
   mkdir(p.c_str(), 0777);
   clearDir(p);
+  // warmMergeMonth's path buffers hold 95 characters (sized for "/fs/history")
+  const std::string probe = monthFile(p, 2026, 9);
+  CHECK_MSG(!probe.empty() && probe.size() < 96, "test dir %s is too long", p.c_str());
   return p;
 }
 
@@ -191,12 +210,6 @@ static bool anyTmp(const std::string &dir) {
     if (n.size() > 4 && n.compare(n.size() - 4, 4, ".tmp") == 0) return true;
   }
   return false;
-}
-
-static std::string monthFile(const std::string &dir, int y, int m, const char *suffix = "") {
-  char buf[256];
-  if (!warmMonthPath(buf, sizeof(buf), dir.c_str(), y, m, suffix)) return std::string();
-  return buf;
 }
 
 static double epochOf(int y, int m, int d, double seconds = 0.0) {
@@ -912,6 +925,43 @@ static void testQuarantine() {
   CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add6, 1, big, h, &res) == WARM_IO_ERROR);
   CHECK(readFile(path) == corrupt && !fileExists(bad) && !anyTmp(dir));
 
+  // A failed rename(.tmp, file) puts the original back
+  clearDir(dir);
+  writeFile(path, corrupt);
+  resetHooks();
+  WarmNewRow add9 = add5;
+  CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add9, 1, big, h, &res) == WARM_OK && res.quarantined);
+  const std::string rebuilt = readFile(path);
+  const std::vector<long> renames = opIndices(fi::OP_RENAME);
+  CHECK(renames.size() == 2);  // file -> .bad, .tmp -> file
+  if (renames.size() == 2) {
+    clearDir(dir);
+    writeFile(path, corrupt);
+    resetHooks();
+    fi::state().failAt = renames[1];
+    WarmNewRow add10 = add5;
+    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add10, 1, big, h, &res) == WARM_IO_ERROR);
+    CHECK(readFile(path) == corrupt && !fileExists(bad) && !anyTmp(dir));
+
+    // ... and when putting it back fails too, the complete .tmp is kept beside
+    // the .bad (the state a power cut between the renames leaves), and the next
+    // merge rebuilds the file from the .bad
+    clearDir(dir);
+    writeFile(path, corrupt);
+    resetHooks();
+    fi::state().failAt = renames[1];
+    fi::state().failAt2 = renames[1] + 1;
+    WarmNewRow add11 = add5;
+    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add11, 1, big, h, &res) == WARM_IO_ERROR);
+    const std::vector<long> tried = opIndices(fi::OP_RENAME);
+    CHECK(tried.size() == 3 && tried[2] == renames[1] + 1);
+    CHECK(!fileExists(path) && readFile(bad) == corrupt && readFile(path + ".tmp") == rebuilt);
+    resetHooks();
+    WarmNewRow add12 = add5;
+    CHECK(warmMergeMonth(dir.c_str(), 2026, 9, &add12, 1, big, h, &res) == WARM_OK && res.wrote);
+    CHECK(readFile(path) == rebuilt && readFile(bad) == corrupt && !anyTmp(dir));
+  }
+
   // A file over the size cap is quarantined and its first maxBytes salvaged
   clearDir(dir);
   std::vector<std::string> rowsText;
@@ -1179,6 +1229,38 @@ static void testScheduler() {
     clearDir(dir);
   }
 
+  // (10b) a month file that can never be read is retried WARM_MAX_FAILED_TICKS
+  // times, then skipped until a restart so the months after it are rolled
+  {
+    resetHooks();
+    Fleet fleet;
+    fleet.addSensors(2, 90);
+    const int32_t today = dnOf(2026, 9, 5);
+    fleet.fill(dnOf(2026, 8, 25), today - 1, 2, 10.0f);
+    const std::string aug = monthFile(dir, 2026, 8);
+    writeFile(aug, "[]");
+    fi::state().failReadsOf = aug;
+    WarmRollupState s;
+    const double now = (double)today * 86400.0 + 3600.0;
+    for (int i = 1; i < WARM_MAX_FAILED_TICKS; ++i) {
+      CHECK(tick(s, fleet, now, cfg, h).batches == 0 && s.nextDn == dnOf(2026, 8, 25) && s.failedTicks == i);
+    }
+    CHECK(s.stats.ioErrors == (uint32_t)(WARM_MAX_FAILED_TICKS - 1) && !fileExists(monthFile(dir, 2026, 9)));
+    const WarmTickSummary sum = tick(s, fleet, now, cfg, h);
+    CHECK(sum.firstYmd == 20260825u && sum.lastYmd == 20260904u && sum.batches == 2 && sum.writes == 1);
+    CHECK(s.stats.ioErrors == (uint32_t)WARM_MAX_FAILED_TICKS && s.stats.skippedDays == 7 && s.failedTicks == 0);
+    CHECK(countLogs("skipped 20260825-20260831 until restart") == 1);
+    CHECK(s.nextDn == today && s.cursorYmd == 20260904u);
+    CHECK(readFile(aug) == "[]" && fileKeys(monthFile(dir, 2026, 9)).size() == 4 * 2);
+    // a restart tries the month again
+    s.nextDn = -1;
+    CHECK(tick(s, fleet, now, cfg, h).batches == 0 && s.failedTicks == 1);
+    // a tick that gets through clears the count
+    fi::state().failReadsOf.clear();
+    CHECK(tick(s, fleet, now, cfg, h).batches > 0 && s.failedTicks == 0);
+    clearDir(dir);
+  }
+
   // (11) a clock before 2024 does nothing
   {
     resetHooks();
@@ -1219,9 +1301,10 @@ struct FaultScenario {
   WarmRollupState s0;   // scheduler state before the tick
   double now;
 
-  void prepare() {
+  void prepare(bool staleTmp = false) {
     clearDir(dir);
     writeFile(monthFile(dir, 2026, 9), p0);
+    if (staleTmp) writeFile(monthFile(dir, 2026, 9, ".tmp"), "[{\"d\":2026");  // power cut mid-write
   }
 };
 
@@ -1301,6 +1384,26 @@ static void testFaultInjection() {
   const int mustFail[] = {fi::OP_STAT, fi::OP_FOPEN, fi::OP_FREAD, fi::OP_FWRITE, fi::OP_FFLUSH, fi::OP_FCLOSE,
                           fi::OP_RENAME, fi::OP_FSEEK, fi::OP_FTELL};
   for (int op : mustFail) CHECK_MSG(failedKinds[op] > 0, "no failure injected into %s", fi::opName(op));
+
+  // Again with a .tmp left by a power cut, so its remove() is failed too (the
+  // merge then overwrites the .tmp, so that fault alone does not stop it)
+  sc.prepare(true);
+  resetHooks();
+  WarmRollupState probeTmp = sc.s0;
+  tick(probeTmp, sc.fleet, sc.now, sc.cfg, h);
+  CHECK(readFile(monthFile(sc.dir, 2026, 9)) == sc.p1 && !anyTmp(sc.dir) && fi::state().perOp[fi::OP_REMOVE] == 1);
+  const long totalOpsTmp = fi::state().ops;
+  long removeFaults = 0;
+  for (long n = 0; n < totalOpsTmp; ++n) {
+    sc.prepare(true);
+    resetHooks();
+    fi::state().failAt = n;
+    WarmRollupState s = sc.s0;
+    tick(s, sc.fleet, sc.now, sc.cfg, h);
+    if (fi::state().failedOp == fi::OP_REMOVE) removeFaults++;
+    checkFaultOutcome(sc, s, fi::opName(fi::state().failedOp), n, &failures, &successes);
+  }
+  CHECK(removeFaults == 1);
 
   // Every ArduinoJson allocation (and the row buffer malloc)
   TestAllocator alloc;
@@ -1653,6 +1756,41 @@ static void testManifest() {
   CHECK(warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res) == WARM_IO_ERROR);
   CHECK(readFile(path) == truncated && !fileExists(bad) && !anyTmp(dir) && countLogs("write failed") == 1);
 
+  // A failed rename(.tmp, manifest) puts the unreadable manifest back unchanged
+  clearDir(dir);
+  writeFile(path, truncated);
+  resetHooks();
+  CHECK(warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res) == WARM_OK && res.quarantined);
+  const std::string salvagedText = readFile(path);
+  const std::vector<long> renames = opIndices(fi::OP_RENAME);
+  CHECK(renames.size() == 2);  // manifest -> .bad, .tmp -> manifest
+  if (renames.size() == 2) {
+    clearDir(dir);
+    writeFile(path, truncated);
+    resetHooks();
+    fi::state().failAt = renames[1];
+    CHECK(warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res) == WARM_IO_ERROR);
+    CHECK(readFile(path) == truncated && !fileExists(bad) && !anyTmp(dir));
+
+    // ... and when putting it back fails too, the complete new manifest stays
+    // in .tmp (as after a power cut between the renames), and the next append
+    // finishes that rename before it adds its entry
+    clearDir(dir);
+    writeFile(path, truncated);
+    resetHooks();
+    fi::state().failAt = renames[1];
+    fi::state().failAt2 = renames[1] + 1;
+    CHECK(warmManifestAppend(path.c_str(), bad.c_str(), added, 48, maxBytes, h, &res) == WARM_IO_ERROR);
+    const std::vector<long> tried = opIndices(fi::OP_RENAME);
+    CHECK(tried.size() == 3 && tried[2] == renames[1] + 1);
+    CHECK(!fileExists(path) && readFile(bad) == truncated && readFile(path + ".tmp") == salvagedText);
+    resetHooks();
+    const WarmManifestEntry later = manifestEntry(201, store);
+    CHECK(warmManifestAppend(path.c_str(), bad.c_str(), later, 48, maxBytes, h, &res) == WARM_OK);
+    CHECK(res.loaded == WARM_MAN_OK && readFile(path) == manifestText({five[0], five[1], five[2], added, later}));
+    CHECK(readFile(bad) == truncated && !anyTmp(dir));
+  }
+
   // ?file= accepts only exact ftpFile values from the manifest, including 'dev:' paths
   clearDir(dir);
   resetHooks();
@@ -1678,15 +1816,14 @@ static void testManifest() {
 
 // ============================================================================
 int main() {
-  const char *tmp = getenv("TMPDIR");
-  std::string tmpl = std::string((tmp && tmp[0]) ? tmp : "/tmp") + "/warm_store_test_XXXXXX";
-  std::vector<char> buf(tmpl.begin(), tmpl.end());
-  buf.push_back('\0');
-  if (!mkdtemp(buf.data())) {
+  // Always under /tmp, not $TMPDIR: the store's path buffers are sized for
+  // "/fs/history", and macOS's long $TMPDIR would overflow them (see makeDir)
+  char root[] = "/tmp/warm_store_test_XXXXXX";
+  if (!mkdtemp(root)) {
     perror("mkdtemp");
     return 2;
   }
-  gRoot = buf.data();
+  gRoot = root;
 
   struct Test {
     const char *name;
