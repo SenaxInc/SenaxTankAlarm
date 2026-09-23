@@ -14488,8 +14488,8 @@ static void buildEmailMessageId(char *out, size_t outLen) {
   if (now > 0.0) {
     snprintf(out, outLen, "%s-%lu-%lu", uid, (unsigned long)now, (unsigned long)emailCounter);
   } else {
-    // Clock not synced yet: uptime in ms keeps IDs from different boots apart.
-    snprintf(out, outLen, "%s-m%lu-%lu", uid, (unsigned long)millis(), (unsigned long)emailCounter);
+    // Clock not synced yet: uptime in microseconds makes a collision between boots very unlikely.
+    snprintf(out, outLen, "%s-u%lu-%lu", uid, (unsigned long)micros(), (unsigned long)emailCounter);
   }
 }
 
