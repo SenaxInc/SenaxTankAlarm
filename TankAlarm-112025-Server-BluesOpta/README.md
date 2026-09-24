@@ -225,6 +225,9 @@ The server generates daily reports:
 3. **Email Requests** (`email.qo`)
    - Outbound email via Blues Notehub integration
    - Can be routed to SendGrid or other email provider
+   - Each note carries a message `id` (left out only if the note would not fit with it); the
+     Apps Script bridge on `/email-setup` uses it and the Notehub event ID to skip route
+     retries of an email it has already sent
 
 ## Troubleshooting
 
