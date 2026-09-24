@@ -53,16 +53,20 @@ static void testState() {
 }
 
 static void testReconcileType() {
-  CHECK(strcmp(dailyReconcileAlarmType("triggered", "digital", true), "triggered") == 0);
-  CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "digital", true), "not_triggered") == 0);
-  CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "", true), "not_triggered") == 0);  // y wins even before st is known
-  CHECK(strcmp(dailyReconcileAlarmType("", "digital", true), "triggered") == 0);            // 2.2.16 client, float
-  CHECK(strcmp(dailyReconcileAlarmType("bogus", "digital", true), "triggered") == 0);
-  CHECK(strcmp(dailyReconcileAlarmType(nullptr, "digital", false), "triggered") == 0);
-  CHECK(strcmp(dailyReconcileAlarmType("", "analog", true), "high") == 0);                  // unchanged
-  CHECK(strcmp(dailyReconcileAlarmType("", "currentLoop", false), "low") == 0);             // unchanged
-  CHECK(strcmp(dailyReconcileAlarmType("high", "analog", false), "low") == 0);              // y only for float types
-  CHECK(strcmp(dailyReconcileAlarmType(nullptr, nullptr, true), "high") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", "digital", true, ""), "triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "digital", true, ""), "not_triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "", true, ""), "not_triggered") == 0);  // y wins even before st is known
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", "digital", true, "not_activated"), "triggered") == 0);  // y beats the config
+  CHECK(strcmp(dailyReconcileAlarmType("", "digital", true, ""), "triggered") == 0);            // 2.2.16 client, no config
+  CHECK(strcmp(dailyReconcileAlarmType("", "digital", true, "activated"), "triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("", "digital", true, "not_activated"), "not_triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("bogus", "digital", true, "not_activated"), "not_triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("bogus", "digital", true, "bogus"), "triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType(nullptr, "digital", false, nullptr), "triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("", "analog", true, "not_activated"), "high") == 0);     // unchanged
+  CHECK(strcmp(dailyReconcileAlarmType("", "currentLoop", false, ""), "low") == 0);             // unchanged
+  CHECK(strcmp(dailyReconcileAlarmType("high", "analog", false, ""), "low") == 0);              // y only for float types
+  CHECK(strcmp(dailyReconcileAlarmType(nullptr, nullptr, true, nullptr), "high") == 0);
 }
 
 static void testNoteValue() {
@@ -104,7 +108,9 @@ static void testSketchText() {
   CHECK(strstr(text, "#include \"TankAlarm_DigitalDisplay.h\"") != nullptr);
   CHECK(strstr(text, "stuckDisabledInConfig = configSensorStuckDisabled(ct);") != nullptr);
   CHECK(strstr(text, "if (alarmNoteCarriesValue(doc.as<JsonObjectConst>())) {") != nullptr);
-  CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", rec->sensorType, hiAlarm)") != nullptr);
+  CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", rec->sensorType, hiAlarm, cfgTrigger)") != nullptr);
+  CHECK(strstr(text, "configDigitalTriggerFor(clientUid, sensorIdx, cfgTrigger, sizeof(cfgTrigger));") != nullptr);
+  CHECK(strstr(text, "strlcpy(out, ct[\"digitalTrigger\"] | \"\", outLen);") != nullptr);
   CHECK(strstr(text, "obj[\"sensorType\"] = \"digital\";") != nullptr);
   CHECK(strstr(text, "Float Switch clear (%s)") != nullptr);
   CHECK(strstr(text, "type, digitalStateText(rec.currentValue));") != nullptr);  // reminder

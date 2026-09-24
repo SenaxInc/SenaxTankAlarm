@@ -13311,7 +13311,8 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
       const char *stateDesc = (strcmp(type, "triggered") == 0) ? "ACTIVATED" : "NOT ACTIVATED";
       snprintf(message, sizeof(message), "%s%s%d Float Switch %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, stateDesc);
     } else if (strcmp(type, "clear") == 0 && isDigitalSensorType(rec->sensorType)) {
-      // S3 (C-A04 B7): a float clear shows the switch state, not "clear alarm 1.0 in".
+      // S3 (C-A04 B7): a float clear shows the switch state, not "clear alarm 0.0 in" ("1.0 in" for a
+      // not_activated float).
       snprintf(message, sizeof(message), "%s%s%d Float Switch clear (%s)", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, digitalStateText(rec->currentValue));
     } else {
       // S3: rec->currentValue is this note's reading, or the last one when the note carries none.
@@ -13392,6 +13393,24 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
   meta->cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
   gClientMetadataDirty = true;
   return meta;
+}
+
+// S3 (C-A04 B4): sensor k's "digitalTrigger" in the client's cached config, copied into out ("" when
+// there is no snapshot, no such sensor or no trigger).
+static void configDigitalTriggerFor(const char *clientUid, uint8_t sensorIdx, char *out, size_t outLen) {
+  if (outLen == 0) return;
+  out[0] = '\0';
+  const ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (!snap || snap->payload[0] == '\0') return;
+  JsonDocument cfg;
+  if (deserializeJson(cfg, snap->payload) != DeserializationError::Ok) return;
+  for (JsonObjectConst ct : cfg["sensors"].as<JsonArrayConst>()) {
+    uint8_t ctn = ct["number"] | 0;
+    if (ctn == sensorIdx) {
+      strlcpy(out, ct["digitalTrigger"] | "", outLen);
+      return;
+    }
+  }
 }
 
 static void handleDaily(JsonDocument &doc, double epoch) {
@@ -13518,8 +13537,13 @@ static void handleDaily(JsonDocument &doc, double epoch) {
           addServerSerialLog("Missed alarm detected via daily report", "warn", "alarm");
           // Update server's alarm state from daily report backup data
           rec->alarmActive = true;
-          // S3 (C-A04 B4): a float latches on "hi"; record its real type ("y" from newer clients).
-          strlcpy(rec->alarmType, dailyReconcileAlarmType(a["y"] | "", rec->sensorType, hiAlarm),
+          // S3 (C-A04 B4): a float latches on "hi"; record its real type: "y" from newer clients,
+          // else the float's trigger from the cached config.
+          char cfgTrigger[16] = "";
+          if (isDigitalSensorType(rec->sensorType)) {
+            configDigitalTriggerFor(clientUid, sensorIdx, cfgTrigger, sizeof(cfgTrigger));
+          }
+          strlcpy(rec->alarmType, dailyReconcileAlarmType(a["y"] | "", rec->sensorType, hiAlarm, cfgTrigger),
                   sizeof(rec->alarmType));
           rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
           gSensorRegistryDirty = true;

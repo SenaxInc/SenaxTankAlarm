@@ -17,17 +17,25 @@ static inline bool isDigitalSensorType(const char *sensorType) {
   return sensorType != nullptr && strcmp(sensorType, "digital") == 0;
 }
 
-// Same threshold as the dashboard's formatSwitch(). NaN reads as OFF.
+// Same threshold as the dashboard's formatSwitch() (value > 0.5). This is for SMS and email text,
+// where a NaN reads as OFF; the pages never get NaN (ArduinoJson writes it as null) and show '-'
+// for a missing value.
 static inline const char *digitalStateText(float value) {
   return (value > 0.5f) ? "ON" : "OFF";
 }
 
 // Alarm type to record when the daily report shows an alarm the server missed. A client that sends
-// the note type ("y", added by CL-5) is trusted for float types; otherwise a digital sensor is
-// "triggered" (floats latch on the high channel) and anything else keeps high/low.
-static inline const char *dailyReconcileAlarmType(const char *y, const char *sensorType, bool highLatched) {
+// the note type ("y", added by CL-5) is trusted for float types. Otherwise a digital sensor (floats
+// latch on the high channel) takes its type from configTrigger, the sensor's "digitalTrigger" in
+// the client's cached config: "not_activated" gives "not_triggered", anything else (including an
+// unknown config) "triggered", the client default. Anything else keeps high/low.
+static inline const char *dailyReconcileAlarmType(const char *y, const char *sensorType, bool highLatched,
+                                                  const char *configTrigger) {
   if (y != nullptr && (strcmp(y, "triggered") == 0 || strcmp(y, "not_triggered") == 0)) return y;
-  if (isDigitalSensorType(sensorType)) return "triggered";
+  if (isDigitalSensorType(sensorType)) {
+    return (configTrigger != nullptr && strcmp(configTrigger, "not_activated") == 0) ? "not_triggered"
+                                                                                    : "triggered";
+  }
   return highLatched ? "high" : "low";
 }
 
