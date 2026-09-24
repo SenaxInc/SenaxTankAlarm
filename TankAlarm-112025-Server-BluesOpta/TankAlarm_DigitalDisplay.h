@@ -1,0 +1,50 @@
+// TankAlarm_DigitalDisplay.h - how the server shows digital (float switch) sensors (C-A04 B4-B8,
+// relay/float project S3). Pure: ArduinoJson and C headers only, host-tested in
+// tests/host/digital_display.
+//
+// A float's reading is 1.0 (activated) or 0.0 (not activated); the dashboard shows it as ON/OFF
+// with the threshold of formatSwitch (value > 0.5). Its alarm types are "triggered" and
+// "not_triggered", both carried on the client's high latch.
+
+#ifndef TANKALARM_DIGITAL_DISPLAY_H
+#define TANKALARM_DIGITAL_DISPLAY_H
+
+#include <stdint.h>
+#include <string.h>
+#include <ArduinoJson.h>
+
+static inline bool isDigitalSensorType(const char *sensorType) {
+  return sensorType != nullptr && strcmp(sensorType, "digital") == 0;
+}
+
+// Same threshold as the dashboard's formatSwitch(). NaN reads as OFF.
+static inline const char *digitalStateText(float value) {
+  return (value > 0.5f) ? "ON" : "OFF";
+}
+
+// Alarm type to record when the daily report shows an alarm the server missed. A client that sends
+// the note type ("y", added by CL-5) is trusted for float types; otherwise a digital sensor is
+// "triggered" (floats latch on the high channel) and anything else keeps high/low.
+static inline const char *dailyReconcileAlarmType(const char *y, const char *sensorType, bool highLatched) {
+  if (y != nullptr && (strcmp(y, "triggered") == 0 || strcmp(y, "not_triggered") == 0)) return y;
+  if (isDigitalSensorType(sensorType)) return "triggered";
+  return highLatched ? "high" : "low";
+}
+
+// True when an alarm note carries a reading. Diagnostic, sensor-recovered and config-push clear
+// notes carry none; resolveLevel() returns 0 for them, which must not overwrite the last value.
+static inline bool alarmNoteCarriesValue(JsonObjectConst note) {
+  return !note["lvl"].isNull() || !note["fl"].isNull() || !note["rm"].isNull() ||
+         !note["ma"].isNull() || !note["sensorMa"].isNull();
+}
+
+// For the stale "sensor-stuck" self-clear: stuck detection counts as disabled for this config
+// sensor when it is a float (floats are exempt: a float that holds its state is normal) or when the
+// flag is off. A missing flag keeps today's meaning (disabled).
+static inline bool configSensorStuckDisabled(JsonObjectConst sensorCfg) {
+  const char *sensor = sensorCfg["sensor"] | "";
+  if (isDigitalSensorType(sensor)) return true;
+  return !(sensorCfg["stuckDetection"] | false);
+}
+
+#endif  // TANKALARM_DIGITAL_DISPLAY_H
