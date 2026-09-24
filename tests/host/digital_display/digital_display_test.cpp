@@ -108,6 +108,8 @@ static void testSketchText() {
   CHECK(strstr(text, "obj[\"sensorType\"] = \"digital\";") != nullptr);
   CHECK(strstr(text, "Float Switch clear (%s)") != nullptr);
   CHECK(strstr(text, "type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
+  CHECK(strstr(text, "Still in %s alarm (%s).%s") != nullptr);                  // snooze/resume notice
+  CHECK(strstr(text, "rec.alarmType, digitalStateText(rec.currentValue),") != nullptr);
   CHECK(strstr(text, "  rec->currentValue = level;\n  // S-D03") == nullptr);  // the unconditional write is gone
 }
 

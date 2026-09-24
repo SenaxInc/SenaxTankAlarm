@@ -14922,15 +14922,27 @@ static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const c
   char shortSite[24];
   strlcpy(shortSite, rec.site, sizeof(shortSite));
   char message[160];
-  snprintf(message, sizeof(message),
-           "%s: %s%s%d reminders %s by %s. Still in %s alarm (%.1f %s).%s",
-           snoozed ? "SNOOZED" : "RESUMED",
-           shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-           rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
-           snoozed ? "paused" : "active again", who,
-           rec.alarmType, rec.currentValue,
-           rec.measurementUnit[0] ? rec.measurementUnit : "in",
-           snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+  if (isDigitalSensorType(rec.sensorType)) {
+    // S3 (C-A04 B7): a float has no value or unit, only a state.
+    snprintf(message, sizeof(message),
+             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%s).%s",
+             snoozed ? "SNOOZED" : "RESUMED",
+             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+             snoozed ? "paused" : "active again", who,
+             rec.alarmType, digitalStateText(rec.currentValue),
+             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+  } else {
+    snprintf(message, sizeof(message),
+             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%.1f %s).%s",
+             snoozed ? "SNOOZED" : "RESUMED",
+             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+             snoozed ? "paused" : "active again", who,
+             rec.alarmType, rec.currentValue,
+             rec.measurementUnit[0] ? rec.measurementUnit : "in",
+             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+  }
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
   sendSmsAlert(message, alarmId);
