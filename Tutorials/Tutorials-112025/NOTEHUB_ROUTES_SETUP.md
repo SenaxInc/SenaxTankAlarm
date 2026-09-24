@@ -446,11 +446,18 @@ The server publishes **two body shapes** to `email.qo`:
   "subject": "Daily Sensor Summary - 2026-07-08",
   "serverName": "Tank Alarm Server",
   "sensors": [ { "client": "dev:...", "site": "Silas", "label": "Cox Wellhead",
-                 "sensorIndex": 1, "levelInches": 43.8, "sensorMa": 8.2,
+                 "sensorIndex": 1, "userNumber": 7, "levelInches": 43.8, "sensorMa": 8.2,
                  "alarm": false, "alarmType": "clear" } ],
   "fmt": { "groupBySite": true, "fieldLevelInches": true, "...": "..." }
 }
 ```
+
+Each `sensors[]` entry names the sensor by `site` and `label`. `userNumber` is the sensor's
+**Display Number** (the "Display Number" box on the client config page) and is left out when
+that box is blank; print it as `#N` after the name. `sensorIndex` is the server's internal
+sensor number: it is still sent for route templates and scripts written before v2.2.17, but
+must not be printed (it shows `#1` for a sensor that has no Display Number). A float switch
+also carries `"sensorType": "digital"`.
 
 The `subject` comes from the **/email-format** page (`{date}` token supported), and the
 page's field/summary toggles ride along in `fmt` so your route template can honor them.
@@ -500,13 +507,24 @@ daily `sensors` array; a float switch, sent with `sensorType: "digital"`, prints
     "value": body.type = "alarm"
       ? body.message
       : $join($map(body.sensors, function($s) {
-          $s.site & " " & $s.label & " #" & $string($s.sensorIndex) & ": " &
-          ($s.sensorType = "digital" ? ($s.levelInches > 0.5 ? "ON" : "OFF") : $string($s.levelInches)) &
-          ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
+          (
+            $name := $join([$trim($s.site), $trim($s.label)][$ != ""], " ");
+            ($name ? $name : "Sensor") &
+            ($s.userNumber > 0 ? " #" & $string($s.userNumber) : "") & ": " &
+            ($s.sensorType = "digital" ? ($s.levelInches > 0.5 ? "ON" : "OFF") : $string($s.levelInches)) &
+            ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
+          )
         }), "\n")
   }]
 }
 ```
+
+Each daily line is the site and label (each trimmed, a blank one left out, `Sensor` if both
+are blank), then ` #N` only when the sensor has a Display Number (`userNumber` > 0), e.g.
+`Silas Cox Wellhead #7: 43.8` or `Silas Cox Wellhead: 43.8`. It never prints `sensorIndex`.
+A route set up before v2.2.17 prints `" #" & $string($s.sensorIndex)`: replace its daily line
+with the one above. Check the expression in Notehub's JSONata tester (the route's
+**Transform Data** panel) against a recent `email.qo` daily-report event before saving.
 
 > **Provider notes:** the `from` address must be a verified sender in SendGrid. For richer
 > formatting, point `content.type` at `text/html` and expand the template using the `fmt`
