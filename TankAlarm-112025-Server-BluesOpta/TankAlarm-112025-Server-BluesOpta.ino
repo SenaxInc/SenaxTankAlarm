@@ -13396,11 +13396,14 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
   return meta;
 }
 
-// S3 (C-A04 B4): sensor k's "digitalTrigger" in the client's cached config, copied into out ("" when
-// there is no snapshot, no such sensor or no trigger).
-static void configDigitalTriggerFor(const char *clientUid, uint8_t sensorIdx, char *out, size_t outLen) {
-  if (outLen == 0) return;
-  out[0] = '\0';
+// S3 (C-A04 B4): sensor k's "sensor" and "digitalTrigger" in the client's cached config, from one
+// parse, copied into sensorOut and triggerOut ("" when there is no snapshot, no such sensor or no
+// field). Both lengths must be non-zero.
+static void configSensorAndTriggerFor(const char *clientUid, uint8_t sensorIdx, char *sensorOut, size_t sensorLen,
+                                      char *triggerOut, size_t triggerLen) {
+  if (sensorLen == 0 || triggerLen == 0) return;
+  sensorOut[0] = '\0';
+  triggerOut[0] = '\0';
   const ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
   if (!snap || snap->payload[0] == '\0') return;
   JsonDocument cfg;
@@ -13408,7 +13411,8 @@ static void configDigitalTriggerFor(const char *clientUid, uint8_t sensorIdx, ch
   for (JsonObjectConst ct : cfg["sensors"].as<JsonArrayConst>()) {
     uint8_t ctn = ct["number"] | 0;
     if (ctn == sensorIdx) {
-      strlcpy(out, ct["digitalTrigger"] | "", outLen);
+      strlcpy(sensorOut, ct["sensor"] | "", sensorLen);
+      strlcpy(triggerOut, ct["digitalTrigger"] | "", triggerLen);
       return;
     }
   }
@@ -13539,12 +13543,26 @@ static void handleDaily(JsonDocument &doc, double epoch) {
           // Update server's alarm state from daily report backup data
           rec->alarmActive = true;
           // S3 (C-A04 B4): a float latches on "hi"; record its real type: "y" from newer clients,
-          // else the float's trigger from the cached config.
-          char cfgTrigger[16] = "";
-          if (isDigitalSensorType(rec->sensorType)) {
-            configDigitalTriggerFor(clientUid, sensorIdx, cfgTrigger, sizeof(cfgTrigger));
+          // else the float's trigger from the cached config. rec->sensorType can be empty or stale
+          // here (this report's sensors[] loop below refreshes it), so classify by this part's "st"
+          // for k, then the config's "sensor", then the record, without storing the result.
+          const char *reportSt = "";
+          for (JsonObjectConst t : doc["sensors"].as<JsonArrayConst>()) {
+            if (t["k"].is<int>() && t["k"].as<int>() == sensorIdx) {
+              reportSt = t["st"] | "";
+              break;
+            }
           }
-          strlcpy(rec->alarmType, dailyReconcileAlarmType(a["y"] | "", rec->sensorType, hiAlarm, cfgTrigger),
+          if (strcmp(reportSt, "rpm") == 0) reportSt = "pulse";  // as the sensors[] loop stores it
+          // The snapshot is the last pushed config and can be ahead of the client until its ACK. A
+          // wrong float label heals when the client applies the config (it clears its latches and
+          // sends clear notes); CL-5's "y" is the real fix.
+          char cfgSensor[16] = "";
+          char cfgTrigger[16] = "";
+          configSensorAndTriggerFor(clientUid, sensorIdx, cfgSensor, sizeof(cfgSensor), cfgTrigger,
+                                    sizeof(cfgTrigger));
+          const char *effType = dailyReconcileSensorType(reportSt, cfgSensor, rec->sensorType);
+          strlcpy(rec->alarmType, dailyReconcileAlarmType(a["y"] | "", effType, hiAlarm, cfgTrigger),
                   sizeof(rec->alarmType));
           rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
           gSensorRegistryDirty = true;

@@ -62,11 +62,36 @@ static void testReconcileType() {
   CHECK(strcmp(dailyReconcileAlarmType("", "digital", true, "not_activated"), "not_triggered") == 0);
   CHECK(strcmp(dailyReconcileAlarmType("bogus", "digital", true, "not_activated"), "not_triggered") == 0);
   CHECK(strcmp(dailyReconcileAlarmType("bogus", "digital", true, "bogus"), "triggered") == 0);
-  CHECK(strcmp(dailyReconcileAlarmType(nullptr, "digital", false, nullptr), "triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType(nullptr, "digital", true, nullptr), "triggered") == 0);
+  // Floats latch only on the high channel: a lone low latch keeps "low" whatever the config says.
+  CHECK(strcmp(dailyReconcileAlarmType("", "digital", false, ""), "low") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("", "digital", false, "not_activated"), "low") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType(nullptr, "digital", false, nullptr), "low") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "digital", false, ""), "not_triggered") == 0);  // y still wins
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", "analog", false, ""), "triggered") == 0);
   CHECK(strcmp(dailyReconcileAlarmType("", "analog", true, "not_activated"), "high") == 0);     // unchanged
   CHECK(strcmp(dailyReconcileAlarmType("", "currentLoop", false, ""), "low") == 0);             // unchanged
   CHECK(strcmp(dailyReconcileAlarmType("high", "analog", false, ""), "low") == 0);              // y only for float types
   CHECK(strcmp(dailyReconcileAlarmType(nullptr, nullptr, true, nullptr), "high") == 0);
+}
+
+static void testReconcileSensorType() {
+  CHECK(strcmp(dailyReconcileSensorType("digital", "analog", "currentLoop"), "digital") == 0);  // report st first
+  CHECK(strcmp(dailyReconcileSensorType("analog", "digital", "digital"), "analog") == 0);
+  CHECK(strcmp(dailyReconcileSensorType("", "digital", "analog"), "digital") == 0);             // then the config
+  CHECK(strcmp(dailyReconcileSensorType(nullptr, "current", "digital"), "current") == 0);
+  CHECK(strcmp(dailyReconcileSensorType("", "", "digital"), "digital") == 0);                   // then the record
+  CHECK(strcmp(dailyReconcileSensorType(nullptr, nullptr, "analog"), "analog") == 0);
+  CHECK(strcmp(dailyReconcileSensorType("", "", ""), "") == 0);
+  CHECK(strcmp(dailyReconcileSensorType(nullptr, nullptr, nullptr), "") == 0);
+  // Copilot's cases: a float whose record is empty or stale is classified from the report or config.
+  CHECK(strcmp(dailyReconcileAlarmType("", dailyReconcileSensorType("", "digital", ""), true, "not_activated"),
+               "not_triggered") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("", dailyReconcileSensorType("digital", "", "analog"), true, ""),
+               "triggered") == 0);
+  // A record still typed "digital" whose sensor is now analog keeps high/low.
+  CHECK(strcmp(dailyReconcileAlarmType("", dailyReconcileSensorType("analog", "", "digital"), false, ""), "low") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("", dailyReconcileSensorType("", "current", "digital"), true, ""), "high") == 0);
 }
 
 static void testNoteValue() {
@@ -110,9 +135,15 @@ static void testSketchText() {
   // A float is exempt even with no cached config snapshot.
   CHECK(strstr(text, "bool stuckDisabledInConfig = isDigitalSensorType(rec->sensorType);") != nullptr);
   CHECK(strstr(text, "if (alarmNoteCarriesValue(doc.as<JsonObjectConst>())) {") != nullptr);
-  CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", rec->sensorType, hiAlarm, cfgTrigger)") != nullptr);
-  CHECK(strstr(text, "configDigitalTriggerFor(clientUid, sensorIdx, cfgTrigger, sizeof(cfgTrigger));") != nullptr);
-  CHECK(strstr(text, "strlcpy(out, ct[\"digitalTrigger\"] | \"\", outLen);") != nullptr);
+  // The missed-alarm reconcile classifies by the effective type (report st, config, record) and
+  // never stores it in the record.
+  CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", effType, hiAlarm, cfgTrigger)") != nullptr);
+  CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", rec->sensorType,") == nullptr);
+  CHECK(strstr(text, "const char *effType = dailyReconcileSensorType(reportSt, cfgSensor, rec->sensorType);") != nullptr);
+  CHECK(strstr(text, "configSensorAndTriggerFor(clientUid, sensorIdx, cfgSensor, sizeof(cfgSensor), cfgTrigger,") != nullptr);
+  CHECK(strstr(text, "configDigitalTriggerFor(") == nullptr);
+  CHECK(strstr(text, "strlcpy(sensorOut, ct[\"sensor\"] | \"\", sensorLen);") != nullptr);
+  CHECK(strstr(text, "strlcpy(triggerOut, ct[\"digitalTrigger\"] | \"\", triggerLen);") != nullptr);
   CHECK(strstr(text, "obj[\"sensorType\"] = \"digital\";") != nullptr);
   CHECK(strstr(text, "Float Switch clear (%s)") != nullptr);
   CHECK(strstr(text, "type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
@@ -124,6 +155,7 @@ static void testSketchText() {
 int main() {
   testState();
   testReconcileType();
+  testReconcileSensorType();
   testNoteValue();
   testStuckDisabled();
   testSketchText();

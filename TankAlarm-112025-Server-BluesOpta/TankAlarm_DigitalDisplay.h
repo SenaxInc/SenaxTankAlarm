@@ -24,15 +24,28 @@ static inline const char *digitalStateText(float value) {
   return (value > 0.5f) ? "ON" : "OFF";
 }
 
+// Sensor type to classify a missed alarm with in the daily reconcile: the first non-empty of
+// reportSt (the "st" of this report's sensors[] entry for the same k), configSensor (the sensor's
+// "sensor" in the cached config) and recordType (the server's record, which can be empty or stale
+// until the report's sensors[] loop refreshes it). Only its digital-ness is used: the config and
+// "st" spell some analog types differently ("current" vs "currentLoop").
+static inline const char *dailyReconcileSensorType(const char *reportSt, const char *configSensor,
+                                                   const char *recordType) {
+  if (reportSt != nullptr && reportSt[0] != '\0') return reportSt;
+  if (configSensor != nullptr && configSensor[0] != '\0') return configSensor;
+  return (recordType != nullptr) ? recordType : "";
+}
+
 // Alarm type to record when the daily report shows an alarm the server missed. A client that sends
-// the note type ("y", added by CL-5) is trusted for float types. Otherwise a digital sensor (floats
-// latch on the high channel) takes its type from configTrigger, the sensor's "digitalTrigger" in
-// the client's cached config: "not_activated" gives "not_triggered", anything else (including an
-// unknown config) "triggered", the client default. Anything else keeps high/low.
+// the note type ("y", added by CL-5) is trusted for float types. Otherwise a digital sensor's high
+// latch (floats latch only on the high channel, so a lone low latch is never a float) takes its type
+// from configTrigger, the sensor's "digitalTrigger" in the client's cached config: "not_activated"
+// gives "not_triggered", anything else (including an unknown config) "triggered", the client
+// default. Anything else keeps high/low.
 static inline const char *dailyReconcileAlarmType(const char *y, const char *sensorType, bool highLatched,
                                                   const char *configTrigger) {
   if (y != nullptr && (strcmp(y, "triggered") == 0 || strcmp(y, "not_triggered") == 0)) return y;
-  if (isDigitalSensorType(sensorType)) {
+  if (highLatched && isDigitalSensorType(sensorType)) {
     return (configTrigger != nullptr && strcmp(configTrigger, "not_activated") == 0) ? "not_triggered"
                                                                                     : "triggered";
   }
