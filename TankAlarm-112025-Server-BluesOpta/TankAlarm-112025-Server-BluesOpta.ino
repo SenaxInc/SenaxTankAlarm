@@ -13174,17 +13174,32 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     return;
   }
 
+  // CR-7: a sensor alarm must name its sensor. The same guard as handleTelemetry (Fix #313-1a):
+  // a missing, non-integer or < 1 "k" would read as 0 and alert on a phantom sensor-0 record.
+  // System alarms (no "k") have already been handled above.
+  if (!doc["k"].is<int>() || doc["k"].as<int>() < 1) {
+    Serial.println(F("Alarm dropped: missing/invalid sensor index k"));
+    return;
+  }
   uint8_t sensorIndex = doc["k"].as<uint8_t>();
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   if (!rec) {
     return;
   }
-  
-  // Store optional user-assigned display number (0 = unset)
-  if (doc.containsKey("un")) {
-    rec->userNumber = doc["un"].as<uint8_t>();
+
+  // Optional user-assigned Display Number (0 = unset). R12: alarm notes carry "un" only when set,
+  // and recovered/clear/fault notes never carry it, so a note without "un" keeps the stored number
+  // (TankAlarm_SensorName.h); a malformed value is ignored rather than clearing it.
+  {
+    JsonVariantConst un = doc["un"];
+    const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
+                                                    false, rec->userNumber);
+    if (displayNumber != rec->userNumber) {
+      rec->userNumber = displayNumber;
+      gSensorRegistryDirty = true;
+    }
   }
-  
+
   // Track client firmware version and reconcile against any expected OTA target.
   noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
@@ -13850,8 +13865,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   const char *siteName = doc["s"] | "";
   const char *noteLabel = doc["n"] | "";  // the client's unload note does not send "n" today
-  uint8_t sensorIndex = doc["k"].as<uint8_t>();
-  
+
   if (!clientUid || strlen(clientUid) == 0) {
     Serial.println(F("Unload event missing client UID"));
     return;
@@ -13859,7 +13873,14 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   if (!isValidClientUid(clientUid)) {
     return;  // rejected and logged by the validator before any state or notification
   }
-  
+  // CR-7: the same guard as handleTelemetry (Fix #313-1a). A missing, non-integer or < 1 "k"
+  // would read as 0: an unload text/email routed as "<uid>_0" and a phantom sensor-0 record.
+  if (!doc["k"].is<int>() || doc["k"].as<int>() < 1) {
+    Serial.println(F("Unload dropped: missing/invalid sensor index k"));
+    return;
+  }
+  uint8_t sensorIndex = doc["k"].as<uint8_t>();
+
   // Extract unload event data
   float peakInches = doc["pk"].as<float>();
   float emptyInches = doc["em"].as<float>();
@@ -13882,14 +13903,12 @@ static void handleUnload(JsonDocument &doc, double epoch) {
 
   // Name the sensor from what the server already knows: the unload note carries neither "n"
   // nor "un", so take the label and the Display Number from the sensor record when the note
-  // lacks them ("Tank" only when there is no label at all).
+  // lacks them. CR-7: an unknown label stays empty (no "Tank" placeholder); the text then names
+  // the sensor by site (and Display Number) alone, and the unload log's "n" is empty too.
   const SensorRecord *known = findSensorByHash(clientUid, sensorIndex);
   const char *tankLabel = noteLabel;
   if (tankLabel[0] == '\0' && known != nullptr) {
     tankLabel = known->label;
-  }
-  if (tankLabel[0] == '\0') {
-    tankLabel = "Tank";
   }
   JsonVariantConst un = doc["un"];
   const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
@@ -13948,10 +13967,10 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   if (rec) {
     strlcpy(rec->site, siteName, sizeof(rec->site));
-    // Only a real label replaces the record's: the "Tank" placeholder used to overwrite the
-    // label the client set (the unload note has no "n"), renaming the sensor on the dashboard.
-    if (noteLabel[0] != '\0' || rec->label[0] == '\0') {
-      strlcpy(rec->label, tankLabel, sizeof(rec->label));
+    // Only a real label from the note replaces the record's (the unload note has no "n" today);
+    // an empty label is never filled with a placeholder, so the dashboard keeps the client's name.
+    if (noteLabel[0] != '\0') {
+      strlcpy(rec->label, noteLabel, sizeof(rec->label));
     }
     if (!un.isNull()) {
       rec->userNumber = displayNumber;  // a future note with "un"; without it the number stays
@@ -15024,25 +15043,20 @@ static bool phoneReceivesAlarm(JsonDocument &contactsDoc, const char *phone, con
 // without it, reminder silence is indistinguishable from "fixed".
 static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const char *who) {
   // Runs on the SMS reply path (handleSmsInbound -> applyReminderSnooze) on the main-thread
-  // stack: one 160-byte tail, one 160-byte message.
-  char tail[160];
+  // stack: a 48-byte reading, one 160-byte message and composeSnoozeText's 160-byte tail.
+  char reading[48];
   if (isDigitalSensorType(rec.sensorType)) {
     // S3 (C-A04 B7): a float has no value or unit, only a state.
-    snprintf(tail, sizeof(tail),
-             " reminders %s by %s. Still in %s alarm (%s).%s",
-             snoozed ? "paused" : "active again", who,
-             rec.alarmType, digitalStateText(rec.currentValue),
-             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+    strlcpy(reading, digitalStateText(rec.currentValue), sizeof(reading));
   } else {
-    snprintf(tail, sizeof(tail),
-             " reminders %s by %s. Still in %s alarm (%.1f %s).%s",
-             snoozed ? "paused" : "active again", who,
-             rec.alarmType, rec.currentValue,
-             rec.measurementUnit[0] ? rec.measurementUnit : "in",
-             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+    snprintf(reading, sizeof(reading), "%.1f %s", rec.currentValue,
+             rec.measurementUnit[0] ? rec.measurementUnit : "in");
   }
+  // CR-8: when the SNOOZED text does not fit, it is rebuilt with the short " Reply UNSNOOZE to
+  // resume." hint so the command is never the part that is cut (TankAlarm_SensorName.h).
   char message[160];
-  composeSensorText(message, sizeof(message), snoozed ? "SNOOZED: " : "RESUMED: ", rec.site, rec.label, rec.userNumber, tail);
+  composeSnoozeText(message, sizeof(message), snoozed, rec.site, rec.label, rec.userNumber, who,
+                    rec.alarmType, reading);
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
   sendSmsAlert(message, alarmId);
@@ -15355,7 +15369,13 @@ static void sendDailyEmail() {
     // even though the internal C++ field was renamed to `currentValue`. Renaming this wire
     // field would break existing SendGrid/SMTP email templates referencing {{levelInches}}.
     obj["levelInches"] = roundTo(gSensorRecords[i].currentValue, 1);
-    obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);
+    // R13: raw mA only for a current-loop sensor, where " (0 mA)" means no valid reading at the
+    // last report, plus a record with no stored type that holds a reading. Voltage, pulse and float
+    // sensors have no mA: without the key the email bridge prints no " (0 mA)".
+    if (strcmp(gSensorRecords[i].sensorType, "currentLoop") == 0 ||
+        (gSensorRecords[i].sensorType[0] == '\0' && gSensorRecords[i].sensorMa > 0.0f)) {
+      obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);
+    }
     obj["alarm"] = gSensorRecords[i].alarmActive;
     obj["alarmType"] = gSensorRecords[i].alarmType;
     // S3 (C-A04 B8): the email bridge prints ON/OFF for floats.

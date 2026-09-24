@@ -94,7 +94,7 @@ Returns the unload event log (up to 50 most recent events):
       "pt": 1735056000,          // Peak timestamp
       "s": "Main Site",          // Site name
       "c": "dev:xxx",            // Client UID
-      "n": "Fuel Tank",          // Tank label (the server's label for the sensor; "Tank" if none)
+      "n": "Fuel Tank",          // Tank label (the server's label for the sensor; "" if none)
       "k": 1,                    // Internal sensor number
       "un": 7,                   // Display Number (left out when blank)
       "pk": 90.0,                // Peak height (inches)

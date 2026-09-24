@@ -462,7 +462,9 @@ Each `sensors[]` entry names the sensor by `site` and `label`. `userNumber` is t
 that box is blank; print it as `#N` after the name. `sensorIndex` is the server's internal
 sensor number: it is still sent for route templates and scripts written before v2.2.17, but
 must not be printed (it shows `#1` for a sensor that has no Display Number). A float switch
-also carries `"sensorType": "digital"`.
+also carries `"sensorType": "digital"`. `sensorMa` (the raw 4-20 mA reading) is sent only for a
+current-loop sensor, where `0` means no valid reading at the last report; voltage, pulse and
+float sensors leave it out.
 
 The `subject` comes from the **/email-format** page (`{date}` token supported), and the
 page's field/summary toggles ride along in `fmt` so your route template can honor them.

@@ -429,25 +429,45 @@ try {
   checkEq('(i) two emails', br.sent.length, 2);
 }
 
-// (i2) S3: a float (sensorType "digital") prints ON/OFF and no mA; analog lines are unchanged
+// (i2) S3: a float (sensorType "digital") prints ON/OFF and no mA; analog lines are unchanged.
+// R13: the server sends sensorMa only for a current-loop sensor, so these rows are what it sends
+// now: floats and a pulse (RPM) sensor carry no sensorMa and print no ' (0 mA)'; a current-loop
+// sensor with no valid reading at the last report still prints ' (0 mA)'.
 {
   const br = makeBridge(source);
   checkEq('(i2) daily with floats ok', br.post(routed('ev-0502', {
     to: 'ops@example.com', subject: 'Daily Sensor Summary - 2026-09-24', id: 'dev:1-1790000420-9',
     sensors: [
       { client: 'dev:4', site: 'East', label: 'High Float', sensorIndex: 3, levelInches: 1,
-        sensorMa: 0, alarm: true, alarmType: 'triggered', sensorType: 'digital' },
+        alarm: true, alarmType: 'triggered', sensorType: 'digital' },
       { client: 'dev:4', site: 'East', label: 'Low Float', sensorIndex: 4, levelInches: 0,
-        sensorMa: 0, alarm: false, alarmType: 'clear', sensorType: 'digital' },
+        alarm: false, alarmType: 'clear', sensorType: 'digital' },
       { client: 'dev:2', site: 'Silas', label: 'Cox Wellhead', sensorIndex: 1, levelInches: 43.8,
         sensorMa: 8.2, alarm: false, alarmType: 'clear' },
+      { client: 'dev:2', site: 'Silas', label: 'Generator RPM', sensorIndex: 2, levelInches: 1800,
+        alarm: false, alarmType: 'clear' },
+      { client: 'dev:2', site: 'Silas', label: 'Tank 3', sensorIndex: 3, levelInches: 0,
+        sensorMa: 0, alarm: false, alarmType: 'clear' },
     ],
   })), 'ok');
   checkEq('(i2) float lines', (br.sent[0] || {}).body, [
     'East High Float: ON  ** ALARM: triggered **',
     'East Low Float: OFF',
     'Silas Cox Wellhead: 43.8 (8.2 mA)',
+    'Silas Generator RPM: 1800',
+    'Silas Tank 3: 0 (0 mA)',
   ].join('\n'));
+}
+
+// (i2b) R13: the server's sendDailyEmail sends sensorMa only for current-loop sensors (plus an
+// untyped record holding a reading); the script itself is unchanged.
+{
+  const page = fs.readFileSync(SKETCH, 'utf8');
+  check('(i2b) sensorMa only for current-loop sensors',
+        page.indexOf('    if (strcmp(gSensorRecords[i].sensorType, "currentLoop") == 0 ||\n' +
+                     "        (gSensorRecords[i].sensorType[0] == '\\0' && gSensorRecords[i].sensorMa > 0.0f)) {\n" +
+                     '      obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);\n' +
+                     '    }\n') >= 0, 'sendDailyEmail sensorMa gate missing');
 }
 
 // (i3) the daily line names a sensor by site and label (trimmed, blanks left out, 'Sensor' when

@@ -159,6 +159,23 @@ static void testFormatSensorName() {
   NAME("Silas Cox  ", "Wellhead ", 0, 64, "Silas Cox Wellhead");
   NAME("   ", "Wellhead", 0, 64, "Wellhead");
   NAME("   ", "   ", 1, 64, "Sensor #1");
+  // CR-8: leading spaces and tabs are trimmed too, and a tab counts as a space, as the daily
+  // email script's String.trim() does.
+  NAME(" Silas Cox", "Wellhead", 0, 64, "Silas Cox Wellhead");
+  NAME("Silas Cox", "  Wellhead", 7, 64, "Silas Cox Wellhead #7");
+  NAME("  Silas Cox  ", "  Wellhead  ", 0, 64, "Silas Cox Wellhead");
+  NAME("\tSilas Cox\t", "\t Wellhead \t", 3, 64, "Silas Cox Wellhead #3");
+  NAME("Silas\tCox", "Well\thead", 0, 64, "Silas\tCox Well\thead");  // inner tabs are kept
+  NAME("\t", " \t ", 0, 64, "Sensor");                              // blanks only: empty
+  NAME(" \t", "Wellhead", 2, 64, "Wellhead #2");
+  // Leading blanks do not use up the 23-byte cap: 3 blanks + a 23-byte site keeps all 23.
+  NAME(" \t ABCDEFGHIJKLMNOPQRSTUVW", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTUVW");
+  NAME("\tABCDEFGHIJKLMNOPQRSTUVWXYZ01234", "Pump", 9, 64, "ABCDEFGHIJKLMNOPQRSTUVW Pump #9");
+  // The cap lands after a tab: trimmed like a space.
+  NAME("ABCDEFGHIJKLMNOPQRSTUV\tWXYZ", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTUV");
+  // Shortening to fit outLen works from the trimmed parts.
+  NAME("  Silas Cox", "\tWellhead", 7, 21, "Silas Cox Wellhea #7");
+  NAME(" Silas", "  Cox Wellhead", 7, 8, "Sila #7");
   // Each part capped at 23 bytes: a 31-byte site is cut to 23.
   NAME("ABCDEFGHIJKLMNOPQRSTUVWXYZ01234", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTUVW");
   NAME("ABCDEFGHIJKLMNOPQRSTUVWXYZ01234", "Pump", 9, 64, "ABCDEFGHIJKLMNOPQRSTUVW Pump #9");
@@ -199,7 +216,8 @@ static void testFormatSensorName() {
 
   // Every size from 1 to 64 for a few inputs: bounded, NUL-terminated, valid UTF-8, and a
   // number is either whole or absent.
-  static const char *const kSites[] = {"Silas Cox", "", "Caf\xC3\xA9 \xE2\x82\xAC Station Longname X", "   "};
+  static const char *const kSites[] = {"Silas Cox", "", "Caf\xC3\xA9 \xE2\x82\xAC Station Longname X", "   ",
+                                        " \t Silas Cox \t"};
   static const char *const kLabels[] = {"Wellhead", "", "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9 Tank"};
   static const uint8_t kNums[] = {0, 7, 255};
   for (size_t si = 0; si < sizeof(kSites) / sizeof(kSites[0]); ++si) {
@@ -212,7 +230,8 @@ static void testFormatSensorName() {
           CHECK(n < outLen && out[n] == '\0' && strlen(out) == n);
           CHECK(out[outLen] == 'Z');
           CHECK(validUtf8(out));
-          CHECK(n == 0 || out[n - 1] != ' ');
+          CHECK(n == 0 || (out[n - 1] != ' ' && out[n - 1] != '\t'));
+          CHECK(n == 0 || (out[0] != ' ' && out[0] != '\t'));  // CR-8: no leading blank
           if (kNums[ni] == 0) {
             CHECK(strchr(out, '#') == nullptr);
           } else if (n > 0) {
@@ -426,6 +445,91 @@ static void testComposeSensorText() {
   CHECK_STR(small, "Site \xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9");
 }
 
+static bool endsWith(const char *s, const char *suffix) {
+  const size_t n = strlen(s);
+  const size_t k = strlen(suffix);
+  return n >= k && strcmp(s + n - k, suffix) == 0;
+}
+
+// CR-8: broadcastSnoozeChange's SNOOZED/RESUMED text. The long hint when it fits; otherwise the
+// short hint, which keeps "Reply UNSNOOZE" whole.
+static void testComposeSnoozeText() {
+  char msg[160];
+  CHECK(strcmp(SNOOZE_HINT, " Auto-resumes on recovery; reply UNSNOOZE to resume now.") == 0);
+  CHECK(strcmp(SNOOZE_HINT_SHORT, " Reply UNSNOOZE to resume.") == 0);
+
+  // Everyday texts are unchanged (the same strings testComposeSensorText pins).
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "Silas Cox", "Wellhead", 0, "Jim", "high", "34.4 in"));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellhead reminders paused by Jim. Still in high alarm (34.4 in). "
+                 "Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  CHECK(composeSnoozeText(msg, sizeof(msg), false, "Silas Cox", "High Float", 3, "dashboard", "triggered", "ON"));
+  CHECK_STR(msg, "RESUMED: Silas Cox High Float #3 reminders active again by dashboard. Still in triggered alarm (ON).");
+  static const char kWho23[] = "Christopher Worthington";  // 23 bytes (char who[24])
+  CHECK(strlen(kWho23) == 23);
+  // A 23-byte contact name with a short alarm type still fits with the long hint.
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "Silas Cox", "Wellhead", 0, kWho23, "high", "34.4 in"));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellhead reminders paused by Christopher Worthington. Still in high alarm "
+                 "(34.4 in). Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+
+  // A 23-byte contact name with not_triggered (a float): the long text would cut the hint, so the
+  // short hint is used and the whole text fits.
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "Johnson Ranch North", "High Float", 0, kWho23,
+                          "not_triggered", "OFF"));
+  CHECK_STR(msg, "SNOOZED: Johnson Ranch North High Float reminders paused by Christopher Worthington. Still in "
+                 "not_triggered alarm (OFF). Reply UNSNOOZE to resume.");
+  // ... and with sensor-fault on an analog sensor, a 28-byte site (capped at 23) and Display Number 7.
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "North Dakota Pump Station 12", "Wellhead", 7, kWho23,
+                          "sensor-fault", "0.0 in"));
+  CHECK_STR(msg, "SNOOZED: North Dakota Pump Stati Wellhead #7 reminders paused by Christopher Worthington. Still "
+                 "in sensor-fault alarm (0.0 in). Reply UNSNOOZE to resume.");
+  // The longest fields: 23-byte who and alarm type, a 16-byte reading, a 31-byte site, a 23-byte
+  // label and Display Number 255. The short text still fits whole; the name gets 20 bytes.
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "SSSSSSSSSSSSSSSSSSSSSSSxxxxxxxx", "LLLLLLLLLLLLLLLLLLLLLLL", 255,
+                          "WWWWWWWWWWWWWWWWWWWWWWW", "TTTTTTTTTTTTTTTTTTTTTTT", "-12345.6 gallons"));
+  CHECK_STR(msg, "SNOOZED: SSSSSSSSSSSSSSS #255 reminders paused by WWWWWWWWWWWWWWWWWWWWWWW. Still in "
+                 "TTTTTTTTTTTTTTTTTTTTTTT alarm (-12345.6 gallons). Reply UNSNOOZE to resume.");
+  CHECK(strlen(msg) == 159);
+
+  // Every who length 0-23 with each alarm type and reading: the SNOOZED text always fits, ends with
+  // one of the two hints (the long one whenever it fits) and keeps "UNSNOOZE"; RESUMED has no hint.
+  static const char *const kTypes[] = {"high", "low", "triggered", "not_triggered", "sensor-fault",
+                                       "sensor-stuck", "relay_timeout", "TTTTTTTTTTTTTTTTTTTTTTT"};
+  static const char *const kReadings[] = {"ON", "OFF", "0.0 in", "34.4 in", "-12345.6 gallons", "-99999.9 gallons"};
+  static const char *const kSitesS[] = {"Silas Cox", "Johnson Ranch North", "SSSSSSSSSSSSSSSSSSSSSSSxxxxxxxx", ""};
+  char who[24];
+  for (size_t w = 0; w <= 23; ++w) {
+    memset(who, 'W', w);
+    who[w] = '\0';
+    for (size_t ti = 0; ti < sizeof(kTypes) / sizeof(kTypes[0]); ++ti) {
+      for (size_t ri = 0; ri < sizeof(kReadings) / sizeof(kReadings[0]); ++ri) {
+        for (size_t si = 0; si < sizeof(kSitesS) / sizeof(kSitesS[0]); ++si) {
+          const bool fit = composeSnoozeText(msg, sizeof(msg), true, kSitesS[si], "LLLLLLLLLLLLLLLLLLLLLLL", 255, who,
+                                             kTypes[ti], kReadings[ri]);
+          ++gChecks;
+          if (!(fit && strlen(msg) <= 159 && strncmp(msg, "SNOOZED: ", 9) == 0 &&
+                strstr(msg, "UNSNOOZE") != nullptr &&
+                (endsWith(msg, SNOOZE_HINT) || endsWith(msg, SNOOZE_HINT_SHORT)))) {
+            ++gFailures;
+            printf("FAIL snooze who=%u type=%s reading=%s: \"%s\"\n", (unsigned)w, kTypes[ti], kReadings[ri], msg);
+          }
+          // The short hint only when the long text does not fit.
+          char longTail[200];
+          tailf(longTail, sizeof(longTail), " reminders paused by %s. Still in %s alarm (%s).%s", who, kTypes[ti],
+                kReadings[ri], SNOOZE_HINT);
+          char probe[160];
+          const bool longFits = composeSensorText(probe, sizeof(probe), "SNOOZED: ", kSitesS[si],
+                                                  "LLLLLLLLLLLLLLLLLLLLLLL", 255, longTail);
+          CHECK(longFits == endsWith(msg, SNOOZE_HINT));
+          CHECK(!longFits || strcmp(probe, msg) == 0);
+          composeSnoozeText(msg, sizeof(msg), false, kSitesS[si], "LLLLLLLLLLLLLLLLLLLLLLL", 255, who, kTypes[ti],
+                            kReadings[ri]);
+          CHECK(strncmp(msg, "RESUMED: ", 9) == 0 && strstr(msg, "UNSNOOZE") == nullptr && endsWith(msg, ").") );
+        }
+      }
+    }
+  }
+}
+
 // strstr from `from`, or nullptr when `from` was not found.
 static const char *findAfter(const char *needle, const char *from) {
   return (from != nullptr) ? strstr(from, needle) : nullptr;
@@ -489,19 +593,56 @@ static void testSketchText() {
   CHECK(dailyCall != nullptr);
   const char *sensorsLoop = findAfter("  JsonArray sensors = doc[\"sensors\"];\n  for (JsonObject t : sensors) {", daily);
   CHECK(sensorsLoop != nullptr && dailyCall != nullptr && sensorsLoop < dailyCall);
-  // Three call sites: telemetry, daily and unload (unload keeps the number when "un" is missing).
-  CHECK(countOf(text, "noteDisplayNumber(") == 3);
+  // Four call sites: telemetry, daily, alarm and unload (alarm and unload keep the number when
+  // "un" is missing: recovered/clear/fault alarm notes and unload notes never carry it).
+  CHECK(countOf(text, "noteDisplayNumber(") == 4);
   CHECK(foundBetween("  JsonVariantConst un = doc[\"un\"];\n"
                      "  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,\n"
                      "                                                  false, known != nullptr ? known->userNumber : 0);\n",
                      unload, unloadEnd));
-  // The presence-only writes are gone from telemetry and daily; handleAlarm keeps its own.
+  // R12: handleAlarm uses the helper with noteAlwaysCarriesUn = false and marks the registry dirty
+  // on a change, like telemetry.
+  CHECK(foundBetween("    JsonVariantConst un = doc[\"un\"];\n"
+                     "    const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,\n"
+                     "                                                    false, rec->userNumber);\n"
+                     "    if (displayNumber != rec->userNumber) {\n"
+                     "      rec->userNumber = displayNumber;\n"
+                     "      gSensorRegistryDirty = true;\n"
+                     "    }\n", alarm, alarmEnd));
+  // The presence-only writes are gone everywhere (a null "un" read as 0, 300 cleared the number).
   CHECK(strstr(text, "    if (t.containsKey(\"un\")) {\n      rec->userNumber = t[\"un\"].as<uint8_t>();") == nullptr);
-  const char *alarmWrite = findAfter("  if (doc.containsKey(\"un\")) {\n    rec->userNumber = doc[\"un\"].as<uint8_t>();\n  }", telemetry);
-  CHECK(alarmWrite != nullptr && alarm != nullptr && daily != nullptr && alarmWrite > alarm && alarmWrite < daily);
-  if (alarmWrite != nullptr) {
-    CHECK(strstr(alarmWrite + 1, "  if (doc.containsKey(\"un\")) {\n    rec->userNumber = doc[\"un\"].as<uint8_t>();\n  }") == nullptr);
-  }
+  CHECK(strstr(text, "containsKey(\"un\")") == nullptr);
+  CHECK(strstr(text, "[\"un\"].as<uint8_t>()") == nullptr);
+
+  // CR-7: handleAlarm's sensor path and handleUnload drop a note whose "k" is missing, not an
+  // integer or < 1 (the telemetry guard), before any record, log, SMS or email work.
+  static const char kAlarmGuard[] =
+      "  if (!doc[\"k\"].is<int>() || doc[\"k\"].as<int>() < 1) {\n"
+      "    Serial.println(F(\"Alarm dropped: missing/invalid sensor index k\"));\n"
+      "    return;\n"
+      "  }\n"
+      "  uint8_t sensorIndex = doc[\"k\"].as<uint8_t>();\n"
+      "  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n";
+  static const char kUnloadGuard[] =
+      "  if (!doc[\"k\"].is<int>() || doc[\"k\"].as<int>() < 1) {\n"
+      "    Serial.println(F(\"Unload dropped: missing/invalid sensor index k\"));\n"
+      "    return;\n"
+      "  }\n"
+      "  uint8_t sensorIndex = doc[\"k\"].as<uint8_t>();\n";
+  const char *alarmGuard = findAfter(kAlarmGuard, alarm);
+  const char *systemReturn = findAfter("  if (isSystemAlarm) {\n", alarm);
+  CHECK(alarmGuard != nullptr && alarmEnd != nullptr && alarmGuard < alarmEnd);
+  CHECK(systemReturn != nullptr && alarmGuard != nullptr && systemReturn < alarmGuard);  // system alarms carry no k
+  CHECK(countOf(text, "uint8_t sensorIndex = doc[\"k\"].as<uint8_t>();") == 3);  // telemetry, alarm, unload
+  const char *unloadGuard = findAfter(kUnloadGuard, unload);
+  CHECK(unloadGuard != nullptr && unloadEnd != nullptr && unloadGuard < unloadEnd);
+  const char *unloadUidCheck = findAfter("  if (!isValidClientUid(clientUid)) {\n", unload);
+  const char *unloadLookup = findAfter("findSensorByHash(clientUid, sensorIndex)", unload);
+  const char *unloadLog = findAfter("  logUnloadEvent(entry);\n", unload);
+  CHECK(unloadUidCheck != nullptr && unloadGuard != nullptr && unloadUidCheck < unloadGuard);
+  CHECK(unloadGuard != nullptr && unloadLookup != nullptr && unloadLog != nullptr && unloadGuard < unloadLookup &&
+        unloadLookup < unloadLog);
+  CHECK(!foundBetween("doc[\"k\"].as<uint8_t>()", unload, unloadGuard));  // no read before the guard
 
   // sendDailyEmail still sends sensorIndex (old pasted scripts print '#undefined' without it) and
   // userNumber only when set.
@@ -511,6 +652,14 @@ static void testSketchText() {
                   "    if (gSensorRecords[i].userNumber > 0) {\n"
                   "      obj[\"userNumber\"] = gSensorRecords[i].userNumber;\n"
                   "    }\n", email) != nullptr);
+  // R13: "sensorMa" only for a current-loop sensor (or an untyped record holding a reading), so
+  // voltage, pulse and float lines print no " (0 mA)".
+  CHECK(findAfter("    if (strcmp(gSensorRecords[i].sensorType, \"currentLoop\") == 0 ||\n"
+                  "        (gSensorRecords[i].sensorType[0] == '\\0' && gSensorRecords[i].sensorMa > 0.0f)) {\n"
+                  "      obj[\"sensorMa\"] = roundTo(gSensorRecords[i].sensorMa, 2);\n"
+                  "    }\n", email) != nullptr);
+  CHECK(countOf(text, "obj[\"sensorMa\"] = ") == 1);
+  CHECK(strstr(text, "\n    obj[\"sensorMa\"] = roundTo(gSensorRecords[i].sensorMa, 2);\n") == nullptr);
 
   // Dashboard "Latest" line: the client-level "un" follows the same sensor as "n"/"k".
   CHECK(strstr(text, "      clientObj[\"k\"] = rec.sensorIndex;\n"
@@ -522,8 +671,10 @@ static void testSketchText() {
                      "      }\n") != nullptr);
 
   // --- SMS/email texts name the sensor with composeSensorText, never with sensorIndex. ---
-  // Four builders: handleAlarm, buildUnloadText, broadcastSnoozeChange, checkAlarmReminders.
-  CHECK(countOf(text, "composeSensorText(") == 4);
+  // Four builders: handleAlarm, buildUnloadText and checkAlarmReminders call composeSensorText;
+  // broadcastSnoozeChange calls composeSnoozeText (TankAlarm_SensorName.h), which calls it.
+  CHECK(countOf(text, "composeSensorText(") == 3);
+  CHECK(countOf(text, "composeSnoozeText(") == 1);
   // handleAlarm: one tail per branch, one compose, the alarm id unchanged.
   CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" Relay safety timeout - relay forced OFF\");\n", alarm, alarmEnd));
   CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" Float Switch %s\", stateDesc);\n", alarm, alarmEnd));
@@ -557,25 +708,20 @@ static void testSketchText() {
   CHECK(foundBetween("    snprintf(alarmId, sizeof(alarmId), \"%s_%d\", rec.clientUid, (int)rec.sensorIndex);\n"
                      "    sendSmsAlert(message, alarmId);\n"
                      "    sendEmailAlert(\"TankAlarm Reminder\", message, alarmId);", reminders, remindersEnd));
-  // broadcastSnoozeChange (SMS reply path: one tail[160] and one message[160] on the stack).
-  CHECK(foundBetween("    snprintf(tail, sizeof(tail),\n"
-                     "             \" reminders %s by %s. Still in %s alarm (%s).%s\",\n"
-                     "             snoozed ? \"paused\" : \"active again\", who,\n"
-                     "             rec.alarmType, digitalStateText(rec.currentValue),\n"
-                     "             snoozed ? \" Auto-resumes on recovery; reply UNSNOOZE to resume now.\" : \"\");\n",
-                     snooze, snoozeEnd));
-  CHECK(foundBetween("    snprintf(tail, sizeof(tail),\n"
-                     "             \" reminders %s by %s. Still in %s alarm (%.1f %s).%s\",\n"
-                     "             snoozed ? \"paused\" : \"active again\", who,\n"
-                     "             rec.alarmType, rec.currentValue,\n"
-                     "             rec.measurementUnit[0] ? rec.measurementUnit : \"in\",\n"
-                     "             snoozed ? \" Auto-resumes on recovery; reply UNSNOOZE to resume now.\" : \"\");\n",
+  // broadcastSnoozeChange (SMS reply path): the reading is the float's state or "value unit", and
+  // composeSnoozeText (tested above) builds the text, falling back to the short UNSNOOZE hint.
+  CHECK(foundBetween("    strlcpy(reading, digitalStateText(rec.currentValue), sizeof(reading));\n", snooze, snoozeEnd));
+  CHECK(foundBetween("    snprintf(reading, sizeof(reading), \"%.1f %s\", rec.currentValue,\n"
+                     "             rec.measurementUnit[0] ? rec.measurementUnit : \"in\");\n",
                      snooze, snoozeEnd));
   CHECK(foundBetween("  char message[160];\n"
-                     "  composeSensorText(message, sizeof(message), snoozed ? \"SNOOZED: \" : \"RESUMED: \", rec.site, rec.label, rec.userNumber, tail);\n",
+                     "  composeSnoozeText(message, sizeof(message), snoozed, rec.site, rec.label, rec.userNumber, who,\n"
+                     "                    rec.alarmType, reading);\n",
                      snooze, snoozeEnd));
+  CHECK(!foundBetween("char tail[", snooze, snoozeEnd));
+  CHECK(strstr(text, "reply UNSNOOZE to resume now.") == nullptr);  // the hints live in the header
   CHECK(foundBetween("  snprintf(alarmId, sizeof(alarmId), \"%s_%d\", rec.clientUid, (int)rec.sensorIndex);\n", snooze, snoozeEnd));
-  CHECK(countOf(text, "char tail[160];") == 4);
+  CHECK(countOf(text, "char tail[160];") == 3);
   CHECK(strstr(text, "char tail[2") == nullptr && strstr(text, "char tail[3") == nullptr);
   // Unload: one builder shared by the SMS and the email; alarm ids unchanged.
   CHECK(foundBetween("  snprintf(tail, sizeof(tail), \" unloaded: %.1f %s delivered (peak %.1f, now %.1f)\",\n"
@@ -589,7 +735,8 @@ static void testSketchText() {
                      "  sendSmsAlert(message, alarmId);\n", unloadSms, unloadEmail));
   CHECK(foundBetween("  snprintf(alarmId, sizeof(alarmId), \"%s_%d\", entry.clientUid, (int)entry.sensorIndex);\n"
                      "  sendEmailAlert(\"TankAlarm Unload Report\", message, alarmId);\n", unloadEmail, upsert));
-  // handleUnload names the sensor from the record and stops clobbering its label with "Tank".
+  // handleUnload names the sensor from the record and never uses a "Tank" placeholder (CR-7): an
+  // unknown label stays empty in the text, the unload log / api "n" and the record.
   CHECK(strstr(text, "  uint8_t sensorIndex;         // Internal sensor index\n"
                      "  uint8_t userNumber;          // Display Number (0 = none); names the sensor as \" #N\" in texts\n") != nullptr);
   CHECK(foundBetween("  const char *noteLabel = doc[\"n\"] | \"\";", unload, unloadEnd));
@@ -599,14 +746,26 @@ static void testSketchText() {
                      "  if (tankLabel[0] == '\\0' && known != nullptr) {\n"
                      "    tankLabel = known->label;\n"
                      "  }\n"
-                     "  if (tankLabel[0] == '\\0') {\n"
-                     "    tankLabel = \"Tank\";\n"
-                     "  }\n", unload, unloadEnd));
+                     "  JsonVariantConst un = doc[\"un\"];\n", unload, unloadEnd));
+  CHECK(!foundBetween("\"Tank\";", unload, unloadEnd) && !foundBetween("\"Tank\",", unload, unloadEnd) &&
+        !foundBetween("\"Tank\")", unload, unloadEnd));
+  CHECK(foundBetween("  strlcpy(entry.tankLabel, tankLabel, sizeof(entry.tankLabel));\n", unload, unloadEnd));
   CHECK(foundBetween("  entry.userNumber = displayNumber;\n", unload, unloadEnd));
-  CHECK(foundBetween("    if (noteLabel[0] != '\\0' || rec->label[0] == '\\0') {\n"
-                     "      strlcpy(rec->label, tankLabel, sizeof(rec->label));\n"
+  // Only a label the note carries replaces the record's; an empty one is never filled in.
+  CHECK(foundBetween("    if (noteLabel[0] != '\\0') {\n"
+                     "      strlcpy(rec->label, noteLabel, sizeof(rec->label));\n"
                      "    }\n", unload, unloadEnd));
-  CHECK(!foundBetween("    strlcpy(rec->label, tankLabel, sizeof(rec->label));\n    rec->currentValue", unload, unloadEnd));
+  CHECK(!foundBetween("strlcpy(rec->label, tankLabel", unload, unloadEnd));
+  // With no label the unload text names the sensor by site (and Display Number) alone.
+  {
+    char msg[160];
+    char tail[160];
+    tailf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)", 85.5f, "in", 90.0f, 4.5f);
+    CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "", 0, tail));
+    CHECK_STR(msg, "Silas Cox unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+    CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "", 4, tail));
+    CHECK_STR(msg, "Silas Cox #4 unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+  }
   // /api/unloads keeps "n" and "k" and adds "un" only for a Display Number.
   CHECK(strstr(text, "    obj[\"n\"] = entry.tankLabel;              // Tank label\n"
                      "    obj[\"k\"] = entry.sensorIndex;             // Sensor index\n"
@@ -627,6 +786,7 @@ int main() {
   testUtf8FitLen();
   testFormatSensorName();
   testComposeSensorText();
+  testComposeSnoozeText();
   testSketchText();
   if (gFailures) {
     printf("sensor_name: %lu of %lu checks FAILED\n", gFailures, gChecks);

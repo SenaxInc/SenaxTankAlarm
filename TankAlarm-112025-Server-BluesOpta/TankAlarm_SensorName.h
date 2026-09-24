@@ -3,7 +3,8 @@
 // client. Pure: C headers only, host-tested in tests/host/sensor_name.
 //
 // NAMING RULE (owner decision 2026-09-24). Every SMS and email that names a sensor calls it
-//   site + " " + label    (each with trailing spaces removed, a blank part left out,
+//   site + " " + label    (each with leading and trailing spaces and tabs removed, as the
+//                           daily-email script's trim() does; a blank part left out,
 //                           "Sensor" when both are blank)
 //   + " #<Display Number>" only when the Display Number is 1-255.
 // The internal sensor number (sensorIndex, "k") is never printed in an SMS or email: it is a
@@ -70,11 +71,28 @@ static inline size_t utf8FitLen(const char *s, size_t maxBytes) {
   return n;
 }
 
+// A space or a tab: the blanks trimmed from both ends of a site or a label (CR-8).
+static inline bool sensorNameBlank(char c) {
+  return c == ' ' || c == '\t';
+}
+
+// s past its leading spaces and tabs (null stays null).
+static inline const char *sensorNameSkipBlank(const char *s) {
+  if (s == NULL) {
+    return NULL;
+  }
+  while (sensorNameBlank(*s)) {
+    ++s;
+  }
+  return s;
+}
+
 // Bytes of s to use when it may take at most maxBytes: cut at a UTF-8 boundary, then drop
-// trailing spaces (so a part of only spaces is empty).
+// trailing spaces and tabs (so a part of only blanks is empty). Leading blanks are skipped by
+// the caller (sensorNameSkipBlank) before the cap, so they never use up the part's bytes.
 static inline size_t sensorNamePartLen(const char *s, size_t maxBytes) {
   size_t n = utf8FitLen(s, maxBytes);
-  while (n > 0 && s[n - 1] == ' ') {
+  while (n > 0 && sensorNameBlank(s[n - 1])) {
     --n;
   }
   return n;
@@ -85,7 +103,7 @@ static inline size_t sensorNamePartLen(const char *s, size_t maxBytes) {
 //   userNumber  - the Display Number; 0 = none
 // When the name is longer than outLen - 1 it is shortened: the " #<n>" is kept whole, then the
 // label is shortened, then the site (or the "Sensor" fallback), each at a UTF-8 boundary with
-// trailing spaces removed. If nothing of the site and label is left the number is written as
+// trailing spaces and tabs removed. If nothing of the site and label is left the number is written as
 // "#7" (no leading space). If " #<n>" itself does not fit, the number is left out entirely
 // (never half a number) and so is the rest. out is always NUL-terminated when outLen > 0;
 // outLen 0 writes nothing.
@@ -95,8 +113,9 @@ static inline size_t formatSensorName(char *out, size_t outLen, const char *site
     return 0;
   }
   const size_t room = outLen - 1;
-  const char *s = (site != NULL) ? site : "";
-  const char *l = (label != NULL) ? label : "";
+  // Leading spaces and tabs are skipped before the cap, so SMS matches the script's trim().
+  const char *s = (site != NULL) ? sensorNameSkipBlank(site) : "";
+  const char *l = (label != NULL) ? sensorNameSkipBlank(label) : "";
   size_t sLen = sensorNamePartLen(s, SENSOR_NAME_PART_MAX);
   size_t lLen = sensorNamePartLen(l, SENSOR_NAME_PART_MAX);
   if (sLen == 0 && lLen == 0) {
@@ -197,6 +216,37 @@ static inline bool composeSensorText(char *out, size_t outLen, const char *prefi
   pos += tailFit;
   out[pos] = '\0';
   return tailFit == tailLen;
+}
+
+// The SNOOZED notice's hint, and the short one used when the whole notice does not fit (CR-8):
+// a 23-byte contact name with a long alarm type (not_triggered, sensor-fault) or reading cut
+// " to resume now." (or more) off the end. The short hint keeps "Reply UNSNOOZE" whole.
+#define SNOOZE_HINT " Auto-resumes on recovery; reply UNSNOOZE to resume now."
+#define SNOOZE_HINT_SHORT " Reply UNSNOOZE to resume."
+
+// Writes the one-time SNOOZED/RESUMED notice broadcastSnoozeChange sends:
+//   "SNOOZED: " + NAME + " reminders paused by <who>. Still in <type> alarm (<reading>)." + hint
+//   "RESUMED: " + NAME + " reminders active again by <who>. Still in <type> alarm (<reading>)."
+// reading is "34.4 in" for an analog sensor or the state ("ON"/"OFF") for a float. When the
+// SNOOZED text with SNOOZE_HINT does not fit outLen it is composed again with SNOOZE_HINT_SHORT.
+// Returns true when the whole text fit (composeSensorText's result).
+static inline bool composeSnoozeText(char *out, size_t outLen, bool snoozed, const char *site,
+                                     const char *label, uint8_t userNumber, const char *who,
+                                     const char *alarmType, const char *reading) {
+  char tail[160];
+  const char *prefix = snoozed ? "SNOOZED: " : "RESUMED: ";
+  snprintf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s",
+           snoozed ? "paused" : "active again", (who != NULL) ? who : "",
+           (alarmType != NULL) ? alarmType : "", (reading != NULL) ? reading : "",
+           snoozed ? SNOOZE_HINT : "");
+  const bool fit = composeSensorText(out, outLen, prefix, site, label, userNumber, tail);
+  if (fit || !snoozed) {
+    return fit;
+  }
+  snprintf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s", "paused",
+           (who != NULL) ? who : "", (alarmType != NULL) ? alarmType : "",
+           (reading != NULL) ? reading : "", SNOOZE_HINT_SHORT);
+  return composeSensorText(out, outLen, prefix, site, label, userNumber, tail);
 }
 
 #endif  // TANKALARM_SENSOR_NAME_H
