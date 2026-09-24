@@ -17,7 +17,7 @@
     h | ?             help
     i                 pin table, terminal modes, outputs-LOW time, coil pin state        A7
     c <n> <0|1>       drive relay n's coil (RELAYn)                                     A2
-    l <n> <0|1>       drive relay n's LED only                                          A2
+    l <n> <0|1>       drive relay n's LED only, at a raw level                          A2
     u <0|1>           drive LED_USER (Opta WiFi only; the Lite has no USER LED)         L1
     x <n> <0|1>       v2.2.16 relay command: pin 7+(n-1) (LED_D0 + index)               A1, A2
     p <0|1>           1: INPUT_PULLUP on the coil pins (not driven); 0: OUTPUT LOW      A3
@@ -31,9 +31,12 @@
 
   Stage 1 (plan v2 section 4):
     A7  Watch the meter and LEDs from power-on to the banner; i shows when outputs went LOW.
-    A1  x 1 1 .. x 4 1: no contact closes; the LEDs of R1, R3, R2 light; x 4 (pin 10) nothing.
-    A2  c <n> 1 / c <n> 0 close and open only contact n; l <n> 1 / l <n> 0 light LEDs only.
-    L1  Opta WiFi only, optional: u 1 / u 0 shows which level lights LED_USER. The firmware
+    A1  x 1 1 .. x 4 1: no contact closes; the LEDs of R1, R3, R2 change state; x 4 (pin 10)
+        nothing.
+    A2  c <n> 1 / c <n> 0 close and open only contact n. l <n> 1 / l <n> 0 change only LED n
+        (the contacts stay open): note which raw level lights it. That level becomes
+        OPTA_LED_ON_LEVEL in TankAlarm_OptaIo.h (D6).
+    L1  Opta WiFi only, optional: u 1 / u 0 shows which raw level lights LED_USER. The firmware
         never drives LED_USER (D1: no alarm light); skip L1 on an Opta Lite.
     A3  p 1: does any relay energise with the coil pins as INPUT_PULLUP? Then p 0.
     A4  sweep (analog), m * d then sweep, m * u then sweep (r between classes); I1/I2 separately.
@@ -79,8 +82,10 @@ static void printBanner();
 static void printHelp();
 
 void setup() {
-  // A7 contract (CL-2's initRelayOutputs copies it): every coil and LED is an output driven LOW
-  // before anything else runs.
+  // A7: every coil and LED is an output before anything else runs. The coils are driven LOW
+  // (contacts open): that is the safety contract CL-2's initRelayOutputs copies. The relay LEDs
+  // and LED_USER are driven raw LOW, a fixed reference for A7 and A2 whatever OPTA_LED_ON_LEVEL
+  // says; initRelayOutputs writes the relay LEDs at their off level, !OPTA_LED_ON_LEVEL, not LOW.
   for (uint8_t r = 0; r < OPTA_RELAY_COUNT; ++r) {
     pinMode(optaRelayCoilPin(r), OUTPUT);
     digitalWrite(optaRelayCoilPin(r), LOW);
@@ -264,8 +269,8 @@ static void printHelp() {
   Serial.println(F("  h | ?            help"));
   Serial.println(F("  i                pin table, modes, outputs-LOW time, coil pin state"));
   Serial.println(F("  c <n> <0|1>      relay n coil"));
-  Serial.println(F("  l <n> <0|1>      relay n LED"));
-  Serial.println(F("  u <0|1>          LED_USER (Opta WiFi only)"));
+  Serial.println(F("  l <n> <0|1>      relay n LED, raw level"));
+  Serial.println(F("  u <0|1>          LED_USER, raw level (Opta WiFi only)"));
   Serial.println(F("  x <n> <0|1>      v2.2.16 relay command (pin 7+(n-1))"));
   Serial.println(F("  p <0|1>          1: coil pins INPUT_PULLUP (not driven); 0: OUTPUT LOW"));
   Serial.println(F("  m <t|*> <a|d|u>  read as analog / digital INPUT / digital INPUT_PULLUP"));

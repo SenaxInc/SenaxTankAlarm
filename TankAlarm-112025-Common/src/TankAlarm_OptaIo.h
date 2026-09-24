@@ -28,7 +28,9 @@ static constexpr uint8_t OPTA_IO_MAX_MONITORS = 8;  // == client MAX_MONITORS
 // LED_USER (LEDB). Only the Opta WiFi has a USER LED; the firmware never drives it (D1: no
 // alarm light). Listed so the bench sketch and the pin-disjointness test cover it.
 static constexpr int16_t OPTA_LED_USER_PIN = 25;
-// Relay LEDs are lit by HIGH. Placeholder until bench A2 confirms it (D6).
+// Raw level that lights a relay LED. HIGH is a placeholder until bench A2 measures it (D6).
+// Firmware callers write a lit LED at OPTA_LED_ON_LEVEL and a dark one at !OPTA_LED_ON_LEVEL,
+// never a literal HIGH or LOW. Only the bench sketch writes raw levels, to measure this one.
 static constexpr uint8_t OPTA_LED_ON_LEVEL = 1;
 
 // Terminal t (0-7 = I1-I8) -> PIN_A0..PIN_A7, or -1.
@@ -484,7 +486,8 @@ static inline bool optaButtonStep(OptaButton &b, bool pressed, uint32_t nowMs) {
 
 // There is no alarm light (D1): the Opta Lite has no USER LED. Bit r (0-3) is relay LED r, which
 // mirrors the coil output as actually driven, so a lit relay LED always means a closed contact.
-// Everything is off in CRITICAL hibernate. The caller writes only bits in prev ^ next.
+// Everything is off in CRITICAL hibernate. The caller writes only bits in prev ^ next, a set bit
+// at OPTA_LED_ON_LEVEL and a clear one at !OPTA_LED_ON_LEVEL.
 static constexpr uint8_t optaIndicatorMask(uint8_t coilDriveMask, bool criticalInhibit) {
   return criticalInhibit ? (uint8_t)0 : (uint8_t)(coilDriveMask & 0x0F);
 }
