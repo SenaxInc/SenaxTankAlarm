@@ -140,6 +140,9 @@ static void testSketchText() {
   CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", effType, hiAlarm, cfgTrigger)") != nullptr);
   CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", rec->sensorType,") == nullptr);
   CHECK(strstr(text, "const char *effType = dailyReconcileSensorType(reportSt, cfgSensor, rec->sensorType);") != nullptr);
+  // reportSt comes from this report's sensors[] entry for the alarm's k.
+  CHECK(strstr(text, "if (t[\"k\"].is<int>() && t[\"k\"].as<int>() == sensorIdx) {\n"
+                     "              reportSt = t[\"st\"] | \"\";") != nullptr);
   CHECK(strstr(text, "configSensorAndTriggerFor(clientUid, sensorIdx, cfgSensor, sizeof(cfgSensor), cfgTrigger,") != nullptr);
   CHECK(strstr(text, "configDigitalTriggerFor(") == nullptr);
   CHECK(strstr(text, "strlcpy(sensorOut, ct[\"sensor\"] | \"\", sensorLen);") != nullptr);
