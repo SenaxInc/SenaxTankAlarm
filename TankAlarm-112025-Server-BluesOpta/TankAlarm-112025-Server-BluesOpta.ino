@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
+#include "WarmTierStore.h"  // S-D03: warm-tier daily summary storage (host-tested in tests/host/warm_store)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4)
   #include <PortentaEthernet.h>
   #include <Ethernet.h>
@@ -681,7 +682,8 @@ static uint8_t gSensorCalibrationCount = 0;
 #endif
 
 struct AlarmLogEntry {
-  double timestamp;           // Epoch timestamp
+  double timestamp;           // Epoch timestamp (server receive time; the log UI, FTP filter and prune use it)
+  double eventEpoch;          // S-D03: when the alarm happened (note "t"), 0 = unknown; the daily count uses it
   char siteName[32];          // Site name
   char clientUid[48];         // Client UID
   uint8_t sensorIndex;         // Internal sensor index
@@ -765,11 +767,7 @@ static void sendUnloadEmail(const UnloadLogEntry &entry);
 #define MAX_HISTORY_SENSORS 20
 #endif
 
-struct TelemetrySnapshot {
-  double timestamp;           // Epoch timestamp
-  float level;                // Level in inches
-  float voltage;              // VIN voltage (0 if not available)
-};
+// struct TelemetrySnapshot (one ring entry) is defined in WarmTierStore.h.
 
 struct SensorHourlyHistory {
   char clientUid[48];
@@ -779,31 +777,11 @@ struct SensorHourlyHistory {
   TelemetrySnapshot snapshots[MAX_HOURLY_HISTORY_PER_SENSOR];
   uint16_t snapshotCount;
   uint16_t writeIndex;        // Ring buffer write pointer
+  uint16_t legacyCount;       // S-D03: oldest entries saved by older firmware; never rolled up (WarmSeries)
 };
 
 static SensorHourlyHistory gSensorHistory[MAX_HISTORY_SENSORS];
 static uint8_t gSensorHistoryCount = 0;
-
-// Structure for daily summaries (warm tier, persisted to LittleFS)
-struct DailySummary {
-  uint32_t date;              // Date as YYYYMMDD
-  float minLevel;
-  float maxLevel;
-  float avgLevel;
-  float openingLevel;         // Level at start of day
-  float closingLevel;         // Level at end of day
-  uint8_t alarmCount;
-  float avgVoltage;
-};
-
-// Monthly archive header for FTP warm tier
-struct MonthlyArchiveHeader {
-  uint16_t year;
-  uint8_t month;
-  uint8_t sensorCount;
-  uint32_t recordCount;
-  uint32_t fileSize;
-};
 
 // History storage settings
 struct HistorySettings {
@@ -832,16 +810,54 @@ static bool gWarmTierDataExists = false;  // Set true when warm tier data is act
 // ============================================================================
 // LittleFS Daily Summary Storage (Warm Tier)
 // ============================================================================
-// Compact daily summaries persisted to flash. Survives reboots. ~32 bytes per
-// day per sensor, stored as JSON in /fs/history/daily_YYYYMM.json files.
+// Compact daily summaries persisted to flash. Survives reboots. One ~120-byte
+// JSON row per sensor per day, one JSON array per month in
+// /fs/history/daily_YYYYMM.json. S-D03: files are read and merged row by row
+// (WarmTierStore.h), so a month's size is not limited by RAM.
 // When FTP is available, monthly archives extend range beyond 3 months.
 // When FTP is NOT available, data is limited to hot tier + 3 months of dailies.
 #ifndef MAX_DAILY_SUMMARY_MONTHS
 #define MAX_DAILY_SUMMARY_MONTHS 3  // Keep 3 months of daily files on LittleFS
 #endif
+#ifndef DAILY_SUMMARY_DIR
+#define DAILY_SUMMARY_DIR "/fs/history"
+#endif
+// S-D03: the rollup backfills missed days still in the hot tier, in bounded steps
+#ifndef DAILY_ROLLUP_MAX_BACKFILL_DAYS
+#define DAILY_ROLLUP_MAX_BACKFILL_DAYS 92       // >= the 90-day hot tier default
+#endif
+#ifndef DAILY_ROLLUP_MAX_BATCHES_PER_TICK
+#define DAILY_ROLLUP_MAX_BATCHES_PER_TICK 16    // batches (<= 8 days in one month) per hourly tick
+#endif
+#ifndef DAILY_ROLLUP_MAX_WRITES_PER_TICK
+#define DAILY_ROLLUP_MAX_WRITES_PER_TICK 2      // month-file rewrites per hourly tick
+#endif
+#ifndef DAILY_ROLLUP_TICK_BUDGET_MS
+#define DAILY_ROLLUP_TICK_BUDGET_MS 8000UL      // no new batch after this (watchdog is 30 s)
+#endif
+#ifndef DAILY_SUMMARY_MAX_FILE_BYTES
+#define DAILY_SUMMARY_MAX_FILE_BYTES (2UL * 31UL * MAX_HISTORY_SENSORS * WARM_ROW_MAX_WRITE)  // ~4x a full month
+#endif
 
 // Last daily rollup tracking (persistent across reboots via history settings)
-static uint32_t gLastDailyRollupDate = 0;  // YYYYMMDD of last completed rollup
+static uint32_t gLastDailyRollupDate = 0;  // YYYYMMDD of the latest day rolled up
+static WarmRollupState gWarmState;         // S-D03: backfill position, late-data mark, counters (RAM only)
+
+// Archived-client manifest (S-D03: M-54, M-55)
+#ifndef ARCHIVE_MANIFEST_PATH
+#define ARCHIVE_MANIFEST_PATH "/fs/archived_clients.json"
+#endif
+#ifndef ARCHIVE_MANIFEST_BAD_PATH
+#define ARCHIVE_MANIFEST_BAD_PATH "/fs/archived_clients.json.bad"  // unreadable manifest kept here
+#endif
+#ifndef MAX_ARCHIVE_MANIFEST_BYTES
+#define MAX_ARCHIVE_MANIFEST_BYTES 32768UL  // oldest entries are dropped to stay below this
+#endif
+#ifndef MAX_ARCHIVE_MANIFEST_ENTRIES
+#define MAX_ARCHIVE_MANIFEST_ENTRIES 48     // ~0.5 KB of heap each while the list is loaded
+#endif
+static uint32_t gManifestAppendFailures = 0;
+static uint32_t gManifestSalvages = 0;
 
 // FTP archive month cache — avoids re-downloading during a single web session
 struct FtpArchiveCache {
@@ -862,14 +878,17 @@ struct FtpArchiveCache {
 static FtpArchiveCache gFtpArchiveCache = {0, 0, false, {}, 0};
 
 // Forward declarations for history functions
-static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh);
+static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh, double eventEpoch);
 static void clearAlarmEvent(const char *clientUid, uint8_t sensorIndex);
 static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch);
-// Daily summary warm tier functions
+// Daily summary warm tier functions (storage logic in WarmTierStore.h)
 static void rollupDailySummaries();
-static bool saveDailySummaryFile(uint16_t year, uint8_t month);
-static bool loadDailySummaryMonth(uint16_t year, uint8_t month, JsonDocument &doc);
+static WarmStatus warmScanMonth(uint16_t year, uint8_t month, WarmRowVisitor visit, void *ctx, uint32_t *rowsOut);
 static void pruneDailySummaryFiles();
+static void refreshWarmTierPresence(uint32_t anchorYmd);
+#ifdef TANKALARM_WARM_SELFTEST
+static void runWarmSelfTest();
+#endif
 // Hot tier persistence (survive reboots)
 static bool saveHotTierSnapshot();
 static void loadHotTierSnapshot();
@@ -878,7 +897,8 @@ static bool loadFtpArchiveCached(uint16_t year, uint8_t month);
 static void populateStatsFromFtpCache(const char *clientUid, uint8_t sensorIndex, JsonObject &statsObj);
 static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uint8_t sensorIndex);
 static void pruneHotTierIfNeeded();
-static bool archiveMonthToFtp(uint16_t year, uint8_t month);
+// S-D03: noinline keeps its warm-summary buffer (~1.4 KB) out of loop()'s stack frame
+static bool archiveMonthToFtp(uint16_t year, uint8_t month) __attribute__((noinline));
 static bool loadArchivedMonth(uint16_t year, uint8_t month, JsonDocument &doc);
 static void populateHistorySettingsJson(JsonDocument &doc);
 static void applyHistorySettingsFromJson(const JsonDocument &doc);
@@ -1336,23 +1356,30 @@ static volatile uint32_t gFlashWritesSinceBoot = 0;
 static volatile uint32_t gFlashWriteFailuresSinceBoot = 0;
 static volatile uint32_t gFlashWritesSkippedHash = 0;
 static volatile uint32_t gFlashBytesWrittenSinceBoot = 0;
-static const char *gLastFlashWritePath = "";
+static char gLastFlashWritePath[64] = "";
 static unsigned long gLastFlashWriteMillis = 0;
-static const char *gLastFlashWriteFailurePath = "";
+static char gLastFlashWriteFailurePath[64] = "";
 static unsigned long gLastFlashWriteFailureMillis = 0;
 
-static inline bool serverWriteFileAtomic(const char *path, const char *data, size_t len) {
-  bool ok = tankalarm_posix_write_file_atomic(path, data, len);
+// Records one flash write (also used by the warm-tier writers, which stream
+// instead of calling serverWriteFileAtomic). S-D03: the path is copied; callers
+// pass stack buffers that no longer exist when /api/system-status reads it.
+static void serverNoteFlashWrite(const char *path, uint32_t bytes, bool ok) {
   if (ok) {
     gFlashWritesSinceBoot++;
-    gFlashBytesWrittenSinceBoot += (uint32_t)len;
-    gLastFlashWritePath = path ? path : "";
+    gFlashBytesWrittenSinceBoot += bytes;
+    strlcpy(gLastFlashWritePath, path ? path : "", sizeof(gLastFlashWritePath));
     gLastFlashWriteMillis = millis();
   } else {
     gFlashWriteFailuresSinceBoot++;
-    gLastFlashWriteFailurePath = path ? path : "";
+    strlcpy(gLastFlashWriteFailurePath, path ? path : "", sizeof(gLastFlashWriteFailurePath));
     gLastFlashWriteFailureMillis = millis();
   }
+}
+
+static inline bool serverWriteFileAtomic(const char *path, const char *data, size_t len) {
+  bool ok = tankalarm_posix_write_file_atomic(path, data, len);
+  serverNoteFlashWrite(path, (uint32_t)len, ok);
   return ok;
 }
 
@@ -4504,6 +4531,10 @@ void setup() {
   loadCalibrationData();  // Load calibration learning data
   loadSensorRegistry();     // Restore sensor records from LittleFS
   loadHistorySettings();  // Restore history tier settings from LittleFS
+  refreshWarmTierPresence(gLastDailyRollupDate);  // S-D03: warmTierAvailable is true right after boot
+#ifdef TANKALARM_WARM_SELFTEST
+  runWarmSelfTest();  // S-D03 bench build only: warm-tier timing and heap
+#endif
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
   printHardwareRequirements();
@@ -4850,12 +4881,13 @@ void loop() {
     lastHistoryMaintenance = now;
     double epoch = currentEpoch();
     
+    // Roll hot tier days into LittleFS daily summaries (warm tier). S-D03: before
+    // the hot-tier prune, which keeps every day the rollup has not processed yet.
+    rollupDailySummaries();
+
     // Prune hot tier data older than retention period
     pruneHotTierIfNeeded();
-    
-    // Roll up yesterday's hot tier snapshots into LittleFS daily summaries (warm tier)
-    rollupDailySummaries();
-    
+
     // Prune daily summary files older than retention period
     pruneDailySummaryFiles();
     
@@ -6364,11 +6396,31 @@ static void handleSystemStatusGet(EthernetClient &client) {
   flash["failures"] = gFlashWriteFailuresSinceBoot;
   flash["skippedHash"] = gFlashWritesSkippedHash;
   flash["bytesWritten"] = gFlashBytesWrittenSinceBoot;
-  flash["lastPath"] = gLastFlashWritePath ? gLastFlashWritePath : "";
+  flash["lastPath"] = gLastFlashWritePath;
   flash["lastMs"] = (uint32_t)gLastFlashWriteMillis;
-  flash["lastFailurePath"] =
-      gLastFlashWriteFailurePath ? gLastFlashWriteFailurePath : "";
+  flash["lastFailurePath"] = gLastFlashWriteFailurePath;
   flash["lastFailureMs"] = (uint32_t)gLastFlashWriteFailureMillis;
+
+  // S-D03: warm-tier rollup state and counters (RAM only; no flash I/O here)
+  JsonObject warm = doc["warmTier"].to<JsonObject>();
+  warm["lastRollup"] = gLastDailyRollupDate;
+  warm["nextDay"] = (gWarmState.nextDn >= 0) ? warmDnToYmd(gWarmState.nextDn) : (uint32_t)0;
+  warm["dataPresent"] = gWarmTierDataExists;
+  warm["writes"] = gWarmState.stats.writes;
+  warm["noChange"] = gWarmState.stats.noChange;
+  warm["ioErrors"] = gWarmState.stats.ioErrors;
+  warm["noMemory"] = gWarmState.stats.noMemory;
+  warm["tooBig"] = gWarmState.stats.tooBig;
+  warm["quarantined"] = gWarmState.stats.quarantined;
+  warm["salvagedRows"] = gWarmState.stats.salvagedRows;
+  warm["skippedDays"] = gWarmState.stats.skippedDays;
+  warm["lateMarks"] = gWarmState.stats.lateMarks;
+  warm["lastError"] = warmStatusName(gWarmState.stats.lastError);
+  warm["lastErrorYmd"] = gWarmState.stats.lastErrorYmd;
+  warm["lastTickMs"] = gWarmState.stats.lastTickMs;
+  warm["maxTickMs"] = gWarmState.stats.maxTickMs;
+  warm["manifestAppendFailures"] = gManifestAppendFailures;
+  warm["manifestSalvages"] = gManifestSalvages;
 
   JsonObject pools = doc["pools"].to<JsonObject>();
   pools["sensorHistoryBytes"] = (uint32_t)sizeof(gSensorHistory);
@@ -7469,7 +7521,7 @@ static bool performFtpRestore(char *errorOut, size_t errorSize) {
 // ============================================================================
 
 // Log an alarm event to the ring buffer
-static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh) {
+static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t sensorIndex, float level, bool isHigh, double eventEpoch) {
   AlarmLogEntry &entry = alarmLog[alarmLogWriteIndex];
   
   // Get current time from Notecard
@@ -7479,6 +7531,7 @@ static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t s
   }
   
   entry.timestamp = now;
+  entry.eventEpoch = eventEpoch;
   strlcpy(entry.siteName, siteName ? siteName : "Unknown", sizeof(entry.siteName));
   strlcpy(entry.clientUid, clientUid ? clientUid : "", sizeof(entry.clientUid));
   entry.sensorIndex = sensorIndex;
@@ -7492,7 +7545,9 @@ static void logAlarmEvent(const char *clientUid, const char *siteName, uint8_t s
   if (alarmLogCount < MAX_ALARM_LOG_ENTRIES) {
     alarmLogCount++;
   }
-  
+  // S-D03: an alarm for a day already rolled up re-rolls that day, so it counts in its `al`
+  if (eventEpoch > 0.0) warmNoteSnapshot(gWarmState, eventEpoch);
+
   Serial.print(F("Alarm logged: "));
   Serial.print(siteName);
   Serial.print(F(" Sensor "));
@@ -7581,6 +7636,7 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
     hist.heightInches = 120.0f;
     hist.snapshotCount = 0;
     hist.writeIndex = 0;
+    hist.legacyCount = 0;
     gSensorHistoryCount++;
     return &hist;
   }
@@ -7591,8 +7647,8 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
 // Record a telemetry snapshot for the per-sensor history ring buffer.
 //
 // `eventEpoch` is the caller's best estimate of when the *sensor reading was
-// actually acquired* (NOT when the note was received). For telemetry/alarm
-// notes this is the client's top-level `t`; for daily notes it is the per-sensor
+// actually acquired* (NOT when the note was received). For telemetry notes
+// this is the client's top-level `t`; for daily notes it is the per-sensor
 // nested `t["t"]` added in v2.0.56. Using sensor time as the chart X-axis keeps
 // trends accurate when Notecard queues drain after a network gap, when daily
 // reports package a reading taken 30+ minutes earlier, or when a stuck/reused
@@ -7600,9 +7656,11 @@ static SensorHourlyHistory *findOrCreateSensorHistory(const char *clientUid, uin
 // cluster at the original acquisition time instead of marching forward with
 // every retransmission.
 //
-// Fallback chain: sane `eventEpoch` -> server's `currentEpoch()` -> drop note
-// (refuse to record with timestamp=0, which the chart's time-window cutoff
-// would silently filter out anyway).
+// S-D03: no fallback. The snapshot is stored at warmAcquisitionEpoch(eventEpoch)
+// (whole seconds) or not at all: a reading whose acquisition time is missing or
+// implausible, e.g. taken before the client's first time sync, is left out
+// rather than filed under the day the server received it. Callers pass only
+// fresh readings, and a voltage only when its poll was on the reading's UTC day.
 static void recordTelemetrySnapshot(const char *clientUid, const char *siteName, uint8_t sensorIndex, float heightInches, float level, float voltage, double eventEpoch) {
   SensorHourlyHistory *hist = findOrCreateSensorHistory(clientUid, sensorIndex);
   if (!hist) {
@@ -7625,41 +7683,34 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
   }
   hist->heightInches = heightInches;
   
-  // Resolve the snapshot timestamp. Prefer the caller-supplied sensor acquisition
-  // epoch when it is in a sane window (2020-01-01 .. server-now + 24h); otherwise
-  // fall back to server-now; otherwise refuse to record.
-  const double MIN_VALID_EPOCH = 1577836800.0;  // 2020-01-01 UTC
-  double serverNow = currentEpoch();
-  double maxAllowed = (serverNow > 0.0) ? (serverNow + 86400.0) : 0.0;  // tolerate up to 24h client clock skew
-  double snapEpoch = 0.0;
-  if (eventEpoch >= MIN_VALID_EPOCH && (maxAllowed <= 0.0 || eventEpoch <= maxAllowed)) {
-    snapEpoch = eventEpoch;
-  } else if (serverNow > 0.0) {
-    snapEpoch = serverNow;
-  }
+  // S-D03: the reading's own acquisition time (2020 .. server-now + 1 h), whole seconds, or drop
+  const double snapEpoch = warmAcquisitionEpoch(eventEpoch, currentEpoch());
   if (snapEpoch <= 0.0) {
     static unsigned long lastNoTimeWarn = 0;
     if (millis() - lastNoTimeWarn > 300000UL) {
       lastNoTimeWarn = millis();
-      Serial.println(F("WARNING: Snapshot dropped — no valid timestamp (clock unsynced and no event epoch)"));
-      addServerSerialLog("Snapshot dropped — no valid timestamp", "warn", "history");
+      Serial.println(F("WARNING: Snapshot dropped — no valid acquisition time"));
+      addServerSerialLog("Snapshot dropped — no valid acquisition time", "warn", "history");
     }
     return;
   }
   
-  // Deduplicate: if the most recent snapshot for this sensor has the same
-  // timestamp AND the same level, the client is republishing a stuck/reused
-  // reading. Skip — adding it would waste ring-buffer slots and stack points
-  // at the same chart X coordinate without conveying any new information.
-  if (hist->snapshotCount > 0) {
-    uint16_t lastIdx = (hist->writeIndex - 1 + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
-    const TelemetrySnapshot &last = hist->snapshots[lastIdx];
-    if (last.timestamp == snapEpoch && fabsf(last.level - level) < 0.01f) {
-      return;
-    }
+  // Deduplicate: the same acquisition can arrive more than once (telemetry, the
+  // daily report's copy, an on-demand re-send), with the same `t` from v2.2.16 or up
+  // to 1 s apart from an older client, and out of order.
+  // S-D03: check the whole ring by time alone (a current-loop level is recomputed on
+  // arrival and can differ) and return before the day is marked for a re-roll, so a
+  // copy is never counted twice in a daily row.
+  if (warmRingHasAcquisition(hist->snapshots, MAX_HOURLY_HISTORY_PER_SENSOR, hist->snapshotCount,
+                             hist->writeIndex, snapEpoch)) {
+    return;
   }
   
-  // Add snapshot to ring buffer
+  // Add snapshot to ring buffer. S-D03: a full ring overwrites its oldest entry, which is
+  // an older firmware's while any are left.
+  if (hist->snapshotCount >= MAX_HOURLY_HISTORY_PER_SENSOR && hist->legacyCount > 0) {
+    hist->legacyCount--;
+  }
   TelemetrySnapshot &snap = hist->snapshots[hist->writeIndex];
   snap.timestamp = snapEpoch;
   snap.level = level;
@@ -7669,6 +7720,7 @@ static void recordTelemetrySnapshot(const char *clientUid, const char *siteName,
   if (hist->snapshotCount < MAX_HOURLY_HISTORY_PER_SENSOR) {
     hist->snapshotCount++;
   }
+  warmNoteSnapshot(gWarmState, snapEpoch);  // S-D03: a snapshot for an already rolled-up day re-rolls it
 }
 
 // Check LittleFS usage and prune old data if needed
@@ -7683,8 +7735,9 @@ static void pruneHotTierIfNeeded() {
     return;  // Prune at most once per day
   }
   
-  // Calculate hot tier retention threshold
-  double cutoffEpoch = now - (gHistorySettings.hotTierRetentionDays * 86400.0);
+  // Calculate hot tier retention threshold. S-D03: never past a day the rollup has not
+  // processed yet (a backfill after an outage takes several hourly ticks)
+  double cutoffEpoch = warmPruneCutoff(gWarmState, now - (gHistorySettings.hotTierRetentionDays * 86400.0));
   uint32_t pruned = 0;
   
   // Prune old telemetry snapshots from each sensor
@@ -7699,9 +7752,11 @@ static void pruneHotTierIfNeeded() {
     // writeIndex keeps the ring buffer correct regardless of timestamp ordering.
     static TelemetrySnapshot survivors[MAX_HOURLY_HISTORY_PER_SENSOR];
     uint16_t newCount = 0;
+    uint16_t newLegacyCount = 0;  // S-D03: older firmware's entries stay the oldest
     for (uint16_t j = 0; j < hist.snapshotCount; j++) {
       uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
       if (hist.snapshots[idx].timestamp >= cutoffEpoch) {
+        if (j < hist.legacyCount) newLegacyCount++;
         survivors[newCount++] = hist.snapshots[idx];
       } else {
         pruned++;
@@ -7715,6 +7770,7 @@ static void pruneHotTierIfNeeded() {
     }
     hist.snapshotCount = newCount;
     hist.writeIndex = newCount % MAX_HOURLY_HISTORY_PER_SENSOR;
+    hist.legacyCount = newLegacyCount;
   }
   
   // Prune old alarms (keep alarms for longer - 30 days)
@@ -7828,46 +7884,25 @@ static bool archiveMonthToFtp(uint16_t year, uint8_t month) {
   
   // If hot tier had no data, try warm tier daily summaries for this month
   if (sensorsWithData == 0) {
-    JsonDocument warmDoc;
-    if (loadDailySummaryMonth(year, month, warmDoc) && warmDoc.is<JsonArray>()) {
-      // Aggregate daily summaries per sensor into monthly summaries
-      struct WarmSummary { char clientUid[48]; uint8_t sensorIndex; float minL; float maxL; float sumL; float sumV; uint16_t count; uint16_t voltCount; };
-      WarmSummary warmed[MAX_HISTORY_SENSORS];
-      uint8_t warmCount = 0;
-
-      for (JsonObject de : warmDoc.as<JsonArray>()) {
-        const char *wUid = de["c"] | "";
-        uint8_t wIdx = de["k"] | 0;
-        float dMin = de["mn"] | 999999.0f;
-        float dMax = de["mx"] | -999999.0f;
-        float dAvg = de["av"] | 0.0f;
-        float dVt  = de["vt"] | 0.0f;
-        uint16_t dN = de["n"] | (uint16_t)1;
-
-        // Find or create warm summary slot
-        WarmSummary *ws = nullptr;
-        for (uint8_t w = 0; w < warmCount; ++w) {
-          if (strcmp(warmed[w].clientUid, wUid) == 0 && warmed[w].sensorIndex == wIdx) { ws = &warmed[w]; break; }
-        }
-        if (!ws && warmCount < MAX_HISTORY_SENSORS) {
-          ws = &warmed[warmCount++];
-          strlcpy(ws->clientUid, wUid, sizeof(ws->clientUid));
-          ws->sensorIndex = wIdx;
-          ws->minL = 999999.0f; ws->maxL = -999999.0f;
-          ws->sumL = 0.0f; ws->sumV = 0.0f;
-          ws->count = 0; ws->voltCount = 0;
-        }
-        if (!ws) continue;
-
-        if (dMin < ws->minL) ws->minL = dMin;
-        if (dMax > ws->maxL) ws->maxL = dMax;
-        ws->sumL += dAvg * dN;
-        ws->count += dN;
-        if (dVt > 0.0f) { ws->sumV += dVt * dN; ws->voltCount += dN; }
-      }
-
+    // Aggregate daily summaries per sensor into monthly summaries, streamed row
+    // by row (S-D03: warmMonthSummaryVisitor in WarmTierStore.h; used only if
+    // the whole month read cleanly)
+    WarmMonthSensor warmed[MAX_HISTORY_SENSORS];
+    WarmMonthSummary warmSummary = {warmed, MAX_HISTORY_SENSORS, 0};
+    const WarmStatus warmStatus = warmScanMonth(year, month, warmMonthSummaryVisitor, &warmSummary, nullptr);
+    if (warmStatus != WARM_OK && warmStatus != WARM_ABSENT) {
+      Serial.print(F("FTP archive: warm summary "));
+      Serial.print(year);
+      Serial.print(month < 10 ? F("0") : F(""));
+      Serial.print(month);
+      Serial.print(F(" unreadable ("));
+      Serial.print(warmStatusName(warmStatus));
+      Serial.println(F(")"));
+    }
+    if (warmStatus == WARM_OK) {
+      const uint8_t warmCount = warmSummary.count;
       for (uint8_t w = 0; w < warmCount; ++w) {
-        WarmSummary &ws = warmed[w];
+        WarmMonthSensor &ws = warmed[w];
         if (ws.count == 0) continue;
         JsonObject sensorObj = sensorsArray.add<JsonObject>();
         sensorObj["clientUid"] = ws.clientUid;
@@ -8172,250 +8207,342 @@ static void loadHistorySettings() {
 // Files: /fs/history/daily_YYYYMM.json  (one per month)
 // Each file contains an array of per-sensor daily summary objects.
 // Automatic pruning keeps only MAX_DAILY_SUMMARY_MONTHS on flash.
+// S-D03: reading, merging and backfill live in WarmTierStore.h; this section
+// connects them to the hot tier, the alarm log, the server log and the watchdog.
 
-// Helper: get YYYYMMDD integer from epoch
-static uint32_t epochToYYYYMMDD(double epoch) {
-  if (epoch <= 0.0) return 0;
-  time_t t = (time_t)epoch;
-  struct tm *tm = gmtime(&t);
-  if (!tm) return 0;
-  return (uint32_t)(tm->tm_year + 1900) * 10000 + (tm->tm_mon + 1) * 100 + tm->tm_mday;
+static void warmHookYield() { dfuKickWatchdog(); }
+
+static uint32_t warmHookNowMs() { return (uint32_t)millis(); }
+
+// Every warm-tier message goes to Serial. The server log gets it as well,
+// unless it repeats the previous message within 6 hours (a failing month is
+// retried every hour).
+static void warmHookLog(const char *level, const char *msg) {
+  static uint32_t lastHash = 0;
+  static unsigned long lastLogMillis = 0;
+  Serial.println(msg);
+  const uint32_t hash = fnv1a32(msg, strlen(msg));
+  if (hash == lastHash && millis() - lastLogMillis < 6UL * 3600000UL) return;
+  lastHash = hash;
+  lastLogMillis = millis();
+  addServerSerialLog(msg, level, "history");
 }
 
-// Roll up yesterday's hot-tier snapshots into a daily summary and persist to LittleFS
+static const WarmHooks kWarmHooks = {warmHookYield, warmHookLog, serverNoteFlashWrite, warmHookNowMs, nullptr};
+
+// Alarms for one sensor and day, counted from the alarm log. S-D03: by when each
+// alarm happened, not when it was received (v2.2.15), so a late note counts on
+// its own day (logAlarmEvent marks that day for a re-roll if it was already
+// rolled up); an alarm with no known time is not counted on any day.
+static uint8_t warmAlarmCount(void *ctx, const char *uid, uint8_t k, double dayBegin, double dayEnd) {
+  (void)ctx;
+  uint8_t alarms = 0;
+  for (uint8_t a = 0; a < alarmLogCount; a++) {
+    int aIdx = (alarmLogWriteIndex - alarmLogCount + a + MAX_ALARM_LOG_ENTRIES) % MAX_ALARM_LOG_ENTRIES;
+    const double ev = alarmLog[aIdx].eventEpoch;
+    if (strcmp(alarmLog[aIdx].clientUid, uid) == 0 &&
+        alarmLog[aIdx].sensorIndex == k &&
+        ev > 0.0 && ev >= dayBegin && ev < dayEnd) {
+      alarms++;
+    }
+  }
+  return alarms;
+}
+
+// Points the store at the hot-tier rings (no copy)
+static uint8_t warmBuildSeries(WarmSeries *out) {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < gSensorHistoryCount && i < MAX_HISTORY_SENSORS; i++) {
+    const SensorHourlyHistory &hist = gSensorHistory[i];
+    WarmSeries &s = out[n++];
+    s.uid = hist.clientUid;
+    s.k = hist.sensorIndex;
+    s.ring = hist.snapshots;
+    s.cap = MAX_HOURLY_HISTORY_PER_SENSOR;
+    s.count = hist.snapshotCount;
+    s.writeIndex = hist.writeIndex;
+    s.legacyCount = hist.legacyCount;
+  }
+  return n;
+}
+
+// Rolls hot-tier days into the month files: every missed day the hot tier
+// still holds (L-29), days that received late snapshots or alarms, and on
+// the first call after boot a re-check of the whole window, which restores
+// rows a crash lost. S-D03: snapshots older firmware saved are not rolled up
+// (legacyCount), so rows it dropped (H-23) are not rebuilt from them.
+// Bounded per call; see warmRollupTick().
 static void rollupDailySummaries() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   if (!mbedFS) return;
-  
-  double now = 0.0;
-  if (gLastSyncedEpoch > 0.0) {
-    now = gLastSyncedEpoch + (double)(millis() - gLastSyncMillis) / 1000.0;
-  }
-  if (now <= 0.0) return;
-  
-  // Determine yesterday's date
-  double yesterdayEpoch = now - 86400.0;
-  uint32_t yesterdayDate = epochToYYYYMMDD(yesterdayEpoch);
-  if (yesterdayDate == 0 || yesterdayDate == gLastDailyRollupDate) return;
-  
-  uint16_t year = yesterdayDate / 10000;
-  uint8_t month = (yesterdayDate / 100) % 100;
-  
-  // Calculate epoch range for yesterday (00:00 - 23:59:59 UTC)
-  struct tm dayStart = {};
-  dayStart.tm_year = year - 1900;
-  dayStart.tm_mon = month - 1;
-  dayStart.tm_mday = yesterdayDate % 100;
-  time_t dayStartEpoch = mktime(&dayStart);
-  // Adjust for timezone (mktime uses local, we want UTC)
-  double dayBegin = (double)dayStartEpoch;
-  double dayEnd = dayBegin + 86400.0;
-  
-  // Load existing month file if present
-  JsonDocument monthDoc;
-  char filePath[64];
-  snprintf(filePath, sizeof(filePath), "/fs/history/daily_%04d%02d.json", year, month);
-  
-  FILE *existing = fopen(filePath, "r");
-  if (existing) {
-    fseek(existing, 0, SEEK_END);
-    long sz = ftell(existing);
-    fseek(existing, 0, SEEK_SET);
-    if (sz > 0 && sz < 8192) {
-      char *buf = (char *)malloc(sz + 1);
-      if (buf) {
-        size_t bytesRead = fread(buf, 1, sz, existing);
-        buf[bytesRead] = '\0';
-        if (bytesRead == (size_t)sz) {
-          deserializeJson(monthDoc, buf);
-        }
-        free(buf);
-      }
-    }
-    fclose(existing);
-  }
-  
-  // Ensure root is array
-  if (!monthDoc.is<JsonArray>()) {
-    monthDoc.to<JsonArray>();
-  }
-  JsonArray entries = monthDoc.as<JsonArray>();
-  
-  // Dedup: remove any existing entries for yesterdayDate (prevents duplicates on reboot)
-  for (int e = (int)entries.size() - 1; e >= 0; --e) {
-    if ((entries[e]["d"] | (uint32_t)0) == yesterdayDate) {
-      entries.remove(e);
-    }
-  }
-  
-  // For each sensor in hot tier, compute yesterday's summary
-  uint8_t addedCount = 0;
-  for (uint8_t i = 0; i < gSensorHistoryCount; i++) {
-    SensorHourlyHistory &hist = gSensorHistory[i];
-    if (hist.snapshotCount == 0) continue;
-    
-    float minLevel = 999999.0f, maxLevel = -999999.0f;
-    float sumLevel = 0.0f, sumVoltage = 0.0f;
-    float openingLevel = 0.0f, closingLevel = 0.0f;
-    double oldestTs = 1e18, newestTs = 0.0;
-    uint16_t count = 0, voltCount = 0;
-    uint8_t alarms = 0;
-    
-    for (uint16_t j = 0; j < hist.snapshotCount; j++) {
-      uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
-      TelemetrySnapshot &snap = hist.snapshots[idx];
-      
-      if (snap.timestamp < dayBegin || snap.timestamp >= dayEnd) continue;
-      
-      if (snap.level < minLevel) minLevel = snap.level;
-      if (snap.level > maxLevel) maxLevel = snap.level;
-      sumLevel += snap.level;
-      count++;
-      
-      if (snap.timestamp < oldestTs) { oldestTs = snap.timestamp; openingLevel = snap.level; }
-      if (snap.timestamp > newestTs) { newestTs = snap.timestamp; closingLevel = snap.level; }
-      
-      if (snap.voltage > 0.0f) { sumVoltage += snap.voltage; voltCount++; }
-    }
-    
-    if (count == 0) continue;  // No data for this sensor yesterday
-    
-    // Count alarms for this sensor on this day
-    for (uint8_t a = 0; a < alarmLogCount; a++) {
-      int aIdx = (alarmLogWriteIndex - alarmLogCount + a + MAX_ALARM_LOG_ENTRIES) % MAX_ALARM_LOG_ENTRIES;
-      if (strcmp(alarmLog[aIdx].clientUid, hist.clientUid) == 0 &&
-          alarmLog[aIdx].sensorIndex == hist.sensorIndex &&
-          alarmLog[aIdx].timestamp >= dayBegin && alarmLog[aIdx].timestamp < dayEnd) {
-        alarms++;
-      }
-    }
-    
-    // Add to month document
-    JsonObject entry = entries.add<JsonObject>();
-    entry["d"] = yesterdayDate;
-    entry["c"] = hist.clientUid;
-    entry["k"] = hist.sensorIndex;
-    entry["mn"] = roundTo(minLevel, 1);
-    entry["mx"] = roundTo(maxLevel, 1);
-    entry["av"] = roundTo(sumLevel / count, 1);
-    entry["op"] = roundTo(openingLevel, 1);
-    entry["cl"] = roundTo(closingLevel, 1);
-    entry["al"] = alarms;
-    entry["vt"] = voltCount > 0 ? roundTo(sumVoltage / voltCount, 2) : 0.0f;
-    entry["n"] = count;
-    addedCount++;
-  }
-  
-  if (addedCount == 0) {
-    gLastDailyRollupDate = yesterdayDate;
-    return;
-  }
-  
-  // Serialize and write to file
-  String output;
-  serializeJson(monthDoc, output);
-  
-  // Ensure directory exists
-  mkdir("/fs/history", 0777);
-  
-  if (serverWriteFileAtomic(filePath, output.c_str(), output.length())) {
-    gLastDailyRollupDate = yesterdayDate;
+
+  gWarmState.cursorYmd = gLastDailyRollupDate;
+  WarmSeries series[MAX_HISTORY_SENSORS];
+  const uint8_t seriesCount = warmBuildSeries(series);
+
+  WarmRollupConfig cfg;
+  cfg.dir = DAILY_SUMMARY_DIR;
+  cfg.maxFileBytes = DAILY_SUMMARY_MAX_FILE_BYTES;
+  cfg.maxSeries = MAX_HISTORY_SENSORS;
+  cfg.maxBackfillDays = DAILY_ROLLUP_MAX_BACKFILL_DAYS;
+  cfg.retainedMonths = MAX_DAILY_SUMMARY_MONTHS;
+  cfg.maxBatches = DAILY_ROLLUP_MAX_BATCHES_PER_TICK;
+  cfg.maxWrites = DAILY_ROLLUP_MAX_WRITES_PER_TICK;
+  cfg.budgetMs = DAILY_ROLLUP_TICK_BUDGET_MS;
+  const WarmTickSummary sum = warmRollupTick(gWarmState, currentEpoch(), series, seriesCount,
+                                             warmAlarmCount, nullptr, roundTo, cfg, kWarmHooks);
+  gLastDailyRollupDate = gWarmState.cursorYmd;  // persisted by saveHistorySettings()
+
+  if (sum.batches > 0) {
     Serial.print(F("Daily summary rollup: "));
-    Serial.print(addedCount);
-    Serial.print(F(" sensors for "));
-    Serial.println(yesterdayDate);
+    Serial.print(sum.firstYmd);
+    Serial.print(F(".."));
+    Serial.print(sum.lastYmd);
+    Serial.print(F(", "));
+    Serial.print(sum.batches);
+    Serial.print(F(" batch(es), "));
+    Serial.print(sum.writes);
+    Serial.println(F(" write(s)"));
   }
   #endif
 #endif
 }
 
-// Load a month's daily summaries from LittleFS
-static bool loadDailySummaryMonth(uint16_t year, uint8_t month, JsonDocument &doc) {
-#ifdef FILESYSTEM_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  if (!mbedFS) return false;
-  
+// Streams one month of daily rows to visit (see warmScanFile for the
+// contract: aggregate only when the result is WARM_OK). Readers never write
+// or quarantine; an unreadable month is left for the rollup to repair.
+static WarmStatus warmScanMonth(uint16_t year, uint8_t month, WarmRowVisitor visit, void *ctx, uint32_t *rowsOut) {
+  if (rowsOut) *rowsOut = 0;
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) return WARM_ABSENT;
+
   char filePath[64];
-  snprintf(filePath, sizeof(filePath), "/fs/history/daily_%04d%02d.json", year, month);
-  
-  FILE *f = fopen(filePath, "r");
-  if (!f) return false;
-  
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  
-  if (sz <= 0 || sz > 16384) {
-    fclose(f);
-    return false;
+  if (!warmMonthPath(filePath, sizeof(filePath), DAILY_SUMMARY_DIR, year, month, "")) return WARM_ABSENT;
+  uint32_t rows = 0;
+  uint32_t failOffset = 0;
+  const WarmStatus st = warmScanFile(filePath, false, DAILY_SUMMARY_MAX_FILE_BYTES, 0, visit, ctx, kWarmHooks,
+                                     &rows, &failOffset);
+  if (rowsOut) *rowsOut = rows;
+  if (st == WARM_OK && rows > 0) {
+    gWarmTierDataExists = true;
+  } else if (st != WARM_OK && st != WARM_ABSENT) {
+    // compare/yoy read the same months once per sensor: at most one warning per 5 minutes
+    static unsigned long lastWarnMillis = 0;
+    if (lastWarnMillis == 0 || millis() - lastWarnMillis > 300000UL) {
+      lastWarnMillis = millis();
+      char msg[128];
+      snprintf(msg, sizeof(msg), "Warm tier: %s unreadable (%s at byte %lu)",
+               filePath, warmStatusName(st), (unsigned long)failOffset);
+      warmHookLog("warn", msg);
+    }
   }
-  
-  char *buf = (char *)malloc(sz + 1);
-  if (!buf) { fclose(f); return false; }
-  
-  size_t bytesRead = fread(buf, 1, sz, f);
-  fclose(f);
-  if (bytesRead != (size_t)sz) {
-    free(buf);
-    return false;
-  }
-  buf[bytesRead] = '\0';
-  
-  DeserializationError err = deserializeJson(doc, buf);
-  free(buf);
-  if (err == DeserializationError::Ok) { gWarmTierDataExists = true; }
-  return (err == DeserializationError::Ok);
-  #endif
+  return st;
+#else
+  (void)year;
+  (void)month;
+  (void)visit;
+  (void)ctx;
+  return WARM_ABSENT;
 #endif
-  return false;
 }
 
-// Prune old daily summary files beyond MAX_DAILY_SUMMARY_MONTHS
+// Prune old daily summary files beyond MAX_DAILY_SUMMARY_MONTHS. S-D03: also
+// removes .tmp/.bad leftovers (restoring a retained month's .tmp that is its only
+// complete copy) and sets gWarmTierDataExists from what is on disk.
 static void pruneDailySummaryFiles() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   if (!mbedFS) return;
-  
-  double now = 0.0;
-  if (gLastSyncedEpoch > 0.0) {
-    now = gLastSyncedEpoch + (double)(millis() - gLastSyncMillis) / 1000.0;
-  }
-  if (now <= 0.0) return;
-  
-  time_t nowTime = (time_t)now;
-  struct tm *nowTm = gmtime(&nowTime);
-  if (!nowTm) return;
-  
-  int curYear = nowTm->tm_year + 1900;
-  int curMonth = nowTm->tm_mon + 1;
-  
-  // Calculate oldest allowed month
-  int oldYear = curYear;
-  int oldMonth = curMonth - MAX_DAILY_SUMMARY_MONTHS;
-  while (oldMonth <= 0) { oldMonth += 12; oldYear--; }
-  
-  // Scan for and remove files older than retention
-  // Try a range of possible old files (24 months back)
-  for (int delta = MAX_DAILY_SUMMARY_MONTHS + 1; delta <= 24; delta++) {
-    int delYear = curYear;
-    int delMonth = curMonth - delta;
-    while (delMonth <= 0) { delMonth += 12; delYear--; }
-    
+
+  const double now = currentEpoch();
+  if (now < WARM_MIN_VALID_EPOCH || now >= WARM_MAX_VALID_EPOCH) return;
+  int curYear, curMonth, curDay;
+  warmDnToCivil(warmEpochToDn(now), &curYear, &curMonth, &curDay);
+
+  // Months 0..MAX_DAILY_SUMMARY_MONTHS back are kept; older files are looked for up to 24 months back
+  bool present = false;
+  for (int delta = 0; delta <= 24; delta++) {
+    int year = curYear;
+    int month = curMonth - delta;
+    while (month <= 0) { month += 12; year--; }
+
     char filePath[64];
-    snprintf(filePath, sizeof(filePath), "/fs/history/daily_%04d%02d.json", delYear, delMonth);
-    
-    FILE *check = fopen(filePath, "r");
-    if (check) {
-      fclose(check);
-      remove(filePath);
+    char sidePath[72];
+    if (!warmMonthPath(filePath, sizeof(filePath), DAILY_SUMMARY_DIR, year, month, "")) continue;
+    if (delta <= MAX_DAILY_SUMMARY_MONTHS) {
+      // Retained month: a leftover .tmp is dropped, or restored when it is the only
+      // complete copy (S-D03: warmRecoverMonthTmp; on an error it is kept for the next try)
+      int state = 0;
+      if (warmMonthPath(sidePath, sizeof(sidePath), DAILY_SUMMARY_DIR, year, month, ".tmp")) {
+        (void)warmRecoverMonthTmp(filePath, sidePath, DAILY_SUMMARY_MAX_FILE_BYTES, kWarmHooks, &state);
+      } else {
+        state = warmStat(filePath);
+      }
+      if (state == 1) present = true;
+      continue;
+    }
+    if (remove(filePath) == 0) {
       Serial.print(F("Pruned old daily summary: "));
       Serial.println(filePath);
     }
+    if (warmMonthPath(sidePath, sizeof(sidePath), DAILY_SUMMARY_DIR, year, month, ".tmp")) remove(sidePath);
+    if (warmMonthPath(sidePath, sizeof(sidePath), DAILY_SUMMARY_DIR, year, month, ".bad")) remove(sidePath);
   }
+  gWarmTierDataExists = present;
   #endif
 #endif
 }
+
+// Boot: /api/history's warmTierAvailable should not wait for the first hourly
+// maintenance. Probes the month after the last rollup and the months before it.
+// S-D03: without a valid last rollup (none yet, or history settings lost), from
+// today's month, or the last heartbeat's while the clock is not set (boot).
+static void refreshWarmTierPresence(uint32_t anchorYmd) {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) return;
+  int32_t anchorDn = 0;
+  if (warmYmdToDn(anchorYmd, &anchorDn)) {
+    anchorDn += 1;
+  } else {
+    double ref = currentEpoch();
+    if (!(ref >= WARM_MIN_VALID_EPOCH && ref < WARM_MAX_VALID_EPOCH)) ref = gLastHeartbeatFileEpoch;
+    if (!(ref >= WARM_MIN_VALID_EPOCH && ref < WARM_MAX_VALID_EPOCH)) return;
+    anchorDn = warmEpochToDn(ref);
+  }
+  int year, month, day;
+  warmDnToCivil(anchorDn, &year, &month, &day);
+  for (int delta = 0; delta <= MAX_DAILY_SUMMARY_MONTHS; delta++) {
+    int y = year;
+    int m = month - delta;
+    while (m <= 0) { m += 12; y--; }
+    char filePath[64];
+    if (warmMonthPath(filePath, sizeof(filePath), DAILY_SUMMARY_DIR, y, m, "") && warmStat(filePath) == 1) {
+      gWarmTierDataExists = true;
+      return;
+    }
+  }
+#else
+  (void)anchorYmd;
+#endif
+}
+
+#ifdef TANKALARM_WARM_SELFTEST
+// S-D03 bench build only (-DTANKALARM_WARM_SELFTEST, never for field units):
+// runs a full 20-sensor month (~76 KB) through the warm-tier store once at
+// boot and prints the time and heap of each step, for the S-D03 bench targets
+// (daily merge < 1.5 s, heap drop < 16 KB). Uses its own folder and removes
+// it afterwards. Free heap reads 0 unless MBED_HEAP_STATS_ENABLED is set.
+static uint32_t gWarmSelfTestMinFree = 0;
+
+static void warmSelfTestYield() {
+  dfuKickWatchdog();
+  const uint32_t freeNow = tankalarm_freeRam();
+  if (freeNow < gWarmSelfTestMinFree) gWarmSelfTestMinFree = freeNow;
+}
+
+// One row per sensor for days firstDay..lastDay of 2026-01
+static uint16_t warmSelfTestRows(WarmNewRow *rows, char (*uids)[24], uint8_t firstDay, uint8_t lastDay) {
+  uint16_t n = 0;
+  for (uint8_t day = firstDay; day <= lastDay; day++) {
+    for (uint8_t i = 0; i < MAX_HISTORY_SENSORS; i++) {
+      WarmNewRow &r = rows[n++];
+      r.c = uids[i];
+      r.d = 20260100UL + day;
+      r.k = (uint8_t)(1 + i % 4);
+      r.al = 0;
+      r.state = WARM_ROW_ADD;
+      r.mn = 40.0f + i;
+      r.mx = r.mn + 12.3f;
+      r.av = r.mn + 6.1f;
+      r.op = r.mn + 1.2f;
+      r.cl = r.mn + 10.4f;
+      r.vt = 12.45f;
+      r.n = 24;
+    }
+  }
+  return n;
+}
+
+static void warmSelfTestReport(const char *step, WarmStatus st, unsigned long startMs) {
+  Serial.print(F("Warm self-test: "));
+  Serial.print(step);
+  Serial.print(F(": "));
+  Serial.print(warmStatusName(st));
+  Serial.print(F(", "));
+  Serial.print(millis() - startMs);
+  Serial.print(F(" ms, min free heap "));
+  Serial.println((unsigned long)gWarmSelfTestMinFree);
+}
+
+static void runWarmSelfTest() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) return;
+  static const char kDir[] = "/fs/history_selftest";
+  const WarmHooks hooks = {warmSelfTestYield, warmHookLog, nullptr, warmHookNowMs, nullptr};
+  const uint16_t cap = (uint16_t)(WARM_MAX_DAYS_PER_BATCH * MAX_HISTORY_SENSORS);
+  const uint32_t freeBefore = tankalarm_freeRam();
+  gWarmSelfTestMinFree = freeBefore;
+  WarmNewRow *rows = (WarmNewRow *)malloc(sizeof(WarmNewRow) * cap);
+  if (!rows) {
+    Serial.println(F("Warm self-test: no memory for rows"));
+    return;
+  }
+  char uids[MAX_HISTORY_SENSORS][24];
+  for (uint8_t i = 0; i < MAX_HISTORY_SENSORS; i++) {
+    snprintf(uids[i], sizeof(uids[i]), "dev:8644730600%05u", (unsigned)i);
+  }
+  mkdir(kDir, 0777);
+  char path[64];
+  warmMonthPath(path, sizeof(path), kDir, 2026, 1, "");
+  remove(path);
+
+  // Days 1-30 in batches of 8 days, as the boot backfill writes them
+  unsigned long t0 = millis();
+  WarmStatus st = WARM_OK;
+  for (uint8_t first = 1; first <= 30 && st == WARM_OK; first += WARM_MAX_DAYS_PER_BATCH) {
+    const uint8_t last = (first + WARM_MAX_DAYS_PER_BATCH - 1 < 30) ? first + WARM_MAX_DAYS_PER_BATCH - 1 : 30;
+    st = warmMergeMonth(kDir, 2026, 1, rows, warmSelfTestRows(rows, uids, first, last),
+                        DAILY_SUMMARY_MAX_FILE_BYTES, hooks, nullptr);
+  }
+  warmSelfTestReport("backfill days 1-30", st, t0);
+
+  // Day 31 into the 600-row file: the steady-state daily rollup
+  WarmMergeResult res = {};
+  t0 = millis();
+  st = warmMergeMonth(kDir, 2026, 1, rows, warmSelfTestRows(rows, uids, 31, 31),
+                      DAILY_SUMMARY_MAX_FILE_BYTES, hooks, &res);
+  warmSelfTestReport("daily merge (day 31)", st, t0);
+  Serial.print(F("Warm self-test: month file "));
+  Serial.print((unsigned long)res.bytes);
+  Serial.println(F(" bytes"));
+
+  // Days 24-31 again, unchanged: one boot re-check batch (reads only)
+  t0 = millis();
+  st = warmMergeMonth(kDir, 2026, 1, rows, warmSelfTestRows(rows, uids, 24, 31),
+                      DAILY_SUMMARY_MAX_FILE_BYTES, hooks, &res);
+  warmSelfTestReport(res.wrote ? "re-check days 24-31 (unexpected write)" : "re-check days 24-31", st, t0);
+
+  // One reader pass over the month (stats, compare, yoy)
+  uint32_t scanned = 0;
+  t0 = millis();
+  st = warmScanFile(path, false, DAILY_SUMMARY_MAX_FILE_BYTES, 0, nullptr, nullptr, hooks, &scanned, nullptr);
+  warmSelfTestReport("scan", st, t0);
+  Serial.print(F("Warm self-test: rows scanned "));
+  Serial.println((unsigned long)scanned);
+
+  free(rows);
+  remove(path);
+  remove(kDir);
+  Serial.print(F("Warm self-test: free heap before "));
+  Serial.print((unsigned long)freeBefore);
+  Serial.print(F(", minimum "));
+  Serial.print((unsigned long)gWarmSelfTestMinFree);
+  Serial.print(F(", after "));
+  Serial.println((unsigned long)tankalarm_freeRam());
+#endif
+}
+#endif  // TANKALARM_WARM_SELFTEST
 
 // ============================================================================
 // Hot Tier Persistence (survive reboots)
@@ -8446,6 +8573,8 @@ static bool saveHotTierSnapshot() {
     sensorObj["s"] = hist.siteName;
     sensorObj["k"] = hist.sensorIndex;
     sensorObj["h"] = hist.heightInches;
+    // S-D03: how many of the oldest entries (written first below) older firmware saved
+    if (hist.legacyCount > 0) sensorObj["lg"] = hist.legacyCount;
     
     JsonArray snaps = sensorObj["d"].to<JsonArray>();
     // Write snapshots in chronological order
@@ -8453,7 +8582,9 @@ static bool saveHotTierSnapshot() {
       uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
       TelemetrySnapshot &snap = hist.snapshots[idx];
       JsonArray entry = snaps.add<JsonArray>();
-      entry.add(snap.timestamp);
+      // S-D03: an integer round-trips exactly. A double that fits a float (e.g. any UTC
+      // midnight) is written with 7 digits and reloads up to 512 s off, on another day.
+      entry.add((uint32_t)snap.timestamp);
       entry.add(roundTo(snap.level, 2));
       entry.add(roundTo(snap.voltage, 2));
     }
@@ -8530,6 +8661,7 @@ static void loadHotTierSnapshot() {
   
   JsonArray arr = doc.as<JsonArray>();
   gSensorHistoryCount = 0;
+  uint16_t untimedSkipped = 0;
   
   for (JsonObject sensorObj : arr) {
     if (gSensorHistoryCount >= MAX_HISTORY_SENSORS) break;
@@ -8547,19 +8679,39 @@ static void loadHotTierSnapshot() {
     hist.heightInches = sensorObj["h"] | 120.0f;
     hist.snapshotCount = 0;
     hist.writeIndex = 0;
+    hist.legacyCount = 0;
+    // S-D03: entries older firmware saved (non-integer timestamps, or the first "lg" of a
+    // file this firmware saved) may be reused, placeholder or receive-time values. They are
+    // kept for the charts but never enter a daily row, so the first boot after the update
+    // does not rewrite the rows that firmware wrote from them.
+    const uint16_t savedLegacy = sensorObj["lg"] | (uint16_t)0;
+    uint16_t entryPos = 0;
+    uint16_t savedLegacyKept = 0;
+    bool olderFormat = false;
     
     JsonArray snaps = sensorObj["d"].as<JsonArray>();
     for (JsonArray entry : snaps) {
       if (hist.snapshotCount >= MAX_HOURLY_HISTORY_PER_SENSOR) break;
+      const uint16_t pos = entryPos++;
+      if (!entry[0].is<uint32_t>()) olderFormat = true;
       
+      // S-D03: keep the ring to whole-second acquisition times. A non-integer timestamp
+      // comes from older firmware; near a UTC midnight its true day is unknown, so drop it.
+      const double ts = warmAcquisitionEpoch(entry[0].as<double>(), 0.0);
+      if (ts <= 0.0 || (!entry[0].is<uint32_t>() && warmLegacyEpochAmbiguous(ts))) {
+        untimedSkipped++;
+        continue;
+      }
+      if (pos < savedLegacy) savedLegacyKept++;
       TelemetrySnapshot &snap = hist.snapshots[hist.writeIndex];
-      snap.timestamp = entry[0].as<double>();
+      snap.timestamp = ts;
       snap.level = entry[1].as<float>();
       snap.voltage = entry[2].as<float>();
       
       hist.writeIndex = (hist.writeIndex + 1) % MAX_HOURLY_HISTORY_PER_SENSOR;
       hist.snapshotCount++;
     }
+    hist.legacyCount = olderFormat ? hist.snapshotCount : savedLegacyKept;
     
     if (hist.clientUid[0] != '\0') {
       gSensorHistoryCount++;
@@ -8569,6 +8721,11 @@ static void loadHotTierSnapshot() {
   Serial.print(F("Hot tier restored: "));
   Serial.print(gSensorHistoryCount);
   Serial.println(F(" sensors from flash"));
+  if (untimedSkipped > 0) {
+    Serial.print(F("Hot tier: skipped "));
+    Serial.print(untimedSkipped);
+    Serial.println(F(" snapshots whose time is not reliable (older file format)"));
+  }
   #endif
 #endif
 }
@@ -8644,36 +8801,22 @@ static void populateStatsFromFtpCache(const char *clientUid, uint8_t sensorIndex
 static void populateStatsFromDailySummary(uint16_t year, uint8_t month,
                                            const char *clientUid, uint8_t sensorIndex,
                                            JsonObject &statsObj) {
-  JsonDocument monthDoc;
-  if (!loadDailySummaryMonth(year, month, monthDoc)) {
+  // S-D03: streamed row by row (warmSensorStatsVisitor in WarmTierStore.h);
+  // used only if the whole month read cleanly
+  WarmSensorStats warmStats;
+  warmSensorStatsInit(warmStats, clientUid, sensorIndex);
+  const WarmStatus st = warmScanMonth(year, month, warmSensorStatsVisitor, &warmStats, nullptr);
+  if (st != WARM_OK) {
     statsObj["available"] = false;
-    statsObj["message"] = "No daily summary data on flash";
+    statsObj["message"] = (st == WARM_ABSENT) ? "No daily summary data on flash" : "Daily summary file unreadable";
     return;
   }
-  
-  JsonArray entries = monthDoc.as<JsonArray>();
-  float minLevel = 999999.0f, maxLevel = -999999.0f, sumAvg = 0.0f;
-  uint16_t dayCount = 0;
-  
-  for (JsonObject entry : entries) {
-    const char *uid = entry["c"] | "";
-    uint8_t sensorIdx = entry["k"] | 0;
-    if (strcmp(uid, clientUid) != 0 || sensorIdx != sensorIndex) continue;
-    
-    float mn = entry["mn"] | 0.0f;
-    float mx = entry["mx"] | 0.0f;
-    float av = entry["av"] | 0.0f;
-    if (mn < minLevel) minLevel = mn;
-    if (mx > maxLevel) maxLevel = mx;
-    sumAvg += av;
-    dayCount++;
-  }
-  
-  if (dayCount > 0) {
-    statsObj["min"] = roundTo(minLevel, 1);
-    statsObj["max"] = roundTo(maxLevel, 1);
-    statsObj["avg"] = roundTo(sumAvg / dayCount, 1);
-    statsObj["readings"] = dayCount;
+
+  if (warmStats.days > 0) {
+    statsObj["min"] = roundTo(warmStats.minLevel, 1);
+    statsObj["max"] = roundTo(warmStats.maxLevel, 1);
+    statsObj["avg"] = roundTo(warmStats.sumAvg / warmStats.days, 1);
+    statsObj["readings"] = warmStats.days;
     statsObj["available"] = true;
     statsObj["dataSource"] = "flash";
   } else {
@@ -12608,6 +12751,13 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
   respondStatus(client, 200, msg);
 }
 
+// S-D03: first client firmware whose note `t` is exact. #318 ships in 2.2.16: such a client
+// sends every telemetry, daily-report and alarm `t` as a whole minute (truncated, as an
+// integer), and on-demand telemetry for a sensor it has not sampled since boot omits `t`
+// instead of stamping its boot value with the send time (see handleTelemetry). Every client
+// note carries its "fv".
+static const char CLIENT_EXACT_T_SINCE[] = "2.2.16";
+
 static void handleTelemetry(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   // Fix #313-1a: reject notes that do not identify a sensor. Client sensor
@@ -12634,6 +12784,7 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // TEMPORARY (2026-06-15): clients now include live system voltage "v" in telemetry (not just
   // the daily report) so the dashboard VIN updates in near-real-time. May be REMOVED later if we
   // revert to daily-only voltage reporting on the client.
+  float noteVin = 0.0f;  // S-D03: this note's accepted "v", measured in the same pass as the reading
   {
     float telemetryVin = doc["v"] | 0.0f;
     // Fix 6/7: only accept a battery voltage that is either tagged with a real measurement
@@ -12642,6 +12793,7 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
     const char *vsrc = doc["vs"] | "";
     bool vTagged = (strcmp(vsrc, "mppt") == 0 || strcmp(vsrc, "vin-divider") == 0);
     if (telemetryVin > 0.0f && (vTagged || telemetryVin >= 6.0f)) {
+      noteVin = telemetryVin;
       ClientMetadata *vmeta = findOrCreateClientMetadata(clientUid);
       if (vmeta) {
         vmeta->vinVoltage = telemetryVin;
@@ -12874,19 +13026,40 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   float recordHeight = doc["cap"] | (doc["h"] | 0.0f);
   if (recordHeight <= 0) recordHeight = 48.0f; // Default only if neither cap nor h present
   
-  // Get voltage from client metadata if available
-  float vinVoltage = 0.0f;
-  ClientMetadata *meta = findClientMetadata(clientUid);
-  if (meta && meta->vinVoltage > 0) {
-    vinVoltage = meta->vinVoltage;
+  // S-D03: history holds only fresh acquisitions (as handleDaily's trustLevel does). A
+  // reused (ru) or failed (sf) value or a faulted read was not taken at `t`. A current-loop
+  // level is converted only from 4-20 mA (mA above); for any other raw mA, or none, newLevel
+  // is resolveLevel's 0.0 default, not the reading (the client sends 3.6-21 mA as valid).
+  // The live value above still updates.
+  const bool freshReading = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull() &&
+      !(strcmp(rec->sensorType, "currentLoop") == 0 && !(mA >= 4.0f && mA <= 20.0f));
+  if (!freshReading) return;
+  // S-D03: a client older than CLIENT_EXACT_T_SINCE answers an on-demand request for a
+  // sensor it has not sampled since boot (solar-only voltage gate closed) with its boot
+  // value, 0.0 with no ru/sf, stamped with the send time. The note cannot be told apart
+  // from a real reading, so no on-demand note from such a client (or one without "fv")
+  // enters history.
+  const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
+  if (strcmp(doc["r"] | "", "ondemand") == 0 && !exactT) {
+    return;
   }
-  
-  // Record telemetry snapshot for historical charting. Use the client's
-  // acquisition epoch (top-level `t`) so the chart X-axis reflects when the
-  // reading was actually taken, not when the server happened to receive the note.
+
+  // Record telemetry snapshot for historical charting at the client's acquisition epoch
+  // (top-level `t`), so the chart X-axis reflects when the reading was actually taken.
+  // S-D03: no fallback to the receive time; a reading without `t` stays out of history.
   double telemetryEpoch = doc["t"] | 0.0;
-  if (telemetryEpoch <= 0.0) telemetryEpoch = epoch;
-  recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, vinVoltage, telemetryEpoch);
+  // S-D03: "v" is the client's last voltage poll when the note was built, up to
+  // WARM_VIN_MAX_AGE_SEC old, and the note is built within 5 minutes of the reading (seconds
+  // later on a current-loop client, whose Phase B runs after every A0602 read). So keep it
+  // only when all of that is on the reading's UTC day. An on-demand note re-sends the last
+  // reading when the client could not sample (solar-only voltage gate) and is built at send
+  // time, so also keep its voltage only when the reading is from the same UTC day and
+  // within an hour of the note's arrival.
+  if (!warmVinOnReadingDay(telemetryEpoch, telemetryEpoch, telemetryEpoch + 300.0) ||
+      (strcmp(doc["r"] | "", "ondemand") == 0 && !warmSameUtcDayWithin(telemetryEpoch, epoch, 3600.0))) {
+    noteVin = 0.0f;
+  }
+  recordTelemetrySnapshot(clientUid, siteName, sensorIndex, recordHeight, newLevel, noteVin, telemetryEpoch);
 }
 
 static void handleAlarm(JsonDocument &doc, double epoch) {
@@ -13048,6 +13221,9 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // Relay safety timeout — relay was forced off after exceeding max ON duration
   // This is an operational event, NOT a sensor alarm clear — do not clear alarmActive
   bool isRelayTimeout = (strcmp(type, "relay_timeout") == 0);
+  // S-D03: when the alarm happened, from the note's "t" with no fallback (0 = unknown), for
+  // the daily alarm count.
+  const double alarmEventEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
 
   if (strcmp(type, "clear") == 0 || isRecovery) {
     rec->alarmActive = false;
@@ -13070,26 +13246,17 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     strlcpy(rec->alarmType, type, sizeof(rec->alarmType));
     const char *siteName = doc["s"] | "";
     bool isHigh = (strcmp(type, "high") == 0 || strcmp(type, "triggered") == 0);
-    logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh);
+    // S-D03: a v2.2.15 client can raise an edge on a reused (ru) or failed (sf) value or a
+    // faulted read, which says nothing about the day it is sent on. It is logged, latched
+    // and alerted as before, but eventEpoch 0 keeps it out of the daily `al`.
+    const bool alarmOnFreshValue = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull();
+    logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh, alarmOnFreshValue ? alarmEventEpoch : 0.0);
   }
   rec->currentValue = level;
-  // Record historical snapshot from alarm so trend data captures alarm events
-  if (level > 0.0f) {
-    const char *alarmSiteName = doc["s"] | rec->site;
-    float alarmVin = 0.0f;
-    ClientMetadata *alarmMeta = findOrCreateClientMetadata(clientUid);
-    if (alarmMeta) alarmVin = alarmMeta->vinVoltage;
-    // Use the client-reported capacity (cap) as the immutable tank height, never the
-    // current level. Falls back to 48 in only if the note predates self-describing payloads.
-    float alarmCap = doc["cap"] | 0.0f;
-    if (alarmCap <= 0.0f) alarmCap = 48.0f;
-    // Acquisition time from the alarm note's top-level `t`, falling back to the
-    // processNotefile epoch if the note predates the acquisition-time fix.
-    double alarmEventEpoch = doc["t"] | 0.0;
-    if (alarmEventEpoch <= 0.0) alarmEventEpoch = epoch;
-    recordTelemetrySnapshot(clientUid, alarmSiteName, sensorIndex,
-                            alarmCap, level, alarmVin, alarmEventEpoch);
-  }
+  // S-D03: an alarm note adds no history snapshot. Its "t" can be when the note was sent,
+  // not when the value was read (seconds later on a current-loop client, hours later for a
+  // config-push clear), and the note does not say which. The reading enters history from
+  // telemetry or the daily report at its own time.
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   gSensorRegistryDirty = true;
 
@@ -13244,7 +13411,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   }
   // Reject an untagged, implausible reading (e.g. the Notecard ~5V rail) so it cannot poison the
   // dashboard; a tagged or MPPT reading is accepted at any plausible battery level.
-  if (isFirstPart && vinVoltage > 0.0f && (vTrusted || vinVoltage >= 6.0f)) {
+  const bool vinAccepted = isFirstPart && vinVoltage > 0.0f && (vTrusted || vinVoltage >= 6.0f);
+  // S-D03: the report's voltage is the client's last poll when the report was built, at its
+  // own "t" (0 = unknown), up to WARM_VIN_MAX_AGE_SEC before it.
+  const double reportVinEpoch = warmAcquisitionEpoch(doc["t"] | 0.0, currentEpoch());
+  if (vinAccepted) {
     ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
     if (meta) {
       meta->vinVoltage = vinVoltage;
@@ -13494,18 +13665,27 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
-    // even when change-based telemetry is disabled (levelChangeThreshold = 0)
-    if (trustLevel && newLevel > 0.0f) {
+    // even when change-based telemetry is disabled (levelChangeThreshold = 0).
+    // S-D03: the per-sensor `t` is when the sensor's last valid reading was taken and
+    // the value is that reading (ru/sf mean no newer one, not a value from another
+    // time), so it is filed at `t` and the ring's dedupe drops a copy telemetry already
+    // brought. A current-loop value enters only from 4-20 mA, as in handleTelemetry.
+    const bool dailyMaInRange = !isCurrentLoopSensor || (mA >= 4.0f && mA <= 20.0f);
+    if (trustLevel && dailyMaInRange && newLevel > 0.0f) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;
-      // Per-sensor acquisition epoch (v2.0.56+). Falls back to the daily report's
-      // top-level epoch (transmission time) and then to server-now in the
-      // recordTelemetrySnapshot fallback chain.
+      // Per-sensor acquisition epoch (v2.0.56+). S-D03: no fallback to the report's
+      // transmission time; a reading without its own `t` stays out of history. The
+      // report's voltage goes with it only when the reading was taken within an hour
+      // of the report on the same UTC day, and the voltage poll (up to
+      // WARM_VIN_MAX_AGE_SEC before the report) was on that day too.
       double dailySensorEpoch = t["t"] | 0.0;
-      if (dailySensorEpoch <= 0.0) dailySensorEpoch = epoch;
+      const float dailyVin = (vinAccepted && warmSameUtcDayWithin(dailySensorEpoch, reportVinEpoch, 3600.0) &&
+                              warmVinOnReadingDay(dailySensorEpoch, reportVinEpoch, reportVinEpoch))
+                                 ? vinVoltage : 0.0f;
       recordTelemetrySnapshot(clientUid, siteName, sensorIndex,
-                              dailyCap, newLevel, vinVoltage, dailySensorEpoch);
+                              dailyCap, newLevel, dailyVin, dailySensorEpoch);
     }
   }
 
@@ -16458,12 +16638,70 @@ static void handleConfigAck(JsonDocument &doc, double epoch) {
 // ============================================================================
 // Client Data FTP Archive
 // ============================================================================
+// Archived-client manifest (/fs/archived_clients.json)
+// ============================================================================
+// S-D03 (M-54, M-55): the manifest used to be read through a 2 KB buffer, so
+// every entry past ~2 KB was dropped on the next append, and it was rewritten
+// with an unchecked write and remove-before-rename. The store now reads it
+// without a text buffer, rewrites it through .tmp + rename, keeps at most
+// MAX_ARCHIVE_MANIFEST_ENTRIES entries under MAX_ARCHIVE_MANIFEST_BYTES (the
+// oldest entries are dropped, their files stay on FTP), and salvages an
+// unreadable manifest entry by entry, keeping the original as .bad.
+
+static void archiveManifestLog(const char *level, const char *msg) {
+  Serial.println(msg);
+  addServerSerialLog(msg, level, "archive");
+}
+
+static const WarmHooks kArchiveManifestHooks = {warmHookYield, archiveManifestLog, serverNoteFlashWrite,
+                                                 warmHookNowMs, nullptr};
+
+// Adds this archive to the manifest, replacing an entry for the same ftpFile.
+// Failures are logged; the archive itself is already on FTP.
+static bool appendArchiveManifestEntry(const char *clientUid, const char *site, const char *displayLabel,
+                                       double firstSeen, double lastUpdate, const char *ftpFile,
+                                       uint8_t sensorCount) {
+#ifdef FILESYSTEM_AVAILABLE
+  WarmManifestEntry entry;
+  entry.clientUid = clientUid;
+  entry.site = site;
+  entry.displayLabel = displayLabel;
+  entry.ftpFile = ftpFile;
+  entry.firstSeenEpoch = firstSeen;
+  entry.lastUpdateEpoch = lastUpdate;
+  entry.archiveEpoch = currentEpoch();
+  entry.sensorCount = sensorCount;
+  WarmManifestAppendResult result;
+  const WarmStatus st = warmManifestAppend(ARCHIVE_MANIFEST_PATH, ARCHIVE_MANIFEST_BAD_PATH, entry,
+                                           MAX_ARCHIVE_MANIFEST_ENTRIES, MAX_ARCHIVE_MANIFEST_BYTES,
+                                           kArchiveManifestHooks, &result);
+  if (result.quarantined) gManifestSalvages++;
+  if (st != WARM_OK) {
+    gManifestAppendFailures++;
+    return false;
+  }
+  return true;
+#else
+  (void)clientUid;
+  (void)site;
+  (void)displayLabel;
+  (void)firstSeen;
+  (void)lastUpdate;
+  (void)ftpFile;
+  (void)sensorCount;
+  return false;
+#endif
+}
+
+// ============================================================================
 // Archives a client's sensor records and hot-tier history to FTP before removal.
 // Only archives if: FTP is enabled, client has been active for >30 days, and
 // has at least one sensor record. The archive filename includes the site name
 // and date range (first seen → last update) so archived entries are uniquely
 // identifiable even if a new client with the same name is created later.
 // File path: {ftpPath}/archived_clients/{Site}_{YYYYMM}-{YYYYMM}_{uid_suffix}.json
+// Returns true when the archive is on FTP and listed in the manifest. Removal
+// does not depend on it (a client can be removed with FTP off or failing).
 
 static bool archiveClientToFtp(const char *clientUid) {
   if (!gConfig.ftpEnabled) return false;
@@ -16511,214 +16749,188 @@ static bool archiveClientToFtp(const char *clientUid) {
   size_t uidLen = strlen(clientUid);
   if (uidLen > 8) uidSuffix = clientUid + uidLen - 8;
 
-  // Build JSON archive document
-  JsonDocument doc;
-  doc["clientUid"] = clientUid;
-  doc["site"] = siteName;
-  doc["archiveEpoch"] = currentEpoch();
-
-  // Human-readable date range label: "Site (Mar 2025 - Mar 2026)"
-  {
-    const char *monthNames[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-    time_t startT = (time_t)earliestSeen;
-    time_t endT = (time_t)latestUpdate;
-    struct tm *tsStart = gmtime(&startT);
-    int sy = tsStart->tm_year + 1900, sm = tsStart->tm_mon;
-    struct tm *tsEnd = gmtime(&endT);
-    int ey = tsEnd->tm_year + 1900, em = tsEnd->tm_mon;
-    char rangeLabel[64];
-    snprintf(rangeLabel, sizeof(rangeLabel), "%s (%s %d - %s %d)",
-             siteName, monthNames[sm], sy, monthNames[em], ey);
-    doc["displayLabel"] = rangeLabel;
-  }
-  doc["firstSeenEpoch"] = earliestSeen;
-  doc["lastUpdateEpoch"] = latestUpdate;
-
-  // Archive all sensor records
-  JsonArray sensorsArr = doc["sensors"].to<JsonArray>();
-  for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
-    if (strcmp(gSensorRecords[i].clientUid, clientUid) != 0) continue;
-    const SensorRecord &rec = gSensorRecords[i];
-    JsonObject obj = sensorsArr.add<JsonObject>();
-    obj["sensorIndex"] = rec.sensorIndex;
-    if (rec.userNumber > 0) obj["userNumber"] = rec.userNumber;
-    obj["site"] = rec.site;
-    obj["label"] = rec.label;
-    if (rec.contents[0] != '\0') obj["contents"] = rec.contents;
-    if (rec.objectType[0] != '\0') obj["objectType"] = rec.objectType;
-    if (rec.sensorType[0] != '\0') obj["sensorType"] = rec.sensorType;
-    if (rec.measurementUnit[0] != '\0') obj["measurementUnit"] = rec.measurementUnit;
-    obj["lastLevel"] = roundTo(rec.currentValue, 1);
-    // Fix 13 (v2.0.52): gate dropped from >=4.0 to >0.0 for consistency with the
-    // live API. Archived records still reflect whatever the live record held at
-    // serialization time.
-    if (rec.sensorMa > 0.0f) obj["lastSensorMa"] = roundTo(rec.sensorMa, 2);
-    if (rec.sensorVoltage > 0.0f) obj["lastSensorVoltage"] = roundTo(rec.sensorVoltage, 3);
-    obj["lastUpdateEpoch"] = rec.lastUpdateEpoch;
-    double fs = rec.firstSeenEpoch > 0.0 ? rec.firstSeenEpoch : rec.lastUpdateEpoch;
-    obj["firstSeenEpoch"] = fs;
-  }
-
-  // Archive hot-tier history snapshots for this client
-  JsonArray historyArr = doc["history"].to<JsonArray>();
-  for (uint8_t h = 0; h < gSensorHistoryCount; ++h) {
-    SensorHourlyHistory &hist = gSensorHistory[h];
-    if (strcmp(hist.clientUid, clientUid) != 0) continue;
-    if (hist.snapshotCount == 0) continue;
-
-    JsonObject hObj = historyArr.add<JsonObject>();
-    hObj["sensorIndex"] = hist.sensorIndex;
-    hObj["heightInches"] = hist.heightInches;
-    JsonArray readings = hObj["readings"].to<JsonArray>();
-    for (uint16_t j = 0; j < hist.snapshotCount; ++j) {
-      uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
-      TelemetrySnapshot &snap = hist.snapshots[idx];
-      JsonArray pt = readings.add<JsonArray>();
-      pt.add(snap.timestamp);
-      pt.add(roundTo(snap.level, 1));
-      pt.add(roundTo(snap.voltage, 2));
-    }
-  }
-
-  // Archive client metadata if available
-  ClientMetadata *meta = findClientMetadata(clientUid);
-  if (meta) {
-    JsonObject metaObj = doc["metadata"].to<JsonObject>();
-    if (meta->vinVoltage > 0.0f) metaObj["vinVoltage"] = roundTo(meta->vinVoltage, 2);
-    if (meta->firmwareVersion[0] != '\0') metaObj["firmwareVersion"] = meta->firmwareVersion;
-    if (meta->latitude != 0.0f) metaObj["latitude"] = meta->latitude;
-    if (meta->longitude != 0.0f) metaObj["longitude"] = meta->longitude;
-    if (meta->signalBars >= 0) metaObj["signalBars"] = meta->signalBars;
-  }
-
-  // Serialize to string
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-
-  // Build sanitized site name for filename (replace spaces/special chars)
-  char safeSite[24];
-  {
-    size_t si = 0;
-    for (size_t c = 0; siteName[c] != '\0' && si < sizeof(safeSite) - 1; ++c) {
-      char ch = siteName[c];
-      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-          (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
-        safeSite[si++] = ch;
-      } else if (ch == ' ') {
-        safeSite[si++] = '_';
-      }
-    }
-    safeSite[si] = '\0';
-    if (si == 0) strlcpy(safeSite, "unknown", sizeof(safeSite));
-  }
-
-  // Upload to FTP: {ftpPath}/{serverUid}/archived_clients/{safeSite}_{startYM}-{endYM}_{uidSuffix}.json
+  // S-D03: the label and remote path outlive the block below, which frees the
+  // archive document and its upload buffer before the manifest is updated
+  char rangeLabel[64];
   char remotePath[256];
-  const char *base = (strlen(gConfig.ftpPath) > 0) ? gConfig.ftpPath : FTP_PATH_DEFAULT;
-  const char *uid = (strlen(gServerUid) > 0) ? gServerUid : "server";
-  snprintf(remotePath, sizeof(remotePath), "%s/%s/archived_clients/%s_%s-%s_%s.json",
-           base, uid, safeSite, startYM, endYM, uidSuffix);
-
-  const bool useFtps = gConfig.ftpsEnabled;
-  FtpSession session;
-  char err[128];
-  bool connected = useFtps ? ftpsConnectAndLogin(err, sizeof(err))
-                           : ftpConnectAndLogin(session, err, sizeof(err));
-  if (!connected) {
-    Serial.print(F("FTP archive client failed (login): "));
-    Serial.println(err);
-    return false;
-  }
-
-  // Ensure {ftpPath}/{uid}/archived_clients/ exists. The per-server
-  // {ftpPath}/{uid} directory should already exist (created by the regular
-  // backup), but MKD on it is idempotent (550 = exists = non-fatal) so we
-  // still issue it for robustness in case archive runs before any backup.
+  bool ok = false;
   {
-    char serverDir[192];
-    snprintf(serverDir, sizeof(serverDir), "%s/%s", base, uid);
-    char archDir[224];
-    snprintf(archDir, sizeof(archDir), "%s/%s/archived_clients", base, uid);
-    char mkdErr[128];
-    mkdErr[0] = '\0';
-    bool mkdParent = useFtps
-        ? gFtpsClient.mkd(serverDir, mkdErr, sizeof(mkdErr))
-        : ftpMakeDir(session, serverDir, mkdErr, sizeof(mkdErr));
-    if (!mkdParent) {
-      Serial.print(F("FTP archive: MKD parent warning (non-fatal): "));
-      Serial.println(mkdErr);
-    }
-    mkdErr[0] = '\0';
-    bool mkdSub = useFtps
-        ? gFtpsClient.mkd(archDir, mkdErr, sizeof(mkdErr))
-        : ftpMakeDir(session, archDir, mkdErr, sizeof(mkdErr));
-    if (!mkdSub) {
-      Serial.print(F("FTP archive: MKD archived_clients warning (non-fatal): "));
-      Serial.println(mkdErr);
-    }
-  }
+    // Build JSON archive document
+    JsonDocument doc;
+    doc["clientUid"] = clientUid;
+    doc["site"] = siteName;
+    doc["archiveEpoch"] = currentEpoch();
 
-  bool ok = useFtps
-              ? ftpsStoreBuffer(remotePath,
-                                (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
-                                err, sizeof(err))
-              : ftpStoreBuffer(session, remotePath,
-                               (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
-                               err, sizeof(err));
-  if (useFtps) {
-    ftpsQuit();
-  } else {
-    ftpQuit(session);
-  }
-
-  if (ok) {
-    char detail[128];
-    snprintf(detail, sizeof(detail), "Archived client %s to FTP: %s", clientUid, remotePath);
-    Serial.println(detail);
-    addServerSerialLog(detail, "info", "archive");
-    logTransmission(clientUid, siteName, "archive", "sent", detail);
-
-    // Append entry to local archive manifest (/fs/archived_clients.json)
-    #ifdef FILESYSTEM_AVAILABLE
+    // Human-readable date range label: "Site (Mar 2025 - Mar 2026)"
     {
-      // Read existing manifest
-      JsonDocument manifest;
-      FILE *mf = fopen("/fs/archived_clients.json", "r");
-      if (mf) {
-        char buf[2048];
-        size_t nRead = fread(buf, 1, sizeof(buf) - 1, mf);
-        fclose(mf);
-        buf[nRead] = '\0';
-        deserializeJson(manifest, buf);
-      }
-      JsonArray entries = manifest["archives"].is<JsonArray>()
-                            ? manifest["archives"].as<JsonArray>()
-                            : manifest["archives"].to<JsonArray>();
-      JsonObject entry = entries.add<JsonObject>();
-      entry["clientUid"] = clientUid;
-      entry["site"] = siteName;
-      entry["displayLabel"] = doc["displayLabel"];
-      entry["firstSeenEpoch"] = earliestSeen;
-      entry["lastUpdateEpoch"] = latestUpdate;
-      entry["archiveEpoch"] = currentEpoch();
-      entry["ftpFile"] = remotePath;
-      entry["sensorCount"] = sensorCount;
+      const char *monthNames[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+      time_t startT = (time_t)earliestSeen;
+      time_t endT = (time_t)latestUpdate;
+      struct tm *tsStart = gmtime(&startT);
+      int sy = tsStart->tm_year + 1900, sm = tsStart->tm_mon;
+      struct tm *tsEnd = gmtime(&endT);
+      int ey = tsEnd->tm_year + 1900, em = tsEnd->tm_mon;
+      snprintf(rangeLabel, sizeof(rangeLabel), "%s (%s %d - %s %d)",
+               siteName, monthNames[sm], sy, monthNames[em], ey);
+      doc["displayLabel"] = rangeLabel;
+    }
+    doc["firstSeenEpoch"] = earliestSeen;
+    doc["lastUpdateEpoch"] = latestUpdate;
 
-      // Write updated manifest atomically (write to temp, rename)
-      mf = fopen("/fs/archived_clients.json.tmp", "w");
-      if (mf) {
-        String manifestJson;
-        serializeJson(manifest, manifestJson);
-        fwrite(manifestJson.c_str(), 1, manifestJson.length(), mf);
-        fclose(mf);
-        remove("/fs/archived_clients.json");
-        rename("/fs/archived_clients.json.tmp", "/fs/archived_clients.json");
+    // Archive all sensor records
+    JsonArray sensorsArr = doc["sensors"].to<JsonArray>();
+    for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
+      if (strcmp(gSensorRecords[i].clientUid, clientUid) != 0) continue;
+      const SensorRecord &rec = gSensorRecords[i];
+      JsonObject obj = sensorsArr.add<JsonObject>();
+      obj["sensorIndex"] = rec.sensorIndex;
+      if (rec.userNumber > 0) obj["userNumber"] = rec.userNumber;
+      obj["site"] = rec.site;
+      obj["label"] = rec.label;
+      if (rec.contents[0] != '\0') obj["contents"] = rec.contents;
+      if (rec.objectType[0] != '\0') obj["objectType"] = rec.objectType;
+      if (rec.sensorType[0] != '\0') obj["sensorType"] = rec.sensorType;
+      if (rec.measurementUnit[0] != '\0') obj["measurementUnit"] = rec.measurementUnit;
+      obj["lastLevel"] = roundTo(rec.currentValue, 1);
+      // Fix 13 (v2.0.52): gate dropped from >=4.0 to >0.0 for consistency with the
+      // live API. Archived records still reflect whatever the live record held at
+      // serialization time.
+      if (rec.sensorMa > 0.0f) obj["lastSensorMa"] = roundTo(rec.sensorMa, 2);
+      if (rec.sensorVoltage > 0.0f) obj["lastSensorVoltage"] = roundTo(rec.sensorVoltage, 3);
+      obj["lastUpdateEpoch"] = rec.lastUpdateEpoch;
+      double fs = rec.firstSeenEpoch > 0.0 ? rec.firstSeenEpoch : rec.lastUpdateEpoch;
+      obj["firstSeenEpoch"] = fs;
+    }
+
+    // Archive hot-tier history snapshots for this client
+    JsonArray historyArr = doc["history"].to<JsonArray>();
+    for (uint8_t h = 0; h < gSensorHistoryCount; ++h) {
+      SensorHourlyHistory &hist = gSensorHistory[h];
+      if (strcmp(hist.clientUid, clientUid) != 0) continue;
+      if (hist.snapshotCount == 0) continue;
+
+      JsonObject hObj = historyArr.add<JsonObject>();
+      hObj["sensorIndex"] = hist.sensorIndex;
+      hObj["heightInches"] = hist.heightInches;
+      JsonArray readings = hObj["readings"].to<JsonArray>();
+      for (uint16_t j = 0; j < hist.snapshotCount; ++j) {
+        uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
+        TelemetrySnapshot &snap = hist.snapshots[idx];
+        JsonArray pt = readings.add<JsonArray>();
+        pt.add((uint32_t)snap.timestamp);  // S-D03: whole seconds, exact (see saveHotTierSnapshot)
+        pt.add(roundTo(snap.level, 1));
+        pt.add(roundTo(snap.voltage, 2));
       }
     }
-    #endif
-  } else {
-    Serial.print(F("FTP archive client failed (store): "));
-    Serial.println(err);
+
+    // Archive client metadata if available
+    ClientMetadata *meta = findClientMetadata(clientUid);
+    if (meta) {
+      JsonObject metaObj = doc["metadata"].to<JsonObject>();
+      if (meta->vinVoltage > 0.0f) metaObj["vinVoltage"] = roundTo(meta->vinVoltage, 2);
+      if (meta->firmwareVersion[0] != '\0') metaObj["firmwareVersion"] = meta->firmwareVersion;
+      if (meta->latitude != 0.0f) metaObj["latitude"] = meta->latitude;
+      if (meta->longitude != 0.0f) metaObj["longitude"] = meta->longitude;
+      if (meta->signalBars >= 0) metaObj["signalBars"] = meta->signalBars;
+    }
+
+    // Serialize to string
+    String jsonOut;
+    serializeJson(doc, jsonOut);
+
+    // Build sanitized site name for filename (replace spaces/special chars)
+    char safeSite[24];
+    {
+      size_t si = 0;
+      for (size_t c = 0; siteName[c] != '\0' && si < sizeof(safeSite) - 1; ++c) {
+        char ch = siteName[c];
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+          safeSite[si++] = ch;
+        } else if (ch == ' ') {
+          safeSite[si++] = '_';
+        }
+      }
+      safeSite[si] = '\0';
+      if (si == 0) strlcpy(safeSite, "unknown", sizeof(safeSite));
+    }
+
+    // Upload to FTP: {ftpPath}/{serverUid}/archived_clients/{safeSite}_{startYM}-{endYM}_{uidSuffix}.json
+    const char *base = (strlen(gConfig.ftpPath) > 0) ? gConfig.ftpPath : FTP_PATH_DEFAULT;
+    const char *uid = (strlen(gServerUid) > 0) ? gServerUid : "server";
+    snprintf(remotePath, sizeof(remotePath), "%s/%s/archived_clients/%s_%s-%s_%s.json",
+             base, uid, safeSite, startYM, endYM, uidSuffix);
+
+    const bool useFtps = gConfig.ftpsEnabled;
+    FtpSession session;
+    char err[128];
+    bool connected = useFtps ? ftpsConnectAndLogin(err, sizeof(err))
+                             : ftpConnectAndLogin(session, err, sizeof(err));
+    if (!connected) {
+      Serial.print(F("FTP archive client failed (login): "));
+      Serial.println(err);
+      return false;
+    }
+
+    // Ensure {ftpPath}/{uid}/archived_clients/ exists. The per-server
+    // {ftpPath}/{uid} directory should already exist (created by the regular
+    // backup), but MKD on it is idempotent (550 = exists = non-fatal) so we
+    // still issue it for robustness in case archive runs before any backup.
+    {
+      char serverDir[192];
+      snprintf(serverDir, sizeof(serverDir), "%s/%s", base, uid);
+      char archDir[224];
+      snprintf(archDir, sizeof(archDir), "%s/%s/archived_clients", base, uid);
+      char mkdErr[128];
+      mkdErr[0] = '\0';
+      bool mkdParent = useFtps
+          ? gFtpsClient.mkd(serverDir, mkdErr, sizeof(mkdErr))
+          : ftpMakeDir(session, serverDir, mkdErr, sizeof(mkdErr));
+      if (!mkdParent) {
+        Serial.print(F("FTP archive: MKD parent warning (non-fatal): "));
+        Serial.println(mkdErr);
+      }
+      mkdErr[0] = '\0';
+      bool mkdSub = useFtps
+          ? gFtpsClient.mkd(archDir, mkdErr, sizeof(mkdErr))
+          : ftpMakeDir(session, archDir, mkdErr, sizeof(mkdErr));
+      if (!mkdSub) {
+        Serial.print(F("FTP archive: MKD archived_clients warning (non-fatal): "));
+        Serial.println(mkdErr);
+      }
+    }
+
+    ok = useFtps
+           ? ftpsStoreBuffer(remotePath,
+                             (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
+                             err, sizeof(err))
+           : ftpStoreBuffer(session, remotePath,
+                            (const uint8_t *)jsonOut.c_str(), jsonOut.length(),
+                            err, sizeof(err));
+    if (useFtps) {
+      ftpsQuit();
+    } else {
+      ftpQuit(session);
+    }
+
+    if (ok) {
+      char detail[128];
+      snprintf(detail, sizeof(detail), "Archived client %s to FTP: %s", clientUid, remotePath);
+      Serial.println(detail);
+      addServerSerialLog(detail, "info", "archive");
+      logTransmission(clientUid, siteName, "archive", "sent", detail);
+    } else {
+      Serial.print(F("FTP archive client failed (store): "));
+      Serial.println(err);
+    }
+  }
+
+  // Record the archive in the local manifest (S-D03: M-54, M-55). The History page can
+  // open only listed archives, so an unlisted one counts as failed; the file stays on
+  // FTP and the manifest's log line gives its path.
+  if (ok) {
+    ok = appendArchiveManifestEntry(clientUid, siteName, rangeLabel, earliestSeen, latestUpdate,
+                                    remotePath, sensorCount);
   }
 
   return ok;
@@ -17264,7 +17476,7 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
       if (cutoffEpoch > 0.0 && snap.timestamp < cutoffEpoch) continue;
       
       JsonObject reading = readings.add<JsonObject>();
-      reading["timestamp"] = snap.timestamp;
+      reading["timestamp"] = (uint32_t)snap.timestamp;  // S-D03: exact (see saveHotTierSnapshot)
       reading["level"] = snap.level;
     }
     
@@ -17317,7 +17529,7 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
       if (cutoffEpoch > 0.0 && snap.timestamp < cutoffEpoch) continue;
       if (snap.voltage > 0) {
         JsonObject voltObj = voltageArray.add<JsonObject>();
-        voltObj["timestamp"] = snap.timestamp;
+        voltObj["timestamp"] = (uint32_t)snap.timestamp;  // S-D03: exact (see saveHotTierSnapshot)
         voltObj["voltage"] = snap.voltage;
         voltObj["client"] = hist.clientUid;
       }
@@ -17465,9 +17677,8 @@ static void handleHistoryCompare(EthernetClient &client, const String &query) {
   bool prevFromWarm = false;
   bool prevFromCold = false;
   if (!prevInHotTier) {
-    // First try LittleFS daily summaries (warm tier)
-    JsonDocument warmDoc;
-    prevFromWarm = loadDailySummaryMonth(prevYear, prevMonth, warmDoc);
+    // First try LittleFS daily summaries (warm tier): usable if the month reads cleanly
+    prevFromWarm = (warmScanMonth(prevYear, prevMonth, nullptr, nullptr, nullptr) == WARM_OK);
     
     // If warm tier not available, try FTP archive (cold tier)
     if (!prevFromWarm && gConfig.ftpEnabled && gHistorySettings.ftpArchiveEnabled) {
@@ -17704,21 +17915,16 @@ static void handleHistoryYearOverYear(EthernetClient &client, const String &quer
         bool foundAnyMonth = false;
         
         for (int m = 1; m <= 12; m++) {
-          // Try warm tier first (LittleFS daily summaries)
-          JsonDocument mDoc;
-          if (loadDailySummaryMonth(targetYear, m, mDoc)) {
-            JsonArray entries = mDoc.as<JsonArray>();
-            for (JsonObject entry : entries) {
-              const char *uid = entry["c"] | "";
-              uint8_t tk = entry["k"] | 0;
-              if (strcmp(uid, hist.clientUid) != 0 || tk != hist.sensorIndex) continue;
-              float mn = entry["mn"] | 0.0f;
-              float mx = entry["mx"] | 0.0f;
-              float av = entry["av"] | 0.0f;
-              if (mn < yMin) yMin = mn;
-              if (mx > yMax) yMax = mx;
-              ySum += av;
-              yDays++;
+          // Try warm tier first (LittleFS daily summaries); S-D03: a month is
+          // folded in only if it read cleanly, otherwise the FTP archive is tried
+          WarmSensorStats warmStats;
+          warmSensorStatsInit(warmStats, hist.clientUid, hist.sensorIndex);
+          if (warmScanMonth(targetYear, m, warmSensorStatsVisitor, &warmStats, nullptr) == WARM_OK) {
+            if (warmStats.days > 0) {
+              if (warmStats.minLevel < yMin) yMin = warmStats.minLevel;
+              if (warmStats.maxLevel > yMax) yMax = warmStats.maxLevel;
+              ySum += warmStats.sumAvg;
+              yDays += warmStats.days;
               foundAnyMonth = true;
             }
           } else if (gConfig.ftpEnabled && gHistorySettings.ftpArchiveEnabled) {
@@ -17871,20 +18077,31 @@ static void handleArchivedClients(EthernetClient &client, const String &query) {
       return;
     }
 
-    // Validate filename: only allow alphanumeric, dash, underscore, dot, slash
-    for (unsigned int i = 0; i < fileParam.length(); ++i) {
-      char ch = fileParam.charAt(i);
-      if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
-            ch == '.' || ch == '/')) {
-        respondStatus(client, 400, F("Invalid filename"));
-        return;
-      }
-    }
-    // Block path traversal
-    if (fileParam.indexOf("..") >= 0) {
+    // S-D03: only archives listed in the manifest can be fetched, by their exact
+    // ftpFile. Archive paths contain the server's 'dev:' UID, which the old
+    // character whitelist rejected, so every "Load Data" returned 400.
+    // CR/LF/NUL (FTP command injection) and ".." are still refused outright.
+    if (fileParam.length() > 255 || strlen(fileParam.c_str()) != fileParam.length() ||
+        fileParam.indexOf('\r') >= 0 || fileParam.indexOf('\n') >= 0 || fileParam.indexOf("..") >= 0) {
       respondStatus(client, 400, F("Invalid filename"));
       return;
+    }
+    {
+      bool listed = false;
+      #ifdef FILESYSTEM_AVAILABLE
+      JsonDocument manifest;  // freed before the FTP session starts
+      const WarmManifestStatus st = warmLoadManifest(ARCHIVE_MANIFEST_PATH, manifest, MAX_ARCHIVE_MANIFEST_BYTES,
+                                                     true, nullptr, kArchiveManifestHooks);
+      if (st == WARM_MAN_IO_ERROR || st == WARM_MAN_NO_MEMORY) {
+        respondStatus(client, 500, F("Archive manifest unreadable"));
+        return;
+      }
+      listed = warmManifestHasFile(manifest, fileParam.c_str());
+      #endif
+      if (!listed) {
+        respondStatus(client, 404, F("Archive not in manifest"));
+        return;
+      }
     }
 
     // Use FTPS when configured, plain FTP otherwise — must match the protocol
@@ -17929,41 +18146,35 @@ static void handleArchivedClients(EthernetClient &client, const String &query) {
     return;
   }
 
-  // Return manifest of archived clients from LittleFS
+  // Return manifest of archived clients from LittleFS. S-D03: read without a
+  // 2 KB buffer; an unreadable manifest still lists the entries that could be
+  // read (manifestStatus "degraded"). Read-only: nothing is renamed here.
   JsonDocument doc;
-  doc["ftpEnabled"] = gConfig.ftpEnabled;
-
+  WarmManifestStatus manifestStatus = WARM_MAN_ABSENT;
   #ifdef FILESYSTEM_AVAILABLE
-  {
-    FILE *mf = fopen("/fs/archived_clients.json", "r");
-    if (mf) {
-      char buf[2048];
-      size_t nRead = fread(buf, 1, sizeof(buf) - 1, mf);
-      fclose(mf);
-      buf[nRead] = '\0';
-      JsonDocument manifest;
-      if (!deserializeJson(manifest, buf) && manifest["archives"].is<JsonArray>()) {
-        doc["archives"] = manifest["archives"];
-      }
-    }
+  manifestStatus = warmLoadManifest(ARCHIVE_MANIFEST_PATH, doc, MAX_ARCHIVE_MANIFEST_BYTES, true, nullptr,
+                                    kArchiveManifestHooks);
+  if (manifestStatus != WARM_MAN_OK && manifestStatus != WARM_MAN_ABSENT && manifestStatus != WARM_MAN_SALVAGED) {
+    respondStatus(client, 500, F("Archive manifest unreadable"));
+    return;
   }
   #endif
 
   if (!doc["archives"].is<JsonArray>()) {
     doc["archives"].to<JsonArray>();  // Empty array
   }
+  doc["ftpEnabled"] = gConfig.ftpEnabled;
+  doc["manifestStatus"] = (manifestStatus == WARM_MAN_SALVAGED) ? "degraded" : "ok";
 
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-
+  // Serialized straight to the socket (no String copy of the manifest)
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: application/json"));
   client.println(F("Connection: close"));
   client.print(F("Content-Length: "));
-  client.println(jsonOut.length());
+  client.println(measureJson(doc));
   client.println(F("Cache-Control: no-cache"));
   client.println();
-  client.print(jsonOut);
+  serializeJson(doc, client);
 }
 
 static bool loadContactsConfig(JsonDocument &doc) {

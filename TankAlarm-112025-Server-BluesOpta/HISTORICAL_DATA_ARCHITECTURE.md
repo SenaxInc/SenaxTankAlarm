@@ -93,9 +93,160 @@ The Historical Data page provides charts and graphs for visualizing collected te
 ## Data Storage Strategy
 
 ### Primary: Local LittleFS Storage
-- **Telemetry Log**: `/history/telemetry_YYYYMM.log` - Daily level readings
-- **Alarm Log**: `/history/alarms.log` - Alarm events with timestamps
-- **Daily Summary**: `/history/daily_YYYYMM.json` - Aggregated daily min/max/avg
+- **Hot tier**: RAM ring of 90 snapshots per sensor (20 sensors fleet-wide), saved hourly to `/fs/history/hot_tier.json`
+- **Daily Summary (warm tier)**: `/fs/history/daily_YYYYMM.json` - one row per sensor per day, see below
+- *Not implemented*: the `/history/telemetry_YYYYMM.log` and `/history/alarms.log` files described in earlier drafts
+
+### Warm Tier: Daily Summaries on Flash
+Each month is one JSON array in `/fs/history/daily_YYYYMM.json` (UTC days). Each
+row summarizes one sensor for one day, about 120 bytes:
+
+```json
+{"d":20260921,"c":"dev:864475...","k":1,"mn":41.2,"mx":44.0,"av":42.7,"op":41.2,"cl":44.0,"al":0,"vt":12.4,"n":24}
+```
+
+`d` date (YYYYMMDD), `c` client UID, `k` sensor index, `mn`/`mx`/`av` min/max/mean
+level, `op`/`cl` level of the earliest/latest snapshot, `al` alarm count, `vt` mean
+voltage (0 = none), `n` snapshots summarized. A row is identified by (`d`, `c`, `k`).
+A full 20-sensor month is about 76 KB.
+
+How it is maintained (S-D03, `WarmTierStore.h`; host tests in `tests/host/warm_store`):
+- **Hourly rollup**, run before the hot-tier prune. It rolls every day the hot tier
+  still holds that has not been rolled yet, up to yesterday, in batches of at most
+  8 days within one month: at most 16 batches, 2 file rewrites and 8 s per hour.
+  Days that have readings in the hot tier but were not rolled up yet (server off, or
+  clock not set, at midnight) are rolled up later; days before the oldest hot-tier
+  snapshot, before the retained months, or more than 92 days back are not. Days
+  without readings stay blank. The hot-tier prune does not remove snapshots from a
+  day the rollup has not processed yet (a backfill that takes several hours, or a
+  month retried after errors); it removes them once the rollup has moved past it.
+- **After a reboot** the first rollup re-checks the whole window. A day whose row is
+  missing, or whose recomputed row has a larger `n`, is written; unchanged days are
+  only read. A snapshot or alarm that arrives for a day already rolled up marks that
+  day, and the next rollup re-rolls it.
+- **Snapshots saved by v2.2.15 or earlier** (loaded from an older `hot_tier.json`) stay
+  in the hot tier for the charts but never enter a daily row: that firmware also
+  recorded reused, placeholder and alarm values and receive times, and the file does not
+  say which. So the first boot after the update neither rewrites the rows that firmware
+  wrote nor rebuilds days it lost (H-23) or had not rolled up yet (an update in the first
+  hour after midnight), and the update day's row holds only readings received after the
+  update. `hot_tier.json` keeps count of these snapshots (`lg`, the oldest entries of a
+  sensor) until they leave the ring.
+- **Merge rules**: files are read one row at a time through a small buffer, so memory
+  use does not depend on the file size. A stored row is replaced only by a row with a
+  larger `n`, or with the same `n` and a higher alarm count (an alarm that arrived after
+  the day was rolled up); the higher alarm count is always kept. All other rows are
+  copied byte for byte, including keys this firmware does not know. If nothing changes,
+  nothing is written. A row too long to store (over 256 bytes, e.g. from an absurdly
+  long client UID) is left out with an error and never replaces the stored row.
+- **Failures never empty a file.** Only a missing file (ENOENT) starts a new one. A
+  read, write or allocation failure leaves the file as it was and is retried the next
+  hour. After 6 failed hours in a row (a batch that gets through, e.g. the month
+  before, starts the count again) the rest of that month is skipped until the next
+  restart (counted in `skippedDays`), so one bad file cannot hold up the days after
+  it. A file that cannot be parsed is rebuilt from its readable rows plus the new
+  rows, and the original is kept as `daily_YYYYMM.json.bad`. Writes go to
+  `daily_YYYYMM.json.tmp` and are renamed over the file. A `.tmp` left by a power cut
+  is dropped when the month file exists; when it does not (the month's first write, or
+  a rebuild cut between moving the original to `.bad` and the rename), the `.tmp` is
+  the only complete copy and is renamed into place if it reads completely.
+- **Retention**: the current month and the 3 months before it
+  (`MAX_DAILY_SUMMARY_MONTHS`). The hourly prune removes older month files with their
+  `.tmp`/`.bad` files, handles a retained month's leftover `.tmp` as above, and sets
+  `warmTierAvailable` (also checked at boot).
+- **Readers** (`/api/history/compare`, `/api/history/yoy`, and the monthly FTP archive
+  when the hot tier has no data for the month) stream the file and use a month only if
+  it reads completely; otherwise they fall back as if it were missing.
+- **Diagnostics**: `/api/system-status` has a `warmTier` block (last rollup, next day,
+  writes, unchanged batches, I/O and memory errors, quarantined files, late-data marks,
+  tick time). Failures are logged to the server serial log (source `history`). A bench
+  build with `-DTANKALARM_WARM_SELFTEST` times a full 20-sensor month (merge, re-check
+  and scan) once at boot and prints the heap it used; it is not for field units.
+
+Downgrading to v2.2.15 or earlier brings back H-23 (month files of 8 KB or more are
+reset to one day at the next rollup).
+
+#### What Enters History
+The hot tier, and so every daily row, holds only fresh readings, on the day they were
+taken (S-D03):
+- **Fresh readings only.** A telemetry value the client reused (`ru`) or sent for a
+  failed sensor (`sf`), a faulted read (`fault`), and a current-loop value without a raw
+  mA from 4 to 20 (telemetry or daily report) update the dashboard but are not recorded.
+  The server has no level for a current-loop read outside 4-20 mA (the client sends
+  3.6-21 mA as valid) and would record 0. The daily report is different: each sensor's
+  value is its last valid reading and its `t` that reading's time (no `t` when there is
+  none), so a sensor flagged `ru` or `sf` there brings that reading, which is recorded at
+  its own time and only once (see below). A current-loop sensor flagged `ru` sends no mA.
+- **No on-demand notes from clients older than v2.2.16.** Such a client answers an
+  on-demand request (the dashboard's Update) for a sensor it has not sampled since boot,
+  e.g. a solar-only client whose sensor voltage gate is closed, with its boot value (0,
+  with no `ru` or `sf`) stamped with the send time. The note does not show this, so no
+  on-demand note from such a client (or one without `fv`) is recorded; its readings
+  still enter through sample telemetry and the daily report. From v2.2.16 (#318) the
+  client leaves `t` out in that case.
+- **No snapshots from alarm notes.** An alarm note's `t` can be when it was sent rather
+  than when its value was read: seconds later on a current-loop client, hours later for a
+  `relay_timeout` or for the `clear` sent when a config push turns alarms off. The note
+  does not say which, so its value is not recorded; the reading enters history through
+  telemetry or the daily report at its own time, and the alarm counts in `al`.
+- **Stamped with the client's acquisition time, never a guessed one.** The time is the
+  note's `t` (the per-sensor `t` in daily reports), stored in whole seconds. A reading
+  without a valid `t` (before 2020, or more than 1 h ahead of the server clock) is left
+  out rather than stamped with the time it was received. This leaves out readings taken
+  before a client's first time sync, and daily-report readings from clients older than
+  v2.0.56, which send no per-sensor `t`. From v2.2.16 (#318) every telemetry, daily-report
+  and alarm `t` is a whole minute, truncated. An older client's `t` arrives in whole seconds, with telemetry and
+  alarm `t` rounded, so a reading or alarm from the last half second of a UTC day may be
+  filed on the next day.
+- **Counted once.** The same reading arriving again (telemetry, then the daily report's
+  copy, or an on-demand re-send) with the same minute (v2.2.16 and later) or within 1 s
+  (older clients) is stored once. Only the time is compared: a current-loop level is
+  recomputed on arrival, with the temperature of that moment. So from v2.2.16 a second
+  reading of a sensor in the same minute, e.g. an on-demand one right after a sample, is
+  left out of history; the live value still updates.
+- **Voltage only from the reading's day.** `vt` uses the voltage sent in the same
+  telemetry note, or the daily report's voltage when the reading was taken within an
+  hour of the report on the same UTC day. The client's voltage is not measured with the
+  reading: it is the last poll of the Vin divider (every 5 minutes by default, 10 in low
+  power) or of the MPPT (every minute, keeping its last good value through up to 4 failed
+  polls) when the note is built. The server allows it to be up to 1 hour old
+  (`WARM_VIN_MAX_AGE_SEC`), and a telemetry note is built within 5 minutes of its
+  reading, so a telemetry voltage is not used for a reading from the first hour or the
+  last 5 minutes of a UTC day, and the report's voltage is not used when the report was
+  built in the first hour of a day. An on-demand note can re-send an older reading (a
+  solar-only client may skip the sample), so its voltage is also used only when the
+  reading is from the same UTC day and within an hour of the note's arrival. A client
+  configured to poll less often than that can still bring a voltage from the day before.
+- **Alarms on the day they happened.** `al` counts alarms by the alarm note's `t`, not by
+  when the server received it; an alarm without a valid `t` is not counted. Neither is an
+  alarm raised on a reused or failed value or a faulted read (`ru`, `sf` or `fault` in the
+  note; v2.2.15 clients can send these), which says nothing about the day it is sent on;
+  it is still logged, shown and alerted. An alarm that arrives after its day was rolled
+  up re-rolls that day, which raises its `al` while the hot tier still holds all of that
+  day's readings. The alarm log is kept in RAM only, so if the server restarts before
+  that re-roll (at most an hour), the alarm is not counted.
+- **No fill-in.** A day with no readings for a sensor has no row. Nothing is interpolated
+  or carried over from another day.
+- **Exact times.** Snapshot timestamps are written as integers in `hot_tier.json`,
+  `/api/history` and the client FTP archive. Older firmware saved doubles, which could
+  reload up to 512 s off; on the first boot after the update, such a snapshot within
+  512 s of a UTC midnight is dropped, since its day is not known.
+
+### Archived Clients Manifest
+When a client is removed and archived to FTP, an entry (client UID, site, display label,
+first/last seen, archive time, FTP path, sensor count) is added to
+`/fs/archived_clients.json`, which the History page lists (`/api/history/archived`).
+- The manifest is read without a size-limited buffer and rewritten through `.tmp` +
+  rename. A re-archive of the same FTP path replaces its entry.
+- It keeps at most 48 entries and stays under 32 KB; the oldest entries are dropped
+  first, with a log line each. Their archive files stay on FTP.
+- An unreadable manifest is salvaged entry by entry: the list endpoint returns the
+  readable entries with `"manifestStatus":"degraded"`, and the next archive rewrites
+  the manifest and keeps the original as `archived_clients.json.bad`.
+- Failures to update it are logged (source `archive`) with the archive's FTP path and
+  counted in `/api/system-status` (`warmTier.manifestAppendFailures`,
+  `warmTier.manifestSalvages`); the archive then counts as failed. Removing a client
+  does not depend on the archive (it works with FTP off or failing).
 
 ### Optional: FTP Server Backup
 When FTP is enabled, historical data can be backed up to the FTP server:
