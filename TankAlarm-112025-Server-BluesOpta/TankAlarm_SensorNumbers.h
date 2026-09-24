@@ -1,5 +1,6 @@
 // TankAlarm_SensorNumbers.h - checks the sensor numbers of a client config before the server
-// caches and dispatches it (S-T01/S1).
+// caches and dispatches it (S-T01/S1), and keeps the config's sensor-number high mark "snh" from
+// going down (CR-5, see below).
 //
 // A sensor's number is its identity everywhere: the config "number", the "k" in every note, the
 // server registry, learned calibration, alarm contacts and Clear Relay. The client takes "number"
@@ -70,6 +71,58 @@ static inline uint8_t sensorNumbersCheck(JsonVariantConst sensorsValue, char *ms
     seen[k >> 3] |= bit;
   }
   return SENSOR_NUMBERS_OK;
+}
+
+// ---- The high-water mark "snh" (CR-5) --------------------------------------------------------
+// The Config Generator writes "snh", the highest sensor number the client has ever used, so a
+// removed sensor's number is never handed out again. The client does not keep snh; the server's
+// cached config snapshot is the only copy. handleConfigPost therefore never lets a post lower it:
+// an imported old file without snh (or with a lower one) must not let a retired number come back.
+
+// The value of an "snh" or "number" when it is an integer 0-255, else 0 (missing, null, 256, -1,
+// 1.5, "5", true, lists and objects count as no value).
+static inline uint8_t sensorNumbersByteValue(JsonVariantConst v) {
+  if (v.is<bool>() || !v.is<uint8_t>()) return 0;
+  return v.as<uint8_t>();
+}
+
+// The highest usable "number" (1-255) in a "sensors" value, 0 when there is none or it is not a list.
+static inline uint8_t sensorNumbersMaxNumber(JsonVariantConst sensorsValue) {
+  uint8_t high = 0;
+  if (!sensorsValue.is<JsonArrayConst>()) return 0;
+  for (JsonVariantConst t : sensorsValue.as<JsonArrayConst>()) {
+    if (!t.is<JsonObjectConst>()) continue;
+    const uint8_t n = sensorNumbersByteValue(t["number"]);
+    if (n > high) high = n;
+  }
+  return high;
+}
+
+// The high mark a cached config payload (the snapshot's JSON text) carries: the larger of its "snh"
+// and its highest sensor number. Snapshots saved before snh existed carry only their numbers.
+// Parses only those two fields, so it needs little memory. 0 for a null, empty or unreadable payload.
+static inline uint8_t sensorNumbersCachedHigh(const char *payload) {
+  if (!payload || payload[0] == '\0') return 0;
+  JsonDocument filter;
+  filter["snh"] = true;
+  filter["sensors"][0]["number"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) return 0;
+  const uint8_t snh = sensorNumbersByteValue(doc["snh"]);
+  const uint8_t top = sensorNumbersMaxNumber(doc["sensors"]);
+  return snh > top ? snh : top;
+}
+
+// The snh to store with a posted config: the largest of the posted "snh" (ignored unless an integer
+// 0-255), the cached snapshot's high mark (sensorNumbersCachedHigh, 0 when there is no snapshot) and
+// the highest sensor number in the posted "sensors". Never lower than any of them.
+static inline uint8_t sensorNumbersHighMark(JsonVariantConst postedSnh, uint8_t cachedHigh,
+                                            JsonVariantConst sensorsValue) {
+  uint8_t high = sensorNumbersByteValue(postedSnh);
+  if (cachedHigh > high) high = cachedHigh;
+  const uint8_t top = sensorNumbersMaxNumber(sensorsValue);
+  if (top > high) high = top;
+  return high;
 }
 
 #endif  // TANKALARM_SENSOR_NUMBERS_H

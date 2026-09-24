@@ -117,13 +117,30 @@ check('1.5 is invalid', !sensorNumbersValid([1.5]));
 check('"1" is invalid', !sensorNumbersValid(['1']));
 check('undefined is invalid', !sensorNumbersValid([undefined]));
 
-// loadSensorNumbers: numbers as the client resolves them, 0 and duplicates renumbered past high
+// loadSensorNumbers: explicit numbers 1-255 first; with snh, anything else is renumbered past the
+// high mark and reported; without snh (older configs), a missing number is the position when free.
 checkEq('legacy config (index+1, no snh)', load([{ number: 1 }, { number: 2 }, { number: 3 }]),
   { nums: [1, 2, 3], high: 3, repaired: [] });
 checkEq('gaps and snh kept', load([{ number: 1 }, { number: 3 }, { number: 4 }], 5),
   { nums: [1, 3, 4], high: 5, repaired: [] });
 checkEq('snh below the numbers in use', load([{ number: 6 }], 2), { nums: [6], high: 6, repaired: [] });
-checkEq('missing number is the position', load([{}, {}]), { nums: [1, 2], high: 2, repaired: [] });
+checkEq('missing number without snh is the position', load([{}, {}]), { nums: [1, 2], high: 2, repaired: [] });
+checkEq('missing number without snh: position taken, so renumbered', load([{ number: 1 }, {}, { number: 2 }]),
+  { nums: [1, 3, 2], high: 3, repaired: [{ position: 2, number: 3 }] });
+checkEq('missing number with snh is renumbered past it', load([{ number: 1 }, {}], 5),
+  { nums: [1, 6], high: 6, repaired: [{ position: 2, number: 6 }] });
+checkEq('null number with snh is renumbered past it', load([{ number: null }], 3),
+  { nums: [4], high: 4, repaired: [{ position: 1, number: 4 }] });
+checkEq('not an object with snh is renumbered past it', load([5, { number: 1 }], 2),
+  { nums: [3, 1], high: 3, repaired: [{ position: 1, number: 3 }] });
+// A sensor without a number never takes an explicit number from a later sensor (it used to take
+// #1 by position, push the real #1 to #6 and name the wrong sensor in the warning).
+checkEq('explicit #1 kept ahead of a missing number (snh)', load([{}, { number: 1 }], 5),
+  { nums: [6, 1], high: 6, repaired: [{ position: 1, number: 6 }] });
+checkEq('explicit #1 kept ahead of a missing number (no snh)', load([{}, { number: 1 }]),
+  { nums: [2, 1], high: 2, repaired: [{ position: 1, number: 2 }] });
+checkEq('explicit #2 kept ahead of a duplicate #2', load([{ number: 3 }, { number: 3 }, { number: 2 }], 3),
+  { nums: [3, 4, 2], high: 4, repaired: [{ position: 2, number: 4 }] });
 checkEq('duplicate repaired', load([{ number: 2 }, { number: 2 }]),
   { nums: [2, 3], high: 3, repaired: [{ position: 2, number: 3 }] });
 checkEq('default that collides is repaired', load([{ number: 2 }, {}], 4),
@@ -138,7 +155,18 @@ checkEq('repair up to 255, then reuse', load([{ number: 254 }, { number: 0 }, { 
   { nums: [254, 255, 1], high: 255, repaired: [{ position: 2, number: 255 }, { position: 3, number: 1, reused: true }] });
 check('repaired numbers are always sendable',
   sensorNumbersValid(load([{ number: 255 }, { number: 255 }, { number: 0 }, {}], 255).nums));
-checkEq('300 is the position, like the client', load([{ number: 300 }]), { nums: [1], high: 1, repaired: [] });
+// A number that is present but unusable is always renumbered and reported, snh or not.
+checkEq('snh 5 and number 300: renumbered past snh', load([{ number: 300 }], 5),
+  { nums: [6], high: 6, repaired: [{ position: 1, number: 6 }] });
+for (const bad of [1.5, '3', -1, 256, true]) {
+  checkEq('snh 5 and number ' + JSON.stringify(bad) + ': renumbered past snh', load([{ number: bad }], 5),
+    { nums: [6], high: 6, repaired: [{ position: 1, number: 6 }] });
+}
+checkEq('number 300 without snh is reported', load([{ number: 300 }]),
+  { nums: [1], high: 1, repaired: [{ position: 1, number: 1 }] });
+checkEq('number "2" without snh is reported, not taken as 2', load([{ number: 1 }, { number: '2' }]),
+  { nums: [1, 2], high: 2, repaired: [{ position: 2, number: 2 }] });
+checkEq('snh 0 counts as present', load([{}], 0), { nums: [1], high: 1, repaired: [{ position: 1, number: 1 }] });
 checkEq('no sensors keep snh', load(undefined, 4), { nums: [], high: 4, repaired: [] });
 checkEq('invalid snh ignored', load([{ number: 1 }], 'x'), { nums: [1], high: 1, repaired: [] });
 
@@ -229,11 +257,26 @@ check('loader keeps numbers',
   page.includes('const loadedNumbers=loadSensorNumbers(c.sensors,c.snh);sensorNumberHigh=loadedNumbers.high;') &&
   page.includes('addSensorCard(loadedNumbers.nums[ti])') && !page.includes('forEach(t=>{addSensor();'));
 check('loader reports repaired numbers', page.includes('if(loadedNumbers.repaired.length){') &&
+  page.includes("sensor numbers repaired (missing, duplicate, 0 or invalid): '") &&
   page.includes("(r.reused?' (an old number: every number up to 255 has been used)':'')") &&
   page.includes("Check their contacts and history before sending.',true,15000);"));
-check('default names follow the number, not the position',
-  ['Tank', 'Gas System', 'Engine'].every(n => page.includes('name=`' + n + ' ${userNum||cardSensorNumber(card)||index+1}`')) &&
-  !page.includes('${userNum||index+1}'));
+// A blank name is the type word alone. Texts and emails add " #<Display Number>" when one is set;
+// the internal sensor number, the Display Number and the position never go into the name.
+check('default names are the type word only',
+  page.includes("if(!name)name=monitorType==='gas'?'Gas System':(monitorType==='rpm'?'Engine':'Tank');"));
+{
+  // Every statement between reading the Name box and the next field of the sensor: none may put a
+  // number (internal number, Display Number or position) into the name.
+  const from = "let name=card.querySelector('.tank-name').value;";
+  const to = 'const sensor=sensorKeyFromValue(type);';
+  const at = page.indexOf(from);
+  const end = at < 0 ? -1 : page.indexOf(to, at);
+  check('collectConfig name handling found', at >= 0 && page.indexOf(from, at + 1) < 0 && end > at);
+  const region = end > at ? page.slice(at + from.length, end).replace(/\/\*[\s\S]*?\*\//g, '') : '';
+  check('default names carry no number',
+    region.includes('name=') && !/cardSensorNumber|userNum|index|\$\{/.test(region), region);
+  check('no numbered default name anywhere on the page', !/(Tank|Gas System|Engine) \$\{/.test(page));
+}
 check('commissioning restarts numbering at 1',
   page.includes("function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;") &&
   page.includes('card.dataset.sensorNumber=String(i+1);') && page.includes('sensorNumberHigh=tpl.length;if(!tpl.length)addSensor();'));
@@ -252,6 +295,31 @@ check('commissioning restarts numbering at 1',
     !/sensorIndex\s*>=?\s*MAX_SENSOR_RECORDS/.test(upsert) && !/sensorIndex\s*>=?\s*MAX_SENSOR_RECORDS/.test(sketch));
   check('registry refuses sensor 0', /if \(sensorIndex == 0\) \{\s*Serial\.print\(F\("ERROR: Sensor index out of range: "\)\);[^}]*return nullptr;/.test(upsert));
   check('registry still caps the record count', upsert.includes('if (gSensorRecordCount >= MAX_SENSOR_RECORDS) {'));
+}
+
+// CR-5: handleConfigPost never lowers the high mark. After the number check and before dispatch it
+// stores the largest of the posted snh, the cached snapshot's mark and the highest posted number
+// (sensorNumbersHighMark, host-tested in sensor_numbers_test.cpp).
+{
+  const sketch = fs.readFileSync(SKETCH, 'utf8');
+  const sig = 'static void handleConfigPost(EthernetClient &client, const String &body) {';
+  const at = sketch.indexOf(sig);
+  const end = at < 0 ? -1 : sketch.indexOf('\n}\n', at);
+  check('handleConfigPost found', at >= 0 && sketch.indexOf(sig, at + 1) < 0 && end > at);
+  const post = end > at ? sketch.slice(at, end) : '';
+  const checkAt = post.indexOf('if (sensorNumbersCheck(doc["config"]["sensors"], numbersMsg, sizeof(numbersMsg)) != SENSOR_NUMBERS_OK) {');
+  const markAt = post.indexOf(
+    '      if (doc["config"].is<JsonObject>()) {\n' +
+    '        const ClientConfigSnapshot *prevSnap = findClientConfigSnapshot(clientUid);\n' +
+    '        const uint8_t cachedHigh = prevSnap ? sensorNumbersCachedHigh(prevSnap->payload) : 0;\n' +
+    '        const uint8_t highMark = sensorNumbersHighMark(doc["config"]["snh"], cachedHigh, doc["config"]["sensors"]);\n' +
+    '        if (highMark > 0) {\n' +
+    '          doc["config"]["snh"] = highMark;\n' +
+    '        }\n' +
+    '      }\n' +
+    '      ConfigDispatchStatus status = dispatchClientConfig(clientUid, doc["config"]);');
+  check('config post keeps the high mark, after the number check and before dispatch',
+    checkAt >= 0 && markAt > checkAt && post.split('dispatchClientConfig(').length === 2);
 }
 
 console.log(failures ? failures + ' of ' + checks + ' checks FAILED' : 'generator numbers: all ' + checks + ' checks passed');
