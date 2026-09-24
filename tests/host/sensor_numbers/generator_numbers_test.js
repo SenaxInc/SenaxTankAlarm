@@ -5,8 +5,9 @@
 //
 // Needs node 18 or later and no packages. Reads the CONFIG_GENERATOR_HTML raw string from the
 // server sketch, runs its numbering helpers (nextSensorNumber, sensorNumbersValid,
-// loadSensorNumbers, cardSensorNumber) in a vm context, and checks that the page uses them where a
-// sensor's number is created, sent, loaded and turned into an alarm-contact id.
+// loadSensorNumbers, cardSensorNumber) in a vm context, runs addSensor and startCommissioning
+// against a small fake DOM, and checks that the page uses the helpers where a sensor's number is
+// created, sent, loaded and turned into an alarm-contact id.
 
 const fs = require('fs');
 const path = require('path');
@@ -139,6 +140,71 @@ checkEq('card number 256', cardSensorNumber(card(256)), 0);
 checkEq('card without a number', cardSensorNumber({ dataset: {} }), 0);
 checkEq('no card', cardSensorNumber(null), 0);
 
+// startCommissioning: a client with no stored config starts at #1, even when the page still holds
+// another client's cards as a template. Runs the page's addSensor and startCommissioning against a
+// fake DOM; addSensorCard, showToast and renderMsgContacts are stubs.
+{
+  let cards = [];
+  let nextId = 0;
+  const rendered = [];
+  const fakeCard = (num, msgOpen) => {
+    const title = { textContent: 'Sensor #' + num };
+    return {
+      id: 'sensor-' + nextId++,
+      dataset: { sensorNumber: String(num) },
+      querySelector(sel) {
+        if (sel === '.sensor-title') return title;
+        if (sel === '.msg-section.visible') return msgOpen ? {} : null;
+        return null;
+      },
+    };
+  };
+  const container = {
+    querySelectorAll(sel) {
+      if (sel !== '.sensor-card') throw new Error('unexpected container query ' + sel);
+      return cards.slice();
+    },
+  };
+  Object.assign(ctx, {
+    CLIENT_MAX_MONITORS: 8,
+    els: { clientUid: { value: 'dev:A' } },
+    document: {
+      getElementById: (id) => (id === 'sensorsContainer' ? container : null),
+      querySelectorAll(sel) {
+        if (sel !== '#sensorsContainer .sensor-card') throw new Error('unexpected query ' + sel);
+        return cards.slice();
+      },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    },
+    showToast: () => {},
+    renderMsgContacts: (id) => rendered.push(id),
+    addSensorCard: (num) => cards.push(fakeCard(num, false)),
+  });
+  vm.runInContext('let sensorNumberHigh=0;', ctx);
+  for (const n of ['addSensor', 'startCommissioning']) vm.runInContext(extractFunction(page, n), ctx);
+  const high = () => vm.runInContext('sensorNumberHigh', ctx);
+  const nums = () => cards.map(cardSensorNumber);
+
+  // Client A is loaded: #1, #3 (contact list open), #4, and it once used #6.
+  cards = [fakeCard(1, false), fakeCard(3, true), fakeCard(4, false)];
+  vm.runInContext('sensorNumberHigh=6;', ctx);
+  ctx.startCommissioning('dev:B');
+  checkEq('commissioning renumbers template cards from 1', nums(), [1, 2, 3]);
+  checkEq('commissioning retitles template cards', cards.map((c) => c.querySelector('.sensor-title').textContent),
+    ['Sensor #1', 'Sensor #2', 'Sensor #3']);
+  checkEq('commissioning resets the high-water mark', high(), 3);
+  checkEq('commissioning sets the new client', ctx.els.clientUid.value, 'dev:B');
+  checkEq('commissioning redraws the open contact list', rendered, [1]);
+  ctx.addSensor();
+  checkEq('a sensor added after commissioning is next', nums(), [1, 2, 3, 4]);
+
+  // Every card removed, then a client with no stored config: its first sensor is #1.
+  cards = [];
+  ctx.startCommissioning('dev:C');
+  checkEq('commissioning an empty page starts at #1', nums(), [1]);
+  checkEq('high-water mark after commissioning an empty page', high(), 1);
+}
+
 // Where the page uses them
 check('card carries its number',
   page.includes('function createSensorHtml(id,num){return `<div class="sensor-card" id="sensor-${id}" data-sensor-number="${num}">') &&
@@ -154,6 +220,9 @@ check('loader keeps numbers',
   page.includes('const loadedNumbers=loadSensorNumbers(c.sensors,c.snh);sensorNumberHigh=loadedNumbers.high;') &&
   page.includes('addSensorCard(loadedNumbers.nums[ti])') && !page.includes('forEach(t=>{addSensor();'));
 check('loader reports repaired numbers', page.includes('if(loadedNumbers.repaired.length){'));
+check('commissioning restarts numbering at 1',
+  page.includes("function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;") &&
+  page.includes('card.dataset.sensorNumber=String(i+1);') && page.includes('sensorNumberHigh=tpl.length;if(!tpl.length)addSensor();'));
 
 console.log(failures ? failures + ' of ' + checks + ' checks FAILED' : 'generator numbers: all ' + checks + ' checks passed');
 process.exit(failures ? 1 : 0);
