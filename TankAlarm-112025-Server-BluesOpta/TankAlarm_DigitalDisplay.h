@@ -37,19 +37,39 @@ static inline const char *dailyReconcileSensorType(const char *reportSt, const c
 }
 
 // Alarm type to record when the daily report shows an alarm the server missed. A client that sends
-// the note type ("y", added by CL-5) is trusted for float types. Otherwise a digital sensor's high
-// latch (floats latch only on the high channel, so a lone low latch is never a float) takes its type
-// from configTrigger, the sensor's "digitalTrigger" in the client's cached config: "not_activated"
-// gives "not_triggered", anything else (including an unknown config) "triggered", the client
-// default. Anything else keeps high/low.
+// the note type ("y", added by CL-5) is trusted when the sensor type is digital or not known yet; a
+// stray float type on a known non-digital sensor is ignored and falls through to high/low.
+// Otherwise a digital sensor's high latch (floats latch only on the high channel, so a lone low
+// latch is never a float) takes its type from configTrigger, the sensor's "digitalTrigger" in the
+// client's cached config: "not_activated" gives "not_triggered", anything else (including an
+// unknown config) "triggered", the client default. Anything else keeps high/low.
 static inline const char *dailyReconcileAlarmType(const char *y, const char *sensorType, bool highLatched,
                                                   const char *configTrigger) {
-  if (y != nullptr && (strcmp(y, "triggered") == 0 || strcmp(y, "not_triggered") == 0)) return y;
+  const bool typeUnknown = (sensorType == nullptr || sensorType[0] == '\0');
+  if (y != nullptr && (strcmp(y, "triggered") == 0 || strcmp(y, "not_triggered") == 0) &&
+      (typeUnknown || isDigitalSensorType(sensorType))) {
+    return y;
+  }
   if (highLatched && isDigitalSensorType(sensorType)) {
     return (configTrigger != nullptr && strcmp(configTrigger, "not_activated") == 0) ? "not_triggered"
                                                                                     : "triggered";
   }
   return highLatched ? "high" : "low";
+}
+
+// R03: whether a daily report's sensors[] entry is filed in history. The test is that a value is
+// present, never the value itself: a real 0 (empty tank at 4.00 mA, 0 psi, float OFF, engine at
+// 0 rpm) is data and is admitted; a missing reading is a gap and stays out (history is never
+// filled). hasT: the entry carries its own acquisition time "t" (no fallback to the report time).
+// trustLevel: handleDaily's Fix 8 check (not a faulted/reused current-loop value). A current-loop
+// entry needs a raw mA ("ma"/"sensorMa") within 4-20 mA, as in handleTelemetry (a failed read
+// carries "fault" and no "ma"); any other type needs "lvl", "fl" or "rm". Re-filing an old value
+// is prevented by the per-sensor "t" and the history ring's acquisition-time dedupe.
+static inline bool dailyReadingAdmissible(const char *sensorType, bool hasT, bool trustLevel,
+                                          bool maPresent, bool maInRange, bool valuePresent) {
+  if (!hasT || !trustLevel) return false;
+  if (sensorType != nullptr && strcmp(sensorType, "currentLoop") == 0) return maPresent && maInRange;
+  return valuePresent;
 }
 
 // True when an alarm note carries a reading. Diagnostic, sensor-recovered and config-push clear

@@ -68,7 +68,13 @@ static void testReconcileType() {
   CHECK(strcmp(dailyReconcileAlarmType("", "digital", false, "not_activated"), "low") == 0);
   CHECK(strcmp(dailyReconcileAlarmType(nullptr, "digital", false, nullptr), "low") == 0);
   CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "digital", false, ""), "not_triggered") == 0);  // y still wins
-  CHECK(strcmp(dailyReconcileAlarmType("triggered", "analog", false, ""), "triggered") == 0);
+  // CR-10a: y is trusted only for a digital or not-yet-known type; a stray float type on a known
+  // non-digital sensor falls through to high/low.
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", "analog", false, ""), "low") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", "currentLoop", true, ""), "high") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("not_triggered", "currentLoop", false, "not_activated"), "low") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", "pulse", true, ""), "high") == 0);
+  CHECK(strcmp(dailyReconcileAlarmType("triggered", nullptr, false, ""), "triggered") == 0);  // unknown type
   CHECK(strcmp(dailyReconcileAlarmType("", "analog", true, "not_activated"), "high") == 0);     // unchanged
   CHECK(strcmp(dailyReconcileAlarmType("", "currentLoop", false, ""), "low") == 0);             // unchanged
   CHECK(strcmp(dailyReconcileAlarmType("high", "analog", false, ""), "low") == 0);              // y only for float types
@@ -108,6 +114,53 @@ static void testNoteValue() {
   CHECK(!carries("{\"fault\":\"loop_open\",\"ma_raw\":0.2}"));    // failed current-loop read
   CHECK(!carries("{\"vt\":4.9}"));                                // voltage alone is not the level
   CHECK(!carries("{\"lvl\":null}"));
+}
+
+// Mirrors handleDaily's call site (pinned in testSketchText): the booleans are computed from the
+// report's sensors[] entry exactly as the sketch does.
+static bool dailyAdmits(const char *json, const char *sensorType, bool trustLevel = true) {
+  JsonDocument doc;
+  deserializeJson(doc, json);
+  JsonObjectConst t = doc.as<JsonObjectConst>();
+  float mA = 0.0f;
+  if (t["ma"]) {
+    mA = t["ma"].as<float>();
+  } else if (t["sensorMa"]) {
+    mA = t["sensorMa"].as<float>();
+  }
+  const double sensorEpoch = t["t"] | 0.0;
+  const bool dailyMaPresent = !t["ma"].isNull() || !t["sensorMa"].isNull();
+  const bool dailyMaInRange = (mA >= 4.0f && mA <= 20.0f);
+  const bool dailyValuePresent = !t["lvl"].isNull() || !t["fl"].isNull() || !t["rm"].isNull();
+  return dailyReadingAdmissible(sensorType, sensorEpoch > 0.0, trustLevel, dailyMaPresent,
+                                dailyMaInRange, dailyValuePresent);
+}
+
+// R03: a real 0 is data (admitted); a missing reading is a gap (never filled).
+static void testDailyAdmission() {
+  // Real zeros.
+  CHECK(dailyAdmits("{\"k\":1,\"st\":\"currentLoop\",\"ma\":4.00,\"t\":1758700000}", "currentLoop"));  // empty tank, level 0
+  CHECK(dailyAdmits("{\"k\":1,\"st\":\"digital\",\"fl\":0,\"lvl\":0,\"t\":1758700000}", "digital"));  // float OFF
+  CHECK(dailyAdmits("{\"k\":1,\"st\":\"digital\",\"fl\":0,\"t\":1758700000}", "digital"));
+  CHECK(dailyAdmits("{\"k\":1,\"st\":\"analog\",\"lvl\":0,\"t\":1758700000}", "analog"));             // 0 psi
+  CHECK(dailyAdmits("{\"k\":1,\"st\":\"pulse\",\"rm\":0,\"lvl\":0,\"t\":1758700000}", "pulse"));     // engine stopped
+  CHECK(dailyAdmits("{\"k\":1,\"sensorMa\":20.0,\"t\":1758700000}", "currentLoop"));
+  CHECK(dailyAdmits("{\"k\":1,\"lvl\":0,\"t\":1758700000}", ""));                                    // st unknown yet
+  CHECK(dailyAdmits("{\"k\":1,\"lvl\":12.5,\"t\":1758700000}", "analog"));
+  // Missing readings.
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"analog\",\"lvl\":0}", "analog"));                           // no t
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"digital\",\"fl\":1,\"t\":0}", "digital"));
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"currentLoop\",\"ma\":4.00}", "currentLoop"));               // no t
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"currentLoop\",\"fault\":\"loop_open\",\"ma_raw\":0.2,\"t\":1758700000}",
+                     "currentLoop"));                                                                // failed read
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"currentLoop\",\"lvl\":0,\"t\":1758700000}", "currentLoop"));  // lvl without ma
+  CHECK(!dailyAdmits("{\"k\":1,\"ma\":3.8,\"t\":1758700000}", "currentLoop"));                        // under range
+  CHECK(!dailyAdmits("{\"k\":1,\"ma\":20.5,\"t\":1758700000}", "currentLoop"));                       // over range
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"analog\",\"vt\":4.9,\"t\":1758700000}", "analog"));           // no value
+  CHECK(!dailyAdmits("{\"k\":1,\"st\":\"analog\",\"lvl\":null,\"t\":1758700000}", "analog"));
+  CHECK(!dailyAdmits("{\"k\":1,\"ma\":12.0,\"t\":1758700000}", "currentLoop", false));             // Fix 8 distrust
+  CHECK(!dailyReadingAdmissible(nullptr, true, true, false, false, false));
+  CHECK(dailyReadingAdmissible(nullptr, true, true, false, false, true));
 }
 
 static void testStuckDisabled() {
@@ -153,6 +206,29 @@ static void testSketchText() {
   CHECK(strstr(text, "Still in %s alarm (%s).%s") != nullptr);                  // snooze/resume notice
   CHECK(strstr(text, "rec.alarmType, digitalStateText(rec.currentValue),") != nullptr);
   CHECK(strstr(text, "  rec->currentValue = level;\n  // S-D03") == nullptr);  // the unconditional write is gone
+  // R03: handleDaily admits a daily reading by value presence (the helper above), never by value.
+  CHECK(strstr(text, "newLevel > 0.0f") == nullptr);
+  CHECK(strstr(text, "    const bool dailyMaPresent = !t[\"ma\"].isNull() || !t[\"sensorMa\"].isNull();\n"
+                     "    const bool dailyMaInRange = (mA >= 4.0f && mA <= 20.0f);\n"
+                     "    const bool dailyValuePresent = !t[\"lvl\"].isNull() || !t[\"fl\"].isNull() || !t[\"rm\"].isNull();\n"
+                     "    if (dailyReadingAdmissible(rec->sensorType, sensorEpoch > 0.0, trustLevel, dailyMaPresent,\n"
+                     "                               dailyMaInRange, dailyValuePresent)) {") != nullptr);
+  CHECK(strstr(text, "    double sensorEpoch = t[\"t\"] | 0.0;") != nullptr);
+  // R11: handleDaily stores the raw mA, like handleTelemetry/handleAlarm; the >=4.0 clamp is gone.
+  CHECK(strstr(text, "(mA >= 4.0f) ? mA : 0.0f") == nullptr);
+  CHECK(strstr(text, "      mA = t[\"ma\"].as<float>();\n      rec->sensorMa = mA;\n") != nullptr);
+  CHECK(strstr(text, "      mA = t[\"sensorMa\"].as<float>();\n      rec->sensorMa = mA;\n") != nullptr);
+  CHECK(strstr(text, "    } else if (strcmp(rec->sensorType, \"currentLoop\") == 0) {\n"
+                     "      // Fix 13: a current-loop daily with NO raw mA") != nullptr);
+  // R10: the missed-alarm reconcile creates a missing record (not a search-only lookup) and fills
+  // an empty site from the note.
+  CHECK(strstr(text, "search without upserting") == nullptr);
+  CHECK(strstr(text, "SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx) : nullptr;\n"
+                     "        if (rec && rec->site[0] == '\\0') {\n"
+                     "          const char *noteSite = doc[\"s\"] | \"\";\n"
+                     "          if (noteSite[0] != '\\0') strlcpy(rec->site, noteSite, sizeof(rec->site));\n"
+                     "        }\n"
+                     "        if (rec && !rec->alarmActive) {") != nullptr);
 }
 
 int main() {
@@ -161,6 +237,7 @@ int main() {
   testReconcileSensorType();
   testNoteValue();
   testStuckDisabled();
+  testDailyAdmission();
   testSketchText();
   if (gFailures) {
     printf("digital_display: %lu of %lu checks FAILED\n", gFailures, gChecks);

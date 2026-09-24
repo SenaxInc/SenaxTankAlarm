@@ -13524,13 +13524,14 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       bool hiAlarm = a["hi"] | false;
       bool loAlarm = a["lo"] | false;
       if (hiAlarm || loAlarm) {
-        // Check if server already knows about this alarm (search without upserting)
-        SensorRecord *rec = nullptr;
-        for (uint8_t ri = 0; ri < gSensorRecordCount; ++ri) {
-          if (strcmp(gSensorRecords[ri].clientUid, clientUid) == 0 && gSensorRecords[ri].sensorIndex == sensorIdx) {
-            rec = &gSensorRecords[ri];
-            break;
-          }
+        // Check if server already knows about this alarm. R10: a latched alarm for a sensor the
+        // server has no record of yet (never reached the server, or a lost registry) creates the
+        // record here, as handleAlarm does, instead of being skipped until tomorrow's report. The
+        // sensors[] loop below fills in the rest. k is 1-based (see the sensors[] loop).
+        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx) : nullptr;
+        if (rec && rec->site[0] == '\0') {
+          const char *noteSite = doc["s"] | "";
+          if (noteSite[0] != '\0') strlcpy(rec->site, noteSite, sizeof(rec->site));
         }
         if (rec && !rec->alarmActive) {
           Serial.print(F("WARNING: Client "));
@@ -13674,12 +13675,14 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     float mA = 0.0f;
     float voltage = 0.0f;
     
+    // R11: store the raw mA as handleTelemetry/handleAlarm do (Fix 13 dropped the legacy >=4.0
+    // gate there); a valid 3.6-3.99 mA live-zero reading is shown, not wiped to 0.
     if (t["ma"]) {
       mA = t["ma"].as<float>();
-      rec->sensorMa = (mA >= 4.0f) ? mA : 0.0f;
+      rec->sensorMa = mA;
     } else if (t["sensorMa"]) {
       mA = t["sensorMa"].as<float>();
-      rec->sensorMa = (mA >= 4.0f) ? mA : 0.0f;
+      rec->sensorMa = mA;
     } else if (strcmp(rec->sensorType, "currentLoop") == 0) {
       // Fix 13: a current-loop daily with NO raw mA means the last acquisition had no valid
       // reading — clear any stored mA so a stale value (e.g. a pegged 18.02) cannot linger.
@@ -13733,8 +13736,13 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     // the value is that reading (ru/sf mean no newer one, not a value from another
     // time), so it is filed at `t` and the ring's dedupe drops a copy telemetry already
     // brought. A current-loop value enters only from 4-20 mA, as in handleTelemetry.
-    const bool dailyMaInRange = !isCurrentLoopSensor || (mA >= 4.0f && mA <= 20.0f);
-    if (trustLevel && dailyMaInRange && newLevel > 0.0f) {
+    // R03: admission tests that a value is present, never the value itself: a real 0 (empty
+    // tank, 0 psi, float OFF, engine stopped) is data; a missing reading is a gap.
+    const bool dailyMaPresent = !t["ma"].isNull() || !t["sensorMa"].isNull();
+    const bool dailyMaInRange = (mA >= 4.0f && mA <= 20.0f);
+    const bool dailyValuePresent = !t["lvl"].isNull() || !t["fl"].isNull() || !t["rm"].isNull();
+    if (dailyReadingAdmissible(rec->sensorType, sensorEpoch > 0.0, trustLevel, dailyMaPresent,
+                               dailyMaInRange, dailyValuePresent)) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;
