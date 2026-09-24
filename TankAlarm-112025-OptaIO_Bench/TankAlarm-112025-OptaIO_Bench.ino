@@ -336,9 +336,16 @@ static void sweepInput(const char *line) {
     return;
   }
   if (line[0] == '\0') {
+    // sweep <t> reads only I<t>; the other cells stay skipped (blank in the CSV).
+    bool first = true;
     for (uint8_t t = 0; t < OPTA_INPUT_COUNT; ++t) {
+      if (gSweepTerminal >= 0 && t != gSweepTerminal) {
+        gSweepValue[gSweepStep][t] = SWEEP_SKIPPED;
+        continue;
+      }
       gSweepValue[gSweepStep][t] = readTerminal(t);
-      Serial.print(t == 0 ? "  " : " | ");
+      Serial.print(first ? "  " : " | ");
+      first = false;
       printCell(t, gSweepValue[gSweepStep][t]);
     }
     Serial.println();
