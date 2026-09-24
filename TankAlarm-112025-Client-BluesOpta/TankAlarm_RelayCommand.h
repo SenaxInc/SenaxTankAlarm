@@ -136,4 +136,32 @@ static inline RelayClearResult relayClearResultFromResolve(RelayResolve rc, uint
   }
 }
 
+struct RelayClearOutcome {
+  RelayResolve resolve;
+  uint8_t slot;        // the monitor slot; meaningful only when resolve == RELAY_RESOLVE_OK
+  uint8_t activeMask;  // relays tracked as ON for that monitor; 0 unless resolve == RELAY_RESOLVE_OK
+  RelayClearResult result;
+};
+
+// The whole Clear Relay step for sensor number k over the configured monitors' numbers. The firmware
+// side effects are passed in, so the host test runs this same code with recording doubles:
+//   activeMaskOf(slot) -> uint8_t  reads the relays tracked as ON (getMonitorActiveRelayMask);
+//   log(outcome)                   writes the one log line;
+//   release(slot)                  switches the monitor's relays off (resetRelayForMonitor).
+// release runs once, after log, and only when exactly one monitor has number k; activeMaskOf runs
+// only then too. Nothing else is touched.
+template <typename ActiveMaskFn, typename LogFn, typename ReleaseFn>
+static inline RelayClearOutcome relayClearSensorNumber(const uint8_t *numbers, uint8_t count, uint8_t k,
+                                                       ActiveMaskFn activeMaskOf, LogFn log,
+                                                       ReleaseFn release) {
+  RelayClearOutcome o;
+  o.slot = 0;
+  o.resolve = relayResolveSensorNumber(numbers, count, k, o.slot);
+  o.activeMask = (o.resolve == RELAY_RESOLVE_OK) ? (uint8_t)activeMaskOf(o.slot) : (uint8_t)0;
+  o.result = relayClearResultFromResolve(o.resolve, o.activeMask);
+  log(o);
+  if (o.resolve == RELAY_RESOLVE_OK) release(o.slot);
+  return o;
+}
+
 #endif  // TANKALARM_RELAY_COMMAND_H

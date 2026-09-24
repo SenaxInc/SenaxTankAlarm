@@ -9484,6 +9484,18 @@ static void processRelayCommand(const JsonDocument &doc) {
       return;
     }
   }
+  // CL-4: server commands carry the routing field "_target". Route #2 delivers to that device and
+  // normally strips it; if it survives, it must still name this device (a sensor number means
+  // nothing on another client).
+  if (!doc["_target"].isNull()) {
+    const char *routedUid = doc["_target"].as<const char*>();
+    if (routedUid && routedUid[0] != '\0' && strcmp(routedUid, gDeviceUID) != 0) {
+      Serial.print(F("Relay command not for this device (_target: "));
+      Serial.print(routedUid);
+      Serial.println(F(") — ignored"));
+      return;
+    }
+  }
 
   // Rate limit: reject commands arriving faster than the minimum cooldown
   // to prevent rapid toggling from stale queued Notes or route replays
@@ -9722,36 +9734,37 @@ static void logRelayClearLine(const char *line) {
 // which sends that client relay/state OFF. Nothing is actuated unless exactly one monitor has
 // number k. C-A02 replaces resetRelayForMonitor's body behind this function; C-T02 reports the
 // returned result to the server.
+static void logRelayClearOutcome(uint8_t sensorNumber, const RelayClearOutcome &o) {
+  char line[160];
+  if (o.resolve == RELAY_RESOLVE_OK) {
+    const MonitorConfig &cfg = gConfig.monitors[o.slot];
+    const RelayScope scope = relayScopeOf(cfg.relayMask, cfg.relayTargetClient, gDeviceUID);
+    snprintf(line, sizeof(line), "Clear Relay sensor #%u -> monitor %u (%s): %s, active 0x%X, binding %s%s",
+             (unsigned)sensorNumber, (unsigned)o.slot, cfg.name, relayClearResultName(o.result),
+             (unsigned)o.activeMask,
+             scope == RELAY_SCOPE_NONE ? "none" : (scope == RELAY_SCOPE_LOCAL ? "local" : "remote "),
+             scope == RELAY_SCOPE_REMOTE ? cfg.relayTargetClient : "");
+  } else {
+    snprintf(line, sizeof(line), "Clear Relay sensor #%u: %s - nothing changed",
+             (unsigned)sensorNumber, relayClearResultName(o.result));
+  }
+  logRelayClearLine(line);
+}
+
 static RelayClearResult clearRelaysForSensorNumber(uint8_t sensorNumber) {
   uint8_t numbers[MAX_MONITORS];
   const uint8_t count = (gConfig.monitorCount < MAX_MONITORS) ? gConfig.monitorCount : MAX_MONITORS;
   for (uint8_t i = 0; i < count; ++i) {
     numbers[i] = gConfig.monitors[i].sensorIndex;
   }
-  uint8_t slot = 0;
-  const RelayResolve rc = relayResolveSensorNumber(numbers, count, sensorNumber, slot);
-  const uint8_t activeMask = (rc == RELAY_RESOLVE_OK) ? getMonitorActiveRelayMask(slot) : 0;
-  const RelayClearResult result = relayClearResultFromResolve(rc, activeMask);
-
-  char line[160];
-  if (rc == RELAY_RESOLVE_OK) {
-    const MonitorConfig &cfg = gConfig.monitors[slot];
-    const RelayScope scope = relayScopeOf(cfg.relayMask, cfg.relayTargetClient, gDeviceUID);
-    snprintf(line, sizeof(line), "Clear Relay sensor #%u -> monitor %u (%s): %s, active 0x%X, binding %s%s",
-             (unsigned)sensorNumber, (unsigned)slot, cfg.name, relayClearResultName(result),
-             (unsigned)activeMask,
-             scope == RELAY_SCOPE_NONE ? "none" : (scope == RELAY_SCOPE_LOCAL ? "local" : "remote "),
-             scope == RELAY_SCOPE_REMOTE ? cfg.relayTargetClient : "");
-  } else {
-    snprintf(line, sizeof(line), "Clear Relay sensor #%u: %s - nothing changed",
-             (unsigned)sensorNumber, relayClearResultName(result));
-  }
-  logRelayClearLine(line);
-
-  if (rc == RELAY_RESOLVE_OK) {
-    resetRelayForMonitor(slot);  // body unchanged (C-A02 replaces it)
-  }
-  return result;
+  // relayClearSensorNumber (TankAlarm_RelayCommand.h) is the host-tested step; this supplies the side
+  // effects. resetRelayForMonitor's body is unchanged (C-A02 replaces it).
+  const RelayClearOutcome o = relayClearSensorNumber(
+      numbers, count, sensorNumber,
+      [](uint8_t slot) { return getMonitorActiveRelayMask(slot); },
+      [sensorNumber](const RelayClearOutcome &out) { logRelayClearOutcome(sensorNumber, out); },
+      [](uint8_t slot) { resetRelayForMonitor(slot); });
+  return o.result;
 }
 
 // ============================================================================

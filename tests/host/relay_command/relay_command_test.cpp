@@ -60,7 +60,11 @@ static void testStrictInteger() {
   CHECK(uintOf("{\"v\":3.0}", 1, 255, v) && v == 3);  // integral double (Notecard/Notehub path)
   const char *bad[] = {"{\"v\":0}", "{\"v\":256}", "{\"v\":-1}", "{\"v\":1.5}", "{\"v\":\"1\"}",
                        "{\"v\":true}", "{\"v\":false}", "{\"v\":null}", "{}", "{\"v\":[1]}",
-                       "{\"v\":{\"k\":1}}", "{\"v\":4294967296}", "{\"v\":1e300}"};
+                       "{\"v\":{\"k\":1}}", "{\"v\":4294967296}", "{\"v\":1e300}",
+                       // Just past 32 bits: narrowed, these would wrap to 1 and 255. is<uint32_t>()
+                       // range-checks the stored integer, so they are refused.
+                       "{\"v\":4294967297}", "{\"v\":4294967551}", "{\"v\":-4294967295}",
+                       "{\"v\":18446744073709551617}", "{\"v\":9223372036854775807}"};
   for (const char *j : bad) {
     v = 77;
     CHECK(!uintOf(j, 1, 255, v));
@@ -186,6 +190,87 @@ static void testSketchText() {
   CHECK(strstr(text, "relayClassifyCommand(doc.as<JsonObjectConst>(), cmd)") != nullptr);
   CHECK(strstr(text, "doc[\"relay_reset_sensor\"]") == nullptr);
   CHECK(strstr(text, "static RelayClearResult clearRelaysForSensorNumber(uint8_t sensorNumber) {") != nullptr);
+  // The sketch runs the host-tested step with the real side effects, and checks _target too.
+  CHECK(strstr(text, "const RelayClearOutcome o = relayClearSensorNumber(") != nullptr);
+  CHECK(strstr(text, "[](uint8_t slot) { return getMonitorActiveRelayMask(slot); },") != nullptr);
+  CHECK(strstr(text, "[](uint8_t slot) { resetRelayForMonitor(slot); });") != nullptr);
+  CHECK(strstr(text, "numbers[i] = gConfig.monitors[i].sensorIndex;") != nullptr);
+  CHECK(strstr(text, "const char *routedUid = doc[\"_target\"].as<const char*>();") != nullptr);
+  CHECK(strstr(text, "RELAY_CMD_RESET_BY_NUMBER:\n        clearRelaysForSensorNumber(cmd.sensorNumber);\n        return;") != nullptr);
+}
+
+// The Clear Relay step with recording doubles for its three side effects.
+struct ClearRecorder {
+  uint8_t masks[8];
+  int maskCalls;
+  int logCalls;
+  int releaseCalls;
+  uint8_t releasedSlot;
+  RelayClearOutcome logged;
+  int order[3];  // 1 = mask, 2 = log, 3 = release, in call order
+  int orderLen;
+};
+
+static RelayClearOutcome runClear(ClearRecorder &r, const uint8_t *numbers, uint8_t count, uint8_t k) {
+  r.maskCalls = r.logCalls = r.releaseCalls = r.orderLen = 0;
+  r.releasedSlot = 0xFF;
+  return relayClearSensorNumber(
+      numbers, count, k,
+      [&r](uint8_t slot) {
+        ++r.maskCalls;
+        if (r.orderLen < 3) r.order[r.orderLen++] = 1;
+        return r.masks[slot];
+      },
+      [&r](const RelayClearOutcome &o) {
+        ++r.logCalls;
+        r.logged = o;
+        if (r.orderLen < 3) r.order[r.orderLen++] = 2;
+      },
+      [&r](uint8_t slot) {
+        ++r.releaseCalls;
+        r.releasedSlot = slot;
+        if (r.orderLen < 3) r.order[r.orderLen++] = 3;
+      });
+}
+
+static void testClearStep() {
+  ClearRecorder r;
+  memset(&r, 0, sizeof(r));
+  r.masks[0] = 0x2;  // sensor #2 has relay 2 on
+  r.masks[1] = 0x1;
+  r.masks[2] = 0x0;
+  const uint8_t numbers[] = {2, 1, 3};  // config order differs from number order
+
+  RelayClearOutcome o = runClear(r, numbers, 3, 1);
+  CHECK(o.resolve == RELAY_RESOLVE_OK && o.slot == 1 && o.activeMask == 0x1);
+  CHECK(o.result == RELAY_CLEAR_RELEASED);
+  CHECK(r.maskCalls == 1 && r.logCalls == 1 && r.releaseCalls == 1 && r.releasedSlot == 1);
+  CHECK(r.orderLen == 3 && r.order[0] == 1 && r.order[1] == 2 && r.order[2] == 3);  // log before release
+  CHECK(r.logged.slot == 1 && r.logged.result == RELAY_CLEAR_RELEASED);
+
+  o = runClear(r, numbers, 3, 3);  // found, nothing on: still released (clears any tracked state)
+  CHECK(o.result == RELAY_CLEAR_NONE_ACTIVE && r.releaseCalls == 1 && r.releasedSlot == 2);
+
+  o = runClear(r, numbers, 3, 9);  // unknown: logged, nothing read or released
+  CHECK(o.result == RELAY_CLEAR_UNKNOWN_SENSOR);
+  CHECK(r.maskCalls == 0 && r.logCalls == 1 && r.releaseCalls == 0 && o.activeMask == 0);
+
+  const uint8_t dup[] = {4, 2, 4};
+  o = runClear(r, dup, 3, 4);  // duplicate: nothing guessed
+  CHECK(o.result == RELAY_CLEAR_DUPLICATE_SENSOR);
+  CHECK(r.maskCalls == 0 && r.logCalls == 1 && r.releaseCalls == 0);
+
+  o = runClear(r, dup, 3, 2);  // the unique one next to a duplicate still resolves
+  CHECK(o.result == RELAY_CLEAR_RELEASED && r.releaseCalls == 1 && r.releasedSlot == 1);
+
+  o = runClear(r, numbers, 3, 0);  // 0 is never a sensor number
+  CHECK(o.result == RELAY_CLEAR_INVALID && r.releaseCalls == 0 && r.maskCalls == 0);
+
+  o = runClear(r, nullptr, 0, 1);  // no monitors
+  CHECK(o.result == RELAY_CLEAR_UNKNOWN_SENSOR && r.releaseCalls == 0 && r.logCalls == 1);
+
+  o = runClear(r, numbers, 2, 3);  // count limits the search: #3 is past the configured monitors
+  CHECK(o.result == RELAY_CLEAR_UNKNOWN_SENSOR && r.releaseCalls == 0);
 }
 
 int main() {
@@ -195,6 +280,7 @@ int main() {
   testLegacyDivergence();
   testScope();
   testResults();
+  testClearStep();
   testSketchText();
   if (gFailures) {
     printf("relay_command: %lu of %lu checks FAILED\n", gFailures, gChecks);
