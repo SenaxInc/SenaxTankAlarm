@@ -2,8 +2,8 @@
   TankAlarm-112025 Opta I/O bench (CL-1)
 
   Serial tool for relay/float bench stage 1: drives the relay coils, relay LEDs and (Opta WiFi
-  only) LED_USER one at a time and reads the I1-I8 terminals as analog or digital inputs, using the same pin tables
-  as the firmware (TankAlarm_OptaIo.h).
+  only) LED_USER one at a time and reads the I1-I8 terminals as analog or digital inputs, using
+  the same pin tables as the firmware (TankAlarm_OptaIo.h).
 
   BENCH UNITS ONLY. Flashing this by USB replaces the TankAlarm client firmware on that Opta.
   Reflash the client firmware by USB when the bench session is over.
@@ -31,8 +31,8 @@
 
   Stage 1 (plan v2 section 4):
     A7  Watch the meter and LEDs from power-on to the banner; i shows when outputs went LOW.
-    A1  x 1 1 .. x 4 1: no contact closes; the LEDs of R1, R3, R2 change state; x 4 (pin 10)
-        nothing.
+    A1  x 1 1 .. x 4 1: no contact closes; the LEDs of R1, R3, R2 change state;
+        x 4 (pin 10) changes nothing.
     A2  c <n> 1 / c <n> 0 close and open only contact n. l <n> 1 / l <n> 0 change only LED n
         (the contacts stay open): note which raw level lights it. That level becomes
         OPTA_LED_ON_LEVEL in TankAlarm_OptaIo.h (D6).
