@@ -1198,7 +1198,8 @@ static void sendSensorJson(EthernetClient &client) {
     obj["l"] = gSensorRecords[i].currentValue;
     obj["a"] = gSensorRecords[i].alarmActive;
     obj["at"] = gSensorRecords[i].alarmType;
-    obj["u"] = gSensorRecords[i].lastUpdateEpoch;
+    // Integer epoch: a double that fits a float would be written with only 7 digits.
+    obj["u"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;
     if (gSensorRecords[i].vinVoltage > 0.0f) {
       obj["v"] = gSensorRecords[i].vinVoltage;
     }
@@ -1828,7 +1829,8 @@ static void enableDfuMode() {
 // ============================================================================
 
 /**
- * Convert a Unix epoch (UTC seconds) to a human-readable "YYYY-MM-DD HH:MM:SS UTC" string.
+ * Convert a Unix epoch (UTC seconds) to a human-readable "YYYY-MM-DD HH:MM UTC" string.
+ * Seconds are dropped (truncated): the printed report only needs the minute.
  * Uses Howard Hinnant's civil_from_days algorithm; no stdlib time functions required.
  *
  * @param epoch  Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
@@ -1840,8 +1842,7 @@ static void epochToDateStr(double epoch, char *buf, size_t bufLen) {
     if (buf && bufLen > 0) strlcpy(buf, "--", bufLen);
     return;
   }
-  uint32_t t = (uint32_t)epoch;
-  uint32_t sec  = t % 60;  t /= 60;
+  uint32_t t = (uint32_t)epoch / 60;  // whole minutes
   uint32_t min  = t % 60;  t /= 60;
   uint32_t hour = t % 24;  t /= 24;
   uint32_t days = t;
@@ -1858,9 +1859,9 @@ static void epochToDateStr(double epoch, char *buf, size_t bufLen) {
   uint32_t m   = mp < 10 ? mp + 3 : mp - 9;
   if (m <= 2) y++;
 
-  snprintf(buf, bufLen, "%04u-%02u-%02u %02u:%02u:%02u UTC",
+  snprintf(buf, bufLen, "%04u-%02u-%02u %02u:%02u UTC",
            (unsigned)y, (unsigned)m, (unsigned)d,
-           (unsigned)hour, (unsigned)min, (unsigned)sec);
+           (unsigned)hour, (unsigned)min);
 }
 
 /**
