@@ -118,7 +118,8 @@ check('"1" is invalid', !sensorNumbersValid(['1']));
 check('undefined is invalid', !sensorNumbersValid([undefined]));
 
 // loadSensorNumbers: explicit numbers 1-255 first; with snh, anything else is renumbered past the
-// high mark and reported; without snh (older configs), a missing number is the position when free.
+// high mark and reported; without snh (older configs), a missing or unusable number is the position
+// when free (as the client runs it), and 0 or a duplicate is renumbered past the mark.
 checkEq('legacy config (index+1, no snh)', load([{ number: 1 }, { number: 2 }, { number: 3 }]),
   { nums: [1, 2, 3], high: 3, repaired: [] });
 checkEq('gaps and snh kept', load([{ number: 1 }, { number: 3 }, { number: 4 }], 5),
@@ -155,17 +156,35 @@ checkEq('repair up to 255, then reuse', load([{ number: 254 }, { number: 0 }, { 
   { nums: [254, 255, 1], high: 255, repaired: [{ position: 2, number: 255 }, { position: 3, number: 1, reused: true }] });
 check('repaired numbers are always sendable',
   sensorNumbersValid(load([{ number: 255 }, { number: 255 }, { number: 0 }, {}], 255).nums));
-// A number that is present but unusable is always renumbered and reported, snh or not.
+// With snh, a number that is present but unusable is renumbered past the mark and reported.
 checkEq('snh 5 and number 300: renumbered past snh', load([{ number: 300 }], 5),
   { nums: [6], high: 6, repaired: [{ position: 1, number: 6 }] });
 for (const bad of [1.5, '3', -1, 256, true]) {
   checkEq('snh 5 and number ' + JSON.stringify(bad) + ': renumbered past snh', load([{ number: bad }], 5),
     { nums: [6], high: 6, repaired: [{ position: 1, number: 6 }] });
 }
+// Without snh, the client runs a number it cannot use (is<uint8_t>() fails) as its position, so the
+// page keeps the position (the sensor's history, contacts and calibration stay on it) and warns.
 checkEq('number 300 without snh is reported', load([{ number: 300 }]),
   { nums: [1], high: 1, repaired: [{ position: 1, number: 1 }] });
+checkEq('number 300 without snh keeps the position the client runs', load([{ number: 300 }, { number: 2 }, { number: 3 }]),
+  { nums: [1, 2, 3], high: 3, repaired: [{ position: 1, number: 1 }] });
+for (const bad of [-1, 1.5, '3', null, 256, true]) {
+  checkEq('number ' + JSON.stringify(bad) + ' without snh keeps the position', load([{ number: 1 }, { number: bad }]),
+    { nums: [1, 2], high: 2, repaired: [{ position: 2, number: 2 }] });
+}
 checkEq('number "2" without snh is reported, not taken as 2', load([{ number: 1 }, { number: '2' }]),
   { nums: [1, 2], high: 2, repaired: [{ position: 2, number: 2 }] });
+checkEq('number 300 without snh: position taken, so renumbered', load([{ number: 300 }, { number: 1 }]),
+  { nums: [2, 1], high: 2, repaired: [{ position: 1, number: 2 }] });
+// 0 is a number the client does run (k=0), and a duplicate is really in use, so neither takes the
+// position: both are renumbered past the mark, as before.
+checkEq('zero without snh does not take the position', load([{ number: 0 }, { number: 5 }]),
+  { nums: [6, 5], high: 6, repaired: [{ position: 1, number: 6 }] });
+checkEq('duplicate without snh does not take the position', load([{ number: 3 }, { number: 3 }, { number: 1 }]),
+  { nums: [3, 4, 1], high: 4, repaired: [{ position: 2, number: 4 }] });
+checkEq('warnings are listed in page order', load([{ number: 0 }, { number: 300 }]),
+  { nums: [3, 2], high: 3, repaired: [{ position: 1, number: 3 }, { position: 2, number: 2 }] });
 checkEq('snh 0 counts as present', load([{}], 0), { nums: [1], high: 1, repaired: [{ position: 1, number: 1 }] });
 checkEq('no sensors keep snh', load(undefined, 4), { nums: [], high: 4, repaired: [] });
 checkEq('invalid snh ignored', load([{ number: 1 }], 'x'), { nums: [1], high: 1, repaired: [] });
