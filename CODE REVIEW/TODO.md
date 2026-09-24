@@ -1,7 +1,7 @@
 # TankAlarm Master TODO List
 
-> **Current Version:** 2.2.15 (server web UI release, September 15, 2026; review baseline `4f30a7f` was 2.2.14)  
-> **Last Updated:** September 15, 2026 (website PRs #314 → #315 → #316 → #317 merged into `master` as `1b516d9`, `2aaecf1`, `31a80bd`, `2e2c97c`; S-W01/02/03 done, S-W05/06/07 merged with residuals; see `CODE_REVIEW_09152026_WEBSITE_PRS_314_317_CLAUDE.md`)  
+> **Current Version:** 2.2.16 (history, alarm debounce, duplicate emails, times to the minute; September 23, 2026)  
+> **Last Updated:** September 23, 2026 (PRs #318 → #321 merged into `master` as `df7195e`, `6706044`, `e5442a2`, `3fc9d22`; S-D03 and C-T01 done, S-T06 closed as a duplicate of S-T01, C-P07 closed; relay/float project (C-A01, C-A02, S-T01, C-A04) next; see `CODE_REVIEW_09232026_PRS_318_321_CLAUDE.md`)  
 > **Purpose:** Comprehensive tracker for all unimplemented changes identified in code reviews and logic reviews. Update after every new review or commit.
 
 ---
@@ -60,23 +60,30 @@
   - PR #314 gives `/contacts` error toasts the shared `isError` colouring.
   - **Merged — PR #317 (`2e2c97c`, 2026-09-15)**: Transmission Log filters built from the emitted vocabulary and export sharing the table filter incl. detail search (M-26, M-27); `saved:false` shown as an error on Contacts and Server Settings (M-57); route alias / FTP user / FTP password rejected above 31 chars with `maxlength` on the inputs (M-58); `/api/location` URL-decodes `client=` (M-61); year-over-year key at the last colon (L-49); login shows the 429/400 reason (L-22/L-24); Config Generator commissioning path for an unknown UID, 8-sensor cap in page and `handleConfigPost`, no daily time from a guessed 05:00 UTC (L-19, L-20, L-21); single settings load (L-18). Residual: L-42 (SMS/email log entries without site/client, 47-char detail) is open.
 
+- [ ] **S-W09 (P3) (S)** Dashboard "24 h change" is computed across gaps in data — _owner discussion, 2026-09-23_
+  - `sendHistoryJson` interpolates across multi-day gaps and falls back to an older snapshot, so a sensor whose last reading is days old still shows a change. Question to the owner is open.
+
 ### Server — Data Ingestion and History
 
 - [ ] **S-D01 (P1) (S)** Registration Is Dropped Before Client Discovery — _CLAUDE H-25_
 - [ ] **S-D02 (P1) (S)** Freshness, Quality, and Event Ordering Need One Contract — _FULL/COPILOT F-11, F-12, F-29; CLAUDE M-45, M-46, M-48, M-49, L-37, L-38, L-39; related INDEPENDENT R-13_
-- [ ] **S-D03 (P1) (S)** Warm History and Archive Manifests Lose Data at Size Boundaries — _CLAUDE H-23, M-54, M-55, L-29_
+- [x] **S-D03 (P1) (S)** Warm History and Archive Manifests Lose Data at Size Boundaries — _CLAUDE H-23, M-54, M-55, L-29_
+  - **Merged — PR #319 (`6706044`, 2026-09-23, v2.2.16)**: month files streamed and merged row by row, fail-closed with `.tmp` + rename and `.bad` salvage (H-23); missed days that have readings rolled up later, days without readings stay blank (L-29); archived-client manifest kept whole, salvaged, `?file=` limited to manifest entries (M-54/M-55). Owner rule applied: only fresh readings at their acquisition time enter history (see the review doc). Residuals: S-D04 items (retention, yoy, compare cost, 8 KB download buffer, `dev:` upload path); v2.2.15 hot-tier snapshots are charted but never rolled up, so days H-23 already wiped are not rebuilt; bench checks in the PR (LittleFS semantics, timing/heap self-test, power cut).
 - [ ] **S-D04 (P2) (S)** Retention, Monthly Completeness, and Peak Memory Are Overstated — _CLAUDE H-26, M-39, M-56; FULL/COPILOT F-20 and performance recommendations_
 - [ ] **S-D05 (P2) (S)** Calibration and Weather History Are Not Reliable Reference Data — _CLAUDE M-37, M-38, M-59, L-50_
 
 ### Server — Alarms, Delivery, and Remote Commands
 
 - [ ] **S-T01 (P1) (S)** Stable Relay Identity Requires an Explicit Protocol Migration — _FULL/COPILOT F-02; INDEPENDENT R-02; CLAUDE prior F-02/R-02_
+  - Includes S-T06 (same defect: Clear Relay sends the dashboard array position). Part of the relay/float project started 2026-09-23; P1 because relays are about to be deployed.
 - [ ] **S-T02 (P1) (S)** Notification Eligibility Must Belong to the Current Alarm Episode — _FULL/COPILOT F-09, F-15; INDEPENDENT R-10/R-13; CLAUDE M-51, M-52, L-45, L-47_
 - [ ] **S-T03 (P1) (S)** Config Revision, ACK, and Retry Semantics Can Misreport Success — _FULL/COPILOT F-10; INDEPENDENT R-09; CLAUDE H-01, M-42, M-43_
 - [ ] **S-T04 (P2) (S)** Note Consumption Needs Idempotency and Observable Failure — _FULL/COPILOT F-24; INDEPENDENT R-19; CLAUDE M-47, L-35, L-36_
 - [ ] **S-T05 (P2) (S)** Contacts, Opt-Outs, and Delivery Metadata Need Consistent Rules — _CLAUDE M-50, M-53, L-40, L-41, L-42, L-43, L-44; earlier recipient/persistence recommendations_
-- [ ] **S-T06 (P2) (S)** Dashboard Clear Relay targets the client monitor by dashboard array position — _Copilot review of #315 (2026-09-14)_
+- [x] **S-T06 (P2) (S)** Dashboard Clear Relay targets the client monitor by dashboard array position — _Copilot review of #315 (2026-09-14)_ — **closed as a duplicate of S-T01** (2026-09-23)
   - `renderDataCard` sends `t.sensorIdx`, the position of the sensor in `/api/clients` `ts[]` (registry order), and the client applies `relay_reset_sensor` as its configured monitor-array index, so a client whose sensors report as `[2, 1]` can clear the wrong monitor. Pre-existing (the inline handler did the same); #315 only moved the value into a data attribute. Fix: send the persistent sensor identity (`sensorIndex`, 1-based) and resolve it to the monitor on the client, or have the server translate it.
+- [x] **S-T07 (P2) (S)** Duplicate emails from Notehub route retries — _owner report, 2026-09-23_
+  - **Merged — PR #320 (`e5442a2`, 2026-09-23, v2.2.16)**: `email.qo` bodies carry a message `id`; the Apps Script bridge on `/email-setup` skips repeats by Notehub event ID and message id (script lock + cache, `sending`/`sent`, 6 h) and waits for a send in progress; Notehub retry schedule in the docs corrected to 30 s / 1 min / 5 min. Operators must paste the new `doPost` and keep their `SECRET`. Residual (Copilot final pass): in a rare three-way retry race the bridge could send an extra copy (per-execution claim token would close it; never a lost email).
 
 ### Server — Persistence, Scheduling, and Maintenance
 
@@ -95,7 +102,10 @@
 
 ### Client — Alarm Evaluation and Delivery
 
-- [ ] **C-T01 (P1) (C)** Consecutive Debounce and Durable Notification-Pending State — _FULL/COPILOT F-04/F-05; INDEPENDENT R-03/R-04; CLAUDE H-06, M-12_
+- [x] **C-T01 (P1) (C)** Consecutive Debounce and Durable Notification-Pending State — _FULL/COPILOT F-04/F-05; INDEPENDENT R-03/R-04; CLAUDE H-06, M-12_
+  - **Merged — PR #318 (`df7195e`, 2026-09-23, v2.2.16)**: strictly consecutive debounce (`TankAlarm_AlarmDebounce.h`, host-tested), invalid samples held, boot clamp removed, wrap-safe hourly prune, publish-only pending retry while the sample is in alarm, re-assertion after sensor-recovered, relay-restore notification, alarm `t` = reading time, whole-minute note times. Residuals: NEW-A config-push latch reset and the stuck-disable path without re-assertion (C-A02); I2C silent `sensorFailed` clear and non-consecutive `recoveryCount` (C-A04, M-09); pulse freshness (C-A03); pending state is RAM-only.
+- [ ] **C-T04 (P3) (C)** Alarm rate limiter edge cases at the `millis()` wrap — _Copilot final pass on #318, 2026-09-23_
+  - Near the first ~49.7-day wrap the synthetic "expired" boot stamp becomes recent again, so the first alarm of a type can be held 5 minutes (sensor-fault notes have no pending retry); on a long-quiet device a stamp older than one wrap can make a stale hourly budget look recent. Fix: explicit per-type "never sent" state, and age out stamps on a timer, not only when an alarm is checked.
 - [ ] **C-T02 (P1) (C)** Remote Commands Need Delivery and Freshness Guarantees — _CLAUDE H-13, M-15, M-16; S-T01_
 - [ ] **C-T03 (P2) (C)** Replay Order and Capacity Must Match the Publisher — _FULL/COPILOT F-11/F-16; CLAUDE M-14; prior July reviews_
 
@@ -107,7 +117,7 @@
 - [ ] **C-P04 (P1) (C)** Solar State Is Stored on the Wrong Logical Volume — _CLAUDE H-28/M-62 (one issue)_
 - [ ] **C-P05 (P2) (C)** Recovery, Health Polling, and Energy Budgets — _CLAUDE M-03, M-04, M-07, L-02/L-03, L-04, L-08, L-09, L-10; working-tree W-03_
 - [ ] **C-P06 (P2) (C)** OTA Trial State, Health Confirmation, and Build Guarantees — _CLAUDE M-63, L-55; FULL/COPILOT W-04 and provisioning recommendations_
-- [ ] **C-P07 (P1) (C)** Existing Working-Tree Regressions Are a Separate Release Gate — _FULL/COPILOT W-01..W-04; INDEPENDENT R-04/R-06; CLAUDE section 1_
+- [x] **C-P07 (P1) (C)** Existing Working-Tree Regressions Are a Separate Release Gate — _FULL/COPILOT W-01..W-04; INDEPENDENT R-04/R-06; CLAUDE section 1_ — **closed 2026-09-22**: the stale copies were verified to hold nothing that is not in history and were discarded; the working tree has been clean since.
   - Working tree on the review machine held byte-identical late-June copies of the client sketch, two Common headers, `TankAlarm_Solar.cpp` and the CI workflow; nothing was committed from it. See CLAUDE review section 1.
 
 ### Viewer
@@ -121,8 +131,10 @@
 
 ### Shared Platform and Repository Tooling
 
-- [ ] **X-R01 (P2) (A)** Reproducible Builds and Regression Tests — _FULL/COPILOT F-27; CLAUDE M-01, M-17, L-01, L-12, L-53, L-63, L-64_
+- [~] **X-R01 (P2) (A)** Reproducible Builds and Regression Tests — _FULL/COPILOT F-27; CLAUDE M-01, M-17, L-01, L-12, L-53, L-63, L-64_
+  - v2.2.16 adds the `host-tests` CI job (C++ suites with ASan/UBSan and -O2, plus a node suite for the email bridge). Still open: the firmware jobs install the core and libraries unpinned (the host tests pin ArduinoJson 7.4.3).
 - [ ] **X-R02 (P3) (A)** Documentation, Published Artifacts, and Trust Model — _INDEPENDENT R-21/R-22; CLAUDE M-18, L-01, L-11, L-12, L-54; FULL documentation/security recommendations_
+  - Also: the committed `firmware/112025/viewer/*.bin` dates from 2026-06-12 because `build-firmware` does not export the viewer (the release asset is current).
 - [ ] **X-R03 (P2) (A)** Provisioning and Diagnostic Utilities — _FULL/COPILOT F-25/F-26; CLAUDE prior appendix_
 - [ ] **X-R04 (open) (A)** Suggestions Requiring Measurement or Further Evidence — _CLAUDE section 9 and efficiency sections; other review recommendations_
 
@@ -855,6 +867,7 @@ This TODO was compiled from the following documents, sorted by date:
 
 | Date | Document | Type |
 |------|----------|------|
+| 2026-09-23 | CODE_REVIEW_09232026_PRS_318_321_CLAUDE.md | PRs #318-#321 (v2.2.16): history, alarm debounce, duplicate emails, times to the minute; verification, review rounds, residuals |
 | 2026-09-15 | CODE_REVIEW_09152026_WEBSITE_PRS_314_317_CLAUDE.md | Website PRs #314-#317: changes, verification, Copilot rounds, residuals |
 | 2026-09-09 | CODE_REVIEW_09092026_MASTER_REPOSITORY_REVIEW.md | Consolidated master review of the four 2026-09-08 reviews; tracked above |
 | 2026-09-08 | CODE_REVIEW_09082026_REPOSITORY_FULL_REVIEW.md | Full repository review |
