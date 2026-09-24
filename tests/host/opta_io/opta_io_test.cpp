@@ -881,23 +881,19 @@ static void testButtonStep() {
 
 static void testIndicators() {
   Tally rule = {0, 0};
-  for (unsigned mask = 0; mask < 16; ++mask) {
-    for (int alarm = 0; alarm < 2; ++alarm) {
-      for (int inhibit = 0; inhibit < 2; ++inhibit) {
-        const uint8_t expect = (uint8_t)(inhibit ? 0u : (mask | (alarm ? 0x10u : 0u)));
-        const long id = (long)(mask * 4 + alarm * 2 + inhibit);
-        tally(rule, optaIndicatorMask((uint8_t)mask, alarm != 0, inhibit != 0) == expect, id);
-        // Only bits 0-3 of the coil mask are relays.
-        tally(rule, optaIndicatorMask((uint8_t)(mask | 0xF0u), alarm != 0, inhibit != 0) == expect, id);
-      }
+  for (unsigned mask = 0; mask < 256; ++mask) {
+    for (int inhibit = 0; inhibit < 2; ++inhibit) {
+      // Only bits 0-3 of the coil mask are relays; nothing else ever lights (D1: no alarm light).
+      const uint8_t expect = (uint8_t)(inhibit ? 0u : (mask & 0x0Fu));
+      const long id = (long)(mask * 2 + inhibit);
+      tally(rule, optaIndicatorMask((uint8_t)mask, inhibit != 0) == expect, id);
     }
   }
   CHECK_TALLY("optaIndicatorMask rule", rule);
-  CHECK(OPTA_IND_USER_LED_BIT == 4);
-  const int16_t pins[5] = {7, 9, 8, 153, 25};
-  for (uint8_t b = 0; b < 5; ++b) CHECK(optaIndicatorPin(b) == pins[b]);
-  CHECK(optaIndicatorPin(5) == -1);
-  CHECK(optaIndicatorPin(255) == -1);
+  const int16_t pins[4] = {7, 9, 8, 153};
+  for (uint8_t b = 0; b < 4; ++b) CHECK(optaIndicatorPin(b) == pins[b]);
+  // LED_USER is not an indicator: the Opta Lite has none.
+  for (unsigned b = 4; b < 256; ++b) CHECK(optaIndicatorPin((uint8_t)b) == -1);
 }
 
 // ---------------------------------------------------------------------------------------------

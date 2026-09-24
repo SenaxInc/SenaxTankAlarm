@@ -1,8 +1,8 @@
 /*
   TankAlarm-112025 Opta I/O bench (CL-1)
 
-  Serial tool for relay/float bench stage 1: drives the relay coils, relay LEDs and LED_USER one
-  at a time and reads the I1-I8 terminals as analog or digital inputs, using the same pin tables
+  Serial tool for relay/float bench stage 1: drives the relay coils, relay LEDs and (Opta WiFi
+  only) LED_USER one at a time and reads the I1-I8 terminals as analog or digital inputs, using the same pin tables
   as the firmware (TankAlarm_OptaIo.h).
 
   BENCH UNITS ONLY. Flashing this by USB replaces the TankAlarm client firmware on that Opta.
@@ -18,7 +18,7 @@
     i                 pin table, terminal modes, outputs-LOW time, coil pin state        A7
     c <n> <0|1>       drive relay n's coil (RELAYn)                                     A2
     l <n> <0|1>       drive relay n's LED only                                          A2
-    u <0|1>           drive LED_USER                                                    L1
+    u <0|1>           drive LED_USER (Opta WiFi only; the Lite has no USER LED)         L1
     x <n> <0|1>       v2.2.16 relay command: pin 7+(n-1) (LED_D0 + index)               A1, A2
     p <0|1>           1: INPUT_PULLUP on the coil pins (not driven); 0: OUTPUT LOW      A3
     m <t|*> <a|d|u>   read terminal t (or all) as analog / digital INPUT / INPUT_PULLUP A4, A5
@@ -33,7 +33,8 @@
     A7  Watch the meter and LEDs from power-on to the banner; i shows when outputs went LOW.
     A1  x 1 1 .. x 4 1: no contact closes; the LEDs of R1, R3, R2 light; x 4 (pin 10) nothing.
     A2  c <n> 1 / c <n> 0 close and open only contact n; l <n> 1 / l <n> 0 light LEDs only.
-    L1  u 1 / u 0: which level lights LED_USER.
+    L1  Opta WiFi only, optional: u 1 / u 0 shows which level lights LED_USER. The firmware
+        never drives LED_USER (D1: no alarm light); skip L1 on an Opta Lite.
     A3  p 1: does any relay energise with the coil pins as INPUT_PULLUP? Then p 0.
     A4  sweep (analog), m * d then sweep, m * u then sweep (r between classes); I1/I2 separately.
     A5  alt 1, alt 2, alt 3, each after r; then m <t> d and alt <t> again.
@@ -87,7 +88,7 @@ void setup() {
     digitalWrite(optaRelayLedPin(r), LOW);
   }
   pinMode(OPTA_LED_USER_PIN, OUTPUT);
-  digitalWrite(OPTA_LED_USER_PIN, LOW);  // LOW assumed off; L1 checks
+  digitalWrite(OPTA_LED_USER_PIN, LOW);  // WiFi model only; no LED on the Lite
   gOutputsLowAtMs = millis();
 
   for (uint8_t t = 0; t < OPTA_INPUT_COUNT; ++t) {
@@ -223,7 +224,8 @@ static void printPins() {
     Serial.println(')');
   }
   Serial.print(F("  LED_USER pin "));
-  Serial.println(OPTA_LED_USER_PIN);
+  Serial.print(OPTA_LED_USER_PIN);
+  Serial.println(F(" (Opta WiFi only)"));
   for (uint8_t t = 0; t < OPTA_INPUT_COUNT; ++t) {
     Serial.print(F("  I"));
     Serial.print(t + 1);
@@ -263,7 +265,7 @@ static void printHelp() {
   Serial.println(F("  i                pin table, modes, outputs-LOW time, coil pin state"));
   Serial.println(F("  c <n> <0|1>      relay n coil"));
   Serial.println(F("  l <n> <0|1>      relay n LED"));
-  Serial.println(F("  u <0|1>          LED_USER"));
+  Serial.println(F("  u <0|1>          LED_USER (Opta WiFi only)"));
   Serial.println(F("  x <n> <0|1>      v2.2.16 relay command (pin 7+(n-1))"));
   Serial.println(F("  p <0|1>          1: coil pins INPUT_PULLUP (not driven); 0: OUTPUT LOW"));
   Serial.println(F("  m <t|*> <a|d|u>  read as analog / digital INPUT / digital INPUT_PULLUP"));

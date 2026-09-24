@@ -3,7 +3,7 @@
 // The pin numbers of the Opta's I1-I8 inputs, R1-R4 relay coils, relay LEDs and LED_USER; the
 // input plan (which monitor, clear button or Vin reading owns each terminal, and the pinMode
 // calls a config change needs); the clear-button key resolver and a non-blocking button step;
-// the indicator LED mask. Nothing here touches hardware: callers do the pinMode/digitalWrite.
+// the relay LED mask. Nothing here touches hardware: callers do the pinMode/digitalWrite.
 // Host-tested in tests/host/opta_io; under ARDUINO_OPTA the tables are also checked against the
 // core at compile time.
 //
@@ -25,8 +25,10 @@
 static constexpr uint8_t OPTA_INPUT_COUNT = 8;      // I1..I8
 static constexpr uint8_t OPTA_RELAY_COUNT = 4;      // R1..R4
 static constexpr uint8_t OPTA_IO_MAX_MONITORS = 8;  // == client MAX_MONITORS
-static constexpr int16_t OPTA_LED_USER_PIN = 25;    // LED_USER (LEDB)
-// Relay LEDs and LED_USER are lit by HIGH. Placeholder until bench A2/L1 confirm it (D6).
+// LED_USER (LEDB). Only the Opta WiFi has a USER LED; the firmware never drives it (D1: no
+// alarm light). Listed so the bench sketch and the pin-disjointness test cover it.
+static constexpr int16_t OPTA_LED_USER_PIN = 25;
+// Relay LEDs are lit by HIGH. Placeholder until bench A2 confirms it (D6).
 static constexpr uint8_t OPTA_LED_ON_LEVEL = 1;
 
 // Terminal t (0-7 = I1-I8) -> PIN_A0..PIN_A7, or -1.
@@ -480,15 +482,14 @@ static inline bool optaButtonStep(OptaButton &b, bool pressed, uint32_t nowMs) {
 // Indicators (D1)
 // ---------------------------------------------------------------------------------------------
 
-static constexpr uint8_t OPTA_IND_USER_LED_BIT = 4;  // bits 0-3: relay LEDs R1-R4; bit 4: LED_USER
-
-// Relay LED r mirrors the coil output as actually driven; LED_USER lights while any level alarm
-// is latched; everything is off in CRITICAL hibernate. The caller writes only bits in prev ^ next.
-static constexpr uint8_t optaIndicatorMask(uint8_t coilDriveMask, bool anyAlarmLatched, bool criticalInhibit) {
-  return criticalInhibit ? (uint8_t)0 : (uint8_t)((coilDriveMask & 0x0F) | (anyAlarmLatched ? 0x10 : 0x00));
+// There is no alarm light (D1): the Opta Lite has no USER LED. Bit r (0-3) is relay LED r, which
+// mirrors the coil output as actually driven, so a lit relay LED always means a closed contact.
+// Everything is off in CRITICAL hibernate. The caller writes only bits in prev ^ next.
+static constexpr uint8_t optaIndicatorMask(uint8_t coilDriveMask, bool criticalInhibit) {
+  return criticalInhibit ? (uint8_t)0 : (uint8_t)(coilDriveMask & 0x0F);
 }
 static constexpr int16_t optaIndicatorPin(uint8_t index) {  // not `bit`: Arduino has a bit() macro
-  return index < 4 ? optaRelayLedPin(index) : index == OPTA_IND_USER_LED_BIT ? OPTA_LED_USER_PIN : (int16_t)-1;
+  return index < OPTA_RELAY_COUNT ? optaRelayLedPin(index) : (int16_t)-1;
 }
 
 #endif  // TANKALARM_OPTA_IO_H
