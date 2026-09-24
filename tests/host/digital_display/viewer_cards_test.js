@@ -1,6 +1,7 @@
 'use strict';
 // S3 (C-A04 B8): the viewer's sensor card (renderCard in VIEWER_DASHBOARD_HTML) shows a float
-// (st === 'digital') as ON/OFF with no unit and no 24 h change; other cards are unchanged.
+// (st === 'digital') as ON/OFF with no unit and no 24 h change, titled "Float Switch" like the
+// server dashboard (CR-10b); other cards are unchanged.
 // Usage: node viewer_cards_test.js [path/to/Viewer.ino]
 const fs = require('fs');
 const path = require('path');
@@ -70,6 +71,7 @@ const html = (t) => ctx.renderCard(t, false).innerHTML;
 const on = html({ st: 'digital', l: 1, mu: 'in', d: 1, n: 'High Float', a: true, at: 'triggered', u: 1 });
 check('float ON value', on.includes('<div class="dc-value">ON <small></small></div>'), on);
 check('float has no 24 h change', !on.includes('/24h'), on);
+check('float titled Float Switch like the server dashboard', on.includes('<div class="dc-type">Float Switch</div>'), on);
 const off = html({ st: 'digital', l: 0, mu: 'in', n: 'Low Float', u: 1 });
 check('float OFF value', off.includes('<div class="dc-value">OFF <small></small></div>'), off);
 const none = html({ st: 'digital', n: 'New Float' });
@@ -77,6 +79,7 @@ check('float without a value', none.includes('<div class="dc-value">- <small></s
 const analog = html({ st: 'analog', l: 43.8, mu: 'in', d: 1.2, n: 'Tank', u: 1 });
 check('analog value unchanged', analog.includes('<div class="dc-value">43.8 <small>in</small></div>'), analog);
 check('analog 24 h change unchanged', analog.includes('+1.2 in/24h'), analog);
+check('analog titled by object type', analog.includes('<div class="dc-type">tank</div>'), analog);
 const legacy = html({ l: 12.34, mu: 'in', n: 'Old record' });
 check('record without st unchanged', legacy.includes('<div class="dc-value">12.3 <small>in</small></div>'), legacy);
 
