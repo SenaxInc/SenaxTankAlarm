@@ -192,6 +192,11 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #ifndef GRID_INBOUND_INTERVAL_MS
 #define GRID_INBOUND_INTERVAL_MS 600000UL
 #endif
+// Each poll reads one relay.qi note, and a command within RELAY_COMMAND_COOLDOWN_MS of the last one
+// is dropped, so a faster poll would lose the second OFF of a multi-relay clear.
+#if GRID_INBOUND_INTERVAL_MS < (2UL * RELAY_COMMAND_COOLDOWN_MS)
+#error "GRID_INBOUND_INTERVAL_MS must be at least 2 x RELAY_COMMAND_COOLDOWN_MS"
+#endif
 
 // SOLAR_OUTBOUND_INTERVAL_MINUTES and SOLAR_INBOUND_INTERVAL_MINUTES
 // are defined in TankAlarm_Config.h (via TankAlarm_Common.h)
