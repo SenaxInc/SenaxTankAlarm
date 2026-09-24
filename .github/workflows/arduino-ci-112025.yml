@@ -9,6 +9,7 @@ on:
       - 'TankAlarm-112025-FTPS_Server_Test/**'
       - 'TankAlarm-112025-Viewer-BluesOpta/**'
       - 'TankAlarm-112025-Common/**'
+      - 'tests/host/**'
       - '.github/workflows/arduino-ci-112025.yml'
   pull_request:
     paths:
@@ -17,6 +18,7 @@ on:
       - 'TankAlarm-112025-FTPS_Server_Test/**'
       - 'TankAlarm-112025-Viewer-BluesOpta/**'
       - 'TankAlarm-112025-Common/**'
+      - 'tests/host/**'
       - '.github/workflows/arduino-ci-112025.yml'
   workflow_dispatch:
 
@@ -237,6 +239,34 @@ jobs:
       - name: Check embedded web pages (script syntax, inline handler reachability)
         run: python3 TankAlarm-112025-Server-BluesOpta/check_web_pages.py
 
+  host-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Fetch ArduinoJson 7.4.3 headers (pinned for the host tests; the firmware jobs install the latest release)
+        run: git clone --quiet --depth 1 --branch v7.4.3 https://github.com/bblanchon/ArduinoJson.git "$RUNNER_TEMP/ArduinoJson"
+
+      - name: Build and run host unit tests (each tests/host/<suite>/Makefile)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          suites=(tests/host/*/Makefile)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "No host test suites found under tests/host/."
+            exit 0
+          fi
+          for mk in "${suites[@]}"; do
+            dir=$(dirname "$mk")
+            echo "::group::$dir"
+            make -C "$dir" test ARDUINOJSON_DIR="$RUNNER_TEMP/ArduinoJson/src"
+            echo "::endgroup::"
+          done
+
   check-version:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -277,7 +307,7 @@ jobs:
           fi
 
   build-firmware:
-    needs: [compile-check, check-web-pages, check-version]
+    needs: [compile-check, check-web-pages, host-tests, check-version]
     if: github.event_name == 'push' && needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:

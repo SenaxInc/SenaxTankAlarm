@@ -25,6 +25,9 @@
 // Shared library - common constants and utilities
 #include <TankAlarm_Common.h>
 
+// C-T01: pure alarm debounce / rate-window helpers (no Arduino deps; host-tested in tests/host)
+#include "TankAlarm_AlarmDebounce.h"
+
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -279,6 +282,14 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #ifndef ALARM_DEBOUNCE_COUNT
 #define ALARM_DEBOUNCE_COUNT 3  // Require 3 consecutive samples to trigger/clear alarm
 #endif
+
+// C-T01: latched edge whose alarm.qo note was denied by checkAlarmRateLimit (RAM only).
+// Plain defines (not an enum) so the Arduino auto-prototypes never need the type.
+#define ALARM_PENDING_NONE          0
+#define ALARM_PENDING_HIGH          1
+#define ALARM_PENDING_LOW           2
+#define ALARM_PENDING_TRIGGERED     3
+#define ALARM_PENDING_NOT_TRIGGERED 4
 
 #ifndef SENSOR_STUCK_THRESHOLD
 #define SENSOR_STUCK_THRESHOLD 10  // Same reading 10 times = stuck sensor
@@ -823,6 +834,7 @@ struct MonitorRuntime {
   float lastDailySentValue;  // Last value included in a daily report (monitor's own unit)
   bool highAlarmLatched;
   bool lowAlarmLatched;
+  uint8_t pendingAlarm;         // C-T01: ALARM_PENDING_* edge awaiting its note; RAM only
   unsigned long lastSampleMillis;
   unsigned long lastAlarmSendMillis;
   // Debouncing state
@@ -1446,6 +1458,12 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow);
 static float getEffectiveBatteryVoltage();
 static void sendRegistration(const char *reason);
 static void sendAlarm(uint8_t idx, const char *alarmType, float inches);
+static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches);
+static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bool isRetry);
+static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry, bool highInAlarm, bool lowInAlarm);
+static uint8_t alarmPendingCodeFor(const char *alarmType);
+static const char *alarmPendingName(uint8_t code);
+static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
 static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
@@ -1766,6 +1784,7 @@ void setup() {
     gMonitorState[i].lastDailySentValue = -9999.0f;
     gMonitorState[i].highAlarmLatched = false;
     gMonitorState[i].lowAlarmLatched = false;
+    gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;
     gMonitorState[i].lastSampleMillis = 0;
     gMonitorState[i].lastAlarmSendMillis = 0;
     gMonitorState[i].highAlarmDebounceCount = 0;
@@ -1781,15 +1800,12 @@ void setup() {
     gMonitorState[i].alarmCount = 0;
     // BugFix v1.6.2 (M-13): Initialize last-alarm timestamps so the first alarm
     // after boot is NOT suppressed by the per-type minimum-interval check.
-    // Setting them to (now - interval - 1) ensures the very first alarm passes.
+    // C-T01: stamp each one interval + 1 ms in the past. The subtraction wraps when millis()
+    // is small and checkAlarmRateLimit tests (now - last) < interval modulo 2^32, so the first
+    // alarm of each type passes at any uptime. The previous clamp to 0 suppressed high/low/
+    // fault notes for the first 300 s of uptime (F-05/M-12a).
     {
-      unsigned long bootNow = millis();
-      unsigned long expired = bootNow - (MIN_ALARM_INTERVAL_SECONDS * 1000UL + 1);
-      // If millis() is still tiny (< interval), use 0 which also won't suppress
-      // because the unsigned subtraction in the rate-limit check will wrap large.
-      if (bootNow < MIN_ALARM_INTERVAL_SECONDS * 1000UL + 1) {
-        expired = 0;
-      }
+      const unsigned long expired = millis() - (MIN_ALARM_INTERVAL_SECONDS * 1000UL + 1UL);
       gMonitorState[i].lastHighAlarmMillis = expired;
       gMonitorState[i].lastLowAlarmMillis = expired;
       gMonitorState[i].lastClearAlarmMillis = expired;
@@ -4362,6 +4378,18 @@ static double currentEpoch() {
   return gLastSyncedEpoch + (double)deltaMs / 1000.0;
 }
 
+// Note times: whole minutes, truncated, so a reading never moves to another UTC day. Always
+// written as an integer, never as a double: ArduinoJson stores a double that fits a float as a
+// float and prints 7 significant digits (up to ~500 s off). currentEpoch() itself stays precise
+// for schedules. 0 = clock not set.
+static uint32_t noteEpochMinute(double epoch) {
+  if (!(epoch > 0.0)) {
+    return 0;
+  }
+  uint32_t seconds = (uint32_t)epoch;
+  return seconds - (seconds % 60U);
+}
+
 static void ensureTimeSync() {
   if (millis() - gLastTimeSyncMillis > 6UL * 60UL * 60UL * 1000UL || gLastSyncedEpoch <= 0.0) {
     syncTimeFromNotecard();
@@ -4822,7 +4850,7 @@ static void reinitializeHardware() {
         recovDoc["k"] = cfg.sensorIndex;
         recovDoc["y"] = "sensor-recovered";
         recovDoc["rd"] = 0;
-        recovDoc["t"] = currentEpoch();
+        recovDoc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, recovDoc, true);
       }
     }
@@ -4837,7 +4865,7 @@ static void reinitializeHardware() {
       clearDoc["k"] = cfg.sensorIndex;
       clearDoc["y"] = "clear";
       clearDoc["rd"] = 0;
-      clearDoc["t"] = currentEpoch();
+      clearDoc["t"] = noteEpochMinute(currentEpoch());
       publishNote(ALARM_FILE, clearDoc, true);
     }
 
@@ -4848,6 +4876,7 @@ static void reinitializeHardware() {
     gMonitorState[i].lowClearDebounceCount = 0;
     gMonitorState[i].highAlarmLatched = false;
     gMonitorState[i].lowAlarmLatched = false;
+    gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;  // C-T01: latches reset; drop any unsent edge
     gMonitorState[i].consecutiveFailures = 0;
     gMonitorState[i].stuckReadingCount = 0;
     gMonitorState[i].sensorFailed = false;
@@ -5171,7 +5200,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
         recovDoc["k"] = gConfig.monitors[i].sensorIndex;
         recovDoc["y"] = "sensor-recovered";
         recovDoc["rd"] = 0;
-        recovDoc["t"] = currentEpoch();
+        recovDoc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, recovDoc, true);
       }
       if (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched) {
@@ -5181,7 +5210,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
         clearDoc["k"] = gConfig.monitors[i].sensorIndex;
         clearDoc["y"] = "clear";
         clearDoc["rd"] = 0;
-        clearDoc["t"] = currentEpoch();
+        clearDoc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, clearDoc, true);
       }
       // Zero out stale runtime state so it's clean if monitor is re-added later
@@ -5205,6 +5234,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       // Previously, stale highAlarmLatched/lowAlarmLatched persisted and were
       // reported in daily reports, causing phantom alarms on the dashboard.
       if (wasAlarmsEnabled && !gConfig.monitors[i].alarmsEnabled) {
+        gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;  // C-T01: never retry once alarms are off
         if (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched) {
           gMonitorState[i].highAlarmLatched = false;
           gMonitorState[i].lowAlarmLatched = false;
@@ -5231,8 +5261,10 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           recovDoc["k"] = gConfig.monitors[i].sensorIndex;
           recovDoc["y"] = "sensor-recovered";
           recovDoc["rd"] = 0;
-          recovDoc["t"] = currentEpoch();
+          recovDoc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, recovDoc, true);
+          // C-T01: no NEW-B re-assertion here; reinitializeHardware() below clears the latch
+          // and sends a clear (see validateSensorReading())
         }
         gMonitorState[i].sensorFailed = false;
         gMonitorState[i].stuckReadingCount = 0;
@@ -5454,7 +5486,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
         doc["s"] = gConfig.siteName;
         doc["k"] = gConfig.monitors[idx].sensorIndex;
         doc["y"] = "sensor-fault";
-        doc["t"] = currentEpoch();
+        doc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, doc, true);
       }
     }
@@ -5515,7 +5547,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
           doc["k"] = cfg.sensorIndex;
           doc["y"] = "sensor-fault";
           doc["rd"] = reading;
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, doc, true);
         }
       }
@@ -5543,7 +5575,7 @@ static bool validateSensorReading(uint8_t idx, float reading) {
           doc["k"] = cfg.sensorIndex;
           doc["y"] = "sensor-stuck";
           doc["rd"] = reading;
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, doc, true);
         }
       }
@@ -5571,8 +5603,40 @@ static bool validateSensorReading(uint8_t idx, float reading) {
         doc["k"] = cfg.sensorIndex;
         doc["y"] = "sensor-recovered";
         doc["rd"] = reading;
-        doc["t"] = currentEpoch();
+        doc["t"] = noteEpochMinute(currentEpoch());
         publishNote(ALARM_FILE, doc, true);
+      }
+      // C-T01 (NEW-B): the server treats sensor-recovered as a clear and has already replaced
+      // the alarm type with sensor-fault, but the level latch was held through the failure.
+      // Queue a publish-only re-assertion of the latched edge; this pass's evaluateAlarms()
+      // sends it after its gates (Phase B on current-loop devices). No I/O here. Like any
+      // pending edge (including one already pending from before the failure), it is sent
+      // only while the sample is in alarm: a reading in the latch's release zone (level moved
+      // during the outage, or a stuck float recovered by changing state) holds it, so no
+      // false alarm, and the normal debounce's clear then supersedes it; if the level returns
+      // to alarm before the latch clears, it is sent then. Two other recoveries are not
+      // hooked. A config update that turns stuck detection off publishes sensor-recovered,
+      // but reinitializeHardware() then clears every latch, this pending edge with it, and
+      // sends a clear (NEW-A), so client and server agree and the level re-latches from fresh
+      // samples; C-A02 must re-assert there if it keeps latches across a config save. The I2C
+      // sensor-only recovery in loop() clears sensorFailed silently; the server's
+      // fresh-telemetry sensor-fault self-clear still drops the level alarm on that path (C-A04).
+      if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
+        if (cfg.sensorInterface == SENSOR_DIGITAL) {
+          if (state.highAlarmLatched) {
+            bool triggerOnActivated = true;
+            (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);  // resolves the type only
+            state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
+          }
+        } else if (state.highAlarmLatched) {
+          state.pendingAlarm = ALARM_PENDING_HIGH;
+        } else if (state.lowAlarmLatched) {
+          state.pendingAlarm = ALARM_PENDING_LOW;
+        }
+        if (state.pendingAlarm != ALARM_PENDING_NONE) {
+          Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
+          Serial.println(cfg.name);
+        }
       }
     }
   }
@@ -6250,6 +6314,47 @@ static bool restorePersistentRelayAfterBoot(uint8_t idx, bool highAlarmActive, b
   return true;
 }
 
+// C-T01: digital (float switch) trigger resolution, moved verbatim out of evaluateAlarms() so
+// the sensor-recovered re-assertion resolves the alarm type the same way. Returns true when
+// `value` is the alarm state; triggerOnActivated tells "triggered" from "not_triggered".
+static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated) {
+  // For digital sensors, value is either DIGITAL_SENSOR_ACTIVATED_VALUE (1.0) or DIGITAL_SENSOR_NOT_ACTIVATED_VALUE (0.0)
+  bool isActivated = (value > DIGITAL_SWITCH_THRESHOLD);
+  bool shouldAlarm = false;
+  triggerOnActivated = true;  // Track what condition triggers the alarm
+
+  // Determine if we should alarm based on trigger configuration
+  if (cfg.digitalTrigger[0] != '\0') {
+    if (strcmp(cfg.digitalTrigger, "activated") == 0) {
+      shouldAlarm = isActivated;  // Alarm when switch is activated
+      triggerOnActivated = true;
+    } else if (strcmp(cfg.digitalTrigger, "not_activated") == 0) {
+      shouldAlarm = !isActivated;  // Alarm when switch is NOT activated
+      triggerOnActivated = false;
+    }
+  } else {
+    // Legacy behavior: use highAlarm/lowAlarm thresholds
+    // Only one of these should be configured for a digital sensor
+    // highAlarm = 1 means trigger when reading is 1.0 (switch activated)
+    // lowAlarm = 0 means trigger when reading is 0.0 (switch not activated)
+    bool hasHighAlarm = (cfg.highAlarmThreshold >= DIGITAL_SENSOR_ACTIVATED_VALUE);
+    bool hasLowAlarm = (cfg.lowAlarmThreshold == DIGITAL_SENSOR_NOT_ACTIVATED_VALUE);
+
+    if (hasHighAlarm && !hasLowAlarm) {
+      shouldAlarm = isActivated;
+      triggerOnActivated = true;
+    } else if (hasLowAlarm && !hasHighAlarm) {
+      shouldAlarm = !isActivated;
+      triggerOnActivated = false;
+    } else if (hasHighAlarm) {
+      // Default to high alarm behavior if both are set
+      shouldAlarm = isActivated;
+      triggerOnActivated = true;
+    }
+  }
+  return shouldAlarm;
+}
+
 static void evaluateAlarms(uint8_t idx) {
   const MonitorConfig &cfg = gConfig.monitors[idx];
   MonitorRuntime &state = gMonitorState[idx];
@@ -6259,157 +6364,101 @@ static void evaluateAlarms(uint8_t idx) {
     return;
   }
 
-  // Skip alarm evaluation if sensor has failed
+  // Skip alarm evaluation if sensor has failed.
+  // C-T01: also discard the debounce evidence, so samples from before a failure never combine
+  // with samples after recovery. The latches and the pending edge are kept.
   if (state.sensorFailed) {
+    state.highAlarmDebounceCount = 0;
+    state.lowAlarmDebounceCount = 0;
+    state.highClearDebounceCount = 0;
+    state.lowClearDebounceCount = 0;
+    return;
+  }
+
+  // C-T01: an invalid sample (validation failed, so sampleMonitors() reused the previous
+  // value) is not evidence. Previously it counted towards latching and clearing. HOLD the
+  // counters (neither count nor reset them) and do not consume the first-sample relay
+  // restore, so the boot placeholder currentValue = 0.0 is never evaluated (an open loop at
+  // boot gave a false LOW, or a LOW relay restore on its first failed read).
+  if (state.sampleReused) {
     return;
   }
 
   unsigned long sampleNow = millis();
   bool firstAlarmSample = (state.lastSampleMillis == 0);
   state.lastSampleMillis = sampleNow;
+  // C-T01: edge left pending by an earlier sample; retried after this sample's own edges
+  const uint8_t pendingAtEntry = state.pendingAlarm;
 
   // Handle digital sensors (float switches) differently
   if (cfg.sensorInterface == SENSOR_DIGITAL) {
-    // For digital sensors, currentValue is either DIGITAL_SENSOR_ACTIVATED_VALUE (1.0) or DIGITAL_SENSOR_NOT_ACTIVATED_VALUE (0.0)
-    bool isActivated = (state.currentValue > DIGITAL_SWITCH_THRESHOLD);
-    bool shouldAlarm = false;
     bool triggerOnActivated = true;  // Track what condition triggers the alarm
-    
-    // Determine if we should alarm based on trigger configuration
-    if (cfg.digitalTrigger[0] != '\0') {
-      if (strcmp(cfg.digitalTrigger, "activated") == 0) {
-        shouldAlarm = isActivated;  // Alarm when switch is activated
-        triggerOnActivated = true;
-      } else if (strcmp(cfg.digitalTrigger, "not_activated") == 0) {
-        shouldAlarm = !isActivated;  // Alarm when switch is NOT activated
-        triggerOnActivated = false;
-      }
-    } else {
-      // Legacy behavior: use highAlarm/lowAlarm thresholds
-      // Only one of these should be configured for a digital sensor
-      // highAlarm = 1 means trigger when reading is 1.0 (switch activated)
-      // lowAlarm = 0 means trigger when reading is 0.0 (switch not activated)
-      bool hasHighAlarm = (cfg.highAlarmThreshold >= DIGITAL_SENSOR_ACTIVATED_VALUE);
-      bool hasLowAlarm = (cfg.lowAlarmThreshold == DIGITAL_SENSOR_NOT_ACTIVATED_VALUE);
-      
-      if (hasHighAlarm && !hasLowAlarm) {
-        shouldAlarm = isActivated;
-        triggerOnActivated = true;
-      } else if (hasLowAlarm && !hasHighAlarm) {
-        shouldAlarm = !isActivated;
-        triggerOnActivated = false;
-      } else if (hasHighAlarm) {
-        // Default to high alarm behavior if both are set
-        shouldAlarm = isActivated;
-        triggerOnActivated = true;
-      }
-    }
+    const bool shouldAlarm = digitalAlarmCondition(cfg, state.currentValue, triggerOnActivated);
+    // Send alarm with descriptive type based on configured trigger condition
+    const char *alarmType = triggerOnActivated ? "triggered" : "not_triggered";
 
     if (firstAlarmSample && shouldAlarm && restorePersistentRelayAfterBoot(idx, true, false, sampleNow)) {
+      // C-T01: the restore has already actuated; also tell the server (publish-only)
+      notifyAlarmEdge(idx, alarmType, state.currentValue, false);
       return;
     }
-    
-    // Handle alarm state with debouncing
-    if (shouldAlarm && !state.highAlarmLatched) {
-      state.highAlarmDebounceCount++;
-      state.highClearDebounceCount = 0;
-      if (state.highAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-        state.highAlarmLatched = true;
-        state.highAlarmDebounceCount = 0;
-        // Send alarm with descriptive type based on configured trigger condition
-        const char *alarmType = triggerOnActivated ? "triggered" : "not_triggered";
-        sendAlarm(idx, alarmType, state.currentValue);
-      }
-    } else if (!shouldAlarm && state.highAlarmLatched) {
-      state.highClearDebounceCount++;
-      state.highAlarmDebounceCount = 0;
-      if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-        state.highAlarmLatched = false;
-        state.highClearDebounceCount = 0;
-        sendAlarm(idx, "clear", state.currentValue);
-      }
-    } else if (!shouldAlarm) {
-      state.highAlarmDebounceCount = 0;
-    } else {
-      state.highClearDebounceCount = 0;
+
+    // Handle alarm state with debouncing. C-T01: same step as the analog channels; the edges
+    // are identical to v2.2.15 for every on/off sequence (host test).
+    const uint8_t edge = alarmDebounceStep(state.highAlarmLatched, shouldAlarm, !shouldAlarm,
+                                           ALARM_DEBOUNCE_COUNT, state.highAlarmDebounceCount,
+                                           state.highClearDebounceCount);
+    if (edge == ALARM_EDGE_ENTER) {
+      state.highAlarmLatched = true;
+      sendAlarm(idx, alarmType, state.currentValue);
+    } else if (edge == ALARM_EDGE_EXIT) {
+      state.highAlarmLatched = false;
+      sendAlarm(idx, "clear", state.currentValue);
     }
+    retryPendingAlarm(idx, pendingAtEntry, shouldAlarm, false);
     return;  // Skip the standard analog threshold evaluation
   }
 
-  // Standard analog/current loop sensor alarm evaluation with hysteresis
-  // Clamp hysteresis to be non-negative; a negative value would invert the clear bands.
-  float hyst = (cfg.hysteresisValue > 0.0f) ? cfg.hysteresisValue : 0.0f;
-  float highTrigger = cfg.highAlarmThreshold;
-  float highClear = cfg.highAlarmThreshold - hyst;
-  float lowTrigger = cfg.lowAlarmThreshold;
-  float lowClear = cfg.lowAlarmThreshold + hyst;
+  // Standard analog/current loop sensor alarm evaluation with hysteresis. The comparisons are
+  // unchanged (hysteresis clamped to >= 0; each alarm clears on its own side of its own
+  // threshold, see alarmAnalogConditions in TankAlarm_AlarmDebounce.h).
+  const AlarmAnalogConditions c = alarmAnalogConditions(state.currentValue, cfg.highAlarmThreshold,
+                                                        cfg.lowAlarmThreshold, cfg.hysteresisValue);
 
-  bool highCondition = state.currentValue >= highTrigger;
-  bool lowCondition = state.currentValue <= lowTrigger;
-  // Decoupled clear conditions: the high alarm clears once the level falls below the high
-  // threshold minus hysteresis; the low alarm clears once the level rises above the low
-  // threshold plus hysteresis. Previously both alarms shared a single mid-band clearCondition
-  // ((x < highClear) && (x > lowClear)); when (highThreshold - lowThreshold) <= 2*hysteresis
-  // that band was empty/inverted and a latched alarm could NEVER clear, and high-alarm
-  // clearing was incorrectly coupled to the (possibly unused) low threshold.
-  bool highClearCondition = state.currentValue < highClear;
-  bool lowClearCondition = state.currentValue > lowClear;
-
-  if (firstAlarmSample && restorePersistentRelayAfterBoot(idx, highCondition, !highCondition && lowCondition, sampleNow)) {
+  if (firstAlarmSample && restorePersistentRelayAfterBoot(idx, c.high, !c.high && c.low, sampleNow)) {
+    // C-T01: the restore has already actuated; also tell the server (publish-only)
+    notifyAlarmEdge(idx, c.high ? "high" : "low", state.currentValue, false);
     return;
   }
 
-  // Handle high alarm with debouncing
-  if (highCondition && !state.highAlarmLatched) {
-    state.highAlarmDebounceCount++;
-    state.lowAlarmDebounceCount = 0;
-    state.highClearDebounceCount = 0;
-    if (state.highAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.highAlarmLatched = true;
-      state.lowAlarmLatched = false;
-      state.highAlarmDebounceCount = 0;
-      sendAlarm(idx, "high", state.currentValue);
-    }
-  } else if (state.highAlarmLatched && highClearCondition) {
-    state.highClearDebounceCount++;
-    state.highAlarmDebounceCount = 0;
-    if (state.highClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.highAlarmLatched = false;
-      state.highClearDebounceCount = 0;
-      sendAlarm(idx, "clear", state.currentValue);
-    }
-  } else if (!highCondition && !highClearCondition) {
-    state.highAlarmDebounceCount = 0;
-  }
-  if (highCondition) {
-    state.highClearDebounceCount = 0;
-  }
+  // C-T01: strictly consecutive debounce (F-04/R-03/H-06). Previously a trigger counter was
+  // reset only by a hysteresis-band sample and a clear counter never, so alternating samples
+  // ([90,50,90,50,90] with high=80) latched or cleared. Now any sample that does not qualify
+  // resets the evidence. A sample inside both trigger zones (low >= high, a misconfiguration)
+  // counts toward neither alarm: it never latches one and it holds an existing latch. In
+  // v2.2.15 the result there depended on the order of the samples: it could latch HIGH or flip
+  // a latch between HIGH and LOW (host test T13). Entering one side unlatches the other, as
+  // before.
+  uint8_t highEdge = ALARM_EDGE_NONE;
+  uint8_t lowEdge = ALARM_EDGE_NONE;
+  alarmAnalogEvaluate(c, ALARM_DEBOUNCE_COUNT, state.highAlarmLatched, state.lowAlarmLatched,
+                      state.highAlarmDebounceCount, state.highClearDebounceCount,
+                      state.lowAlarmDebounceCount, state.lowClearDebounceCount, highEdge, lowEdge);
 
-  // Handle low alarm with debouncing
-  if (lowCondition && !state.lowAlarmLatched) {
-    state.lowAlarmDebounceCount++;
-    state.highAlarmDebounceCount = 0;
-    state.lowClearDebounceCount = 0;
-    if (state.lowAlarmDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.lowAlarmLatched = true;
-      state.highAlarmLatched = false;
-      state.lowAlarmDebounceCount = 0;
-      sendAlarm(idx, "low", state.currentValue);
-    }
-  } else if (state.lowAlarmLatched && lowClearCondition) {
-    state.lowClearDebounceCount++;
-    state.lowAlarmDebounceCount = 0;
-    if (state.lowClearDebounceCount >= ALARM_DEBOUNCE_COUNT) {
-      state.lowAlarmLatched = false;
-      state.lowClearDebounceCount = 0;
-      sendAlarm(idx, "clear", state.currentValue);
-    }
-  } else if (!lowCondition && !lowClearCondition) {
-    state.lowAlarmDebounceCount = 0;
+  // Notes and actuation in v2.2.15 order: high edge, then low edge. sendAlarm() reads neither
+  // the latches nor the counters, so acting after both channels are updated is equivalent.
+  if (highEdge == ALARM_EDGE_ENTER) {
+    sendAlarm(idx, "high", state.currentValue);
+  } else if (highEdge == ALARM_EDGE_EXIT) {
+    sendAlarm(idx, "clear", state.currentValue);
   }
-  if (lowCondition) {
-    state.lowClearDebounceCount = 0;
+  if (lowEdge == ALARM_EDGE_ENTER) {
+    sendAlarm(idx, "low", state.currentValue);
+  } else if (lowEdge == ALARM_EDGE_EXIT) {
+    sendAlarm(idx, "clear", state.currentValue);
   }
+  // In alarm = not in that latch's release zone, the test that holds the latch
+  retryPendingAlarm(idx, pendingAtEntry, !c.highRelease, !c.lowRelease);
 }
 
 // ---- Registration note for unconfigured clients ----
@@ -6420,7 +6469,7 @@ static void sendRegistration(const char *reason) {
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["r"] = reason;
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   doc["mc"] = 0;  // Signals server: no monitors configured
   doc["fv"] = FIRMWARE_VERSION;
 
@@ -6538,8 +6587,14 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
   buildSensorObject(doc.as<JsonObject>(), idx);
 
   doc["r"] = reason;
-  // Use acquisition time so stale/reused values do not get a fresh timestamp.
-  doc["t"] = (state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch();
+  // Use acquisition time so stale/reused values do not get a fresh timestamp. Whole minutes,
+  // truncated (noteEpochMinute()), like the alarm note's t and the daily report's per-sensor t,
+  // so every copy of a reading carries the same t and stays on the day it was measured. No
+  // valid reading since boot (e.g. an on-demand request before the first sample): send no t
+  // rather than a guessed one.
+  if (state.lastReadingEpoch > 0.0) {
+    doc["t"] = noteEpochMinute(state.lastReadingEpoch);
+  }
 
   // TEMPORARY (2026-06-15): include system voltage in every telemetry note so the dashboard
   // VIN reflects the live battery/MPPT reading instead of waiting for the once-daily report.
@@ -6639,13 +6694,13 @@ static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType) {
   }
 
   // Check hourly rate limit - remove timestamps older than 1 hour
-  // BugFix v1.6.2 (I-12): Guard against unsigned underflow when millis() < 1 hour.
-  // When uptime is less than 1 hour, all timestamps are inherently recent — skip pruning.
-  if (now >= 3600000UL) {
-    unsigned long oneHourAgo = now - 3600000UL;
+  // C-T01: wrap-safe; the old ts > now-3600000 test (and its skip in the first hour of
+  // uptime) never pruned stamps taken in the last hour before the 49.7-day wrap (M-12d).
+  // Before the wrap this keeps exactly the entries the old test kept.
+  {
     uint8_t validCount = 0;
     for (uint8_t i = 0; i < state.alarmCount; ++i) {
-      if (state.alarmTimestamps[i] > oneHourAgo) {
+      if (alarmWithinWindow(now, state.alarmTimestamps[i], 3600000UL)) {
         state.alarmTimestamps[validCount++] = state.alarmTimestamps[i];
       }
     }
@@ -6669,17 +6724,15 @@ static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType) {
   // Previously, per-monitor timestamp was added first, so global rejection still consumed
   // the per-monitor budget — accelerating per-monitor rate exhaustion.
   {
-    // BugFix v1.6.2 (I-12): Same unsigned-underflow guard for global alarm budget.
-    if (now >= 3600000UL) {
-      unsigned long oneHourAgo = now - 3600000UL;
-      uint8_t gValid = 0;
-      for (uint8_t g = 0; g < gGlobalAlarmCount; ++g) {
-        if (gGlobalAlarmTimestamps[g] > oneHourAgo) {
-          gGlobalAlarmTimestamps[gValid++] = gGlobalAlarmTimestamps[g];
-        }
+    // C-T01: wrap-safe; the old ts > now-3600000 test never pruned stamps taken in the last
+    // hour before the 49.7-day wrap (M-12d)
+    uint8_t gValid = 0;
+    for (uint8_t g = 0; g < gGlobalAlarmCount; ++g) {
+      if (alarmWithinWindow(now, gGlobalAlarmTimestamps[g], 3600000UL)) {
+        gGlobalAlarmTimestamps[gValid++] = gGlobalAlarmTimestamps[g];
       }
-      gGlobalAlarmCount = gValid;
     }
+    gGlobalAlarmCount = gValid;
 
     if (gGlobalAlarmCount >= MAX_GLOBAL_ALARMS_PER_HOUR) {
       Serial.print(F("Rate limit: Global hourly cap reached ("));
@@ -6757,7 +6810,6 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
   }
 
   const MonitorConfig &cfg = gConfig.monitors[idx];
-  bool allowSmsEscalation = cfg.enableAlarmSms;
 
   // Always activate local alarm regardless of rate limits
   // relay_timeout is an operational notification, not an alarm condition
@@ -6814,12 +6866,38 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
     }
   }
 
-  // Check rate limit before sending remote alarm notification
-  // Note: Rate limiting only gates Notecard message transmission, NOT relay actuation above
-  if (!checkAlarmRateLimit(idx, alarmType)) {
-    return;  // Rate limit exceeded — relay already handled above
+  // Rate limiting only gates the Notecard note, NOT relay actuation above.
+  // C-T01: a rate-limited latch edge is kept pending and re-sent publish-only.
+  notifyAlarmEdge(idx, alarmType, inches, false);
+}
+
+static uint8_t alarmPendingCodeFor(const char *alarmType) {
+  if (strcmp(alarmType, "high") == 0) return ALARM_PENDING_HIGH;
+  if (strcmp(alarmType, "low") == 0) return ALARM_PENDING_LOW;
+  if (strcmp(alarmType, "triggered") == 0) return ALARM_PENDING_TRIGGERED;
+  if (strcmp(alarmType, "not_triggered") == 0) return ALARM_PENDING_NOT_TRIGGERED;
+  return ALARM_PENDING_NONE;
+}
+
+static const char *alarmPendingName(uint8_t code) {
+  switch (code) {
+    case ALARM_PENDING_HIGH: return "high";
+    case ALARM_PENDING_LOW: return "low";
+    case ALARM_PENDING_TRIGGERED: return "triggered";
+    case ALARM_PENDING_NOT_TRIGGERED: return "not_triggered";
+    default: return "";
+  }
+}
+
+// C-T01: builds and publishes one alarm.qo note. Publish-only: never actuates, so a retry
+// never re-drives local outputs or remote relays. Note content is unchanged from v2.2.15.
+static void publishAlarmNote(uint8_t idx, const char *alarmType, float inches) {
+  if (idx >= gConfig.monitorCount) {
+    return;
   }
 
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  bool allowSmsEscalation = cfg.enableAlarmSms;
   MonitorRuntime &state = gMonitorState[idx];
   state.lastAlarmSendMillis = millis();
 
@@ -6842,7 +6920,11 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
   if (allowSmsEscalation) {
     doc["se"] = true;  // Only include when true (false is default)
   }
-  doc["t"] = currentEpoch();
+  // Acquisition time of the reading this note carries, as sendTelemetry() does, so the server
+  // files the level under the day it was measured (a relay_timeout or config-push note can go
+  // out hours after the last sample). Every latch edge and retry is sent on a fresh sample.
+  // Whole minutes, truncated, as in sendTelemetry().
+  doc["t"] = noteEpochMinute((state.lastReadingEpoch > 0.0) ? state.lastReadingEpoch : currentEpoch());
 
   publishNote(ALARM_FILE, doc, true);
   Serial.print(F("Alarm sent for monitor "));
@@ -6857,6 +6939,115 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
   const char *logUnit = (cfg.measurementUnit[0] != '\0') ? cfg.measurementUnit : "in";
   snprintf(logMsg, sizeof(logMsg), "Alarm: %s - %s - %.1f %s", cfg.name, alarmType, inches, logUnit);
   addSerialLog(logMsg);
+}
+
+// C-T01: rate-limit gate plus pending bookkeeping for one alarm note. Never actuates.
+// Previously a denied note was simply dropped, so a latch edge caught by the 300 s per-type
+// interval or the hourly caps (boot window, config-push re-latch, flapping) never reached the
+// server. Now the monitor's single pending slot keeps the newest denied latch edge and
+// retryPendingAlarm() re-sends it, under the same limits, from a later valid sample that is
+// still in alarm.
+static void notifyAlarmEdge(uint8_t idx, const char *alarmType, float inches, bool isRetry) {
+  if (idx >= gConfig.monitorCount) {
+    return;
+  }
+
+  MonitorRuntime &state = gMonitorState[idx];
+  const uint8_t code = alarmPendingCodeFor(alarmType);
+  char logMsg[96];
+  if (!checkAlarmRateLimit(idx, alarmType)) {
+    // Only latch edges are kept; clear, sensor-recovered and relay_timeout are never limited.
+    if (code != ALARM_PENDING_NONE && state.pendingAlarm != code) {
+      state.pendingAlarm = code;  // newest unsent edge wins; logged once, not on each denied retry
+      snprintf(logMsg, sizeof(logMsg), "Alarm deferred (rate limit): %s - %s", gConfig.monitors[idx].name, alarmType);
+      Serial.println(logMsg);
+      addSerialLog(logMsg);
+    }
+    return;
+  }
+
+  // A published latch edge or clear supersedes the pending edge; relay_timeout leaves it. A
+  // clear that supersedes an edge that was never sent is logged: the server never gets it.
+  const bool isClear = (strcmp(alarmType, "clear") == 0);
+  if (isClear && state.pendingAlarm != ALARM_PENDING_NONE) {
+    snprintf(logMsg, sizeof(logMsg), "Pending alarm dropped (cleared before it was sent): %s - %s",
+             gConfig.monitors[idx].name, alarmPendingName(state.pendingAlarm));
+    Serial.println(logMsg);
+    addSerialLog(logMsg);
+  }
+  if (code != ALARM_PENDING_NONE || isClear) {
+    state.pendingAlarm = ALARM_PENDING_NONE;
+  }
+  publishAlarmNote(idx, alarmType, inches);
+  if (isRetry) {
+    snprintf(logMsg, sizeof(logMsg), "Pending alarm sent: %s - %s", gConfig.monitors[idx].name, alarmType);
+    Serial.println(logMsg);
+    addSerialLog(logMsg);
+  }
+}
+
+// C-T01: re-sends the edge that was pending when this sample's evaluation began, unless this
+// sample replaced it (newer denied edge) or cleared it (clear / latch edge sent). Called only
+// from evaluateAlarms(), so retries follow the Phase-B rule on current-loop devices. The note
+// carries the current reading and send time, a consistent snapshot for the server.
+// highInAlarm / lowInAlarm: this valid sample still supports a high / low edge (digital: the
+// alarm state in highInAlarm). A latched edge is re-sent only while its side is in alarm;
+// otherwise it is held (alarmPendingRetryAction in TankAlarm_AlarmDebounce.h).
+static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry, bool highInAlarm, bool lowInAlarm) {
+  if (idx >= gConfig.monitorCount) {
+    return;
+  }
+
+  MonitorRuntime &state = gMonitorState[idx];
+  if (pendingAtEntry == ALARM_PENDING_NONE || state.pendingAlarm != pendingAtEntry) {
+    return;
+  }
+
+  const bool digital = (gConfig.monitors[idx].sensorInterface == SENSOR_DIGITAL);
+  bool stillLatched = false;
+  bool inAlarm = false;
+  uint8_t releaseCount = 0;  // consecutive release samples counted against that latch
+  switch (pendingAtEntry) {
+    case ALARM_PENDING_HIGH:
+      stillLatched = !digital && state.highAlarmLatched;
+      inAlarm = highInAlarm;
+      releaseCount = state.highClearDebounceCount;
+      break;
+    case ALARM_PENDING_LOW:
+      stillLatched = !digital && state.lowAlarmLatched;
+      inAlarm = lowInAlarm;
+      releaseCount = state.lowClearDebounceCount;
+      break;
+    case ALARM_PENDING_TRIGGERED:
+    case ALARM_PENDING_NOT_TRIGGERED:
+      stillLatched = digital && state.highAlarmLatched;
+      inAlarm = highInAlarm;
+      releaseCount = state.highClearDebounceCount;
+      break;
+    default: break;
+  }
+  const uint8_t action = alarmPendingRetryAction(stillLatched, inAlarm);
+  if (action == ALARM_RETRY_HOLD) {
+    // Logged on the first release sample of a run only (that latch's clear count is then 1)
+    if (releaseCount == 1) {
+      char logMsg[96];
+      snprintf(logMsg, sizeof(logMsg), "Pending alarm held (reading not in alarm): %s - %s",
+               gConfig.monitors[idx].name, alarmPendingName(pendingAtEntry));
+      Serial.println(logMsg);
+      addSerialLog(logMsg);
+    }
+    return;
+  }
+  if (action == ALARM_RETRY_DROP) {
+    char logMsg[96];
+    snprintf(logMsg, sizeof(logMsg), "Pending alarm dropped (latch released): %s - %s",
+             gConfig.monitors[idx].name, alarmPendingName(pendingAtEntry));
+    Serial.println(logMsg);
+    addSerialLog(logMsg);
+    state.pendingAlarm = ALARM_PENDING_NONE;
+    return;
+  }
+  notifyAlarmEdge(idx, alarmPendingName(pendingAtEntry), state.currentValue, true);
 }
 
 // ============================================================================
@@ -6993,8 +7184,8 @@ static void sendUnloadEvent(uint8_t idx, float peakInches, float currentValue, d
   // Note: "type" = "unload" omitted — routing is by file (unload.qi)
   doc["pk"] = roundTo(peakInches, 1);      // Peak height
   doc["em"] = roundTo(currentValue, 1);   // Empty/low height
-  doc["pt"] = peakEpoch;                    // Peak timestamp
-  doc["t"] = currentEpoch();               // Event timestamp
+  doc["pt"] = noteEpochMinute(peakEpoch);         // Peak timestamp
+  doc["t"] = noteEpochMinute(currentEpoch());     // Event timestamp
 
   // Include raw sensor readings only if available
   if (state.unloadPeakSensorMa >= 4.0f) {
@@ -7124,7 +7315,7 @@ static void sendSolarAlarm(SolarAlertType alertType) {
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["y"] = "solar";
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   
   // Alert type ("desc" omitted — derivable from alert enum on server)
   switch (alertType) {
@@ -7436,7 +7627,7 @@ static void sendBatteryAlarm(BatteryAlertType alertType, float voltage) {
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["y"] = "battery";
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   
   // Alert type ("desc" and "state" omitted — derivable from alert + voltage on server)
   switch (alertType) {
@@ -7575,7 +7766,7 @@ static void sendPowerStateChange(PowerState oldState, PowerState newState, float
   doc["c"] = gDeviceUID;
   doc["s"] = gConfig.siteName;
   doc["y"] = "power";
-  doc["t"] = currentEpoch();
+  doc["t"] = noteEpochMinute(currentEpoch());
   
   // State transition (compact: "from"/"to" encode direction, no need for "recovering" or "desc")
   doc["from"] = oldDesc;
@@ -7945,7 +8136,7 @@ static void checkSolarOnlySunsetProtocol(unsigned long now) {
           doc["c"] = gDeviceUID;
           doc["s"] = gConfig.siteName;
           doc["y"] = "solar_sunset";
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           doc["v"] = roundTo(gVinVoltage, 2);
           doc["bootCount"] = gSolarOnlyBootCount;
           doc["uptime"] = millis() / 1000UL;
@@ -8196,7 +8387,7 @@ static void updatePowerState() {
           doc["c"] = gDeviceUID;
           doc["s"] = gConfig.siteName;
           doc["y"] = "battery_failure";
-          doc["t"] = currentEpoch();
+          doc["t"] = noteEpochMinute(currentEpoch());
           doc["v"] = roundTo(voltage, 2);
           doc["failCount"] = gSolarOnlyBatFailCount;
           doc["se"] = true;  // Escalate via SMS
@@ -8243,7 +8434,7 @@ static void sendDailyReport() {
     return;
   }
 
-  double reportEpoch = currentEpoch();
+  const uint32_t reportEpoch = noteEpochMinute(currentEpoch());
   size_t monitorCursor = 0;
   uint8_t part = 0;
   bool queuedAny = false;
@@ -8381,7 +8572,7 @@ static void sendDailyReport() {
     doc["recs"] = gI2cBusRecoveryCount;
     doc["ok"] = gCurrentLoopReadsOk;
     doc["or"] = gCurrentLoopOverRange;
-    doc["t"] = currentEpoch();
+    doc["t"] = noteEpochMinute(currentEpoch());
     publishNote(ALARM_FILE, doc, true);
   }
 
@@ -8418,9 +8609,10 @@ static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t moni
   // Per-sensor acquisition epoch. Mirrors telemetry.qo's top-level `t` so the
   // server can distinguish report transmission time from the time the reading
   // was actually acquired — critical when `ru`/`sf` indicate the daily is
-  // republishing a stale cached value (orphaned-epoch fix).
+  // republishing a stale cached value (orphaned-epoch fix). Whole minutes,
+  // truncated, as in sendTelemetry().
   if (state.lastReadingEpoch > 0.0) {
-    t["t"] = (uint32_t)state.lastReadingEpoch;
+    t["t"] = noteEpochMinute(state.lastReadingEpoch);
   }
 
   if (measureJson(doc) > payloadLimit) {
