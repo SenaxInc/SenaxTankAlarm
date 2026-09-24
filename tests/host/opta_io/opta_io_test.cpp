@@ -98,15 +98,19 @@ static bool samePlan(const OptaIoPlan &a, const OptaIoPlan &b) {
     if (a.monitorTerminal[i] != b.monitorTerminal[i] || a.monitorErr[i] != b.monitorErr[i]) return false;
   }
   for (uint8_t t = 0; t < OPTA_INPUT_COUNT; ++t) {
-    if (a.role[t] != b.role[t] || a.cls[t] != b.cls[t] || a.usedClass[t] != b.usedClass[t]) return false;
+    if (a.role[t] != b.role[t] || a.cls[t] != b.cls[t] || a.pull[t] != b.pull[t] ||
+        a.usedClass[t] != b.usedClass[t]) {
+      return false;
+    }
   }
   return a.buttonTerminal == b.buttonTerminal && a.buttonErr == b.buttonErr && a.warnings == b.warnings;
 }
 
-// True when no terminal has a role, a class or a first use.
+// True when no terminal has a role, a class, a pull or a first use.
 static bool planIsEmpty(const OptaIoPlan &p) {
   for (uint8_t t = 0; t < OPTA_INPUT_COUNT; ++t) {
-    if (p.role[t] != OPTA_ROLE_NONE || p.cls[t] != OPTA_CLASS_NONE || p.usedClass[t] != OPTA_CLASS_NONE) {
+    if (p.role[t] != OPTA_ROLE_NONE || p.cls[t] != OPTA_CLASS_NONE || p.pull[t] != OPTA_PULL_NONE ||
+        p.usedClass[t] != OPTA_CLASS_NONE) {
       return false;
     }
   }
@@ -115,9 +119,8 @@ static bool planIsEmpty(const OptaIoPlan &p) {
 
 // Every pin-op call in the targeted tests goes through here: no op may target a pin outside
 // 15-22 or a terminal that `next` reads as ADC, and no terminal gets two ops.
-static uint8_t pinOps(const OptaIoPlan &prev, const OptaIoPlan &next, const OptaIoOptions &opt,
-                      OptaPinOp *ops) {
-  const uint8_t n = optaPlanPinOps(prev, next, opt, ops, OPTA_INPUT_COUNT);
+static uint8_t pinOps(const OptaIoPlan &prev, const OptaIoPlan &next, OptaPinOp *ops) {
+  const uint8_t n = optaPlanPinOps(prev, next, ops, OPTA_INPUT_COUNT);
   CHECK(n <= OPTA_INPUT_COUNT);
   bool seen[OPTA_INPUT_COUNT] = {false, false, false, false, false, false, false, false};
   for (uint8_t k = 0; k < n && k < OPTA_INPUT_COUNT; ++k) {
@@ -338,15 +341,16 @@ static bool fieldPlanOk(const OptaIoRequest &r, const OptaIoOptions &opt, const 
   for (int t = 0; t < 8; ++t) {
     if (channelCount[t] >= 2) expectWarn |= OPTA_IOW_ANALOG_SHARED;
     if (channelCount[t] >= 1 && r.vinEnabled && r.vinTerminal == t) expectWarn |= OPTA_IOW_ANALOG_VIN_SHARED;
-    ok = ok && out.cls[t] != OPTA_CLASS_GPIO && out.role[t] != OPTA_ROLE_CONTACT &&
-         out.role[t] != OPTA_ROLE_PULSE && out.role[t] != OPTA_ROLE_BUTTON;
+    ok = ok && out.cls[t] != OPTA_CLASS_GPIO && out.pull[t] == OPTA_PULL_NONE &&
+         out.role[t] != OPTA_ROLE_CONTACT && out.role[t] != OPTA_ROLE_PULSE &&
+         out.role[t] != OPTA_ROLE_BUTTON;
   }
   ok = ok && out.warnings == expectWarn;
   OptaPinOp ops[OPTA_INPUT_COUNT];
   const OptaIoPlan boot = bootPlan();
-  ok = ok && optaPlanPinOps(boot, out, opt, ops, OPTA_INPUT_COUNT) == 0;
-  ok = ok && optaPlanPinOps(out, out, opt, ops, OPTA_INPUT_COUNT) == 0;
-  ok = ok && optaPlanPinOps(prev, out, opt, ops, OPTA_INPUT_COUNT) == 0;
+  ok = ok && optaPlanPinOps(boot, out, ops, OPTA_INPUT_COUNT) == 0;
+  ok = ok && optaPlanPinOps(out, out, ops, OPTA_INPUT_COUNT) == 0;
+  ok = ok && optaPlanPinOps(prev, out, ops, OPTA_INPUT_COUNT) == 0;
   return ok;
 }
 
@@ -631,38 +635,38 @@ static void testTransitions() {
   const OptaIoPlan p1 = build(contact, kAdc, boot);
   CHECK(p1.monitorErr[0] == OPTA_IOE_OK && p1.role[2] == OPTA_ROLE_CONTACT);
   CHECK(p1.cls[2] == OPTA_CLASS_ADC && p1.usedClass[2] == OPTA_CLASS_ADC);
-  CHECK(pinOps(boot, p1, kAdc, ops) == 0);
+  CHECK(pinOps(boot, p1, ops) == 0);
   const OptaIoPlan p2 = build(pulse, kAdc, p1);
   CHECK(p2.monitorErr[0] == OPTA_IOE_RESTART && p2.monitorTerminal[0] == -1);
   CHECK(p2.role[2] == OPTA_ROLE_NONE && p2.cls[2] == OPTA_CLASS_NONE && p2.usedClass[2] == OPTA_CLASS_ADC);
-  CHECK(pinOps(p1, p2, kAdc, ops) == 0);
+  CHECK(pinOps(p1, p2, ops) == 0);
 
   // Pulse, then a contact (ADC) on the same terminal: RESTART and the pull-up is released.
   const OptaIoPlan q1 = build(pulse, kAdc, boot);
   CHECK(q1.monitorErr[0] == OPTA_IOE_OK && q1.monitorTerminal[0] == 2 && q1.role[2] == OPTA_ROLE_PULSE);
-  CHECK(q1.cls[2] == OPTA_CLASS_GPIO && q1.usedClass[2] == OPTA_CLASS_GPIO);
-  CHECK(pinOps(boot, q1, kAdc, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_UP));
+  CHECK(q1.cls[2] == OPTA_CLASS_GPIO && q1.pull[2] == OPTA_PULL_UP && q1.usedClass[2] == OPTA_CLASS_GPIO);
+  CHECK(pinOps(boot, q1, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_UP));
   const OptaIoPlan q2 = build(contact, kAdc, q1);
   CHECK(q2.monitorErr[0] == OPTA_IOE_RESTART && q2.monitorTerminal[0] == -1);
-  CHECK(q2.role[2] == OPTA_ROLE_NONE && q2.cls[2] == OPTA_CLASS_NONE);
-  CHECK(pinOps(q1, q2, kAdc, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  CHECK(q2.role[2] == OPTA_ROLE_NONE && q2.cls[2] == OPTA_CLASS_NONE && q2.pull[2] == OPTA_PULL_NONE);
+  CHECK(pinOps(q1, q2, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
 
   // Pulse removed: released, and the terminal stays GPIO-used.
   const OptaIoPlan q3 = build(emptyRequest(), kAdc, q1);
   CHECK(q3.role[2] == OPTA_ROLE_NONE && q3.cls[2] == OPTA_CLASS_NONE && q3.usedClass[2] == OPTA_CLASS_GPIO);
-  CHECK(pinOps(q1, q3, kAdc, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  CHECK(pinOps(q1, q3, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
 
   // Pulse moved I3 -> I4: release I3, pull-up on I4.
   OptaIoRequest pulse4 = emptyRequest();
   addMonitor(pulse4, OPTA_IFACE_PULSE, -1, 3);
   const OptaIoPlan q4 = build(pulse4, kAdc, q1);
   CHECK(q4.monitorErr[0] == OPTA_IOE_OK && q4.monitorTerminal[0] == 3 && q4.cls[3] == OPTA_CLASS_GPIO);
-  CHECK(pinOps(q1, q4, kAdc, ops) == 2 && isOp(ops[0], 17, OPTA_PULL_NONE) && isOp(ops[1], 18, OPTA_PULL_UP));
+  CHECK(pinOps(q1, q4, ops) == 2 && isOp(ops[0], 17, OPTA_PULL_NONE) && isOp(ops[1], 18, OPTA_PULL_UP));
 
   // The same config applied twice: the same plan and no op.
   const OptaIoPlan q1again = build(pulse, kAdc, q1);
   CHECK(samePlan(q1, q1again));
-  CHECK(pinOps(q1, q1again, kAdc, ops) == 0);
+  CHECK(pinOps(q1, q1again, ops) == 0);
 
   // RESTART persists over an unrelated config and clears only with optaIoPlanInit (a reboot).
   OptaIoRequest other = emptyRequest();
@@ -671,37 +675,58 @@ static void testTransitions() {
   CHECK(p3.monitorErr[0] == OPTA_IOE_OK && p3.usedClass[2] == OPTA_CLASS_ADC);
   const OptaIoPlan p4 = build(pulse, kAdc, p3);
   CHECK(p4.monitorErr[0] == OPTA_IOE_RESTART && p4.cls[2] == OPTA_CLASS_NONE);
-  CHECK(pinOps(p3, p4, kAdc, ops) == 0);
+  CHECK(pinOps(p3, p4, ops) == 0);
   const OptaIoPlan p5 = build(pulse, kAdc, boot);
   CHECK(p5.monitorErr[0] == OPTA_IOE_OK && p5.cls[2] == OPTA_CLASS_GPIO);
 
   // Contacts read by digitalRead: contact -> pulse keeps the class and changes only the pull.
   const OptaIoPlan g1 = build(contact, kGpio, boot);
   CHECK(g1.monitorErr[0] == OPTA_IOE_OK && g1.role[2] == OPTA_ROLE_CONTACT && g1.cls[2] == OPTA_CLASS_GPIO);
-  CHECK(pinOps(boot, g1, kGpio, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  CHECK(g1.pull[2] == OPTA_PULL_NONE);
+  CHECK(pinOps(boot, g1, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
   const OptaIoPlan g2 = build(pulse, kGpio, g1);
   CHECK(g2.monitorErr[0] == OPTA_IOE_OK && g2.role[2] == OPTA_ROLE_PULSE && g2.cls[2] == OPTA_CLASS_GPIO);
-  CHECK(pinOps(g1, g2, kGpio, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_UP));
+  CHECK(pinOps(g1, g2, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_UP));
   const OptaIoPlan g3 = build(contact, kGpio, g2);
   CHECK(g3.monitorErr[0] == OPTA_IOE_OK && g3.role[2] == OPTA_ROLE_CONTACT);
-  CHECK(pinOps(g2, g3, kGpio, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  CHECK(pinOps(g2, g3, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
   const OptaIoOptions gpioUp = { false, OPTA_PULL_UP, OPTA_PULL_UP };
   const OptaIoPlan u1 = build(contact, gpioUp, boot);
   const OptaIoPlan u2 = build(pulse, gpioUp, u1);
-  CHECK(u2.monitorErr[0] == OPTA_IOE_OK && pinOps(u1, u2, gpioUp, ops) == 0);  // same pull
+  CHECK(u2.monitorErr[0] == OPTA_IOE_OK && pinOps(u1, u2, ops) == 0);  // same pull
+
+  // Only a pull option changes (CL-3 pulseInputPull / contact pull): exactly one op, both ways.
+  const OptaIoOptions adcNoPull = { true, OPTA_PULL_NONE, OPTA_PULL_NONE };
+  const OptaIoPlan n1 = build(pulse, adcNoPull, q1);
+  CHECK(n1.monitorErr[0] == OPTA_IOE_OK && n1.role[2] == OPTA_ROLE_PULSE && n1.cls[2] == OPTA_CLASS_GPIO);
+  CHECK(n1.pull[2] == OPTA_PULL_NONE);
+  CHECK(pinOps(q1, n1, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  const OptaIoPlan n2 = build(pulse, kAdc, n1);
+  CHECK(n2.pull[2] == OPTA_PULL_UP && pinOps(n1, n2, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_UP));
+  const OptaIoPlan c1 = build(contact, gpioUp, g1);  // contactPull NONE -> UP
+  CHECK(c1.monitorErr[0] == OPTA_IOE_OK && c1.role[2] == OPTA_ROLE_CONTACT && c1.pull[2] == OPTA_PULL_UP);
+  CHECK(pinOps(g1, c1, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_UP));
+  const OptaIoPlan c2 = build(contact, kGpio, c1);
+  CHECK(pinOps(c1, c2, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  const OptaIoOptions gpioPulseNone = { false, OPTA_PULL_NONE, OPTA_PULL_NONE };
+  const OptaIoPlan c3 = build(contact, gpioPulseNone, g1);  // the other role's pull: no op
+  CHECK(samePlan(c3, g1) && pinOps(g1, c3, ops) == 0);
+  const OptaIoOptions adcContactUp = { true, OPTA_PULL_UP, OPTA_PULL_UP };
+  const OptaIoPlan a0 = build(contact, adcContactUp, p1);  // contacts read by ADC have no pull
+  CHECK(samePlan(a0, p1) && a0.pull[2] == OPTA_PULL_NONE && pinOps(p1, a0, ops) == 0);
 
   // An analog monitor or Vin on a terminal used as GPIO this boot.
   OptaIoRequest analog = emptyRequest();
   addMonitor(analog, OPTA_IFACE_ANALOG, 2);
   const OptaIoPlan a1 = build(analog, kAdc, q1);
   CHECK(a1.monitorErr[0] == OPTA_IOE_RESTART && a1.monitorTerminal[0] == -1 && a1.role[2] == OPTA_ROLE_NONE);
-  CHECK(pinOps(q1, a1, kAdc, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  CHECK(pinOps(q1, a1, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
   OptaIoRequest vin = emptyRequest();
   vin.vinEnabled = true;
   vin.vinTerminal = 2;
   const OptaIoPlan v1 = build(vin, kAdc, q1);
   CHECK(v1.warnings == OPTA_IOW_VIN_RESTART && v1.role[2] == OPTA_ROLE_NONE && v1.cls[2] == OPTA_CLASS_NONE);
-  CHECK(pinOps(q1, v1, kAdc, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
+  CHECK(pinOps(q1, v1, ops) == 1 && isOp(ops[0], 17, OPTA_PULL_NONE));
   OptaIoRequest vinContact = vin;  // Vin wins a conflict on a GPIO-used terminal: still a restart
   addMonitor(vinContact, OPTA_IFACE_DIGITAL, 2);
   const OptaIoPlan v2 = build(vinContact, kAdc, q1);
@@ -710,18 +735,18 @@ static void testTransitions() {
 
   // Plans not built from each other: GPIO -> ADC still gets no op on the ADC terminal.
   const OptaIoPlan fresh = build(contact, kAdc, boot);
-  CHECK(pinOps(q1, fresh, kAdc, ops) == 0);
+  CHECK(pinOps(q1, fresh, ops) == 0);
 
   // Eight pulses need eight ops; maxOps stops early.
   OptaIoRequest eight = emptyRequest();
   for (int16_t t = 0; t < 8; ++t) addMonitor(eight, OPTA_IFACE_PULSE, -1, t);
   const OptaIoPlan e1 = build(eight, kAdc, boot);
-  CHECK(pinOps(boot, e1, kAdc, ops) == 8);
+  CHECK(pinOps(boot, e1, ops) == 8);
   const int16_t pins[8] = {15, 16, 17, 18, 19, 20, 21, 22};
   for (uint8_t k = 0; k < 8; ++k) CHECK(isOp(ops[k], pins[k], OPTA_PULL_UP));
-  CHECK(optaPlanPinOps(boot, e1, kAdc, ops, 3) == 3 && isOp(ops[2], 17, OPTA_PULL_UP));
-  CHECK(optaPlanPinOps(boot, e1, kAdc, ops, 0) == 0);
-  CHECK(pinOps(e1, boot, kAdc, ops) == 8 && isOp(ops[7], 22, OPTA_PULL_NONE));
+  CHECK(optaPlanPinOps(boot, e1, ops, 3) == 3 && isOp(ops[2], 17, OPTA_PULL_UP));
+  CHECK(optaPlanPinOps(boot, e1, ops, 0) == 0);
+  CHECK(pinOps(e1, boot, ops) == 8 && isOp(ops[7], 22, OPTA_PULL_NONE));
 
   // out may be the same object as prev.
   OptaIoPlan same = q1;

@@ -96,7 +96,7 @@ static_assert(OPTA_INPUT_COUNT == NUM_ANALOG_INPUTS,
 //    so it keeps the terminal with warning VIN_CONFLICT. Analog and Vin claims may share, with
 //    warnings ANALOG_SHARED / ANALOG_VIN_SHARED.
 // 4. Class. ANALOG and VIN are ADC; CONTACT and BUTTON are ADC when contactsUseAdc, else GPIO;
-//    PULSE is GPIO.
+//    PULSE is GPIO. A GPIO terminal also records its pull (pulsePull or contactPull).
 // 5. RESTART. The core caches an AnalogIn per pin on the first analogRead and pinMode builds a
 //    new DigitalInOut; neither hands the pin back to the other, so a terminal is only used in
 //    the class it first had since boot. A winner of the other class gets RESTART (Vin: warning
@@ -147,6 +147,7 @@ struct OptaIoPlan {
   uint8_t buttonErr;                              // OptaIoErr
   uint8_t role[OPTA_INPUT_COUNT];                 // winning OptaIoRole per terminal (NONE if unused or contested)
   uint8_t cls[OPTA_INPUT_COUNT];                  // OptaIoClass this plan configures per terminal
+  uint8_t pull[OPTA_INPUT_COUNT];                 // OptaPull set on a GPIO terminal, else NONE
   uint8_t usedClass[OPTA_INPUT_COUNT];            // first class used since boot (sticky)
   uint8_t warnings;                               // OPTA_IOW_* bits
 };
@@ -162,6 +163,7 @@ static inline void optaIoPlanInit(OptaIoPlan &p) {
   for (uint8_t t = 0; t < OPTA_INPUT_COUNT; ++t) {
     p.role[t] = OPTA_ROLE_NONE;
     p.cls[t] = OPTA_CLASS_NONE;
+    p.pull[t] = OPTA_PULL_NONE;
     p.usedClass[t] = OPTA_CLASS_NONE;
   }
   p.warnings = 0;
@@ -297,6 +299,7 @@ static inline void optaBuildIoPlan(const OptaIoRequest &req, const OptaIoOptions
     }
     out.role[t] = winner;
     out.cls[t] = cls;
+    out.pull[t] = (cls == OPTA_CLASS_GPIO) ? optaIoRolePull(winner, opt) : (uint8_t)OPTA_PULL_NONE;
     if (out.usedClass[t] == OPTA_CLASS_NONE) out.usedClass[t] = cls;
   }
 
@@ -316,15 +319,17 @@ struct OptaPinOp {
 // becomes GPIO or changes pull, release (INPUT, no pull) one that stops being GPIO. At most one
 // per terminal, so ops[8] is always enough; returns the number written (stops at maxOps). Never
 // an op for a terminal that `next` reads as ADC: pinMode would replace the pin's setup.
+// CL-1: the pulls come from the plans, not the options, so a config push that changes only
+// pulsePull or contactPull still reconfigures the pin.
 static inline uint8_t optaPlanPinOps(const OptaIoPlan &prev, const OptaIoPlan &next,
-                                     const OptaIoOptions &opt, OptaPinOp *ops, uint8_t maxOps) {
+                                     OptaPinOp *ops, uint8_t maxOps) {
   uint8_t n = 0;
   for (uint8_t t = 0; t < OPTA_INPUT_COUNT && n < maxOps; ++t) {
     if (next.cls[t] == OPTA_CLASS_ADC) continue;
     const bool wasGpio = prev.cls[t] == OPTA_CLASS_GPIO;
     if (next.cls[t] == OPTA_CLASS_GPIO) {
-      const uint8_t want = optaIoRolePull(next.role[t], opt);
-      if (wasGpio && optaIoRolePull(prev.role[t], opt) == want) continue;
+      const uint8_t want = next.pull[t];
+      if (wasGpio && prev.pull[t] == want) continue;
       ops[n].pin = optaInputPin(t);
       ops[n].pull = want;
       ++n;
