@@ -1,9 +1,12 @@
-// Host tests for TankAlarm-112025-Server-BluesOpta/TankAlarm_SensorName.h: how the server keeps a
-// sensor's Display Number ("un") in step with telemetry and daily-report notes, and the sketch
-// text that uses it (the daily email's "#N" and the dashboard's Latest line).
+// Host tests for TankAlarm-112025-Server-BluesOpta/TankAlarm_SensorName.h: how the server names a
+// sensor in SMS and email text (site + label, "#N" only for a Display Number, never the internal
+// sensorIndex), how it keeps a sensor's Display Number ("un") in step with the client, and the
+// sketch text that uses both (alarm, reminder, snooze and unload texts, the daily email's "#N"
+// and the dashboard's Latest line).
 //
 //   make -C tests/host/sensor_name test
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +29,56 @@ static unsigned long gFailures = 0;
     }                                                                  \
   } while (0)
 
+#define CHECK_STR(actual, expected)                                                    \
+  do {                                                                                 \
+    ++gChecks;                                                                         \
+    if (strcmp((actual), (expected)) != 0) {                                           \
+      ++gFailures;                                                                     \
+      printf("FAIL %s:%d: got \"%s\", want \"%s\"\n", __FILE__, __LINE__, (actual),   \
+             (expected));                                                              \
+    }                                                                                  \
+  } while (0)
+
+// The sketch builds each tail with snprintf into char tail[160]. This wrapper does the same
+// without the compiler's truncation analysis (the max-length cases truncate on purpose).
+#ifdef __GNUC__
+__attribute__((format(printf, 3, 4)))
+#endif
+static int tailf(char *out, size_t outLen, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(out, outLen, fmt, ap);
+  va_end(ap);
+  return w;
+}
+
+// True when s is well-formed UTF-8 (lead bytes followed by the right number of continuation
+// bytes; no stray continuation bytes; no truncated sequence at the end).
+static bool validUtf8(const char *s) {
+  const unsigned char *p = (const unsigned char *)s;
+  while (*p != 0) {
+    unsigned need;
+    if (*p < 0x80) {
+      need = 0;
+    } else if ((*p & 0xE0) == 0xC0) {
+      need = 1;
+    } else if ((*p & 0xF0) == 0xE0) {
+      need = 2;
+    } else if ((*p & 0xF8) == 0xF0) {
+      need = 3;
+    } else {
+      return false;
+    }
+    ++p;
+    for (unsigned i = 0; i < need; ++i, ++p) {
+      if ((*p & 0xC0) != 0x80) {
+        return false;  // also catches the terminating NUL mid-sequence
+      }
+    }
+  }
+  return true;
+}
+
 static void testNoteDisplayNumber() {
   CHECK(noteDisplayNumber(true, 5, true, 0) == 5);      // set
   CHECK(noteDisplayNumber(true, 0, true, 5) == 0);      // explicit 0 clears
@@ -42,9 +95,300 @@ static void testNoteDisplayNumber() {
   CHECK(noteDisplayNumber(true, INT32_MAX, true, 9) == 9);
 }
 
+static void testUtf8FitLen() {
+  CHECK(utf8FitLen(nullptr, 10) == 0);
+  CHECK(utf8FitLen("", 10) == 0);
+  CHECK(utf8FitLen("abc", 10) == 3);
+  CHECK(utf8FitLen("abc", 3) == 3);
+  CHECK(utf8FitLen("abc", 2) == 2);
+  CHECK(utf8FitLen("abc", 0) == 0);
+  // "a" + e-acute (C3 A9) + "b": a cut after 2 bytes would split the e-acute.
+  static const char kAcute[] = "a\xC3\xA9" "b";
+  CHECK(utf8FitLen(kAcute, 1) == 1);
+  CHECK(utf8FitLen(kAcute, 2) == 1);
+  CHECK(utf8FitLen(kAcute, 3) == 3);
+  CHECK(utf8FitLen(kAcute, 4) == 4);
+  // Euro sign (E2 82 AC), 3 bytes, and a 4-byte emoji (F0 9F 9B A2).
+  static const char kEuro[] = "\xE2\x82\xAC\xE2\x82\xAC";
+  CHECK(utf8FitLen(kEuro, 2) == 0);
+  CHECK(utf8FitLen(kEuro, 3) == 3);
+  CHECK(utf8FitLen(kEuro, 5) == 3);
+  CHECK(utf8FitLen(kEuro, 6) == 6);
+  static const char kEmoji[] = "x\xF0\x9F\x9B\xA2y";
+  CHECK(utf8FitLen(kEmoji, 1) == 1);
+  CHECK(utf8FitLen(kEmoji, 4) == 1);
+  CHECK(utf8FitLen(kEmoji, 5) == 5);
+  CHECK(utf8FitLen(kEmoji, 100) == 6);
+}
+
+static void checkName(const char *site, const char *label, uint8_t un, size_t outLen,
+                      const char *expected, int line) {
+  char out[80];
+  memset(out, 'Z', sizeof(out));
+  const size_t n = formatSensorName(out, outLen, site, label, un);
+  ++gChecks;
+  if (strcmp(out, expected) != 0 || n != strlen(expected)) {
+    ++gFailures;
+    printf("FAIL line %d: formatSensorName(\"%s\", \"%s\", %u, %u) = \"%s\" (%u), want \"%s\"\n", line,
+           site ? site : "(null)", label ? label : "(null)", (unsigned)un, (unsigned)outLen, out,
+           (unsigned)n, expected);
+  }
+  CHECK(n < outLen);
+  CHECK(out[outLen - 1] == '\0' || strlen(out) < outLen);
+  if (outLen < sizeof(out)) {
+    CHECK(out[outLen] == 'Z');  // nothing written past outLen
+  }
+  CHECK(validUtf8(out));
+}
+#define NAME(site, label, un, outLen, expected) checkName(site, label, un, outLen, expected, __LINE__)
+
+static void testFormatSensorName() {
+  // The owner's examples.
+  NAME("Silas Cox", "Wellhead", 0, 64, "Silas Cox Wellhead");
+  NAME("Silas Cox", "Wellhead", 7, 64, "Silas Cox Wellhead #7");
+  NAME("Silas Cox", "Wellhead", 255, 64, "Silas Cox Wellhead #255");
+  NAME("Silas", "", 0, 64, "Silas");
+  NAME("", "Cox Wellhead", 0, 64, "Cox Wellhead");
+  NAME("", "Cox Wellhead", 4, 64, "Cox Wellhead #4");
+  NAME("", "", 0, 64, "Sensor");
+  NAME("", "", 3, 64, "Sensor #3");
+  NAME(nullptr, nullptr, 0, 64, "Sensor");
+  NAME(nullptr, "Wellhead", 0, 64, "Wellhead");
+  NAME("Silas", nullptr, 2, 64, "Silas #2");
+  // Trailing spaces trimmed; an all-space part is empty.
+  NAME("Silas Cox  ", "Wellhead ", 0, 64, "Silas Cox Wellhead");
+  NAME("   ", "Wellhead", 0, 64, "Wellhead");
+  NAME("   ", "   ", 1, 64, "Sensor #1");
+  // Each part capped at 23 bytes: a 31-byte site is cut to 23.
+  NAME("ABCDEFGHIJKLMNOPQRSTUVWXYZ01234", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTUVW");
+  NAME("ABCDEFGHIJKLMNOPQRSTUVWXYZ01234", "Pump", 9, 64, "ABCDEFGHIJKLMNOPQRSTUVW Pump #9");
+  // The cap lands after a trailing space: trimmed.
+  NAME("ABCDEFGHIJKLMNOPQRSTUV WXYZ", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTUV");
+  // A 2-byte character straddling the 23-byte cap is left out whole: 22 ASCII + e-acute.
+  NAME("ABCDEFGHIJKLMNOPQRSTUV\xC3\xA9", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTUV");
+  NAME("", "ABCDEFGHIJKLMNOPQRSTUV\xC3\xA9X", 0, 64, "ABCDEFGHIJKLMNOPQRSTUV");
+  NAME("ABCDEFGHIJKLMNOPQRSTU\xC3\xA9", "", 0, 64, "ABCDEFGHIJKLMNOPQRSTU\xC3\xA9");  // exactly 23
+  // Shortening to fit outLen: the label first, then the site; the number stays whole.
+  NAME("Silas Cox", "Wellhead", 7, 22, "Silas Cox Wellhead #7");  // exactly fits (21 bytes)
+  NAME("Silas Cox", "Wellhead", 7, 21, "Silas Cox Wellhea #7");
+  NAME("Silas Cox", "Wellhead", 7, 13, "Silas Cox #7");            // no room for " W": label dropped
+  NAME("Silas Cox", "Wellhead", 7, 15, "Silas Cox W #7");
+  NAME("Silas", "Cox Wellhead", 7, 8, "Sila #7");
+  NAME("Silas", "Cox Wellhead", 7, 4, "#7");
+  NAME("Silas", "Cox Wellhead", 7, 3, "");
+  NAME("Silas", "Cox Wellhead", 7, 1, "");
+  NAME("Silas", "Cox Wellhead", 0, 4, "Sil");
+  NAME("Silas", "Cox Wellhead", 0, 11, "Silas Cox");     // "Silas Cox " trimmed
+  NAME("Silas", "Cox Wellhead", 255, 6, "#255");
+  NAME("Silas", "Cox Wellhead", 255, 5, "");
+  NAME("", "", 3, 5, "S #3");                            // "Sensor" fallback shortened like a site
+  NAME("", "", 3, 6, "Se #3");
+  NAME("", "", 3, 7, "Sen #3");
+  NAME("Silas Cox", "", 0, 7, "Silas");                  // "Silas " trimmed
+  // A cut inside a 2-byte character drops the whole character.
+  NAME("Caf\xC3\xA9", "Tank", 0, 5, "Caf");
+  NAME("Caf\xC3\xA9", "Tank", 0, 6, "Caf\xC3\xA9");
+  NAME("Site", "\xC3\xA9\xC3\xA9", 0, 8, "Site \xC3\xA9");
+  NAME("Site", "\xC3\xA9\xC3\xA9", 0, 7, "Site");         // "Site " + half a character -> "Site"
+
+  // outLen 0 writes nothing; null out is safe.
+  char guard[4] = {'Q', 'Q', 'Q', 'Q'};
+  CHECK(formatSensorName(guard, 0, "Silas", "Cox", 7) == 0);
+  CHECK(guard[0] == 'Q');
+  CHECK(formatSensorName(nullptr, 10, "Silas", "Cox", 7) == 0);
+
+  // Every size from 1 to 64 for a few inputs: bounded, NUL-terminated, valid UTF-8, and a
+  // number is either whole or absent.
+  static const char *const kSites[] = {"Silas Cox", "", "Caf\xC3\xA9 \xE2\x82\xAC Station Longname X", "   "};
+  static const char *const kLabels[] = {"Wellhead", "", "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9 Tank"};
+  static const uint8_t kNums[] = {0, 7, 255};
+  for (size_t si = 0; si < sizeof(kSites) / sizeof(kSites[0]); ++si) {
+    for (size_t li = 0; li < sizeof(kLabels) / sizeof(kLabels[0]); ++li) {
+      for (size_t ni = 0; ni < sizeof(kNums) / sizeof(kNums[0]); ++ni) {
+        for (size_t outLen = 1; outLen <= 64; ++outLen) {
+          char out[65];
+          memset(out, 'Z', sizeof(out));
+          const size_t n = formatSensorName(out, outLen, kSites[si], kLabels[li], kNums[ni]);
+          CHECK(n < outLen && out[n] == '\0' && strlen(out) == n);
+          CHECK(out[outLen] == 'Z');
+          CHECK(validUtf8(out));
+          CHECK(n == 0 || out[n - 1] != ' ');
+          if (kNums[ni] == 0) {
+            CHECK(strchr(out, '#') == nullptr);
+          } else if (n > 0) {
+            char want[8];
+            snprintf(want, sizeof(want), "#%u", (unsigned)kNums[ni]);
+            const size_t wl = strlen(want);
+            CHECK(n >= wl && strcmp(out + n - wl, want) == 0);
+          }
+        }
+      }
+    }
+  }
+}
+
+static void testComposeSensorText() {
+  char msg[160];
+  char tail[160];
+
+  // The owner's analog alarm example, with and without a Display Number.
+  tailf(tail, sizeof(tail), " %s alarm %.1f %s", "high", 34.4f, "in");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead", 0, tail));
+  CHECK_STR(msg, "Silas Cox Wellhead high alarm 34.4 in");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead", 7, tail));
+  CHECK_STR(msg, "Silas Cox Wellhead #7 high alarm 34.4 in");
+  // A site-only record (the field fleet before labels): no "sensor 1".
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "", 0, tail));
+  CHECK_STR(msg, "Silas Cox high alarm 34.4 in");
+
+  // Each call site's text (tails built with the sketch's format strings, pinned below).
+  tailf(tail, sizeof(tail), " Relay safety timeout - relay forced OFF");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Pump Relay", 2, tail));
+  CHECK_STR(msg, "Silas Cox Pump Relay #2 Relay safety timeout - relay forced OFF");
+  tailf(tail, sizeof(tail), " Float Switch %s", "ACTIVATED");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "High Float", 0, tail));
+  CHECK_STR(msg, "Silas Cox High Float Float Switch ACTIVATED");
+  tailf(tail, sizeof(tail), " Float Switch clear (%s)", "OFF");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "High Float", 3, tail));
+  CHECK_STR(msg, "Silas Cox High Float #3 Float Switch clear (OFF)");
+  tailf(tail, sizeof(tail), " still in %s alarm (%.1f %s)", "high", 34.4f, "in");
+  CHECK(composeSensorText(msg, sizeof(msg), "REMINDER: ", "Silas Cox", "Wellhead", 0, tail));
+  CHECK_STR(msg, "REMINDER: Silas Cox Wellhead still in high alarm (34.4 in)");
+  tailf(tail, sizeof(tail), " still in %s alarm (%s)", "triggered", "ON");
+  CHECK(composeSensorText(msg, sizeof(msg), "REMINDER: ", "Silas Cox", "High Float", 3, tail));
+  CHECK_STR(msg, "REMINDER: Silas Cox High Float #3 still in triggered alarm (ON)");
+  tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%.1f %s).%s", "paused", "Jim",
+        "high", 34.4f, "in", " Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  CHECK(composeSensorText(msg, sizeof(msg), "SNOOZED: ", "Silas Cox", "Wellhead", 0, tail));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellhead reminders paused by Jim. Still in high alarm (34.4 in). "
+                 "Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s", "active again", "dashboard",
+        "triggered", "ON", "");
+  CHECK(composeSensorText(msg, sizeof(msg), "RESUMED: ", "Silas Cox", "High Float", 3, tail));
+  CHECK_STR(msg, "RESUMED: Silas Cox High Float #3 reminders active again by dashboard. Still in triggered alarm (ON).");
+  tailf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)", 85.5f, "in", 90.0f, 4.5f);
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead", 0, tail));
+  CHECK_STR(msg, "Silas Cox Wellhead unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead", 7, tail));
+  CHECK_STR(msg, "Silas Cox Wellhead #7 unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+
+  // Max-length cases: 23-byte site, 23-byte label (both longer in the record), Display Number
+  // 255, the longest alarm type/unit/who and a wide reading. strlen <= 159 and the reading is
+  // kept.
+  static const char kSite[] = "SSSSSSSSSSSSSSSSSSSSSSSxxxxxxxx";   // 31 bytes, capped at 23
+  static const char kLabel[] = "LLLLLLLLLLLLLLLLLLLLLLL";          // 23 bytes (char label[24])
+  static const char kType[] = "TTTTTTTTTTTTTTTTTTTTTTT";           // char alarmType[24]
+  static const char kUnit[] = "gallons";                           // char measurementUnit[8]
+  static const char kWho[] = "WWWWWWWWWWWWWWWWWWWWWWW";            // char who[24]
+  const float kValue = -99999.9f;
+  struct Case {
+    const char *prefix;
+    const char *reading;  // must survive in the text
+  };
+  char reading[48];
+  tailf(reading, sizeof(reading), "%.1f %s", kValue, kUnit);
+  for (int which = 0; which < 9; ++which) {
+    Case c = {"", reading};
+    switch (which) {
+      case 0: tailf(tail, sizeof(tail), " Relay safety timeout - relay forced OFF"); c.reading = "forced OFF"; break;
+      case 1: tailf(tail, sizeof(tail), " Float Switch %s", "NOT ACTIVATED"); c.reading = "NOT ACTIVATED"; break;
+      case 2: tailf(tail, sizeof(tail), " Float Switch clear (%s)", "OFF"); c.reading = "(OFF)"; break;
+      case 3: tailf(tail, sizeof(tail), " %s alarm %.1f %s", kType, kValue, kUnit); break;
+      case 4:
+        c.prefix = "REMINDER: ";
+        tailf(tail, sizeof(tail), " still in %s alarm (%s)", kType, "OFF");
+        c.reading = "(OFF)";
+        break;
+      case 5:
+        c.prefix = "REMINDER: ";
+        tailf(tail, sizeof(tail), " still in %s alarm (%.1f %s)", kType, kValue, kUnit);
+        break;
+      case 6:
+        c.prefix = "SNOOZED: ";
+        tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s", "paused", kWho, kType, "OFF",
+              " Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+        c.reading = "alarm (OFF).";
+        break;
+      case 7:
+        c.prefix = "SNOOZED: ";
+        tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%.1f %s).%s", "paused", kWho, kType,
+              kValue, kUnit, " Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+        break;
+      default:
+        tailf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)", kValue, kUnit, kValue,
+              kValue);
+        break;
+    }
+    memset(msg, 'Z', sizeof(msg));
+    composeSensorText(msg, sizeof(msg), c.prefix, kSite, kLabel, 255, tail);
+    ++gChecks;
+    if (!(strlen(msg) <= 159 && strstr(msg, c.reading) != nullptr && validUtf8(msg) &&
+          strncmp(msg, c.prefix, strlen(c.prefix)) == 0)) {
+      ++gFailures;
+      printf("FAIL max-length case %d: \"%s\"\n", which, msg);
+    }
+    // The name keeps at least 16 bytes: 11 of the site and " #255".
+    CHECK(strncmp(msg + strlen(c.prefix), "SSSSSSSSSSS", 11) == 0);
+    CHECK(strstr(msg, " #255 ") != nullptr);
+  }
+  // With realistic values the whole max-name text fits in 160: 23+1+23+5 bytes of name.
+  tailf(tail, sizeof(tail), " %s alarm %.1f %s", "high", 34.4f, "in");
+  CHECK(composeSensorText(msg, sizeof(msg), "", kSite, kLabel, 255, tail));
+  CHECK_STR(msg, "SSSSSSSSSSSSSSSSSSSSSSS LLLLLLLLLLLLLLLLLLLLLLL #255 high alarm 34.4 in");
+
+  // A long prefix plus a tail longer than outLen: no overflow, NUL-terminated, returns false.
+  char small[40];
+  memset(small, 'Z', sizeof(small));
+  static const char kLongPrefix[] = "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP";  // 56 bytes
+  static const char kLongTail[] =
+      " tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail";
+  CHECK(!composeSensorText(small, 20, kLongPrefix, "Silas", "Cox", 7, kLongTail));
+  CHECK(strlen(small) == 19 && small[19] == '\0' && small[20] == 'Z');
+  CHECK(!composeSensorText(small, 30, "REMINDER: ", "Silas", "Cox", 7, kLongTail));
+  CHECK(strlen(small) <= 29 && small[30] == 'Z');
+  CHECK(strncmp(small, "REMINDER: Silas Cox #7", 22) == 0);  // name keeps its 16 bytes
+  CHECK(!composeSensorText(small, 12, "REMINDER: ", "Silas", "Cox", 0, kLongTail));
+  CHECK_STR(small, "REMINDER: S");  // only 1 byte left after the prefix: the name gets it
+  // With a Display Number that byte cannot hold " #7": no half number, and no name without it.
+  CHECK(!composeSensorText(small, 12, "REMINDER: ", "Silas", "Cox", 7, kLongTail));
+  CHECK_STR(small, "REMINDER:  ");
+  // A tail longer than the whole buffer with no prefix.
+  CHECK(!composeSensorText(msg, 40, "", "Silas Cox", "Wellhead", 7, kLongTail));
+  CHECK(strlen(msg) == 39);
+  CHECK(strncmp(msg, "Silas Cox Wel #7 tail", 21) == 0);  // 16 bytes of room: "Silas Cox Wel #7"
+  // Null prefix and tail are empty; outLen 0 and 1.
+  CHECK(composeSensorText(msg, sizeof(msg), nullptr, "Silas", "", 0, nullptr));
+  CHECK_STR(msg, "Silas");
+  small[0] = 'Q';
+  CHECK(!composeSensorText(small, 0, "", "Silas", "", 0, " x"));
+  CHECK(small[0] == 'Q');
+  CHECK(!composeSensorText(small, 1, "", "Silas", "", 0, " x"));
+  CHECK(small[0] == '\0');
+  CHECK(!composeSensorText(nullptr, 10, "", "Silas", "", 0, " x"));
+  // The tail is cut at a UTF-8 boundary.
+  // (20 bytes of room: "Site" + 16 bytes of tail would end inside the 8th e-acute.)
+  CHECK(!composeSensorText(small, 21, "", "Site", "", 0, " \xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9"));
+  CHECK(validUtf8(small) && strlen(small) == 19);
+  CHECK_STR(small, "Site \xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9");
+}
+
 // strstr from `from`, or nullptr when `from` was not found.
 static const char *findAfter(const char *needle, const char *from) {
   return (from != nullptr) ? strstr(from, needle) : nullptr;
+}
+
+// True when needle occurs in [begin, end).
+static bool foundBetween(const char *needle, const char *begin, const char *end) {
+  const char *p = findAfter(needle, begin);
+  return p != nullptr && end != nullptr && p < end;
+}
+
+static unsigned countOf(const char *text, const char *needle) {
+  unsigned n = 0;
+  for (const char *p = strstr(text, needle); p != nullptr; p = strstr(p + 1, needle)) {
+    ++n;
+  }
+  return n;
 }
 
 static void testSketchText() {
@@ -69,20 +413,34 @@ static void testSketchText() {
       "                                                      true, rec->userNumber);\n";
   const char *telemetry = strstr(text, "static void handleTelemetry(JsonDocument &doc, double epoch) {");
   const char *alarm = strstr(text, "static void handleAlarm(JsonDocument &doc, double epoch) {");
+  const char *alarmEnd = strstr(text, "static ClientMetadata *findClientMetadata(const char *clientUid) {");
   const char *daily = strstr(text, "static void handleDaily(JsonDocument &doc, double epoch) {");
-  CHECK(telemetry != nullptr && alarm != nullptr && daily != nullptr);
+  const char *unload = strstr(text, "static void handleUnload(JsonDocument &doc, double epoch) {");
+  const char *unloadEnd = strstr(text, "static void logUnloadEvent(const UnloadLogEntry &entry) {");
+  const char *buildUnload = strstr(text, "static void buildUnloadText(char *out, size_t outLen, const UnloadLogEntry &entry) {");
+  const char *unloadSms = strstr(text, "static void sendUnloadSms(const UnloadLogEntry &entry) {");
+  const char *unloadEmail = strstr(text, "static void sendUnloadEmail(const UnloadLogEntry &entry) {");
+  const char *upsert = strstr(text, "static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex) {");
+  const char *snooze = strstr(text, "static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const char *who) {");
+  const char *snoozeEnd = strstr(text, "static bool applyReminderSnooze(SensorRecord &rec, bool snooze, const char *who) {");
+  const char *reminders = strstr(text, "static void checkAlarmReminders() {");
+  CHECK(telemetry != nullptr && alarm != nullptr && alarmEnd != nullptr && daily != nullptr);
+  CHECK(unload != nullptr && unloadEnd != nullptr && buildUnload != nullptr && unloadSms != nullptr);
+  CHECK(unloadEmail != nullptr && upsert != nullptr && snooze != nullptr && snoozeEnd != nullptr);
+  CHECK(reminders != nullptr);
+  const char *remindersEnd = findAfter("\n}\n", reminders);
   const char *telemetryCall = findAfter(kTelemetryCall, telemetry);
   CHECK(telemetryCall != nullptr && alarm != nullptr && telemetryCall < alarm);
   const char *dailyCall = findAfter(kDailyCall, daily);
   CHECK(dailyCall != nullptr);
   const char *sensorsLoop = findAfter("  JsonArray sensors = doc[\"sensors\"];\n  for (JsonObject t : sensors) {", daily);
   CHECK(sensorsLoop != nullptr && dailyCall != nullptr && sensorsLoop < dailyCall);
-  // Exactly two call sites.
-  unsigned calls = 0;
-  for (const char *p = strstr(text, "noteDisplayNumber("); p != nullptr; p = strstr(p + 1, "noteDisplayNumber(")) {
-    ++calls;
-  }
-  CHECK(calls == 2);
+  // Three call sites: telemetry, daily and unload (unload keeps the number when "un" is missing).
+  CHECK(countOf(text, "noteDisplayNumber(") == 3);
+  CHECK(foundBetween("  JsonVariantConst un = doc[\"un\"];\n"
+                     "  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,\n"
+                     "                                                  false, known != nullptr ? known->userNumber : 0);\n",
+                     unload, unloadEnd));
   // The presence-only writes are gone from telemetry and daily; handleAlarm keeps its own.
   CHECK(strstr(text, "    if (t.containsKey(\"un\")) {\n      rec->userNumber = t[\"un\"].as<uint8_t>();") == nullptr);
   const char *alarmWrite = findAfter("  if (doc.containsKey(\"un\")) {\n    rec->userNumber = doc[\"un\"].as<uint8_t>();\n  }", telemetry);
@@ -108,10 +466,104 @@ static void testSketchText() {
                      "      } else {\n"
                      "        clientObj.remove(\"un\");\n"
                      "      }\n") != nullptr);
+
+  // --- SMS/email texts name the sensor with composeSensorText, never with sensorIndex. ---
+  // Four builders: handleAlarm, buildUnloadText, broadcastSnoozeChange, checkAlarmReminders.
+  CHECK(countOf(text, "composeSensorText(") == 4);
+  // handleAlarm: one tail per branch, one compose, the alarm id unchanged.
+  CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" Relay safety timeout - relay forced OFF\");\n", alarm, alarmEnd));
+  CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" Float Switch %s\", stateDesc);\n", alarm, alarmEnd));
+  CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" Float Switch clear (%s)\", digitalStateText(rec->currentValue));\n", alarm, alarmEnd));
+  CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" %s alarm %.1f %s\", rec->alarmType, rec->currentValue, rec->measurementUnit[0] ? rec->measurementUnit : \"in\");\n", alarm, alarmEnd));
+  CHECK(foundBetween("    char tail[160];\n", alarm, alarmEnd));
+  CHECK(foundBetween("    char message[160];\n"
+                     "    composeSensorText(message, sizeof(message), \"\", rec->site, rec->label, rec->userNumber, tail);\n",
+                     alarm, alarmEnd));
+  CHECK(foundBetween("    snprintf(alarmId, sizeof(alarmId), \"%s_%d\", clientUid, (int)rec->sensorIndex);\n"
+                     "    sendSmsAlert(message, alarmId);\n"
+                     "    sendEmailAlert(\"TankAlarm Alert\", message, alarmId);", alarm, alarmEnd));
+  // checkAlarmReminders.
+  CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" still in %s alarm (%s)\",\n"
+                     "               type, digitalStateText(rec.currentValue));\n", reminders, remindersEnd));
+  CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" still in %s alarm (%.1f %s)\",\n"
+                     "               type, rec.currentValue,\n"
+                     "               rec.measurementUnit[0] ? rec.measurementUnit : \"in\");\n", reminders, remindersEnd));
+  CHECK(foundBetween("    char message[160];\n"
+                     "    composeSensorText(message, sizeof(message), \"REMINDER: \", rec.site, rec.label, rec.userNumber, tail);\n",
+                     reminders, remindersEnd));
+  CHECK(foundBetween("    snprintf(alarmId, sizeof(alarmId), \"%s_%d\", rec.clientUid, (int)rec.sensorIndex);\n"
+                     "    sendSmsAlert(message, alarmId);\n"
+                     "    sendEmailAlert(\"TankAlarm Reminder\", message, alarmId);", reminders, remindersEnd));
+  // broadcastSnoozeChange (SMS reply path: one tail[160] and one message[160] on the stack).
+  CHECK(foundBetween("    snprintf(tail, sizeof(tail),\n"
+                     "             \" reminders %s by %s. Still in %s alarm (%s).%s\",\n"
+                     "             snoozed ? \"paused\" : \"active again\", who,\n"
+                     "             rec.alarmType, digitalStateText(rec.currentValue),\n"
+                     "             snoozed ? \" Auto-resumes on recovery; reply UNSNOOZE to resume now.\" : \"\");\n",
+                     snooze, snoozeEnd));
+  CHECK(foundBetween("    snprintf(tail, sizeof(tail),\n"
+                     "             \" reminders %s by %s. Still in %s alarm (%.1f %s).%s\",\n"
+                     "             snoozed ? \"paused\" : \"active again\", who,\n"
+                     "             rec.alarmType, rec.currentValue,\n"
+                     "             rec.measurementUnit[0] ? rec.measurementUnit : \"in\",\n"
+                     "             snoozed ? \" Auto-resumes on recovery; reply UNSNOOZE to resume now.\" : \"\");\n",
+                     snooze, snoozeEnd));
+  CHECK(foundBetween("  char message[160];\n"
+                     "  composeSensorText(message, sizeof(message), snoozed ? \"SNOOZED: \" : \"RESUMED: \", rec.site, rec.label, rec.userNumber, tail);\n",
+                     snooze, snoozeEnd));
+  CHECK(foundBetween("  snprintf(alarmId, sizeof(alarmId), \"%s_%d\", rec.clientUid, (int)rec.sensorIndex);\n", snooze, snoozeEnd));
+  CHECK(countOf(text, "char tail[160];") == 4);
+  CHECK(strstr(text, "char tail[2") == nullptr && strstr(text, "char tail[3") == nullptr);
+  // Unload: one builder shared by the SMS and the email; alarm ids unchanged.
+  CHECK(foundBetween("  snprintf(tail, sizeof(tail), \" unloaded: %.1f %s delivered (peak %.1f, now %.1f)\",\n"
+                     "           delivered, u, entry.peakInches, entry.emptyInches);\n"
+                     "  composeSensorText(out, outLen, \"\", entry.siteName, entry.tankLabel, entry.userNumber, tail);\n",
+                     buildUnload, unloadSms));
+  CHECK(foundBetween("  char message[160];\n  buildUnloadText(message, sizeof(message), entry);\n", unloadSms, unloadEmail));
+  CHECK(foundBetween("  char message[160];\n  buildUnloadText(message, sizeof(message), entry);\n", unloadEmail, upsert));
+  CHECK(countOf(text, "buildUnloadText(message, sizeof(message), entry);") == 2);
+  CHECK(foundBetween("  snprintf(alarmId, sizeof(alarmId), \"%s_%d\", entry.clientUid, (int)entry.sensorIndex);\n"
+                     "  sendSmsAlert(message, alarmId);\n", unloadSms, unloadEmail));
+  CHECK(foundBetween("  snprintf(alarmId, sizeof(alarmId), \"%s_%d\", entry.clientUid, (int)entry.sensorIndex);\n"
+                     "  sendEmailAlert(\"TankAlarm Unload Report\", message, alarmId);\n", unloadEmail, upsert));
+  // handleUnload names the sensor from the record and stops clobbering its label with "Tank".
+  CHECK(strstr(text, "  uint8_t sensorIndex;         // Internal sensor index\n"
+                     "  uint8_t userNumber;          // Display Number (0 = none); names the sensor as \" #N\" in texts\n") != nullptr);
+  CHECK(foundBetween("  const char *noteLabel = doc[\"n\"] | \"\";", unload, unloadEnd));
+  CHECK(strstr(text, "doc[\"n\"] | \"Tank\"") == nullptr);
+  CHECK(foundBetween("  const SensorRecord *known = findSensorByHash(clientUid, sensorIndex);\n"
+                     "  const char *tankLabel = noteLabel;\n"
+                     "  if (tankLabel[0] == '\\0' && known != nullptr) {\n"
+                     "    tankLabel = known->label;\n"
+                     "  }\n"
+                     "  if (tankLabel[0] == '\\0') {\n"
+                     "    tankLabel = \"Tank\";\n"
+                     "  }\n", unload, unloadEnd));
+  CHECK(foundBetween("  entry.userNumber = displayNumber;\n", unload, unloadEnd));
+  CHECK(foundBetween("    if (noteLabel[0] != '\\0' || rec->label[0] == '\\0') {\n"
+                     "      strlcpy(rec->label, tankLabel, sizeof(rec->label));\n"
+                     "    }\n", unload, unloadEnd));
+  CHECK(!foundBetween("    strlcpy(rec->label, tankLabel, sizeof(rec->label));\n    rec->currentValue", unload, unloadEnd));
+  // /api/unloads keeps "n" and "k" and adds "un" only for a Display Number.
+  CHECK(strstr(text, "    obj[\"n\"] = entry.tankLabel;              // Tank label\n"
+                     "    obj[\"k\"] = entry.sensorIndex;             // Sensor index\n"
+                     "    if (entry.userNumber > 0) {\n"
+                     "      obj[\"un\"] = entry.userNumber;          // Display Number (left out when blank)\n"
+                     "    }\n") != nullptr);
+
+  // Negative pins: the old "sensor <k>" / "#<k>" naming is gone from every text.
+  CHECK(strstr(text, "? \" #\" : \" sensor \"") == nullptr);
+  CHECK(strstr(text, "\"%s #%d unloaded") == nullptr);
+  CHECK(strstr(text, "rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex") == nullptr);
+  CHECK(strstr(text, "rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex") == nullptr);
+  CHECK(strstr(text, "char shortSite[24];") == nullptr);
 }
 
 int main() {
   testNoteDisplayNumber();
+  testUtf8FitLen();
+  testFormatSensorName();
+  testComposeSensorText();
   testSketchText();
   if (gFailures) {
     printf("sensor_name: %lu of %lu checks FAILED\n", gFailures, gChecks);

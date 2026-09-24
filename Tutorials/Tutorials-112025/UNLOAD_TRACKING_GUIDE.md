@@ -298,12 +298,11 @@ Example:
 
 **Message Format:**
 ```
-Site: North Farm
-Tank: Diesel Fuel Tank
-Unloaded: 78.5 in delivered
-Peak: 85.0 in at 2:45 PM
-Now: 6.5 in at 4:20 PM
+North Farm Diesel Fuel Tank unloaded: 78.5 in delivered (peak 85.0, now 6.5)
 ```
+
+The sensor is named by its site and label, plus `#N` only when it has a Display Number
+(`North Farm Diesel Fuel Tank #2 unloaded: ...`). The internal sensor number is never printed.
 
 **Delivery Time:**
 - Sent immediately when unload detected

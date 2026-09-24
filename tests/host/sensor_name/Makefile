@@ -1,6 +1,6 @@
-# Host tests for how the server keeps a sensor's Display Number ("un") in step with telemetry and
-# daily-report notes: TankAlarm-112025-Server-BluesOpta/TankAlarm_SensorName.h, plus pins on the
-# sketch text that uses it.
+# Host tests for how the server names a sensor in SMS and email text and keeps its Display Number
+# ("un") in step with the client: TankAlarm-112025-Server-BluesOpta/TankAlarm_SensorName.h, plus
+# pins on the sketch text that uses it.
 #
 #   make test
 #

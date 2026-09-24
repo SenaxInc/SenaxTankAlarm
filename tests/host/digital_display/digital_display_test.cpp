@@ -148,9 +148,12 @@ static void testSketchText() {
   CHECK(strstr(text, "strlcpy(sensorOut, ct[\"sensor\"] | \"\", sensorLen);") != nullptr);
   CHECK(strstr(text, "strlcpy(triggerOut, ct[\"digitalTrigger\"] | \"\", triggerLen);") != nullptr);
   CHECK(strstr(text, "obj[\"sensorType\"] = \"digital\";") != nullptr);
-  CHECK(strstr(text, "Float Switch clear (%s)") != nullptr);
-  CHECK(strstr(text, "type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
-  CHECK(strstr(text, "Still in %s alarm (%s).%s") != nullptr);                  // snooze/resume notice
+  // Float texts show the switch state (ON/OFF), not a reading and unit. The name before each
+  // tail comes from composeSensorText (pinned in tests/host/sensor_name).
+  CHECK(strstr(text, "snprintf(tail, sizeof(tail), \" Float Switch clear (%s)\", digitalStateText(rec->currentValue));") != nullptr);
+  CHECK(strstr(text, "snprintf(tail, sizeof(tail), \" still in %s alarm (%s)\",\n"
+                     "               type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
+  CHECK(strstr(text, "\" reminders %s by %s. Still in %s alarm (%s).%s\",") != nullptr);  // snooze/resume notice
   CHECK(strstr(text, "rec.alarmType, digitalStateText(rec.currentValue),") != nullptr);
   CHECK(strstr(text, "  rec->currentValue = level;\n  // S-D03") == nullptr);  // the unconditional write is gone
 }

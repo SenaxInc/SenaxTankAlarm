@@ -45,7 +45,7 @@
 #include <FtpsTypes.h>
 #include <FtpsErrors.h>
 #include "TankAlarm_DigitalDisplay.h"  // S3: float (digital) display rules (host-tested in tests/host/digital_display)
-#include "TankAlarm_SensorName.h"      // Display Number ("un") from telemetry/daily notes (host-tested in tests/host/sensor_name)
+#include "TankAlarm_SensorName.h"      // Sensor names in SMS/email text; Display Number ("un") updates (host-tested in tests/host/sensor_name)
 
 // POSIX-compliant standard library headers
 #include <stdio.h>
@@ -738,6 +738,7 @@ struct UnloadLogEntry {
   char clientUid[48];         // Client UID
   char tankLabel[24];         // Tank label/name
   uint8_t sensorIndex;         // Internal sensor index
+  uint8_t userNumber;          // Display Number (0 = none); names the sensor as " #N" in texts
   float peakInches;           // Peak level before unload
   float emptyInches;          // Level after unload (empty reading)
   float peakSensorMa;         // Sensor reading at peak (for diagnostics)
@@ -756,6 +757,7 @@ static void handleUnload(JsonDocument &doc, double epoch);
 static void logUnloadEvent(const UnloadLogEntry &entry);
 static void sendUnloadSms(const UnloadLogEntry &entry);
 static void sendUnloadEmail(const UnloadLogEntry &entry);
+static void buildUnloadText(char *out, size_t outLen, const UnloadLogEntry &entry);
 
 // Structure for hourly telemetry snapshots (hot tier)
 #ifndef MAX_HOURLY_HISTORY_PER_SENSOR
@@ -10471,6 +10473,9 @@ static void sendUnloadLogJson(EthernetClient &client) {
     obj["c"] = entry.clientUid;              // Client UID
     obj["n"] = entry.tankLabel;              // Tank label
     obj["k"] = entry.sensorIndex;             // Sensor index
+    if (entry.userNumber > 0) {
+      obj["un"] = entry.userNumber;          // Display Number (left out when blank)
+    }
     obj["pk"] = entry.peakInches;            // Peak height
     obj["em"] = entry.emptyInches;           // Empty height
     obj["dl"] = entry.peakInches - entry.emptyInches;  // Delivered amount
@@ -13312,24 +13317,26 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   bool bypassMinimumInterval = (strcmp(type, "clear") == 0) || isRecovery;
   bool suppressSmsForDiagnostic = isDiagnostic && !isRecovery;
   if (!suppressSmsForDiagnostic && clientWantsSms && smsAllowedByServer && checkSmsRateLimit(rec, bypassMinimumInterval)) {
-    // BugFix v1.6.2 (M-16): Pre-truncate site name to leave room for alarm details.
-    // Long site names can consume the entire 160-char SMS budget.
-    char shortSite[24];
-    strlcpy(shortSite, rec->site, sizeof(shortSite));
-    char message[160];
+    // The text is NAME + tail (TankAlarm_SensorName.h): site and label, plus " #N" only for a
+    // Display Number; never the internal sensorIndex. composeSensorText caps the site and
+    // label (BugFix v1.6.2 M-16: a long site must not eat the 160-char SMS budget) and keeps
+    // the tail's reading.
+    char tail[160];
     if (isRelayTimeout) {
-      snprintf(message, sizeof(message), "%s%s%d Relay safety timeout - relay forced OFF", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex);
+      snprintf(tail, sizeof(tail), " Relay safety timeout - relay forced OFF");
     } else if (isDigitalAlarm) {
       const char *stateDesc = (strcmp(type, "triggered") == 0) ? "ACTIVATED" : "NOT ACTIVATED";
-      snprintf(message, sizeof(message), "%s%s%d Float Switch %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, stateDesc);
+      snprintf(tail, sizeof(tail), " Float Switch %s", stateDesc);
     } else if (strcmp(type, "clear") == 0 && isDigitalSensorType(rec->sensorType)) {
       // S3 (C-A04 B7): a float clear shows the switch state, not "clear alarm 0.0 in" ("1.0 in" for a
       // not_activated float).
-      snprintf(message, sizeof(message), "%s%s%d Float Switch clear (%s)", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, digitalStateText(rec->currentValue));
+      snprintf(tail, sizeof(tail), " Float Switch clear (%s)", digitalStateText(rec->currentValue));
     } else {
       // S3: rec->currentValue is this note's reading, or the last one when the note carries none.
-      snprintf(message, sizeof(message), "%s%s%d %s alarm %.1f %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, rec->alarmType, rec->currentValue, rec->measurementUnit[0] ? rec->measurementUnit : "in");
+      snprintf(tail, sizeof(tail), " %s alarm %.1f %s", rec->alarmType, rec->currentValue, rec->measurementUnit[0] ? rec->measurementUnit : "in");
     }
+    char message[160];
+    composeSensorText(message, sizeof(message), "", rec->site, rec->label, rec->userNumber, tail);
     // CONTACT-2a: pass the alarm id so contacts with alarmAssociations only receive
     // the alarms they opted into (id format matches handleContactsGet).
     char alarmId[64];
@@ -13828,7 +13835,7 @@ static void handleDaily(JsonDocument &doc, double epoch) {
 static void handleUnload(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   const char *siteName = doc["s"] | "";
-  const char *tankLabel = doc["n"] | "Tank";
+  const char *noteLabel = doc["n"] | "";  // the client's unload note does not send "n" today
   uint8_t sensorIndex = doc["k"].as<uint8_t>();
   
   if (!clientUid || strlen(clientUid) == 0) {
@@ -13858,7 +13865,22 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   
   // Get measurement unit if provided
   const char *unit = doc["mu"] | "inches";
-  
+
+  // Name the sensor from what the server already knows: the unload note carries neither "n"
+  // nor "un", so take the label and the Display Number from the sensor record when the note
+  // lacks them ("Tank" only when there is no label at all).
+  const SensorRecord *known = findSensorByHash(clientUid, sensorIndex);
+  const char *tankLabel = noteLabel;
+  if (tankLabel[0] == '\0' && known != nullptr) {
+    tankLabel = known->label;
+  }
+  if (tankLabel[0] == '\0') {
+    tankLabel = "Tank";
+  }
+  JsonVariantConst un = doc["un"];
+  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
+                                                  false, known != nullptr ? known->userNumber : 0);
+
   Serial.print(F("Unload event received: "));
   Serial.print(siteName);
   Serial.print(F(" #"));
@@ -13881,6 +13903,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   strlcpy(entry.clientUid, clientUid, sizeof(entry.clientUid));
   strlcpy(entry.tankLabel, tankLabel, sizeof(entry.tankLabel));
   entry.sensorIndex = sensorIndex;
+  entry.userNumber = displayNumber;
   entry.peakInches = peakInches;
   entry.emptyInches = emptyInches;
   entry.peakSensorMa = peakSensorMa;
@@ -13911,7 +13934,14 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   if (rec) {
     strlcpy(rec->site, siteName, sizeof(rec->site));
-    strlcpy(rec->label, tankLabel, sizeof(rec->label));
+    // Only a real label replaces the record's: the "Tank" placeholder used to overwrite the
+    // label the client set (the unload note has no "n"), renaming the sensor on the dashboard.
+    if (noteLabel[0] != '\0' || rec->label[0] == '\0') {
+      strlcpy(rec->label, tankLabel, sizeof(rec->label));
+    }
+    if (!un.isNull()) {
+      rec->userNumber = displayNumber;  // a future note with "un"; without it the number stays
+    }
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;
   }
@@ -13935,16 +13965,21 @@ static void logUnloadEvent(const UnloadLogEntry &entry) {
   Serial.println(entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "inches");
 }
 
-static void sendUnloadSms(const UnloadLogEntry &entry) {
-  char message[160];
+// Unload SMS and email text: NAME + " unloaded: ..." (TankAlarm_SensorName.h: site and label,
+// plus " #N" only for a Display Number; never the internal sensorIndex).
+static void buildUnloadText(char *out, size_t outLen, const UnloadLogEntry &entry) {
   float delivered = entry.peakInches - entry.emptyInches;
   const char *u = entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "in";
-  
-  snprintf(message, sizeof(message), 
-           "%s #%d unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
-           entry.siteName, entry.sensorIndex, delivered, u,
-           entry.peakInches, entry.emptyInches);
-  
+  char tail[160];
+  snprintf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
+           delivered, u, entry.peakInches, entry.emptyInches);
+  composeSensorText(out, outLen, "", entry.siteName, entry.tankLabel, entry.userNumber, tail);
+}
+
+static void sendUnloadSms(const UnloadLogEntry &entry) {
+  char message[160];
+  buildUnloadText(message, sizeof(message), entry);
+
   // CONTACT-2a: unload SMS respects per-contact alarm associations for this sensor.
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", entry.clientUid, (int)entry.sensorIndex);
@@ -13957,13 +13992,7 @@ static void sendUnloadSms(const UnloadLogEntry &entry) {
 // unload note was parsed but never acted on). Mirrors sendUnloadSms via the email channel.
 static void sendUnloadEmail(const UnloadLogEntry &entry) {
   char message[160];
-  float delivered = entry.peakInches - entry.emptyInches;
-  const char *u = entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "in";
-
-  snprintf(message, sizeof(message),
-           "%s #%d unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
-           entry.siteName, entry.sensorIndex, delivered, u,
-           entry.peakInches, entry.emptyInches);
+  buildUnloadText(message, sizeof(message), entry);
 
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", entry.clientUid, (int)entry.sensorIndex);
@@ -14980,30 +15009,26 @@ static bool phoneReceivesAlarm(JsonDocument &contactsDoc, const char *phone, con
 // One-time notice to the alarm's subscribed recipients when reminders are paused/resumed —
 // without it, reminder silence is indistinguishable from "fixed".
 static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const char *who) {
-  char shortSite[24];
-  strlcpy(shortSite, rec.site, sizeof(shortSite));
-  char message[160];
+  // Runs on the SMS reply path (handleSmsInbound -> applyReminderSnooze) on the main-thread
+  // stack: one 160-byte tail, one 160-byte message.
+  char tail[160];
   if (isDigitalSensorType(rec.sensorType)) {
     // S3 (C-A04 B7): a float has no value or unit, only a state.
-    snprintf(message, sizeof(message),
-             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%s).%s",
-             snoozed ? "SNOOZED" : "RESUMED",
-             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+    snprintf(tail, sizeof(tail),
+             " reminders %s by %s. Still in %s alarm (%s).%s",
              snoozed ? "paused" : "active again", who,
              rec.alarmType, digitalStateText(rec.currentValue),
              snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
   } else {
-    snprintf(message, sizeof(message),
-             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%.1f %s).%s",
-             snoozed ? "SNOOZED" : "RESUMED",
-             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+    snprintf(tail, sizeof(tail),
+             " reminders %s by %s. Still in %s alarm (%.1f %s).%s",
              snoozed ? "paused" : "active again", who,
              rec.alarmType, rec.currentValue,
              rec.measurementUnit[0] ? rec.measurementUnit : "in",
              snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
   }
+  char message[160];
+  composeSensorText(message, sizeof(message), snoozed ? "SNOOZED: " : "RESUMED: ", rec.site, rec.label, rec.userNumber, tail);
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
   sendSmsAlert(message, alarmId);
@@ -15112,22 +15137,18 @@ static void checkAlarmReminders() {
     if (isHighLike && !gConfig.smsOnHigh) continue;
     if (isLow && !gConfig.smsOnLow) continue;
 
-    char shortSite[24];
-    strlcpy(shortSite, rec.site, sizeof(shortSite));
-    char message[160];
+    char tail[160];
     if (isDigitalSensorType(rec.sensorType)) {
       // S3 (C-A04 B7): a float has no value or unit, only a state.
-      snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%s)",
-               shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-               rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+      snprintf(tail, sizeof(tail), " still in %s alarm (%s)",
                type, digitalStateText(rec.currentValue));
     } else {
-      snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%.1f %s)",
-               shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-               rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+      snprintf(tail, sizeof(tail), " still in %s alarm (%.1f %s)",
                type, rec.currentValue,
                rec.measurementUnit[0] ? rec.measurementUnit : "in");
     }
+    char message[160];
+    composeSensorText(message, sizeof(message), "REMINDER: ", rec.site, rec.label, rec.userNumber, tail);
 
     char alarmId[64];
     snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);

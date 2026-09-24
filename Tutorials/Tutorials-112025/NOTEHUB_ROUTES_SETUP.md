@@ -358,10 +358,15 @@ to `sms.qo`, each with a scalar `to` field:
 
 ```json
 {
-  "message": "Silas #1 high alarm 43.8 psi",
+  "message": "Silas Cox Wellhead high alarm 43.8 psi",
   "to": "+15551234567"
 }
 ```
+
+The message names the sensor by its site and label, and adds `#N` only when the sensor has a
+**Display Number** (for example `Silas Cox Wellhead #7 high alarm 43.8 psi`). It never prints
+the server's internal sensor number (servers before v2.2.17 wrote `Silas Cox sensor 1` or
+`Silas #1` there). Reminder, snooze, float, relay-timeout and unload texts use the same name.
 
 Because each event carries exactly one destination, a **single Twilio route** using the
 `[.body.to]` placeholder delivers to every recipient — the dashboard's Contacts → SMS Alert
@@ -467,7 +472,7 @@ page's field/summary toggles ride along in `fmt` so your route template can hono
 
 ```json
 { "to": "ops@example.com", "subject": "TankAlarm Alert",
-  "message": "Silas #1 high alarm 43.8 psi", "type": "alarm",
+  "message": "Silas Cox Wellhead high alarm 43.8 psi", "type": "alarm",
   "id": "dev:860000000000000-1783501234-4" }
 ```
 

@@ -68,8 +68,12 @@ Add these settings to each tank's configuration in the client:
 When `unloadAlarmSms` is enabled and SMS is configured on the server:
 
 ```
-Site Name #1 unloaded: 85.5 in delivered (peak 90.0, now 4.5)
+Main Site Fuel Tank unloaded: 85.5 in delivered (peak 90.0, now 4.5)
 ```
+
+The sensor is named by its site and label, plus `#N` only when it has a Display Number
+(`Main Site Fuel Tank #7 unloaded: ...`); the internal sensor number is never printed. The
+same text goes by email to contacts with email alerts enabled when `unloadAlarmEmail` is on.
 
 ### Email Summary
 
@@ -90,8 +94,9 @@ Returns the unload event log (up to 50 most recent events):
       "pt": 1735056000,          // Peak timestamp
       "s": "Main Site",          // Site name
       "c": "dev:xxx",            // Client UID
-      "n": "Fuel Tank",          // Tank label
-      "k": 1,                    // Tank number
+      "n": "Fuel Tank",          // Tank label (the server's label for the sensor; "Tank" if none)
+      "k": 1,                    // Internal sensor number
+      "un": 7,                   // Display Number (left out when blank)
       "pk": 90.0,                // Peak height (inches)
       "em": 4.5,                 // Empty height (inches)
       "dl": 85.5,                // Delivered amount (inches)
@@ -111,8 +116,8 @@ The client sends unload events via the `unload.qo` notefile (delivered as `unloa
 {
   "c": "dev:xxx",          // Client UID
   "s": "Main Site",        // Site name
-  "n": "Fuel Tank",        // Tank label
-  "k": 1,                  // Tank number
+  "n": "Fuel Tank",        // Tank label (optional: current clients omit it and the server uses its own)
+  "k": 1,                  // Internal sensor number
   "type": "unload",        // Event type
   "pk": 90.0,              // Peak height
   "em": 4.5,               // Empty height
