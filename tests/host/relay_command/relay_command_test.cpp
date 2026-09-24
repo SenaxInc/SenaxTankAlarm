@@ -1,0 +1,205 @@
+// Host tests for TankAlarm-112025-Client-BluesOpta/TankAlarm_RelayCommand.h (S-T01, relay/float CL-4).
+//
+//   make -C tests/host/relay_command test ARDUINOJSON_DIR=/path/to/ArduinoJson/src
+//
+// legacy_v2216_relay.h is a frozen copy of what v2.2.16 does with a relay.qi note; it is used to
+// show that old firmware ignores the new key and that the old key named a list position.
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <ArduinoJson.h>
+
+#include "TankAlarm_RelayCommand.h"
+#include "legacy_v2216_relay.h"
+
+#ifndef CLIENT_SKETCH
+#define CLIENT_SKETCH "../../../TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino"
+#endif
+
+static unsigned long gChecks = 0;
+static unsigned long gFailures = 0;
+
+#define CHECK(cond)                                                    \
+  do {                                                                 \
+    ++gChecks;                                                         \
+    if (!(cond)) {                                                     \
+      ++gFailures;                                                     \
+      printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);           \
+    }                                                                  \
+  } while (0)
+
+static const char *kUid = "dev:111111111111111";
+
+static RelayCmdKind classify(const char *json, RelayCommand &cmd) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) {
+    printf("FAIL bad test JSON: %s\n", json);
+    ++gFailures;
+  }
+  return relayClassifyCommand(doc.as<JsonObjectConst>(), cmd);
+}
+
+static LegacyDecision legacy(const char *json) {
+  JsonDocument doc;
+  deserializeJson(doc, json);
+  return legacyV2216Decide(doc, kUid);
+}
+
+static bool uintOf(const char *json, uint32_t lo, uint32_t hi, uint32_t &out) {
+  JsonDocument doc;
+  deserializeJson(doc, json);
+  return relayJsonUint(doc["v"], lo, hi, out);
+}
+
+static void testStrictInteger() {
+  uint32_t v = 0;
+  CHECK(uintOf("{\"v\":1}", 1, 255, v) && v == 1);
+  CHECK(uintOf("{\"v\":255}", 1, 255, v) && v == 255);
+  CHECK(uintOf("{\"v\":3.0}", 1, 255, v) && v == 3);  // integral double (Notecard/Notehub path)
+  const char *bad[] = {"{\"v\":0}", "{\"v\":256}", "{\"v\":-1}", "{\"v\":1.5}", "{\"v\":\"1\"}",
+                       "{\"v\":true}", "{\"v\":false}", "{\"v\":null}", "{}", "{\"v\":[1]}",
+                       "{\"v\":{\"k\":1}}", "{\"v\":4294967296}", "{\"v\":1e300}"};
+  for (const char *j : bad) {
+    v = 77;
+    CHECK(!uintOf(j, 1, 255, v));
+    CHECK(v == 77);  // out is untouched on failure
+  }
+}
+
+static void testClassify() {
+  RelayCommand c;
+  CHECK(classify("{\"relay_reset_sensor_number\":2,\"source\":\"server-dashboard\",\"_sv\":1}", c) == RELAY_CMD_RESET_BY_NUMBER && c.sensorNumber == 2);
+  // the full envelope the server sends after S5 (relay/float release)
+  CHECK(classify("{\"_target\":\"dev:111111111111111\",\"_type\":\"relay\",\"relay_reset_sensor_number\":7,\"source\":\"server-dashboard\",\"_sv\":1}", c) == RELAY_CMD_RESET_BY_NUMBER && c.sensorNumber == 7);
+  // unknown future keys (C-T02) do not change the meaning
+  CHECK(classify("{\"relay_reset_sensor_number\":7,\"cid\":12,\"t\":1790000000,\"exp\":1790003600}", c) == RELAY_CMD_RESET_BY_NUMBER && c.sensorNumber == 7);
+  const char *invalid[] = {"{\"relay_reset_sensor_number\":0}", "{\"relay_reset_sensor_number\":256}",
+                           "{\"relay_reset_sensor_number\":-1}", "{\"relay_reset_sensor_number\":1.5}",
+                           "{\"relay_reset_sensor_number\":\"1\"}", "{\"relay_reset_sensor_number\":true}",
+                           "{\"relay_reset_sensor_number\":[1]}"};
+  for (const char *j : invalid) {
+    CHECK(classify(j, c) == RELAY_CMD_RESET_INVALID);
+    CHECK(c.sensorNumber == 0);
+  }
+  // never falls back to the legacy key
+  CHECK(classify("{\"relay_reset_sensor_number\":0,\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_INVALID);
+  CHECK(classify("{\"relay_reset_sensor_number\":3,\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_BY_NUMBER && c.sensorNumber == 3);
+  // the reset wins over relay/state in the same note
+  CHECK(classify("{\"relay_reset_sensor_number\":3,\"relay\":1,\"state\":true}", c) == RELAY_CMD_RESET_BY_NUMBER);
+  // legacy only
+  CHECK(classify("{\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
+  CHECK(classify("{\"relay_reset_sensor\":\"x\"}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
+  // JSON null counts as absent
+  CHECK(classify("{\"relay_reset_sensor_number\":null,\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
+  CHECK(classify("{\"relay_reset_sensor_number\":null}", c) == RELAY_CMD_NONE);
+  // relay/state and empty notes fall through unchanged
+  CHECK(classify("{\"relay\":1,\"state\":true,\"source\":\"server\"}", c) == RELAY_CMD_NONE);
+  CHECK(classify("{}", c) == RELAY_CMD_NONE);
+  {
+    JsonDocument arr;
+    deserializeJson(arr, "[1,2]");
+    CHECK(relayClassifyCommand(arr.as<JsonObjectConst>(), c) == RELAY_CMD_NONE);  // not an object
+  }
+}
+
+static void testResolve() {
+  uint8_t slot = 99;
+  const uint8_t inOrder[] = {1, 2, 3};
+  const uint8_t reordered[] = {2, 1, 3};
+  const uint8_t sparse[] = {1, 3, 7};
+  const uint8_t dup[] = {1, 2, 2};
+  CHECK(relayResolveSensorNumber(inOrder, 3, 1, slot) == RELAY_RESOLVE_OK && slot == 0);
+  CHECK(relayResolveSensorNumber(inOrder, 3, 3, slot) == RELAY_RESOLVE_OK && slot == 2);
+  CHECK(relayResolveSensorNumber(reordered, 3, 1, slot) == RELAY_RESOLVE_OK && slot == 1);
+  CHECK(relayResolveSensorNumber(reordered, 3, 2, slot) == RELAY_RESOLVE_OK && slot == 0);
+  CHECK(relayResolveSensorNumber(sparse, 3, 7, slot) == RELAY_RESOLVE_OK && slot == 2);
+  slot = 99;
+  CHECK(relayResolveSensorNumber(sparse, 3, 2, slot) == RELAY_RESOLVE_NOT_FOUND && slot == 99);
+  CHECK(relayResolveSensorNumber(dup, 3, 2, slot) == RELAY_RESOLVE_DUPLICATE && slot == 99);
+  CHECK(relayResolveSensorNumber(dup, 3, 1, slot) == RELAY_RESOLVE_OK && slot == 0);
+  CHECK(relayResolveSensorNumber(inOrder, 3, 0, slot) == RELAY_RESOLVE_INVALID);
+  CHECK(relayResolveSensorNumber(nullptr, 0, 1, slot) == RELAY_RESOLVE_NOT_FOUND);
+  CHECK(relayResolveSensorNumber(nullptr, 3, 1, slot) == RELAY_RESOLVE_INVALID);
+  // a removed monitor: its number is simply gone
+  CHECK(relayResolveSensorNumber(inOrder, 2, 3, slot) == RELAY_RESOLVE_NOT_FOUND);
+  uint8_t full[8] = {1, 2, 3, 4, 5, 6, 7, 255};
+  CHECK(relayResolveSensorNumber(full, 8, 255, slot) == RELAY_RESOLVE_OK && slot == 7);
+}
+
+// The defect S-T01 fixes: the dashboard sent the card's list position (registry order), the old
+// client used it as a slot; the new client resolves the number.
+static void testLegacyDivergence() {
+  const uint8_t monitors[] = {2, 1, 3};  // config order: slot 0 is sensor #2
+  // Card for sensor #1 was at list position 0 in the dashboard (registry order 1,2,3).
+  LegacyDecision old = legacy("{\"relay_reset_sensor\":0}");
+  CHECK(old.action == LEGACY_RESET_SLOT && old.slot == 0);  // v2.2.16 cleared slot 0 = sensor #2 (wrong)
+  uint8_t slot = 99;
+  CHECK(relayResolveSensorNumber(monitors, 3, 1, slot) == RELAY_RESOLVE_OK && slot == 1);  // new: sensor #1
+  // Old firmware ignores every envelope the new server sends ("Invalid relay command").
+  CHECK(legacy("{\"_target\":\"dev:111111111111111\",\"_type\":\"relay\",\"relay_reset_sensor_number\":1,\"source\":\"server-dashboard\",\"_sv\":1}").action == LEGACY_INVALID);
+  CHECK(legacy("{\"relay_reset_sensor_number\":255}").action == LEGACY_INVALID);
+  // ...and the new classifier ignores the old key.
+  RelayCommand c;
+  CHECK(classify("{\"relay_reset_sensor\":0}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
+  // Unchanged relay/state decisions still mean the same on both.
+  CHECK(legacy("{\"relay\":2,\"state\":true}").action == LEGACY_SET);
+  CHECK(classify("{\"relay\":2,\"state\":true}", c) == RELAY_CMD_NONE);
+  CHECK(legacy("{\"target\":\"dev:222\",\"relay_reset_sensor\":1}").action == LEGACY_NOT_FOR_US);
+}
+
+static void testScope() {
+  CHECK(relayScopeOf(0, "dev:222", kUid) == RELAY_SCOPE_NONE);
+  CHECK(relayScopeOf(0x10, "", kUid) == RELAY_SCOPE_NONE);  // only bits 0-3 are relays
+  CHECK(relayScopeOf(1, "", kUid) == RELAY_SCOPE_LOCAL);
+  CHECK(relayScopeOf(1, nullptr, kUid) == RELAY_SCOPE_LOCAL);
+  CHECK(relayScopeOf(3, kUid, kUid) == RELAY_SCOPE_LOCAL);
+  CHECK(relayScopeOf(3, "dev:222", kUid) == RELAY_SCOPE_REMOTE);
+  CHECK(relayScopeOf(3, "dev:222", "") == RELAY_SCOPE_REMOTE);
+  CHECK(relayScopeOf(3, "dev:222", nullptr) == RELAY_SCOPE_REMOTE);
+}
+
+static void testResults() {
+  CHECK(relayClearResultFromResolve(RELAY_RESOLVE_OK, 0x5) == RELAY_CLEAR_RELEASED);
+  CHECK(relayClearResultFromResolve(RELAY_RESOLVE_OK, 0) == RELAY_CLEAR_NONE_ACTIVE);
+  CHECK(relayClearResultFromResolve(RELAY_RESOLVE_NOT_FOUND, 0) == RELAY_CLEAR_UNKNOWN_SENSOR);
+  CHECK(relayClearResultFromResolve(RELAY_RESOLVE_DUPLICATE, 0) == RELAY_CLEAR_DUPLICATE_SENSOR);
+  CHECK(relayClearResultFromResolve(RELAY_RESOLVE_INVALID, 0) == RELAY_CLEAR_INVALID);
+  const char *names[] = {"released", "none-active", "unknown-sensor", "duplicate-sensor", "invalid", "legacy-ignored"};
+  for (uint8_t i = 0; i < RELAY_CLEAR_RESULT_COUNT; ++i) CHECK(strcmp(relayClearResultName(i), names[i]) == 0);
+  CHECK(strcmp(relayClearResultName(RELAY_CLEAR_RESULT_COUNT), "invalid") == 0);
+  CHECK(strcmp(relayClearResultName(255), "invalid") == 0);
+}
+
+// The sketch must use the classifier and never read the legacy key as a slot again.
+static void testSketchText() {
+  FILE *f = fopen(CLIENT_SKETCH, "rb");
+  CHECK(f != nullptr);
+  if (!f) return;
+  static char text[1 << 20];
+  const size_t n = fread(text, 1, sizeof(text) - 1, f);
+  fclose(f);
+  text[n] = '\0';
+  CHECK(n > 100000 && n < sizeof(text) - 1);
+  CHECK(strstr(text, "#include \"TankAlarm_RelayCommand.h\"") != nullptr);
+  CHECK(strstr(text, "relayClassifyCommand(doc.as<JsonObjectConst>(), cmd)") != nullptr);
+  CHECK(strstr(text, "doc[\"relay_reset_sensor\"]") == nullptr);
+  CHECK(strstr(text, "static RelayClearResult clearRelaysForSensorNumber(uint8_t sensorNumber) {") != nullptr);
+}
+
+int main() {
+  testStrictInteger();
+  testClassify();
+  testResolve();
+  testLegacyDivergence();
+  testScope();
+  testResults();
+  testSketchText();
+  if (gFailures) {
+    printf("relay_command: %lu of %lu checks FAILED\n", gFailures, gChecks);
+    return 1;
+  }
+  printf("relay_command: all %lu checks passed\n", gChecks);
+  return 0;
+}
