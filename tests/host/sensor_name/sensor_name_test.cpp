@@ -335,6 +335,60 @@ static void testComposeSensorText() {
   tailf(tail, sizeof(tail), " %s alarm %.1f %s", "high", 34.4f, "in");
   CHECK(composeSensorText(msg, sizeof(msg), "", kSite, kLabel, 255, tail));
   CHECK_STR(msg, "SSSSSSSSSSSSSSSSSSSSSSS LLLLLLLLLLLLLLLLLLLLLLL #255 high alarm 34.4 in");
+  // So do the relay-timeout, float, reminder, unload and RESUMED texts.
+  static const char kMaxName[] = "SSSSSSSSSSSSSSSSSSSSSSS LLLLLLLLLLLLLLLLLLLLLLL #255";  // 52 bytes
+  for (int which = 0; which < 6; ++which) {
+    const char *prefix = "";
+    switch (which) {
+      case 0: tailf(tail, sizeof(tail), " Relay safety timeout - relay forced OFF"); break;
+      case 1: tailf(tail, sizeof(tail), " Float Switch %s", "NOT ACTIVATED"); break;
+      case 2: tailf(tail, sizeof(tail), " Float Switch clear (%s)", "OFF"); break;
+      case 3:
+        prefix = "REMINDER: ";
+        tailf(tail, sizeof(tail), " still in %s alarm (%.1f %s)", "high", 34.4f, "in");
+        break;
+      case 4:
+        prefix = "RESUMED: ";
+        tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%.1f %s).%s", "active again", "SMS reply",
+              "high", 34.4f, "in", "");
+        break;
+      default:
+        tailf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)", 85.5f, "in", 90.0f, 4.5f);
+        break;
+    }
+    CHECK(composeSensorText(msg, sizeof(msg), prefix, kSite, kLabel, 255, tail));
+    CHECK(strncmp(msg + strlen(prefix), kMaxName, strlen(kMaxName)) == 0 &&
+          strcmp(msg + strlen(prefix) + strlen(kMaxName), tail) == 0);
+  }
+  // A SNOOZED notice carries the auto-resume sentence: its tail is 112 bytes with who "Jim",
+  // 118 with "SMS reply" or "dashboard" and 132 with a 23-byte contact name, which leaves 38,
+  // 32 or 18 bytes for the name. The tail stays whole; the label is shortened first.
+  static const char kAutoResume[] = " Auto-resumes on recovery; reply UNSNOOZE to resume now.";
+  tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%.1f %s).%s", "paused", "Jim", "high", 34.4f,
+        "in", kAutoResume);
+  CHECK(strlen(tail) == 112);
+  CHECK(composeSensorText(msg, sizeof(msg), "SNOOZED: ", kSite, kLabel, 255, tail));
+  CHECK_STR(msg, "SNOOZED: SSSSSSSSSSSSSSSSSSSSSSS LLLLLLLLL #255 reminders paused by Jim. Still in high alarm "
+                 "(34.4 in). Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%.1f %s).%s", "paused", "SMS reply", "high",
+        34.4f, "in", kAutoResume);
+  CHECK(strlen(tail) == 118);
+  CHECK(composeSensorText(msg, sizeof(msg), "SNOOZED: ", kSite, kLabel, 255, tail));
+  CHECK_STR(msg, "SNOOZED: SSSSSSSSSSSSSSSSSSSSSSS LLL #255 reminders paused by SMS reply. Still in high alarm "
+                 "(34.4 in). Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  static const char kWho23[] = "Dashboard user name xyz";  // 23 bytes (char who[24])
+  tailf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%.1f %s).%s", "paused", kWho23, "high", 34.4f,
+        "in", kAutoResume);
+  CHECK(strlen(tail) == 132);
+  // Today's field name without a Display Number (18 bytes) still fits whole ...
+  CHECK(composeSensorText(msg, sizeof(msg), "SNOOZED: ", "Silas Cox", "Wellhead", 0, tail));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellhead reminders paused by Dashboard user name xyz. Still in high alarm "
+                 "(34.4 in). Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  // ... and with Display Number 7 (21 bytes) the label loses 3 bytes.
+  CHECK(composeSensorText(msg, sizeof(msg), "SNOOZED: ", "Silas Cox", "Wellhead", 7, tail));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellh #7 reminders paused by Dashboard user name xyz. Still in high alarm "
+                 "(34.4 in). Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+  CHECK(strlen(msg) == 159);
 
   // A long prefix plus a tail longer than outLen: no overflow, NUL-terminated, returns false.
   char small[40];
