@@ -82,7 +82,7 @@ static void testClassify() {
   const char *invalid[] = {"{\"relay_reset_sensor_number\":0}", "{\"relay_reset_sensor_number\":256}",
                            "{\"relay_reset_sensor_number\":-1}", "{\"relay_reset_sensor_number\":1.5}",
                            "{\"relay_reset_sensor_number\":\"1\"}", "{\"relay_reset_sensor_number\":true}",
-                           "{\"relay_reset_sensor_number\":[1]}"};
+                           "{\"relay_reset_sensor_number\":[1]}", "{\"relay_reset_sensor_number\":null}"};
   for (const char *j : invalid) {
     CHECK(classify(j, c) == RELAY_CMD_RESET_INVALID);
     CHECK(c.sensorNumber == 0);
@@ -95,9 +95,12 @@ static void testClassify() {
   // legacy only
   CHECK(classify("{\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
   CHECK(classify("{\"relay_reset_sensor\":\"x\"}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
-  // JSON null counts as absent
-  CHECK(classify("{\"relay_reset_sensor_number\":null,\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
-  CHECK(classify("{\"relay_reset_sensor_number\":null}", c) == RELAY_CMD_NONE);
+  // A present key counts even when it is JSON null; only a missing key is absent. isNull() would
+  // treat these as absent and let relay/state switch a relay (Copilot review, fail closed).
+  CHECK(classify("{\"relay_reset_sensor_number\":null,\"relay\":1,\"state\":true}", c) == RELAY_CMD_RESET_INVALID);
+  CHECK(classify("{\"relay_reset_sensor_number\":null,\"relay_reset_sensor\":1}", c) == RELAY_CMD_RESET_INVALID);  // no fallback
+  CHECK(classify("{\"relay_reset_sensor\":null}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
+  CHECK(classify("{\"relay_reset_sensor\":null,\"relay\":1,\"state\":true}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
   // relay/state and empty notes fall through unchanged
   CHECK(classify("{\"relay\":1,\"state\":true,\"source\":\"server\"}", c) == RELAY_CMD_NONE);
   CHECK(classify("{}", c) == RELAY_CMD_NONE);
@@ -150,6 +153,10 @@ static void testLegacyDivergence() {
   // Unchanged relay/state decisions still mean the same on both.
   CHECK(legacy("{\"relay\":2,\"state\":true}").action == LEGACY_SET);
   CHECK(classify("{\"relay\":2,\"state\":true}", c) == RELAY_CMD_NONE);
+  // Intended difference: v2.2.16 read a null Clear Relay key as absent and ran relay/state; the new
+  // classifier fails closed and switches nothing. No server sends a null key.
+  CHECK(legacy("{\"relay_reset_sensor\":null,\"relay\":2,\"state\":true}").action == LEGACY_SET);
+  CHECK(classify("{\"relay_reset_sensor\":null,\"relay\":2,\"state\":true}", c) == RELAY_CMD_RESET_LEGACY_IGNORED);
   CHECK(legacy("{\"target\":\"dev:222\",\"relay_reset_sensor\":1}").action == LEGACY_NOT_FOR_US);
 }
 

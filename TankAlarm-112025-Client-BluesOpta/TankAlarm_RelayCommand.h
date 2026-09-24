@@ -44,8 +44,8 @@ static inline bool relayJsonUint(JsonVariantConst v, uint32_t lo, uint32_t hi, u
 enum RelayCmdKind : uint8_t {
   RELAY_CMD_NONE = 0,             // no Clear Relay key: the caller runs the existing relay/state path
   RELAY_CMD_RESET_BY_NUMBER,      // relay_reset_sensor_number = k, an integer 1..255
-  RELAY_CMD_RESET_INVALID,        // relay_reset_sensor_number present but not an integer 1..255
-  RELAY_CMD_RESET_LEGACY_IGNORED  // only relay_reset_sensor (a list position from a v2.2.16 server)
+  RELAY_CMD_RESET_INVALID,        // relay_reset_sensor_number present (even null), not 1..255
+  RELAY_CMD_RESET_LEGACY_IGNORED  // only relay_reset_sensor, any value (v2.2.16 list position)
 };
 
 struct RelayCommand {
@@ -54,12 +54,15 @@ struct RelayCommand {
 };
 
 // Precedence: relay_reset_sensor_number (never falls back to the legacy key, and wins over
-// relay/state in the same note), then relay_reset_sensor, then NONE. A JSON null counts as absent.
+// relay/state in the same note), then relay_reset_sensor, then NONE. A key that is present counts
+// whatever its value, JSON null included: isUnbound() is true only for a missing key, while isNull()
+// is also true for an explicit null and would let {"relay_reset_sensor_number":null,"relay":1,
+// "state":true} fall through and switch a relay. Only NONE runs relay/state (fail closed).
 static inline RelayCmdKind relayClassifyCommand(JsonObjectConst doc, RelayCommand &out) {
   out.kind = RELAY_CMD_NONE;
   out.sensorNumber = 0;
   JsonVariantConst byNumber = doc["relay_reset_sensor_number"];
-  if (!byNumber.isNull()) {
+  if (!byNumber.isUnbound()) {
     uint32_t k = 0;
     if (relayJsonUint(byNumber, 1, 255, k)) {
       out.kind = RELAY_CMD_RESET_BY_NUMBER;
@@ -69,7 +72,7 @@ static inline RelayCmdKind relayClassifyCommand(JsonObjectConst doc, RelayComman
     }
     return out.kind;
   }
-  if (!doc["relay_reset_sensor"].isNull()) out.kind = RELAY_CMD_RESET_LEGACY_IGNORED;
+  if (!doc["relay_reset_sensor"].isUnbound()) out.kind = RELAY_CMD_RESET_LEGACY_IGNORED;
   return out.kind;
 }
 
