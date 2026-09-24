@@ -107,6 +107,8 @@ static void testSketchText() {
   CHECK(n > 500000 && n < sizeof(text) - 1);
   CHECK(strstr(text, "#include \"TankAlarm_DigitalDisplay.h\"") != nullptr);
   CHECK(strstr(text, "stuckDisabledInConfig = configSensorStuckDisabled(ct);") != nullptr);
+  // A float is exempt even with no cached config snapshot.
+  CHECK(strstr(text, "bool stuckDisabledInConfig = isDigitalSensorType(rec->sensorType);") != nullptr);
   CHECK(strstr(text, "if (alarmNoteCarriesValue(doc.as<JsonObjectConst>())) {") != nullptr);
   CHECK(strstr(text, "dailyReconcileAlarmType(a[\"y\"] | \"\", rec->sensorType, hiAlarm, cfgTrigger)") != nullptr);
   CHECK(strstr(text, "configDigitalTriggerFor(clientUid, sensorIdx, cfgTrigger, sizeof(cfgTrigger));") != nullptr);

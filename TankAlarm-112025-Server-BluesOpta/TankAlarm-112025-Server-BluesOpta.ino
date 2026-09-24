@@ -12976,8 +12976,9 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // stale and is cleared without requiring a config re-push. Scoped to the stuck-disabled
   // case so a genuine stuck condition under active detection is never masked.
   if (rec->alarmActive && strcmp(rec->alarmType, "sensor-stuck") == 0) {
-    bool stuckDisabledInConfig = false;
-    const ClientConfigSnapshot *stuckSnap = findClientConfigSnapshot(clientUid);
+    // S3 (C-A04 B5): a float is exempt whether or not a config snapshot is cached.
+    bool stuckDisabledInConfig = isDigitalSensorType(rec->sensorType);
+    const ClientConfigSnapshot *stuckSnap = stuckDisabledInConfig ? nullptr : findClientConfigSnapshot(clientUid);
     if (stuckSnap && stuckSnap->payload[0] != '\0') {
       JsonDocument stuckCfg;
       if (deserializeJson(stuckCfg, stuckSnap->payload) == DeserializationError::Ok) {
