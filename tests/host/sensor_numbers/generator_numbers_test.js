@@ -129,6 +129,15 @@ checkEq('duplicate repaired', load([{ number: 2 }, { number: 2 }]),
 checkEq('default that collides is repaired', load([{ number: 2 }, {}], 4),
   { nums: [2, 5], high: 5, repaired: [{ position: 2, number: 5 }] });
 checkEq('zero repaired', load([{ number: 0 }]), { nums: [1], high: 1, repaired: [{ position: 1, number: 1 }] });
+// A repair never goes past 255: it takes the lowest number not on the page and says so.
+checkEq('repair at 255 takes the lowest free number', load([{ number: 255 }, { number: 1 }, { number: 255 }]),
+  { nums: [255, 1, 2], high: 255, repaired: [{ position: 3, number: 2, reused: true }] });
+checkEq('repair when snh is 255', load([{ number: 3 }, { number: 3 }], 255),
+  { nums: [3, 1], high: 255, repaired: [{ position: 2, number: 1, reused: true }] });
+checkEq('repair up to 255, then reuse', load([{ number: 254 }, { number: 0 }, { number: 0 }]),
+  { nums: [254, 255, 1], high: 255, repaired: [{ position: 2, number: 255 }, { position: 3, number: 1, reused: true }] });
+check('repaired numbers are always sendable',
+  sensorNumbersValid(load([{ number: 255 }, { number: 255 }, { number: 0 }, {}], 255).nums));
 checkEq('300 is the position, like the client', load([{ number: 300 }]), { nums: [1], high: 1, repaired: [] });
 checkEq('no sensors keep snh', load(undefined, 4), { nums: [], high: 4, repaired: [] });
 checkEq('invalid snh ignored', load([{ number: 1 }], 'x'), { nums: [1], high: 1, repaired: [] });
@@ -220,6 +229,7 @@ check('loader keeps numbers',
   page.includes('const loadedNumbers=loadSensorNumbers(c.sensors,c.snh);sensorNumberHigh=loadedNumbers.high;') &&
   page.includes('addSensorCard(loadedNumbers.nums[ti])') && !page.includes('forEach(t=>{addSensor();'));
 check('loader reports repaired numbers', page.includes('if(loadedNumbers.repaired.length){') &&
+  page.includes("(r.reused?' (an old number: every number up to 255 has been used)':'')") &&
   page.includes("Check their contacts and history before sending.',true,15000);"));
 check('default names follow the number, not the position',
   ['Tank', 'Gas System', 'Engine'].every(n => page.includes('name=`' + n + ' ${userNum||cardSensorNumber(card)||index+1}`')) &&

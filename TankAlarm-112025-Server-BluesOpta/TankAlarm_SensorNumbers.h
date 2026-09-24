@@ -22,16 +22,23 @@
 #include <ArduinoJson.h>
 
 #define SENSOR_NUMBERS_OK        0
-#define SENSOR_NUMBERS_INVALID   1  // an entry is not an object, or its number is missing or not an integer 1-255
+#define SENSOR_NUMBERS_INVALID   1  // "sensors" is not a list, an entry is not an object, or its number is
+                                    // missing or not an integer 1-255
 #define SENSOR_NUMBERS_DUPLICATE 2  // two sensors resolve to the same number
 
-// Checks every entry of a config's "sensors" array. Every entry needs a "number"; a missing or null
-// one is INVALID (see above). Returns SENSOR_NUMBERS_OK, or an error with a short reason in msg (always
-// NUL-terminated when msgLen > 0; msg may be null). A null array is OK: a config without sensors
-// changes none.
-static inline uint8_t sensorNumbersCheck(JsonArrayConst sensors, char *msg, size_t msgLen) {
+// Checks a config's "sensors" value, passed as it is in the document (not converted to an array,
+// which would turn an object or a string into a null array and let it through). Every entry needs a
+// "number"; a missing or null one is INVALID (see above). Returns SENSOR_NUMBERS_OK, or an error
+// with a short reason in msg (always NUL-terminated when msgLen > 0; msg may be null). A missing or
+// null "sensors" is OK: a config without sensors changes none. Any other non-list value is INVALID.
+static inline uint8_t sensorNumbersCheck(JsonVariantConst sensorsValue, char *msg, size_t msgLen) {
   if (msg && msgLen) msg[0] = '\0';
-  if (sensors.isNull()) return SENSOR_NUMBERS_OK;
+  if (sensorsValue.isNull()) return SENSOR_NUMBERS_OK;
+  if (!sensorsValue.is<JsonArrayConst>()) {
+    if (msg && msgLen) snprintf(msg, msgLen, "sensors must be a list");
+    return SENSOR_NUMBERS_INVALID;
+  }
+  JsonArrayConst sensors = sensorsValue.as<JsonArrayConst>();
   uint8_t seen[32];  // one bit per number 0-255
   memset(seen, 0, sizeof(seen));
   size_t position = 0;

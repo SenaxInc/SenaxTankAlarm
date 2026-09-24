@@ -26,12 +26,13 @@ static unsigned long gFailures = 0;
     }                                                                  \
   } while (0)
 
-// Parses json and checks its "sensors" array with a message buffer of msgLen bytes.
+// Parses json and checks its "sensors" value as handleConfigPost does (the raw variant), with a
+// message buffer of msgLen bytes.
 static uint8_t checkJson(const char *json, char *msg, size_t msgLen) {
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, json);
   CHECK(!err);
-  return sensorNumbersCheck(doc["sensors"].as<JsonArrayConst>(), msg, msgLen);
+  return sensorNumbersCheck(doc["sensors"], msg, msgLen);
 }
 
 static void expectResult(const char *json, uint8_t wantCode, const char *wantMsg) {
@@ -105,6 +106,13 @@ static void testInvalid() {
                "sensor 2 is not an object");
   expectResult("{\"sensors\":[null]}", SENSOR_NUMBERS_INVALID, "sensor 1 is not an object");
   expectResult("{\"sensors\":[[]]}", SENSOR_NUMBERS_INVALID, "sensor 1 is not an object");
+  // A present "sensors" that is not a list: converting it to an array would give a null array.
+  static const char *const kNotLists[] = {"{\"number\":0}", "{}", "\"1\"", "5", "true", "false"};
+  for (size_t i = 0; i < sizeof(kNotLists) / sizeof(kNotLists[0]); ++i) {
+    char json[64];
+    snprintf(json, sizeof(json), "{\"sensors\":%s}", kNotLists[i]);
+    expectResult(json, SENSOR_NUMBERS_INVALID, "sensors must be a list");
+  }
   // Every sensor needs its number: a live config update would keep the slot's old number.
   expectResult("{\"sensors\":[{},{},{}]}", SENSOR_NUMBERS_INVALID, "sensor 1 has no number");
   expectResult("{\"sensors\":[{\"number\":null}]}", SENSOR_NUMBERS_INVALID,
