@@ -536,6 +536,15 @@ static void testSketchText() {
   CHECK(foundBetween("    snprintf(alarmId, sizeof(alarmId), \"%s_%d\", clientUid, (int)rec->sensorIndex);\n"
                      "    sendSmsAlert(message, alarmId);\n"
                      "    sendEmailAlert(\"TankAlarm Alert\", message, alarmId);", alarm, alarmEnd));
+  // A record first created by an alarm gets its site from the note (fill only, never overwrite),
+  // before the alarm text is composed; handleAlarm never writes the label.
+  const char *alarmSiteFill = findAfter("  if (rec->site[0] == '\\0') {\n"
+                                        "    strlcpy(rec->site, doc[\"s\"] | \"\", sizeof(rec->site));\n"
+                                        "  }\n", alarm);
+  const char *alarmCompose = findAfter("    composeSensorText(message, sizeof(message), \"\", rec->site", alarm);
+  CHECK(alarmSiteFill != nullptr && alarmCompose != nullptr && alarmSiteFill < alarmCompose);
+  CHECK(!foundBetween("strlcpy(rec->label", alarm, alarmEnd));
+  CHECK(!foundBetween("\n  strlcpy(rec->site, doc[\"s\"] | \"\", sizeof(rec->site));\n", alarm, alarmEnd));
   // checkAlarmReminders.
   CHECK(foundBetween("      snprintf(tail, sizeof(tail), \" still in %s alarm (%s)\",\n"
                      "               type, digitalStateText(rec.currentValue));\n", reminders, remindersEnd));

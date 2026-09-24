@@ -13234,6 +13234,12 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     else strlcpy(rec->sensorType, stField, sizeof(rec->sensorType));
   }
 
+  // A record first created by this alarm has no site yet (telemetry, daily and unload notes
+  // set it). Fill it from the note's "s" so the alarm text names the site; never overwrite.
+  if (rec->site[0] == '\0') {
+    strlcpy(rec->site, doc["s"] | "", sizeof(rec->site));
+  }
+
   // Resolve the display level (trusts the client's self-describing "lvl" unless its
   // calibration version is stale, in which case the server re-applies its coefficients).
   float level = resolveLevel(clientUid, sensorIndex, rec->sensorType, doc.as<JsonObjectConst>());
