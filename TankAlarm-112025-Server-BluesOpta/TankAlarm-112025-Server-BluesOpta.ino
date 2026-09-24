@@ -13917,10 +13917,11 @@ static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorInd
     return nullptr;
   }
 
-  // Bound the sensor index. A note that omits "k" deserializes to 0, and a garbled note
-  // could carry any 0-255 value; reject implausible indices so they cannot pollute the
-  // registry or consume slots toward MAX_SENSOR_RECORDS.
-  if (sensorIndex >= MAX_SENSOR_RECORDS) {
+  // Sensor numbers are permanent and never reused, so any 1-255 is a real sensor (it is
+  // not bounded by MAX_SENSOR_RECORDS, which caps the record COUNT below). A note that
+  // omits "k", or carries a k over 255, reads as 0 and is rejected. A garbled k takes at
+  // most one slot per value and ages out through the LRU eviction below.
+  if (sensorIndex == 0) {
     Serial.print(F("ERROR: Sensor index out of range: "));
     Serial.println(sensorIndex);
     return nullptr;

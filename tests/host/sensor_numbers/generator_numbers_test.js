@@ -238,5 +238,21 @@ check('commissioning restarts numbering at 1',
   page.includes("function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;") &&
   page.includes('card.dataset.sensorNumber=String(i+1);') && page.includes('sensorNumberHigh=tpl.length;if(!tpl.length)addSensor();'));
 
+// The server registry takes every number the page can send (1-255). Numbers are never reused, so
+// they pass MAX_SENSOR_RECORDS (which caps the record count, not the number); a note with no "k"
+// (0) is still refused.
+{
+  const sketch = fs.readFileSync(SKETCH, 'utf8');
+  const sig = 'static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex) {';
+  const at = sketch.indexOf(sig);
+  const end = at < 0 ? -1 : sketch.indexOf('\n}\n', at);
+  check('upsertSensorRecord found', at >= 0 && sketch.indexOf(sig, at + 1) < 0 && end > at);
+  const upsert = end > at ? sketch.slice(at, end) : '';
+  check('registry accepts numbers past MAX_SENSOR_RECORDS',
+    !/sensorIndex\s*>=?\s*MAX_SENSOR_RECORDS/.test(upsert) && !/sensorIndex\s*>=?\s*MAX_SENSOR_RECORDS/.test(sketch));
+  check('registry refuses sensor 0', /if \(sensorIndex == 0\) \{\s*Serial\.print\(F\("ERROR: Sensor index out of range: "\)\);[^}]*return nullptr;/.test(upsert));
+  check('registry still caps the record count', upsert.includes('if (gSensorRecordCount >= MAX_SENSOR_RECORDS) {'));
+}
+
 console.log(failures ? failures + ' of ' + checks + ' checks FAILED' : 'generator numbers: all ' + checks + ' checks passed');
 process.exit(failures ? 1 : 0);
