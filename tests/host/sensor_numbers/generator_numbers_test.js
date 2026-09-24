@@ -219,7 +219,11 @@ check('alarm-contact id uses the number', page.includes("const num=cardSensorNum
 check('loader keeps numbers',
   page.includes('const loadedNumbers=loadSensorNumbers(c.sensors,c.snh);sensorNumberHigh=loadedNumbers.high;') &&
   page.includes('addSensorCard(loadedNumbers.nums[ti])') && !page.includes('forEach(t=>{addSensor();'));
-check('loader reports repaired numbers', page.includes('if(loadedNumbers.repaired.length){'));
+check('loader reports repaired numbers', page.includes('if(loadedNumbers.repaired.length){') &&
+  page.includes("Check their contacts and history before sending.',true,15000);"));
+check('default names follow the number, not the position',
+  ['Tank', 'Gas System', 'Engine'].every(n => page.includes('name=`' + n + ' ${userNum||cardSensorNumber(card)||index+1}`')) &&
+  !page.includes('${userNum||index+1}'));
 check('commissioning restarts numbering at 1',
   page.includes("function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;") &&
   page.includes('card.dataset.sensorNumber=String(i+1);') && page.includes('sensorNumberHigh=tpl.length;if(!tpl.length)addSensor();'));

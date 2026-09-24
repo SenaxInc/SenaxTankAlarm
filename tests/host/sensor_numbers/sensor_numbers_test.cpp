@@ -52,13 +52,10 @@ static void testAccepted() {
   expectOk("{}");                                   // no sensors key: a null array
   expectOk("{\"sensors\":null}");
   expectOk("{\"sensors\":[]}");
-  expectOk("{\"sensors\":[{},{},{}]}");             // missing numbers are positions 1, 2, 3
   expectOk("{\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":3}]}");
   expectOk("{\"sensors\":[{\"number\":2},{\"number\":1},{\"number\":3}]}");
   expectOk("{\"sensors\":[{\"number\":1},{\"number\":3},{\"number\":4}]}");  // #2 removed, #4 added
   expectOk("{\"sensors\":[{\"number\":255}]}");
-  expectOk("{\"sensors\":[{\"number\":null}]}");    // null means the position, as on the client
-  expectOk("{\"sensors\":[{\"number\":3},{}]}");    // position 2 defaults to 2
   expectOk("{\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":3},{\"number\":4},"
            "{\"number\":5},{\"number\":6},{\"number\":7},{\"number\":8}]}");
   // Shaped like the Config Generator's output after sensor #2 was removed and one added.
@@ -90,10 +87,6 @@ static void testAccepted() {
 static void testDuplicates() {
   expectResult("{\"sensors\":[{\"number\":1},{\"number\":1}]}", SENSOR_NUMBERS_DUPLICATE,
                "sensor number 1 is used twice");
-  expectResult("{\"sensors\":[{},{\"number\":1}]}", SENSOR_NUMBERS_DUPLICATE,
-               "sensor number 1 is used twice");  // position 1 defaults to 1
-  expectResult("{\"sensors\":[{\"number\":2},{}]}", SENSOR_NUMBERS_DUPLICATE,
-               "sensor number 2 is used twice");  // position 2 defaults to 2
   expectResult("{\"sensors\":[{\"number\":255},{\"number\":7},{\"number\":255}]}",
                SENSOR_NUMBERS_DUPLICATE, "sensor number 255 is used twice");
 }
@@ -112,6 +105,16 @@ static void testInvalid() {
                "sensor 2 is not an object");
   expectResult("{\"sensors\":[null]}", SENSOR_NUMBERS_INVALID, "sensor 1 is not an object");
   expectResult("{\"sensors\":[[]]}", SENSOR_NUMBERS_INVALID, "sensor 1 is not an object");
+  // Every sensor needs its number: a live config update would keep the slot's old number.
+  expectResult("{\"sensors\":[{},{},{}]}", SENSOR_NUMBERS_INVALID, "sensor 1 has no number");
+  expectResult("{\"sensors\":[{\"number\":null}]}", SENSOR_NUMBERS_INVALID,
+               "sensor 1 has no number");
+  expectResult("{\"sensors\":[{\"number\":3},{}]}", SENSOR_NUMBERS_INVALID,
+               "sensor 2 has no number");  // a client holding [1,3] would end up with 3,3
+  expectResult("{\"sensors\":[{},{\"number\":1}]}", SENSOR_NUMBERS_INVALID,
+               "sensor 1 has no number");
+  expectResult("{\"sensors\":[{\"number\":2},{\"name\":\"Tank\"}]}", SENSOR_NUMBERS_INVALID,
+               "sensor 2 has no number");
   // The first problem in array order is the one reported.
   expectResult("{\"sensors\":[{\"number\":4},{\"number\":4},{\"number\":0}]}",
                SENSOR_NUMBERS_DUPLICATE, "sensor number 4 is used twice");
@@ -144,7 +147,7 @@ static void testMessageBuffer() {
   // An accepted config clears the message.
   JsonDocument okDoc;
   CHECK(!deserializeJson(okDoc, "{\"sensors\":[{\"number\":1}]}"));
-  char msg[16];
+  char msg[80];  // as large as expectResult's: a constant 16 could trip -Wformat-truncation if inlined
   memset(msg, 'x', sizeof(msg));
   CHECK(sensorNumbersCheck(okDoc["sensors"].as<JsonArrayConst>(), msg, sizeof(msg)) ==
         SENSOR_NUMBERS_OK);

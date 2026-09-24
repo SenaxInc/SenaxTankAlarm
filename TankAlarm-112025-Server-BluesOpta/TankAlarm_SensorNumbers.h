@@ -3,9 +3,11 @@
 //
 // A sensor's number is its identity everywhere: the config "number", the "k" in every note, the
 // server registry, learned calibration, alarm contacts and Clear Relay. The client takes "number"
-// when it is an integer 0-255 and otherwise uses position+1 (initMonitorDefaults and
-// parseMonitorFromJson in the client sketch), and it accepts 0 and duplicates without complaint,
-// so the server must refuse them.
+// when it is an integer 0-255 and accepts 0 and duplicates without complaint, so the server must
+// refuse them. Without a usable "number" the client's result depends on the path: a load from
+// flash uses position+1, but a live config update keeps that slot's previous number
+// (applyConfigUpdate does not reset the monitor first). The server therefore requires every
+// sensor to carry its number; the Config Generator always writes it.
 //
 // This header needs only ArduinoJson and the C library, so tests/host/sensor_numbers can build it
 // with the PC compiler.
@@ -20,11 +22,11 @@
 #include <ArduinoJson.h>
 
 #define SENSOR_NUMBERS_OK        0
-#define SENSOR_NUMBERS_INVALID   1  // an entry is not an object, or its number is not an integer 1-255
+#define SENSOR_NUMBERS_INVALID   1  // an entry is not an object, or its number is missing or not an integer 1-255
 #define SENSOR_NUMBERS_DUPLICATE 2  // two sensors resolve to the same number
 
-// Checks every entry of a config's "sensors" array. A missing (or null) "number" means position+1,
-// as on the client. Returns SENSOR_NUMBERS_OK, or an error with a short reason in msg (always
+// Checks every entry of a config's "sensors" array. Every entry needs a "number"; a missing or null
+// one is INVALID (see above). Returns SENSOR_NUMBERS_OK, or an error with a short reason in msg (always
 // NUL-terminated when msgLen > 0; msg may be null). A null array is OK: a config without sensors
 // changes none.
 static inline uint8_t sensorNumbersCheck(JsonArrayConst sensors, char *msg, size_t msgLen) {
@@ -42,7 +44,8 @@ static inline uint8_t sensorNumbersCheck(JsonArrayConst sensors, char *msg, size
     JsonVariantConst n = t["number"];
     uint32_t k;
     if (n.isNull()) {
-      k = (uint32_t)position;
+      if (msg && msgLen) snprintf(msg, msgLen, "sensor %u has no number", (unsigned)position);
+      return SENSOR_NUMBERS_INVALID;
     } else if (!n.is<bool>() && n.is<uint8_t>()) {
       k = n.as<uint8_t>();
     } else {
