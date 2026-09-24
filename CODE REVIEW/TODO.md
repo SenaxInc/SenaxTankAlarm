@@ -99,6 +99,7 @@
   - Display Number reads use `is<int32_t>()`, so a `7.0` is ignored and the stored number is kept; #324's `relayJsonUint` accepts it. No sender produces a double today. If a shared whole-number rule is added, apply it to the Display Number only: sensor-number reads must keep matching the client's `is<uint8_t>()`.
 - [D] **S-T09 (P3) (S)** Optional warning for an unknown sensor number — _Copilot 2026-09-24 CR-6_
   - After #323 the registry accepts any `k` from 1 to 255 (the old `k < 64` bound is gone). Optional: log a warning when `k` is not in the client's cached config, and evict unknown-number records first. Do not drop such notes: that would lose real alarms from a client whose new config is still pending.
+  - Import of an old file for a known client (review of #323, 2026-09-24): the Config Generator allocates new numbers from the loaded file's `snh`, so importing an older file (no `snh`, or a lower one) and then adding a sensor can hand out a retired number. #323's CR-5 fix only stops the server's stored mark from going down; it cannot undo a number the page already chose. Fix: when a config is loaded or imported for a client that has a cached snapshot, the page starts from max(file `snh`, cached mark) before allocating (for example, fetch the cached mark with the client's config).
 
 ### Server — Persistence, Scheduling, and Maintenance
 
