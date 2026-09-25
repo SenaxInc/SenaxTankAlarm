@@ -578,7 +578,7 @@ static void testSketchText() {
   const char *buildUnload = strstr(text, "static void buildUnloadText(char *out, size_t outLen, const UnloadLogEntry &entry) {");
   const char *unloadSms = strstr(text, "static void sendUnloadSms(const UnloadLogEntry &entry) {");
   const char *unloadEmail = strstr(text, "static void sendUnloadEmail(const UnloadLogEntry &entry) {");
-  const char *upsert = strstr(text, "static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex) {");
+  const char *upsert = strstr(text, "static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created) {");
   const char *snooze = strstr(text, "static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const char *who) {");
   const char *snoozeEnd = strstr(text, "static bool applyReminderSnooze(SensorRecord &rec, bool snooze, const char *who) {");
   const char *reminders = strstr(text, "static void checkAlarmReminders() {");

@@ -2631,7 +2631,7 @@ static void addServerSerialLog(const char *message, const char *level = "info", 
 static ClientSerialBuffer *findOrCreateClientSerialBuffer(const char *clientUid);
 static void addClientSerialLog(const char *clientUid, const char *message, double timestamp, const char *level = "info", const char *source = "client");
 static SerialRequestResult requestClientSerialLogs(const char *clientUid, String &errorMessage);
-static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex);
+static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created = nullptr);
 static uint8_t sendSmsAlert(const char *message, const char *alarmId = nullptr, const char *listKey = "smsAlertRecipients");
 static uint8_t sendServerSmsAlert(const char *message);
 static uint8_t sendEmailAlert(const char *subject, const char *message, const char *alarmId = nullptr);
@@ -13567,7 +13567,8 @@ static void handleDaily(JsonDocument &doc, double epoch) {
         // server has no record of yet (never reached the server, or a lost registry) creates the
         // record here, as handleAlarm does, instead of being skipped until tomorrow's report. The
         // sensors[] loop below fills in the rest. k is 1-based (see the sensors[] loop).
-        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx) : nullptr;
+        bool recCreated = false;
+        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;
         if (rec && rec->site[0] == '\0') {
           const char *noteSite = doc["s"] | "";
           if (noteSite[0] != '\0') strlcpy(rec->site, noteSite, sizeof(rec->site));
@@ -13587,9 +13588,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
           // here (this report's sensors[] loop below refreshes it), so classify by this part's "st"
           // for k, then the config's "sensor", then the record, without storing the result.
           const char *reportSt = "";
+          double reportSensorEpoch = 0.0;  // this part's reading time for k (R02 below)
           for (JsonObjectConst t : doc["sensors"].as<JsonArrayConst>()) {
             if (t["k"].is<int>() && t["k"].as<int>() == sensorIdx) {
               reportSt = t["st"] | "";
+              reportSensorEpoch = t["t"] | 0.0;
               break;
             }
           }
@@ -13604,7 +13607,17 @@ static void handleDaily(JsonDocument &doc, double epoch) {
           const char *effType = dailyReconcileSensorType(reportSt, cfgSensor, rec->sensorType);
           strlcpy(rec->alarmType, dailyReconcileAlarmType(a["y"] | "", effType, hiAlarm, cfgTrigger),
                   sizeof(rec->alarmType));
-          rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+          // R02: the reconcile takes no reading, so an existing record keeps its time; the
+          // sensors[] loop below sets it from this report's reading for k. (A report-time stamp
+          // here would hide that reading's age and could clear an update request's badge, since
+          // the loop never moves the time back.) A record created just above holds only the
+          // server clock from upsertSensorRecord, so it takes the time the loop would give it:
+          // this part's `t` for k, else the report time.
+          if (recCreated) {
+            rec->lastUpdateEpoch = (reportSensorEpoch > 0.0)
+                                       ? reportSensorEpoch
+                                       : ((epoch > 0.0) ? epoch : currentEpoch());
+          }
           gSensorRegistryDirty = true;
         }
       }
@@ -13661,7 +13674,8 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       continue;
     }
     uint8_t sensorIndex = t["k"].as<uint8_t>();
-    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
+    bool recCreated = false;
+    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);
     if (!rec) {
       continue;
     }
@@ -13773,7 +13787,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     if (trustLevel) {
       rec->currentValue = newLevel;
     }
-    rec->lastUpdateEpoch = now;
+    // R02: the per-sensor `t` is the last acquisition minute and can be at or before a telemetry
+    // reply already stored here (pollNotecard runs handleTelemetry before handleDaily), so it
+    // never moves the time back: that would bring back an update request's badge. A record made
+    // by this loop's upsert holds only the server clock, not a reading, so it takes `now`.
+    if (recCreated || now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
@@ -14032,7 +14050,10 @@ static void sendUnloadEmail(const UnloadLogEntry &entry) {
   sendEmailAlert("TankAlarm Unload Report", message, alarmId);
 }
 
-static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex) {
+static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created) {
+  // *created is set only when a new record is made. Its lastUpdateEpoch is then the server clock,
+  // not a reading time (handleDaily uses this; see R02 there).
+  if (created) *created = false;
   // Validate UID length to prevent silent truncation issues
   if (!isValidClientUid(clientUid)) {
     Serial.println(F("ERROR: Invalid client UID, skipping sensor record"));
@@ -14128,7 +14149,8 @@ static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorInd
   // Insert into hash table
   insertSensorIntoHash(newIndex);
   gSensorRegistryDirty = true;
-  
+  if (created) *created = true;
+
   return &rec;
 }
 
