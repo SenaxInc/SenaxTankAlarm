@@ -267,6 +267,12 @@ static void testSketchText() {
   CHECK(strstr(text, "static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created) {\n") != nullptr);
   CHECK(strstr(text, "  if (created) *created = false;\n") != nullptr);
   CHECK(strstr(text, "  insertSensorIntoHash(newIndex);\n  gSensorRegistryDirty = true;\n  if (created) *created = true;\n") != nullptr);
+  {
+    // ...and nowhere else: only the new-record path reports a created record.
+    size_t sets = 0;
+    for (const char *p = strstr(text, "*created = true"); p != nullptr; p = strstr(p + 1, "*created = true")) ++sets;
+    CHECK(sets == 1);
+  }
   // R11: handleDaily stores the raw mA, like handleTelemetry/handleAlarm; the >=4.0 clamp is gone.
   CHECK(strstr(text, "(mA >= 4.0f) ? mA : 0.0f") == nullptr);
   CHECK(strstr(text, "      mA = t[\"ma\"].as<float>();\n      rec->sensorMa = mA;\n") != nullptr);
