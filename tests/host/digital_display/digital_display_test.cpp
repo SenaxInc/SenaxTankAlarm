@@ -201,10 +201,16 @@ static void testSketchText() {
   CHECK(strstr(text, "strlcpy(sensorOut, ct[\"sensor\"] | \"\", sensorLen);") != nullptr);
   CHECK(strstr(text, "strlcpy(triggerOut, ct[\"digitalTrigger\"] | \"\", triggerLen);") != nullptr);
   CHECK(strstr(text, "obj[\"sensorType\"] = \"digital\";") != nullptr);
-  CHECK(strstr(text, "Float Switch clear (%s)") != nullptr);
-  CHECK(strstr(text, "type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
-  CHECK(strstr(text, "Still in %s alarm (%s).%s") != nullptr);                  // snooze/resume notice
-  CHECK(strstr(text, "rec.alarmType, digitalStateText(rec.currentValue),") != nullptr);
+  // Float texts show the switch state (ON/OFF), not a reading and unit. The name before each
+  // tail comes from composeSensorText (pinned in tests/host/sensor_name).
+  CHECK(strstr(text, "snprintf(tail, sizeof(tail), \" Float Switch clear (%s)\", digitalStateText(rec->currentValue));") != nullptr);
+  CHECK(strstr(text, "snprintf(tail, sizeof(tail), \" still in %s alarm (%s)\",\n"
+                     "               type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
+  // Snooze/resume notice: the float's state is the reading composeSnoozeText prints in "(%s)"
+  // (TankAlarm_SensorName.h, tested in tests/host/sensor_name).
+  CHECK(strstr(text, "    strlcpy(reading, digitalStateText(rec.currentValue), sizeof(reading));\n") != nullptr);
+  CHECK(strstr(text, "composeSnoozeText(message, sizeof(message), snoozed, rec.site, rec.label, rec.userNumber, who,\n"
+                     "                    rec.alarmType, reading);") != nullptr);
   CHECK(strstr(text, "  rec->currentValue = level;\n  // S-D03") == nullptr);  // the unconditional write is gone
   // R03: handleDaily admits a daily reading by value presence (the helper above), never by value.
   CHECK(strstr(text, "newLevel > 0.0f") == nullptr);
