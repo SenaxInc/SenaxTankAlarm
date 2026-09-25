@@ -6,8 +6,9 @@
 // Needs node 18 or later and no packages. Reads the CONFIG_GENERATOR_HTML raw string from the
 // server sketch, runs its numbering helpers (nextSensorNumber, sensorNumbersValid,
 // loadSensorNumbers, cardSensorNumber) in a vm context, runs addSensor and startCommissioning
-// against a small fake DOM, and checks that the page uses the helpers where a sensor's number is
-// created, sent, loaded and turned into an alarm-contact id.
+// against a small fake DOM, runs cachedSensorHigh, the import handler, submitConfig and the Device
+// UID change handler against a stub fetch, and checks that the page uses the helpers where a
+// sensor's number is created, sent, loaded and turned into an alarm-contact id.
 
 const fs = require('fs');
 const path = require('path');
@@ -73,6 +74,21 @@ function extractFunction(page, name) {
   return page.slice(at, bodyEnd(page, page.indexOf(')', at)));
 }
 
+// The same for an async function: the source must say "async function <name>(".
+function extractAsyncFunction(page, name) {
+  if (!page.includes('async function ' + name + '(')) throw new Error(name + ' is not an async function');
+  return 'async ' + extractFunction(page, name);
+}
+
+// The arrow function that follows `marker` (which must occur once), e.g. an event handler.
+function extractArrow(page, marker) {
+  const at = page.indexOf(marker);
+  if (at < 0) throw new Error(marker + ' not found in CONFIG_GENERATOR_HTML');
+  if (page.indexOf(marker, at + 1) >= 0) throw new Error('more than one ' + marker);
+  const start = at + marker.length;
+  return page.slice(start, bodyEnd(page, page.indexOf('=>', start)));
+}
+
 const page = generatorPage();
 const ctx = {};
 vm.createContext(ctx);
@@ -81,7 +97,7 @@ for (const n of ['nextSensorNumber', 'sensorNumbersValid', 'loadSensorNumbers', 
 }
 const { nextSensorNumber, sensorNumbersValid, loadSensorNumbers, cardSensorNumber } = ctx;
 // Results cross the vm boundary; compare them as plain JSON.
-const load = (sensors, snh) => JSON.parse(JSON.stringify(loadSensorNumbers(sensors, snh)));
+const load = (sensors, snh, floor) => JSON.parse(JSON.stringify(loadSensorNumbers(sensors, snh, floor)));
 const card = (n) => ({ dataset: { sensorNumber: String(n) } });
 
 // nextSensorNumber: max(numbers in use, high-water mark) + 1
@@ -189,6 +205,34 @@ checkEq('snh 0 counts as present', load([{}], 0), { nums: [1], high: 1, repaired
 checkEq('no sensors keep snh', load(undefined, 4), { nums: [], high: 4, repaired: [] });
 checkEq('invalid snh ignored', load([{ number: 1 }], 'x'), { nums: [1], high: 1, repaired: [] });
 
+// The floor (the mark the server holds for the client) raises the high mark, so a sensor added
+// or repaired after loading an older file never reuses a number the server has already used.
+checkEq('floor above the file: kept numbers, high mark raised', load([{ number: 1 }, { number: 2 }], undefined, 5),
+  { nums: [1, 2], high: 5, repaired: [] });
+checkEq('floor above the file: next number passes it', nextSensorNumber([1, 2], load([{ number: 1 }, { number: 2 }], undefined, 5).high), 6);
+checkEq('floor above snh: a repair lands past the floor', load([{ number: 1 }, { number: 0 }], 2, 5),
+  { nums: [1, 6], high: 6, repaired: [{ position: 2, number: 6 }] });
+checkEq('floor above snh: a duplicate lands past the floor', load([{ number: 2 }, { number: 2 }], 2, 5),
+  { nums: [2, 6], high: 6, repaired: [{ position: 2, number: 6 }] });
+// hasSnh still comes from the file: without snh the position rule is unchanged under a floor.
+checkEq('no snh under a floor: missing and unusable numbers keep the position', load([{}, { number: 'x' }], undefined, 5),
+  { nums: [1, 2], high: 5, repaired: [{ position: 2, number: 2 }] });
+checkEq('no snh under a floor: missing numbers are the positions', load([{}, {}], undefined, 5),
+  { nums: [1, 2], high: 5, repaired: [] });
+checkEq('no snh under a floor: 0 lands past the floor', load([{ number: 0 }, { number: 1 }], undefined, 5),
+  { nums: [6, 1], high: 6, repaired: [{ position: 1, number: 6 }] });
+checkEq('no snh under a floor: a taken position lands past the floor', load([{ number: 1 }, {}, { number: 2 }], undefined, 5),
+  { nums: [1, 6, 2], high: 6, repaired: [{ position: 2, number: 6 }] });
+checkEq('floor below snh never lowers it', load([{ number: 1 }], 7, 5), { nums: [1], high: 7, repaired: [] });
+checkEq('floor below the numbers in use never lowers it', load([{ number: 9 }], undefined, 5), { nums: [9], high: 9, repaired: [] });
+checkEq('floor with no sensors', load(undefined, undefined, 5), { nums: [], high: 5, repaired: [] });
+checkEq('floor 255: a repair reuses the lowest free number', load([{ number: 3 }, { number: 3 }], undefined, 255),
+  { nums: [3, 1], high: 255, repaired: [{ position: 2, number: 1, reused: true }] });
+for (const bad of [0, -1, 256, 5.5, '5', null, undefined, true]) {
+  checkEq('floor ' + JSON.stringify(bad) + ' ignored', load([{ number: 1 }, { number: 2 }], undefined, bad),
+    { nums: [1, 2], high: 2, repaired: [] });
+}
+
 // cardSensorNumber: the number stored on the card, 0 when there is none
 checkEq('card number', cardSensorNumber(card(7)), 7);
 checkEq('card number 0', cardSensorNumber(card(0)), 0);
@@ -199,6 +243,7 @@ checkEq('no card', cardSensorNumber(null), 0);
 // startCommissioning: a client with no stored config starts at #1, even when the page still holds
 // another client's cards as a template. Runs the page's addSensor and startCommissioning against a
 // fake DOM; addSensorCard, showToast and renderMsgContacts are stubs.
+let flowTests = null;
 {
   let cards = [];
   let nextId = 0;
@@ -259,6 +304,194 @@ checkEq('no card', cardSensorNumber(null), 0);
   ctx.startCommissioning('dev:C');
   checkEq('commissioning an empty page starts at #1', nums(), [1]);
   checkEq('high-water mark after commissioning an empty page', high(), 1);
+
+  // The page learns the server's mark (P323 review): importing a file and sending a config both
+  // read GET /api/client, so Add Sensor never reuses a number the server has already used. Runs the
+  // page's cachedSensorHigh, the import handler, submitConfig and the Device UID change handler
+  // against a stub fetch. loadConfig is a stub that runs the loader's two numbering statements.
+  const toasts = [];
+  let stored = {};        // uid -> GET /api/client reply body; a missing uid is a 404
+  let getFails = false;   // GET /api/client throws (server unreachable)
+  let postStatus = 200;
+  let postText = 'OK';
+  let onGet = null;       // runs while a GET is in flight
+  const gets = [];
+  const posts = [];
+  ctx.showToast = (msg, kind) => toasts.push({ msg: String(msg), kind });
+  ctx.fetch = async (url, opts) => {
+    if (url === '/api/config') {
+      posts.push(JSON.parse(opts.body));
+      return { status: postStatus, statusText: '', text: async () => postText };
+    }
+    const prefix = '/api/client?uid=';
+    if (!url.startsWith(prefix)) throw new Error('unexpected fetch ' + url);
+    gets.push(url);
+    if (onGet) { const f = onGet; onGet = null; f(); }
+    if (getFails) throw new Error('network down');
+    const uid = decodeURIComponent(url.slice(prefix.length));
+    if (!(uid in stored)) return { ok: false, status: 404, json: async () => { throw new Error('no body'); } };
+    return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(stored[uid])) };
+  };
+  ctx.__nums = nums;
+  ctx.__setCards = (list) => { cards = list.map((n) => fakeCard(n, false)); };
+  ctx.retryBtn = { style: {} };
+  ctx.syncBtn = { style: {} };
+  vm.runInContext(extractAsyncFunction(page, 'cachedSensorHigh'), ctx);
+  vm.runInContext(extractAsyncFunction(page, 'submitConfig'), ctx);
+  // The loader's numbering, as window.loadConfig runs it (pinned below); null throws like the page.
+  vm.runInContext('var loadConfig=function(c,floor){if(c===null)throw new TypeError("null config");' +
+    'const loadedNumbers=loadSensorNumbers(c.sensors,c.snh,floor);sensorNumberHigh=loadedNumbers.high;' +
+    '__setCards(loadedNumbers.nums);};', ctx);
+  // collectConfig's number handling: each card's number, snh = max(mark, numbers in use).
+  vm.runInContext('var collectConfig=function(){const ns=__nums();return {sensors:ns.map(n=>({number:n})),' +
+    'snh:Math.max(sensorNumberHigh,...ns)};};', ctx);
+  const onload = vm.runInContext('(' + extractArrow(page, 'const r=new FileReader();r.onload=') + ')', ctx);
+  const onUidChange = vm.runInContext('(' + extractArrow(page, "if(els.clientUid)els.clientUid.addEventListener('change',") + ')', ctx);
+  const setHigh = (n) => vm.runInContext('sensorNumberHigh=' + n + ';', ctx);
+  const importFile = (text) => onload({ target: { result: text } });
+  const submit = () => ctx.submitConfig({ preventDefault() {} });
+  const reset = () => {
+    stored = {}; getFails = false; postStatus = 200; postText = 'OK'; onGet = null;
+    gets.length = 0; posts.length = 0; toasts.length = 0;
+    cards = []; setHigh(0); ctx.els.clientUid.value = 'dev:A';
+  };
+  // Client dev:A once used #1, #2, #4 and #5; #3 and #5 were removed (the server's mark is 5).
+  const clientA = { config: { snh: 5, sensors: [{ number: 1 }, { number: 2 }, { number: 4 }] } };
+
+  flowTests = async () => {
+    // cachedSensorHigh
+    reset();
+    stored = { 'dev:A': clientA };
+    checkEq('cached mark is the stored snh', await ctx.cachedSensorHigh('dev:A'), 5);
+    checkEq('cached mark reads the client by its encoded UID', gets, ['/api/client?uid=dev%3AA']);
+    stored = { 'dev:A': { config: { snh: 3, sensors: [{ number: 7 }, 'x', null] } } };
+    checkEq('cached mark is the highest stored number above snh', await ctx.cachedSensorHigh('dev:A'), 7);
+    stored = { 'dev:A': { config: { sensors: [{ number: 255 }] } } };
+    checkEq('cached mark at 255', await ctx.cachedSensorHigh('dev:A'), 255);
+    stored = { 'dev:A': { config: { snh: 999, sensors: 'x' } } };
+    checkEq('cached mark ignores a bad stored config', await ctx.cachedSensorHigh('dev:A'), 0);
+    stored = { 'dev:A': {} };
+    checkEq('cached mark without a stored config', await ctx.cachedSensorHigh('dev:A'), 0);
+    stored = {};
+    checkEq('cached mark on 404', await ctx.cachedSensorHigh('dev:A'), 0);
+    getFails = true;
+    checkEq('cached mark when the server cannot be reached', await ctx.cachedSensorHigh('dev:A'), 0);
+    gets.length = 0;
+    checkEq('cached mark without a UID', await ctx.cachedSensorHigh(''), 0);
+    checkEq('no request without a UID', gets, []);
+
+    // Import an older file (no snh) of client A, then Add Sensor: #6, not #3 or #5.
+    reset();
+    stored = { 'dev:A': clientA };
+    await importFile(JSON.stringify({ deviceUid: ' dev:A ', sensors: [{ number: 1 }, { number: 2 }] }));
+    checkEq('import reads the file client\'s mark', gets, ['/api/client?uid=dev%3AA']);
+    checkEq('import keeps the file\'s numbers', nums(), [1, 2]);
+    checkEq('import raises the mark to the server\'s', high(), 5);
+    ctx.addSensor();
+    checkEq('import then Add Sensor passes the server\'s mark', nums(), [1, 2, 6]);
+
+    // A repair made while loading also lands past the server's mark.
+    reset();
+    stored = { 'dev:A': clientA };
+    await importFile(JSON.stringify({ deviceUid: 'dev:A', snh: 2, sensors: [{ number: 1 }, { number: 0 }] }));
+    checkEq('import repairs past the server\'s mark', nums(), [1, 6]);
+
+    // A file whose mark is above the server's keeps its own.
+    reset();
+    stored = { 'dev:A': clientA };
+    await importFile(JSON.stringify({ deviceUid: 'dev:A', snh: 7, sensors: [{ number: 1 }] }));
+    checkEq('import never lowers the file\'s mark', high(), 7);
+
+    // 404, an unreachable server and a file without a UID behave as before the fix.
+    for (const [label, setup, file] of [
+      ['404', () => { stored = {}; }, { deviceUid: 'dev:A', sensors: [{ number: 1 }, { number: 2 }] }],
+      ['server unreachable', () => { stored = { 'dev:A': clientA }; getFails = true; }, { deviceUid: 'dev:A', sensors: [{ number: 1 }, { number: 2 }] }],
+      ['no UID in the file', () => { stored = { 'dev:A': clientA }; }, { sensors: [{ number: 1 }, { number: 2 }] }],
+    ]) {
+      reset();
+      setup();
+      await importFile(JSON.stringify(file));
+      ctx.addSensor();
+      checkEq('import, ' + label + ': numbered from the file as before', [nums(), high()], [[1, 2, 3], 3]);
+    }
+    reset();
+    stored = { 'dev:A': clientA };
+    await importFile(JSON.stringify({ deviceUid: 'dev:A', sensors: [{ number: 1 }, { number: 2 }] }).replace('{', '{,'));
+    checkEq('import of invalid JSON', [toasts.map((t) => t.msg), gets.length, nums()], [['Invalid JSON'], 0, []]);
+    reset();
+    await importFile('null');
+    checkEq('import of null', [toasts.map((t) => t.msg), gets.length], [['Invalid JSON'], 0]);
+
+    // Send a config loaded while the server was unreachable, then Add Sensor: #6.
+    for (const [status, text] of [[200, 'OK'], [200, 'WARNING: saved, but ...'], [202, 'Config saved locally']]) {
+      reset();
+      stored = { 'dev:A': clientA };
+      getFails = true;
+      await importFile(JSON.stringify({ deviceUid: 'dev:A', sensors: [{ number: 1 }, { number: 2 }] }));
+      checkEq('submit ' + status + ' ' + text.slice(0, 7) + ': starts from the file\'s mark', high(), 2);
+      getFails = false;
+      postStatus = status;
+      postText = text;
+      gets.length = 0;
+      await submit();
+      checkEq('submit ' + status + ' ' + text.slice(0, 7) + ': sends to the client', [posts.length, posts[0] && posts[0].client], [1, 'dev:A']);
+      checkEq('submit ' + status + ' ' + text.slice(0, 7) + ': reads the server\'s mark', gets, ['/api/client?uid=dev%3AA']);
+      checkEq('submit ' + status + ' ' + text.slice(0, 7) + ': raises the mark', high(), 5);
+      ctx.addSensor();
+      checkEq('submit ' + status + ' ' + text.slice(0, 7) + ' then Add Sensor passes the server\'s mark', nums(), [1, 2, 6]);
+    }
+    // A refused send leaves the mark and makes no extra request.
+    reset();
+    stored = { 'dev:A': clientA };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    postStatus = 400;
+    postText = 'Sensor numbers must be unique';
+    await submit();
+    checkEq('refused submit leaves the mark', [high(), gets.length], [2, 0]);
+    // 404 or an unreachable server after a good send: the sent mark, as before.
+    for (const [label, setup] of [['404', () => { stored = {}; }], ['server unreachable', () => { getFails = true; }]]) {
+      reset();
+      stored = { 'dev:A': clientA };
+      ctx.__setCards([1, 2]);
+      setHigh(3);
+      setup();
+      await submit();
+      checkEq('submit, ' + label + ': mark unchanged', high(), 3);
+    }
+    // The send never lowers the mark, even when Add Sensor runs while the GET is in flight.
+    reset();
+    stored = { 'dev:A': clientA };
+    ctx.__setCards([1, 2]);
+    setHigh(7);
+    await submit();
+    checkEq('submit never lowers the mark', high(), 7);
+    reset();
+    stored = { 'dev:A': { config: { snh: 2, sensors: [{ number: 1 }, { number: 2 }] } } };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    onGet = () => ctx.addSensor();
+    await submit();
+    checkEq('Add Sensor during the send keeps its number', [nums(), high()], [[1, 2, 3], 3]);
+
+    // A Device UID typed in raises the mark to that client's; never lowers it.
+    reset();
+    stored = { 'dev:A': clientA };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    ctx.els.clientUid.value = ' dev:A ';
+    await onUidChange();
+    checkEq('typed UID raises the mark', [gets, high()], [['/api/client?uid=dev%3AA'], 5]);
+    setHigh(7);
+    await onUidChange();
+    checkEq('typed UID never lowers the mark', high(), 7);
+    reset();
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    ctx.els.clientUid.value = 'dev:new';
+    await onUidChange();
+    checkEq('typed UID of a new client leaves the mark', high(), 2);
+  };
 }
 
 // Where the page uses them
@@ -273,7 +506,8 @@ check('config is refused with bad numbers and carries snh',
   page.includes('if(!sensorNumbersValid(sensorNums)){') && page.includes('cfg.snh=Math.max(sensorNumberHigh,...sensorNums);'));
 check('alarm-contact id uses the number', page.includes("const num=cardSensorNumber(card);if(!num)return '';return uid+'_'+num;};"));
 check('loader keeps numbers',
-  page.includes('const loadedNumbers=loadSensorNumbers(c.sensors,c.snh);sensorNumberHigh=loadedNumbers.high;') &&
+  page.includes('window.loadConfig=function(c,floor){') &&
+  page.includes('const loadedNumbers=loadSensorNumbers(c.sensors,c.snh,floor);sensorNumberHigh=loadedNumbers.high;') &&
   page.includes('addSensorCard(loadedNumbers.nums[ti])') && !page.includes('forEach(t=>{addSensor();'));
 check('loader reports repaired numbers', page.includes('if(loadedNumbers.repaired.length){') &&
   page.includes("sensor numbers repaired (missing, duplicate, 0 or invalid): '") &&
@@ -286,7 +520,7 @@ check('default names are the type word only',
 {
   // Every statement between reading the Name box and the next field of the sensor: none may put a
   // number (internal number, Display Number or position) into the name.
-  const from = "let name=card.querySelector('.tank-name').value;";
+  const from = "let name=card.querySelector('.tank-name').value.trim();";
   const to = 'const sensor=sensorKeyFromValue(type);';
   const at = page.indexOf(from);
   const end = at < 0 ? -1 : page.indexOf(to, at);
@@ -296,6 +530,28 @@ check('default names are the type word only',
     region.includes('name=') && !/cardSensorNumber|userNum|index|\$\{/.test(region), region);
   check('no numbered default name anywhere on the page', !/(Tank|Gas System|Engine) \$\{/.test(page));
 }
+// The sensor name is trimmed like the site, so a name of only spaces is the type word.
+check('sensor name is trimmed',
+  page.split("let name=card.querySelector('.tank-name').value.trim();").length === 2 &&
+  !page.includes("let name=card.querySelector('.tank-name').value;"));
+// P323: the page learns the server's mark where a file is imported, a config is sent and a Device
+// UID is typed; loading from the server passes no floor (the stored config carries its own snh).
+check('import handler loads with the server\'s mark',
+  page.includes("r.onload=async(evt)=>{let c;try{c=JSON.parse(evt.target.result);}catch(err){showToast('Invalid JSON',true);return;}" +
+    "const floor=await cachedSensorHigh(String((c&&c.deviceUid)||'').trim());try{loadConfig(c,floor);}catch(err){showToast('Invalid JSON',true);}};"));
+check('submitConfig raises the mark after 200 or 202',
+  extractFunction(page, 'submitConfig').includes(
+    'if(res.status===200||res.status===202){const h=await cachedSensorHigh(clientUid);sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);}'));
+check('Device UID change raises the mark',
+  page.includes("if(els.clientUid)els.clientUid.addEventListener('change',async()=>{const h=await cachedSensorHigh(els.clientUid.value.trim());if(h>sensorNumberHigh)sensorNumberHigh=h;});"));
+check('loading from the server passes no floor',
+  page.includes('if(c&&c.config)loadConfig(c.config);else startCommissioning(uid);') && page.split('loadConfig(').length === 3);
+// Every place the mark is set: only the declaration and commissioning can lower it; a new one
+// must be added here after checking that it never reuses a number.
+checkEq('every assignment of the mark',
+  (page.match(/sensorNumberHigh=(?!=)[^;]*;/g) || []).sort(),
+  ['sensorNumberHigh=0;', 'sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);', 'sensorNumberHigh=h;',
+    'sensorNumberHigh=loadedNumbers.high;', 'sensorNumberHigh=num;', 'sensorNumberHigh=tpl.length;'].sort());
 check('commissioning restarts numbering at 1',
   page.includes("function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;") &&
   page.includes('card.dataset.sensorNumber=String(i+1);') && page.includes('sensorNumberHigh=tpl.length;if(!tpl.length)addSensor();'));
@@ -341,5 +597,10 @@ check('commissioning restarts numbering at 1',
     checkAt >= 0 && markAt > checkAt && post.split('dispatchClientConfig(').length === 2);
 }
 
-console.log(failures ? failures + ' of ' + checks + ' checks FAILED' : 'generator numbers: all ' + checks + ' checks passed');
-process.exit(failures ? 1 : 0);
+flowTests().then(() => {
+  console.log(failures ? failures + ' of ' + checks + ' checks FAILED' : 'generator numbers: all ' + checks + ' checks passed');
+  process.exit(failures ? 1 : 0);
+}, (err) => {
+  console.log('FAIL the server-mark flow threw: ' + (err && err.stack || err));
+  process.exit(1);
+});
