@@ -13727,7 +13727,10 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     if (trustLevel) {
       rec->currentValue = newLevel;
     }
-    rec->lastUpdateEpoch = now;
+    // R02: the per-sensor `t` is the last acquisition minute and can be at or before a telemetry
+    // reply already stored here (pollNotecard runs handleTelemetry before handleDaily), so it
+    // never moves the time back: that would bring back an update request's badge.
+    if (now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data

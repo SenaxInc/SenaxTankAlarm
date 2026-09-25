@@ -214,6 +214,29 @@ static void testSketchText() {
                      "    if (dailyReadingAdmissible(rec->sensorType, sensorEpoch > 0.0, trustLevel, dailyMaPresent,\n"
                      "                               dailyMaInRange, dailyValuePresent)) {") != nullptr);
   CHECK(strstr(text, "    double sensorEpoch = t[\"t\"] | 0.0;") != nullptr);
+  // R02: handleDaily's sensors[] loop never moves lastUpdateEpoch back. Its only write in the loop
+  // (from the per-sensor `t` to the history snapshot) is the guarded one.
+  CHECK(strstr(text, "    if (trustLevel) {\n      rec->currentValue = newLevel;\n    }\n") != nullptr);
+  CHECK(strstr(text, "\n    if (now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;\n    gSensorRegistryDirty = true;\n") != nullptr);
+  CHECK(strstr(text, "\n    rec->lastUpdateEpoch = now;\n") == nullptr);
+  {
+    const char *loopBegin = strstr(text, "    double sensorEpoch = t[\"t\"] | 0.0;");
+    const char *loopEnd = loopBegin ? strstr(loopBegin, "      recordTelemetrySnapshot(clientUid, siteName, sensorIndex,") : nullptr;
+    CHECK(loopBegin != nullptr && loopEnd != nullptr);
+    if (loopBegin && loopEnd) {
+      int writes = 0;
+      int guarded = 0;
+      static const char kWrite[] = "rec->lastUpdateEpoch = ";
+      static const char kGuard[] = "if (now > rec->lastUpdateEpoch) ";
+      for (const char *p = strstr(loopBegin, kWrite); p && p < loopEnd; p = strstr(p + 1, kWrite)) {
+        ++writes;
+        const size_t g = sizeof(kGuard) - 1;
+        if ((size_t)(p - loopBegin) >= g && strncmp(p - g, kGuard, g) == 0) ++guarded;
+      }
+      CHECK(writes == 1);
+      CHECK(guarded == 1);
+    }
+  }
   // R11: handleDaily stores the raw mA, like handleTelemetry/handleAlarm; the >=4.0 clamp is gone.
   CHECK(strstr(text, "(mA >= 4.0f) ? mA : 0.0f") == nullptr);
   CHECK(strstr(text, "      mA = t[\"ma\"].as<float>();\n      rec->sensorMa = mA;\n") != nullptr);

@@ -36,13 +36,18 @@ static inline const char *dailyReconcileSensorType(const char *reportSt, const c
   return (recordType != nullptr) ? recordType : "";
 }
 
-// Alarm type to record when the daily report shows an alarm the server missed. A client that sends
-// the note type ("y", added by CL-5) is trusted when the sensor type is digital or not known yet; a
-// stray float type on a known non-digital sensor is ignored and falls through to high/low.
-// Otherwise a digital sensor's high latch (floats latch only on the high channel, so a lone low
-// latch is never a float) takes its type from configTrigger, the sensor's "digitalTrigger" in the
-// client's cached config: "not_activated" gives "not_triggered", anything else (including an
-// unknown config) "triggered", the client default. Anything else keeps high/low.
+// Alarm type to record when the daily report shows an alarm the server missed.
+// 1. The note type ("y", added by CL-5) is trusted when the sensor type is digital or not known
+//    yet, whichever channel latched: a conforming client sends "y" only on a float's alarms[]
+//    entry, and a float latches only on the high channel (for "triggered" and "not_triggered"
+//    alike), so "y" always comes with hi:true. Gating "y" on highLatched would only change the
+//    impossible lo:true case, and would then record a float as "low". A stray float type on a
+//    known non-digital sensor is ignored and falls through to high/low.
+// 2. With no usable "y" (older clients), a digital sensor's high latch takes its type from
+//    configTrigger, the sensor's "digitalTrigger" in the client's cached config: "not_activated"
+//    gives "not_triggered", anything else (including an unknown config) "triggered", the client
+//    default. This fallback needs highLatched because a lone low latch is never a float.
+// 3. Anything else keeps high/low.
 static inline const char *dailyReconcileAlarmType(const char *y, const char *sensorType, bool highLatched,
                                                   const char *configTrigger) {
   const bool typeUnknown = (sensorType == nullptr || sensorType[0] == '\0');
