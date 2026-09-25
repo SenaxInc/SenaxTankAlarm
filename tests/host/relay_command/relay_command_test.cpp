@@ -183,6 +183,34 @@ static void testResults() {
   CHECK(strcmp(relayClearResultName(255), "invalid") == 0);
 }
 
+// The log word: a remote release only requested OFF, so it is not logged as "released".
+static const char kClearLineFmt[] = "Clear Relay sensor #%u -> monitor %u (%s): %s, active 0x%X, binding %s%s";
+
+static void testLogWord() {
+  CHECK(strcmp(relayClearLogWord(RELAY_CLEAR_RELEASED, RELAY_SCOPE_REMOTE), "off-requested") == 0);
+  CHECK(strcmp(relayClearLogWord(RELAY_CLEAR_RELEASED, RELAY_SCOPE_LOCAL), "released") == 0);
+  CHECK(strcmp(relayClearLogWord(RELAY_CLEAR_RELEASED, RELAY_SCOPE_NONE), "released") == 0);
+  CHECK(strcmp(relayClearLogWord(RELAY_CLEAR_NONE_ACTIVE, RELAY_SCOPE_REMOTE), "none-active") == 0);
+  for (uint8_t i = 1; i < RELAY_CLEAR_RESULT_COUNT; ++i) {
+    for (uint8_t s = RELAY_SCOPE_NONE; s <= RELAY_SCOPE_REMOTE; ++s) {
+      CHECK(strcmp(relayClearLogWord(i, s), relayClearResultName(i)) == 0);  // only RELEASED+REMOTE differs
+    }
+  }
+  CHECK(strcmp(relayClearLogWord(255, RELAY_SCOPE_REMOTE), "invalid") == 0);
+  // Worst case of the sketch's line (23-char name, 47-char target, widest numbers) still fits the
+  // 160-byte buffer and serial log entry without truncation.
+  char name[24];
+  char target[48];
+  memset(name, 'N', sizeof(name) - 1);
+  name[sizeof(name) - 1] = '\0';
+  memset(target, 'T', sizeof(target) - 1);
+  target[sizeof(target) - 1] = '\0';
+  char line[160];
+  const int len = snprintf(line, sizeof(line), kClearLineFmt, 255u, 255u, name,
+                           relayClearLogWord(RELAY_CLEAR_RELEASED, RELAY_SCOPE_REMOTE), 0xFFu, "remote ", target);
+  CHECK(len > 0 && len < (int)sizeof(line));
+}
+
 // The sketch must use the classifier and never read the legacy key as a slot again.
 static void testSketchText() {
   FILE *f = fopen(CLIENT_SKETCH, "rb");
@@ -204,6 +232,10 @@ static void testSketchText() {
   CHECK(strstr(text, "numbers[i] = gConfig.monitors[i].sensorIndex;") != nullptr);
   CHECK(strstr(text, "const char *routedUid = doc[\"_target\"].as<const char*>();") != nullptr);
   CHECK(strstr(text, "RELAY_CMD_RESET_BY_NUMBER:\n        clearRelaysForSensorNumber(cmd.sensorNumber);\n        return;") != nullptr);
+  // The Clear Relay log line uses the tested word and the format whose worst case testLogWord measures.
+  CHECK(strstr(text, "cfg.name, relayClearLogWord(o.result, scope),") != nullptr);
+  CHECK(strstr(text, kClearLineFmt) != nullptr);
+  CHECK(strstr(text, "char line[160];") != nullptr);
 }
 
 // The Clear Relay step with recording doubles for its three side effects.
@@ -287,6 +319,7 @@ int main() {
   testLegacyDivergence();
   testScope();
   testResults();
+  testLogWord();
   testClearStep();
   testSketchText();
   if (gFailures) {

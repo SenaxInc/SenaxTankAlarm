@@ -7,7 +7,8 @@
 //
 // Sensor numbers belong to the client that owns the sensor, so a by-number command is always
 // resolved here, on the source, and is never forwarded. If the resolved monitor drives relays on
-// another client, the source switches them off with ordinary relay/state commands.
+// another client, the source asks the server to forward ordinary relay/state OFF commands to it
+// (queued, not confirmed until C-T02).
 //
 // Pure: ArduinoJson and C headers only, C++14, no RTTI, so tests/host/relay_command compiles this
 // exact file. Unknown keys are ignored, so later fields (C-T02: cid, t, exp; C-A02:
@@ -103,8 +104,12 @@ static inline RelayResolve relayResolveSensorNumber(const uint8_t *numbers, uint
 
 enum RelayScope : uint8_t { RELAY_SCOPE_NONE = 0, RELAY_SCOPE_LOCAL, RELAY_SCOPE_REMOTE };
 
-// How a monitor's relay binding is configured: no relays (mask 0), this client's own relays (blank
-// target or this device's UID), or another client's relays. Plan rule R6; C-A02 drives relays by it.
+// How a monitor's relay binding is configured, by the relay/float plan's rule R6: no relays (relayMask
+// 0; "no relay" is always written as mask 0), this client's own relays (blank target or this device's
+// own UID; the new page's "This client" writes a blank target), or another client's relays.
+// v2.2.16's tracked activation and boot-restore paths still skip a blank target (they test
+// relayTargetClient[0] directly) until CL-6b converts them to this rule, so in CL-4 this function
+// only labels the Clear Relay log line; it changes no relay. C-A02 drives relays by it.
 static inline RelayScope relayScopeOf(uint8_t relayMask, const char *target, const char *ownUid) {
   if ((relayMask & 0x0F) == 0) return RELAY_SCOPE_NONE;
   if (target == nullptr || target[0] == '\0') return RELAY_SCOPE_LOCAL;
@@ -114,7 +119,10 @@ static inline RelayScope relayScopeOf(uint8_t relayMask, const char *target, con
 
 // Outcome of one Clear Relay command. Logged today; C-T02 reports it to the server ("rr").
 enum RelayClearResult : uint8_t {
-  RELAY_CLEAR_RELEASED = 0,      // relays tracked for the sensor were switched off (OFF forwarded if remote)
+  // RELAY_CLEAR_RELEASED: relays tracked as ON for the sensor were released here. A local binding's
+  // coils are off; for a remote binding the OFF was only requested (queued for the server to forward),
+  // not confirmed and not retried until C-A02 (retry) and C-T02 (confirmation). See relayClearLogWord.
+  RELAY_CLEAR_RELEASED = 0,      // tracked relays released (remote: OFF requested, not confirmed)
   RELAY_CLEAR_NONE_ACTIVE,       // sensor found; nothing tracked as ON for it
   RELAY_CLEAR_UNKNOWN_SENSOR,    // no monitor has this number
   RELAY_CLEAR_DUPLICATE_SENSOR,  // two monitors have this number: nothing is guessed
@@ -127,6 +135,15 @@ static inline const char *relayClearResultName(uint8_t result) {
   static const char *const kNames[RELAY_CLEAR_RESULT_COUNT] = {
       "released", "none-active", "unknown-sensor", "duplicate-sensor", "invalid", "legacy-ignored"};
   return result < RELAY_CLEAR_RESULT_COUNT ? kNames[result] : "invalid";
+}
+
+// The result word for the Clear Relay log line. A remote binding's release only queues an OFF request
+// (not confirmed; C-A02 retries, C-T02 confirms), so it is logged as "off-requested" instead of
+// "released". A word swap, not a suffix, so the line stays inside the 160-byte serial log entry. The
+// result name reported later ("rr", C-T02) is still relayClearResultName.
+static inline const char *relayClearLogWord(uint8_t result, uint8_t scope) {
+  if (result == RELAY_CLEAR_RELEASED && scope == RELAY_SCOPE_REMOTE) return "off-requested";
+  return relayClearResultName(result);
 }
 
 static inline RelayClearResult relayClearResultFromResolve(RelayResolve rc, uint8_t activeMask) {

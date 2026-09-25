@@ -9731,16 +9731,18 @@ static void logRelayClearLine(const char *line) {
 
 // Clear Relay for sensor number k (S-T01/CL-4). Numbers belong to this client, so k is resolved here and
 // never forwarded; a monitor bound to another client's relays is released by resetRelayForMonitor,
-// which sends that client relay/state OFF. Nothing is actuated unless exactly one monitor has
-// number k. C-A02 replaces resetRelayForMonitor's body behind this function; C-T02 reports the
-// returned result to the server.
+// which asks the server to forward relay/state OFF to that client (queued only: not confirmed and not
+// retried; C-A02 retries, C-T02 confirms). Local tracking is cleared either way, so the log line says
+// "off-requested" rather than "released" for a remote binding (relayClearLogWord). Nothing is
+// actuated unless exactly one monitor has number k. C-A02 replaces resetRelayForMonitor's body behind
+// this function; C-T02 reports the returned result to the server.
 static void logRelayClearOutcome(uint8_t sensorNumber, const RelayClearOutcome &o) {
   char line[160];
   if (o.resolve == RELAY_RESOLVE_OK) {
     const MonitorConfig &cfg = gConfig.monitors[o.slot];
     const RelayScope scope = relayScopeOf(cfg.relayMask, cfg.relayTargetClient, gDeviceUID);
     snprintf(line, sizeof(line), "Clear Relay sensor #%u -> monitor %u (%s): %s, active 0x%X, binding %s%s",
-             (unsigned)sensorNumber, (unsigned)o.slot, cfg.name, relayClearResultName(o.result),
+             (unsigned)sensorNumber, (unsigned)o.slot, cfg.name, relayClearLogWord(o.result, scope),
              (unsigned)o.activeMask,
              scope == RELAY_SCOPE_NONE ? "none" : (scope == RELAY_SCOPE_LOCAL ? "local" : "remote "),
              scope == RELAY_SCOPE_REMOTE ? cfg.relayTargetClient : "");
