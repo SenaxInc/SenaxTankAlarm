@@ -1,7 +1,7 @@
 # TankAlarm Master TODO List
 
 > **Current Version:** 2.2.16 (history, alarm debounce, duplicate emails, times to the minute; September 23, 2026)  
-> **Last Updated:** September 23, 2026 (PRs #318 → #321 merged into `master` as `df7195e`, `6706044`, `e5442a2`, `3fc9d22`; S-D03 and C-T01 done, S-T06 closed as a duplicate of S-T01, C-P07 closed; relay/float project (C-A01, C-A02, S-T01, C-A04) next; see `CODE_REVIEW_09232026_PRS_318_321_CLAUDE.md`)  
+> **Last Updated:** September 25, 2026 (Copilot comments of 2026-09-25 on #323-#327 answered in the Follow-up section of `CODE_REVIEW_09242026_COPILOT_REVIEWS_RESPONSE_CLAUDE.md`; S-T09's import bullet fixed in #323 `a35b328`; notes added under S-T08, C-A02 and C-T05. September 24: Copilot reviews of PRs #318-#326 answered in `CODE_REVIEW_09242026_COPILOT_REVIEWS_RESPONSE_CLAUDE.md`; deferred items added as S-D06, S-D07, S-T08, S-T09 and C-T05, with notes under S-D02, S-T01, S-T07, C-A01, C-A02, C-T02, C-P01 and X-R01. September 23: PRs #318 → #321 merged into `master` as `df7195e`, `6706044`, `e5442a2`, `3fc9d22`; S-D03 and C-T01 done, S-T06 closed as a duplicate of S-T01, C-P07 closed; relay/float project (C-A01, C-A02, S-T01, C-A04) next; see `CODE_REVIEW_09232026_PRS_318_321_CLAUDE.md`)  
 > **Purpose:** Comprehensive tracker for all unimplemented changes identified in code reviews and logic reviews. Update after every new review or commit.
 
 ---
@@ -67,15 +67,23 @@
 
 - [ ] **S-D01 (P1) (S)** Registration Is Dropped Before Client Discovery — _CLAUDE H-25_
 - [ ] **S-D02 (P1) (S)** Freshness, Quality, and Event Ordering Need One Contract — _FULL/COPILOT F-11, F-12, F-29; CLAUDE M-45, M-46, M-48, M-49, L-37, L-38, L-39; related INDEPENDENT R-13_
+  - **In progress — PR #325 (`1e1b13a`, open)**: `handleDaily` stores the raw mA (L-38; Copilot 2026-09-24 R11) and admits a real 0 into history through `dailyReadingAdmissible()` (R03); the part-0 missed-alarm reconcile creates a missing record (R10). Held for the relay/float release (owner, 2026-09-24).
 - [x] **S-D03 (P1) (S)** Warm History and Archive Manifests Lose Data at Size Boundaries — _CLAUDE H-23, M-54, M-55, L-29_
   - **Merged — PR #319 (`6706044`, 2026-09-23, v2.2.16)**: month files streamed and merged row by row, fail-closed with `.tmp` + rename and `.bad` salvage (H-23); missed days that have readings rolled up later, days without readings stay blank (L-29); archived-client manifest kept whole, salvaged, `?file=` limited to manifest entries (M-54/M-55). Owner rule applied: only fresh readings at their acquisition time enter history (see the review doc). Residuals: S-D04 items (retention, yoy, compare cost, 8 KB download buffer, `dev:` upload path); v2.2.15 hot-tier snapshots are charted but never rolled up, so days H-23 already wiped are not rebuilt; bench checks in the PR (LittleFS semantics, timing/heap self-test, power cut).
 - [ ] **S-D04 (P2) (S)** Retention, Monthly Completeness, and Peak Memory Are Overstated — _CLAUDE H-26, M-39, M-56; FULL/COPILOT F-20 and performance recommendations_
 - [ ] **S-D05 (P2) (S)** Calibration and Weather History Are Not Reliable Reference Data — _CLAUDE M-37, M-38, M-59, L-50_
+- [D] **S-D06 (P3) (S)(C)** Daily history assumes battery voltage is at most an hour old — _Copilot 2026-09-24 R04 (first Copilot review R2)_
+  - `warmVinOnReadingDay()` assumes the voltage was measured within 3600 s of the note. The client allows `solarCharger.pollIntervalSec` up to 3600 s and keeps the last MPPT data through failed polls, and `vinMonitor.pollIntervalSec` has no upper limit, so with a hand-set interval of about 30 min or more yesterday's voltage can enter today's row. The defaults (MPPT 60 s, Vin 300 s) are safe, and levels are not affected.
+  - Fix (client + server): the client sends the voltage's age next to `v`, and the server uses it in place of the fixed 3600 s when present. Do not just raise `WARM_VIN_MAX_AGE_SEC`. The Vin poll clamp (5–3600 s) goes in the CS-1 wave (see C-P01).
+- [D] **S-D07 (P3) (S)** A late alarm cannot raise a day's alarm count once some of that day's readings have left the hot ring — _Copilot 2026-09-24 R05 (first Copilot review R3)_
+  - `warmDecideVisitor()` keeps the stored row whenever its `n` is larger (`WarmTierStore.h:792`), so a recomputed row with a higher `al` is dropped, and a day with no readings left emits no row. Practically unreachable with default settings (about one history reading per day). Only the warm-history alarm count is affected; levels, emails and texts are not.
+  - Fix: when the stored `n` is larger but the new `al` is higher, rewrite the stored row raising only `al`; allow an alarm-only raise on an existing row for a day with no readings left; never create a row (no fabricated levels). Tests with partial and empty rings; repeat delivery must be idempotent.
 
 ### Server — Alarms, Delivery, and Remote Commands
 
 - [ ] **S-T01 (P1) (S)** Stable Relay Identity Requires an Explicit Protocol Migration — _FULL/COPILOT F-02; INDEPENDENT R-02; CLAUDE prior F-02/R-02_
   - Includes S-T06 (same defect: Clear Relay sends the dashboard array position). Part of the relay/float project started 2026-09-23; P1 because relays are about to be deployed.
+  - **S5 scope (release gate, 2026-09-24)**: client PR #324 (CL-4) ignores the legacy `relay_reset_sensor` key, so it ships only in the same release as S5, server first. S5 must have the dashboard post the sensor number `k`, not the card index (`data-idx` is the position in `/api/clients` `ts[]`); validate `k` in `handleRelayClearPost` before sending `relay_reset_sensor_number`; and word the success message so it does not claim delivery (200 means queued). _Copilot 2026-09-24 CR-1/R08; R08's legacy fallback is rejected because it restores the wrong-sensor clear._
 - [ ] **S-T02 (P1) (S)** Notification Eligibility Must Belong to the Current Alarm Episode — _FULL/COPILOT F-09, F-15; INDEPENDENT R-10/R-13; CLAUDE M-51, M-52, L-45, L-47_
 - [ ] **S-T03 (P1) (S)** Config Revision, ACK, and Retry Semantics Can Misreport Success — _FULL/COPILOT F-10; INDEPENDENT R-09; CLAUDE H-01, M-42, M-43_
 - [ ] **S-T04 (P2) (S)** Note Consumption Needs Idempotency and Observable Failure — _FULL/COPILOT F-24; INDEPENDENT R-19; CLAUDE M-47, L-35, L-36_
@@ -84,6 +92,16 @@
   - `renderDataCard` sends `t.sensorIdx`, the position of the sensor in `/api/clients` `ts[]` (registry order), and the client applies `relay_reset_sensor` as its configured monitor-array index, so a client whose sensors report as `[2, 1]` can clear the wrong monitor. Pre-existing (the inline handler did the same); #315 only moved the value into a data attribute. Fix: send the persistent sensor identity (`sensorIndex`, 1-based) and resolve it to the monitor on the client, or have the server translate it.
 - [x] **S-T07 (P2) (S)** Duplicate emails from Notehub route retries — _owner report, 2026-09-23_
   - **Merged — PR #320 (`e5442a2`, 2026-09-23, v2.2.16)**: `email.qo` bodies carry a message `id`; the Apps Script bridge on `/email-setup` skips repeats by Notehub event ID and message id (script lock + cache, `sending`/`sent`, 6 h) and waits for a send in progress; Notehub retry schedule in the docs corrected to 30 s / 1 min / 5 min. Operators must paste the new `doPost` and keep their `SECRET`. Residual (Copilot final pass): in a rare three-way retry race the bridge could send an extra copy (per-execution claim token would close it; never a lost email).
+  - **Release gate (relay/float release)**: operators re-paste the Apps Script from `/email-setup` (first line `// TankAlarm email bridge v2.2.17 (Display Number, float ON/OFF)`) and redeploy it as a new version of the same Web App; a server update does not replace a deployed script. The script carries this dedupe and #326's naming. Until then, the one-line Display Number edit in #326's PR text stops the daily email from printing the internal sensor number. _Copilot 2026-09-24, first review suggestion 2 and CR-8_
+- [D] **S-T08 (P3) (S)** Sensor-name and message residuals after #326 — _Copilot 2026-09-24 R14, CR-7, CR-10c_
+  - Alarm and snooze emails are built from the same `char message[160]` as the SMS (`handleAlarm`, `broadcastSnoozeChange`), so they are cut to SMS length. Decouple the email text from the SMS buffer later.
+  - `handleTelemetry` and `handleDaily` still write the placeholder `Tank` into an empty record label, so a sensor with a blank name reads `<site> Tank` in texts; #326 stopped only the unload path from doing this.
+  - Display Number reads use `is<int32_t>()`, so a `7.0` is ignored and the stored number is kept; #324's `relayJsonUint` accepts it. No sender produces a double today. If a shared whole-number rule is added, apply it to the Display Number only: sensor-number reads must keep matching the client's `is<uint8_t>()`.
+  - **Client: UTF-8-safe name copies (Copilot 2026-09-25 on #326)**: the client copies the sensor name and site with a byte-wise `strlcpy` (`master` Client `.ino` ~3051 `mon.name`, ~3460 `cfg.siteName`), so a long name can be cut inside a UTF-8 character. The server now drops an incomplete tail in the SMS name part (`84d2145`) and in the daily email's site and label (`9678cb1`), but the client is where the split happens. Add a UTF-8-safe copy for these strings in the relay/float client wave.
+- [D] **S-T09 (P3) (S)** Optional warning for an unknown sensor number — _Copilot 2026-09-24 CR-6_
+  - After #323 the registry accepts any `k` from 1 to 255 (the old `k < 64` bound is gone). Optional: log a warning when `k` is not in the client's cached config, and evict unknown-number records first. Do not drop such notes: that would lose real alarms from a client whose new config is still pending.
+  - **Fixed in #323 (`a35b328`, 2026-09-25)**: the page reads the server's stored mark (`GET /api/client`) before numbering an imported file and uses it as a floor, so repairs made during the load also land above it; a send answered with 200, WARNING or 202 raises the page's mark; the mark is never lowered. Host tests in `tests/host/sensor_numbers/generator_numbers_test.js` (160 checks). _Copilot 2026-09-25 on #323_
+  - ~~Import of an old file for a known client (review of #323, 2026-09-24): the Config Generator allocates new numbers from the loaded file's `snh`, so importing an older file (no `snh`, or a lower one) and then adding a sensor can hand out a retired number. #323's CR-5 fix only stops the server's stored mark from going down; it cannot undo a number the page already chose. Fix: when a config is loaded or imported for a client that has a cached snapshot, the page starts from max(file `snh`, cached mark) before allocating (for example, fetch the cached mark with the client's config).~~
 
 ### Server — Persistence, Scheduling, and Maintenance
 
@@ -95,7 +113,11 @@
 ### Client — Sensor Acquisition and Control
 
 - [ ] **C-A01 (P1) (C)** Map Physical Outputs and Input Terminals Explicitly — _CLAUDE H-04, H-11, H-12_
+  - **CL-2 notes (2026-09-24, from the #322 review)**: `usedClass` stays sticky for the whole boot; firmware never calls `optaLegacyRelayPin` (bench sketch and host tests only); `OPTA_LED_ON_LEVEL` is a placeholder and is used in firmware only after bench A2 measures it. _Copilot 2026-09-24 CR-10d_
 - [ ] **C-A02 (P1) (C)** Unify Relay Ownership, Modes, and Reconfiguration — _CLAUDE H-02, H-05, H-07; related FULL/COPILOT F-05 and S-T01_
+  - **Remote OFF (Copilot 2026-09-24 CR-1)**: `resetRelayForMonitor` sends a remote OFF only for the RAM-tracked `activeMask`, which is 0 after a reboot or when another monitor took the bit, so Clear Relay can leave a remote coil ON and log `none-active`. In the C-A02 wave: send remote OFF for the monitor's whole configured `relayMask` whenever the binding is remote (OFF is idempotent), restore tracked state after a reboot, and log "OFF sent (none tracked)" instead of `none-active`. Pre-existing, not from #324.
+  - **Blank relay target (Copilot 2026-09-25 on #324)**: in CL-6b, convert the blank-target guards to `relayScopeOf` (rule R6: a blank target or the client's own UID is LOCAL, any other UID is REMOTE; "no relay" is `relayMask` 0). The guards in `master`'s client `.ino` are at 5282 (config push counts a cleared target as "relay removed"), 6293 (boot restore), 6824 (`sendAlarm`), 8318, 9658 and 9681 (`resetRelayForMonitor`). Update the `MonitorConfig` comment `relayTargetClient[48]; // ... (empty = none)` (`master` :714) to match. In the relay plan, strike R6's stale "the 2.2.17 generator emits the relay keys only when both target and mask are non-empty" in favour of CP-4's "mask always sent". #324 (`082bc24`) only rewrote the `relayScopeOf` comment; in CL-4 the scope labels the Clear Relay log line and nothing else.
+  - **Remote release wording (Copilot 2026-09-25 on #324)**: #324 (`082bc24`) logs `off-requested` for a remote release (`relayClearLogWord`), and the `RELAY_CLEAR_RELEASED` comment says a remote OFF was only requested (queued to the server, not confirmed, not retried). When C-A02's OFF retry or C-T02's delivery confirmation adds a queue or confirmation status, update that log word and the `RELAY_CLEAR_RELEASED` comment (and the `.ino` comment above `logRelayClearOutcome`) to report it.
 - [ ] **C-A03 (P1) (C)** Pulse Acquisition Must Observe the Whole Measurement Window — _FULL/COPILOT F-06; INDEPENDENT R-14; CLAUDE M-02 and prior-item evidence_
 - [ ] **C-A04 (P2) (C)** Sensor Failure and Recovery Need Fresh, Sensor-Specific Evidence — _CLAUDE H-03, M-09, M-11, L-06; FULL/COPILOT F-12_
 - [ ] **C-A05 (P2) (C)** Analog Scale, Acquisition Delays, and I2C Timeout Assumptions — _CLAUDE M-10, L-07, L-56_
@@ -106,12 +128,17 @@
   - **Merged — PR #318 (`df7195e`, 2026-09-23, v2.2.16)**: strictly consecutive debounce (`TankAlarm_AlarmDebounce.h`, host-tested), invalid samples held, boot clamp removed, wrap-safe hourly prune, publish-only pending retry while the sample is in alarm, re-assertion after sensor-recovered, relay-restore notification, alarm `t` = reading time, whole-minute note times. Residuals: NEW-A config-push latch reset and the stuck-disable path without re-assertion (C-A02); I2C silent `sensorFailed` clear and non-consecutive `recoveryCount` (C-A04, M-09); pulse freshness (C-A03); pending state is RAM-only.
 - [ ] **C-T04 (P3) (C)** Alarm rate limiter edge cases at the `millis()` wrap — _Copilot final pass on #318, 2026-09-23_
   - Near the first ~49.7-day wrap the synthetic "expired" boot stamp becomes recent again, so the first alarm of a type can be held 5 minutes (sensor-fault notes have no pending retry); on a long-quiet device a stamp older than one wrap can make a stale hourly budget look recent. Fix: explicit per-type "never sent" state, and age out stamps on a timer, not only when an alarm is checked.
+- [ ] **C-T05 (P3) (C)** Float alarms skip the 5-minute minimum alarm spacing — _Copilot 2026-09-24 R07_
+  - `checkAlarmRateLimit()` applies the 300 s spacing to `high`, `low`, `sensor-fault` and `sensor-stuck` only; `triggered`/`not_triggered` have just the hourly cap. With the 3-sample debounce and the page's 1-minute sample minimum, a float alarms at most once per 6 minutes. Add the float types to the spacing check when CL-5 changes float alarm timing. Pre-existing (same in v2.2.15).
+  - **CL-5 host test (Copilot 2026-09-25 on #325)**: the server trusts a daily entry's `y` whichever channel latched, because a conforming client sends `y` only on high-latched float entries (floats latch only on the high channel). CL-5's host test must assert that every digital `alarms[]` entry the client builds has `hi:true`, `lo:false`.
 - [ ] **C-T02 (P1) (C)** Remote Commands Need Delivery and Freshness Guarantees — _CLAUDE H-13, M-15, M-16; S-T01_
+  - **Optional cooldown hardening (Copilot 2026-09-24 CR-9/R09)**: the 5 s relay command cooldown cannot fire in a field build (one `relay.qi` note per inbound poll, at least 60 s apart), so nothing is lost today. In the C-T02 wave, optionally: keep a note refused for cooldown instead of deleting it, exempt OFF/Clear from the cooldown, and guard the awaiting-config and solar inbound-interval overrides the way `GRID_INBOUND_INTERVAL_MS` is guarded (bench builds only).
 - [ ] **C-T03 (P2) (C)** Replay Order and Capacity Must Match the Publisher — _FULL/COPILOT F-11/F-16; CLAUDE M-14; prior July reviews_
 
 ### Client — Configuration, Power, and OTA
 
 - [ ] **C-P01 (P1) (C)** Numeric Configuration Must Be Validated Before Narrowing — _CLAUDE H-01, M-06, M-08, M-42, L-19, L-57; FULL/COPILOT F-10_
+  - **CS-1 wave (Copilot 2026-09-24 R07, R04)**: the client accepts any `sampleSeconds`, including 0 (the 1-minute floor exists only because the page sends `sampleMinutes*60`); add a client minimum, for example 60 s. `vinMonitor.pollIntervalSec` has no upper limit; clamp it to 5–3600 s like `solarCharger.pollIntervalSec` (see S-D06).
 - [ ] **C-P02 (P1) (C)** Battery Alerts Can Repeat Without a Bounded Episode Policy — _CLAUDE H-08/H-09 (one issue), M-05, H-29, L-52_
 - [ ] **C-P03 (P2) (C)** Power Transitions Must Use Fresh Voltage and Complete Side Effects — _FULL/COPILOT F-18; INDEPENDENT R-15; CLAUDE H-10, M-13, L-05_
 - [ ] **C-P04 (P1) (C)** Solar State Is Stored on the Wrong Logical Volume — _CLAUDE H-28/M-62 (one issue)_
@@ -133,6 +160,7 @@
 
 - [~] **X-R01 (P2) (A)** Reproducible Builds and Regression Tests — _FULL/COPILOT F-27; CLAUDE M-01, M-17, L-01, L-12, L-53, L-63, L-64_
   - v2.2.16 adds the `host-tests` CI job (C++ suites with ASan/UBSan and -O2, plus a node suite for the email bridge). Still open: the firmware jobs install the core and libraries unpinned (the host tests pin ArduinoJson 7.4.3).
+  - Optional (Copilot 2026-09-24 R15, refuted as a failure): suites that read a sketch as text could strip CR first, so a CRLF copy made outside git cannot make their negative "must not contain" checks pass without testing anything. `*.ino text eol=lf` already keeps real checkouts LF.
 - [ ] **X-R02 (P3) (A)** Documentation, Published Artifacts, and Trust Model — _INDEPENDENT R-21/R-22; CLAUDE M-18, L-01, L-11, L-12, L-54; FULL documentation/security recommendations_
   - Also: the committed `firmware/112025/viewer/*.bin` dates from 2026-06-12 because `build-firmware` does not export the viewer (the release asset is current).
 - [ ] **X-R03 (P2) (A)** Provisioning and Diagnostic Utilities — _FULL/COPILOT F-25/F-26; CLAUDE prior appendix_
@@ -867,6 +895,10 @@ This TODO was compiled from the following documents, sorted by date:
 
 | Date | Document | Type |
 |------|----------|------|
+| 2026-09-24 | CODE_REVIEW_09242026_COPILOT_REVIEWS_RESPONSE_CLAUDE.md | Verdicts and actions for the three Copilot reviews below; owner decisions, release gates, open bench items |
+| 2026-09-24 | CODE_REVIEW_09242026_PRS_318_321_COPILOT.md | Copilot review of PRs #318-#326 (R01-R15) |
+| 2026-09-24 | CODE_REVIEW_09242026_PRS_322_326_COPILOT.md | Copilot review of open PRs #322-#326 (CR-1 to CR-10) |
+| 2026-09-24 | CODE_REVIEW_09242026_PRS_318_321_HISTORY_COPILOT.md | Copilot review of PRs #318-#321 and history edge cases (R1-R4); restored from `a1a2c16` |
 | 2026-09-23 | CODE_REVIEW_09232026_PRS_318_321_CLAUDE.md | PRs #318-#321 (v2.2.16): history, alarm debounce, duplicate emails, times to the minute; verification, review rounds, residuals |
 | 2026-09-15 | CODE_REVIEW_09152026_WEBSITE_PRS_314_317_CLAUDE.md | Website PRs #314-#317: changes, verification, Copilot rounds, residuals |
 | 2026-09-09 | CODE_REVIEW_09092026_MASTER_REPOSITORY_REVIEW.md | Consolidated master review of the four 2026-09-08 reviews; tracked above |
