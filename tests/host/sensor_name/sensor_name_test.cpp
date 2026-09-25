@@ -153,6 +153,52 @@ static void testUtf8CompleteLen() {
   CHECK(utf8CompleteLen("a\xFF", 2) == 2);             // not a lead byte
 }
 
+// utf8CompleteCopy: the daily email's site and label (P326 review round 5).
+static void checkCopy(const char *s, size_t outLen, const char *expected, int line) {
+  char out[40];
+  memset(out, 'Z', sizeof(out));
+  const size_t n = utf8CompleteCopy(out, outLen, s);
+  ++gChecks;
+  if (strcmp(out, expected) != 0 || n != strlen(expected)) {
+    ++gFailures;
+    printf("FAIL line %d: utf8CompleteCopy(%u, \"%s\") = \"%s\" (%u), want \"%s\"\n", line,
+           (unsigned)outLen, s ? s : "(null)", out, (unsigned)n, expected);
+  }
+  CHECK(out[outLen] == 'Z');  // nothing written past outLen
+  CHECK(validUtf8(out));
+}
+#define COPY(s, outLen, expected) checkCopy(s, outLen, expected, __LINE__)
+
+static void testUtf8CompleteCopy() {
+  char out[4] = {'Z', 'Z', 'Z', 'Z'};
+  CHECK(utf8CompleteCopy(out, 0, "abc") == 0 && out[0] == 'Z');  // outLen 0 writes nothing
+  CHECK(utf8CompleteCopy(nullptr, 4, "abc") == 0);
+  COPY(nullptr, 8, "");
+  COPY("", 8, "");
+  COPY("abc", 1, "");
+  COPY("Wellhead", 24, "Wellhead");
+  // Blanks are kept (the email routes trim), complete characters are kept.
+  COPY(" Tank 1 ", 24, " Tank 1 ");
+  COPY("Caf\xC3\xA9", 24, "Caf\xC3\xA9");
+  COPY("Well \xF0\x9F\x98\x80", 24, "Well \xF0\x9F\x98\x80");
+  // A stored value that ends mid-character loses the partial character: a lone C3, E2 82 and
+  // F0 9F 98.
+  COPY("Wellhead\xC3", 24, "Wellhead");
+  COPY("Wellhead\xE2\x82", 24, "Wellhead");
+  COPY("Wellhead\xF0\x9F\x98", 24, "Wellhead");
+  COPY("Tank \xC3", 24, "Tank ");
+  COPY("\xE2\x82", 24, "");
+  // Too long for out: cut at a character boundary, never inside one.
+  COPY("ab\xC3\xA9", 4, "ab");
+  COPY("ab\xC3\xA9", 5, "ab\xC3\xA9");
+  COPY("x\xF0\x9F\x98\x80y", 5, "x");
+  // The record sizes the daily email copies into (site[32], label[24]): a 23-byte label that
+  // ends in a lone lead byte, and a 31-byte site cut inside a 3-byte character.
+  COPY("ABCDEFGHIJKLMNOPQRSTUV\xC3", 24, "ABCDEFGHIJKLMNOPQRSTUV");
+  COPY("ABCDEFGHIJKLMNOPQRSTUVWXYZ012\xE2\x82", 32, "ABCDEFGHIJKLMNOPQRSTUVWXYZ012");
+  COPY("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123\xE2\x82\xAC", 32, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123");
+}
+
 static void checkName(const char *site, const char *label, uint8_t un, size_t outLen,
                       const char *expected, int line) {
   char out[80];
@@ -868,6 +914,27 @@ static void testSketchText() {
                      "      obj[\"un\"] = entry.userNumber;          // Display Number (left out when blank)\n"
                      "    }\n") != nullptr);
 
+  // P326 (review round 5): the daily email's sensors[] entries carry site and label copied
+  // without a partial UTF-8 character at the end, since the email routes build the name from them.
+  {
+    const char *dailyEmail = strstr(text, "static void sendDailyEmail() {");
+    CHECK(dailyEmail != nullptr);
+    const char *dailyLoop = findAfter("  for (uint8_t i = 0; i < gSensorRecordCount; ++i) {\n"
+                                      "    JsonObject obj = sensors.add<JsonObject>();\n"
+                                      "    obj[\"client\"] = gSensorRecords[i].clientUid;\n", dailyEmail);
+    CHECK(dailyLoop != nullptr);
+    const char *dailyLoopEnd = findAfter("    obj[\"sensorIndex\"] = gSensorRecords[i].sensorIndex;\n", dailyLoop);
+    CHECK(dailyLoopEnd != nullptr);
+    CHECK(foundBetween("    char dailySite[sizeof(gSensorRecords[i].site)];\n"
+                       "    char dailyLabel[sizeof(gSensorRecords[i].label)];\n"
+                       "    utf8CompleteCopy(dailySite, sizeof(dailySite), gSensorRecords[i].site);\n"
+                       "    utf8CompleteCopy(dailyLabel, sizeof(dailyLabel), gSensorRecords[i].label);\n"
+                       "    obj[\"site\"] = dailySite;", dailyLoop, dailyLoopEnd));
+    CHECK(foundBetween("    obj[\"label\"] = dailyLabel;\n", dailyLoop, dailyLoopEnd));
+    CHECK(strstr(text, "obj[\"site\"] = gSensorRecords[i].site;") == nullptr);
+    CHECK(strstr(text, "obj[\"label\"] = gSensorRecords[i].label;") == nullptr);
+  }
+
   // Negative pins: the old "sensor <k>" / "#<k>" naming is gone from every text.
   CHECK(strstr(text, "? \" #\" : \" sensor \"") == nullptr);
   CHECK(strstr(text, "\"%s #%d unloaded") == nullptr);
@@ -880,6 +947,7 @@ int main() {
   testNoteDisplayNumber();
   testUtf8FitLen();
   testUtf8CompleteLen();
+  testUtf8CompleteCopy();
   testFormatSensorName();
   testComposeSensorText();
   testComposeSnoozeText();

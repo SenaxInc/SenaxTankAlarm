@@ -14,9 +14,13 @@
 // of printable text with single inner spaces (what the config page produces); a name with NBSP
 // at an end, or with inner tabs or doubled spaces, can differ by those characters between SMS
 // and the email routes.
-// UTF-8: each part is cut at a character boundary, and a part that already ends in an
-// incomplete multi-byte sequence (a client or older server stored it cut by bytes) loses that
-// partial character, so SMS and email never carry a broken character.
+// UTF-8: a stored site or label can end in an incomplete multi-byte sequence (a client or older
+// server copied it with strlcpy, which cuts by bytes). The texts the server builds here
+// (formatSensorName / composeSensorText: the alarm, reminder, snooze and unload SMS and emails)
+// cut each part at a character boundary and drop such a partial character. The daily email's
+// sensors[] entries carry site and label whole for the email routes to name the sensor, so
+// their builder copies each with utf8CompleteCopy (below), which drops the same partial
+// character. The root cause, the client's byte cut, is fixed in the client wave.
 // The internal sensor number (sensorIndex, "k") is never printed in an SMS or email: it is a
 // registry key, not something an operator set. Examples:
 //   "Silas Cox Wellhead high alarm 34.4 in"      (Display Number blank)
@@ -111,6 +115,22 @@ static inline size_t utf8CompleteLen(const char *s, size_t n) {
     return n;  // ASCII, a 4th continuation byte or an invalid byte: nothing cut here
   }
   return (n - (i - 1) < need) ? i - 1 : n;
+}
+
+// Copies s into out (outLen bytes) cut at a UTF-8 boundary to fit and without an incomplete
+// multi-byte sequence at the end (utf8CompleteLen); nothing else changes (no trimming: the
+// daily email routes trim). out is always NUL-terminated when outLen > 0; a null s copies "".
+// Returns the bytes copied.
+static inline size_t utf8CompleteCopy(char *out, size_t outLen, const char *s) {
+  if (out == NULL || outLen == 0) {
+    return 0;
+  }
+  const size_t n = utf8CompleteLen(s, utf8FitLen(s, outLen - 1));
+  if (n > 0) {
+    memcpy(out, s, n);
+  }
+  out[n] = '\0';
+  return n;
 }
 
 // A space or a tab: the blanks trimmed from both ends of a site or a label (CR-8).

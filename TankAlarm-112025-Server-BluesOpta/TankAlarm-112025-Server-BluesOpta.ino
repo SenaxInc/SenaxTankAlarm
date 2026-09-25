@@ -15386,8 +15386,14 @@ static void sendDailyEmail() {
   for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
     JsonObject obj = sensors.add<JsonObject>();
     obj["client"] = gSensorRecords[i].clientUid;
-    obj["site"] = gSensorRecords[i].site;
-    obj["label"] = gSensorRecords[i].label;
+    // P326: the email routes name the sensor from site and label, so each goes without a partial
+    // UTF-8 character left at its end by a byte cut, as in SMS (TankAlarm_SensorName.h).
+    char dailySite[sizeof(gSensorRecords[i].site)];
+    char dailyLabel[sizeof(gSensorRecords[i].label)];
+    utf8CompleteCopy(dailySite, sizeof(dailySite), gSensorRecords[i].site);
+    utf8CompleteCopy(dailyLabel, sizeof(dailyLabel), gSensorRecords[i].label);
+    obj["site"] = dailySite;    // char[] assignment copies into the document
+    obj["label"] = dailyLabel;
     obj["sensorIndex"] = gSensorRecords[i].sensorIndex;
     if (gSensorRecords[i].userNumber > 0) {
       obj["userNumber"] = gSensorRecords[i].userNumber;
