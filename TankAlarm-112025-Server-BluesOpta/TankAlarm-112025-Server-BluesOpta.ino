@@ -13929,7 +13929,8 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     tankLabel = known->label;
   }
   JsonVariantConst un = doc["un"];
-  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
+  const int32_t unValue = un.is<int32_t>() ? un.as<int32_t>() : -1;
+  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), unValue,
                                                   false, known != nullptr ? known->userNumber : 0);
 
   Serial.print(F("Unload event received: "));
@@ -13990,11 +13991,15 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     if (noteLabel[0] != '\0') {
       strlcpy(rec->label, noteLabel, sizeof(rec->label));
     }
-    if (!un.isNull()) {
-      rec->userNumber = displayNumber;  // a future note with "un"; without it the number stays
-    }
+    // A future note with a valid "un" sets the number; a missing or malformed one keeps the
+    // record's own (read from rec, not `known`, so a hash miss that the upsert's linear scan
+    // recovers cannot clear it).
+    rec->userNumber = noteDisplayNumber(!un.isNull(), unValue, false, rec->userNumber);
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;
+    // Every field written above is saved in the registry, so mark it dirty as handleTelemetry,
+    // handleAlarm and handleDaily do (an existing record's upsert does not).
+    gSensorRegistryDirty = true;
   }
 }
 

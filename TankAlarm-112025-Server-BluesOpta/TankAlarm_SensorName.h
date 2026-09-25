@@ -3,10 +3,20 @@
 // client. Pure: C headers only, host-tested in tests/host/sensor_name.
 //
 // NAMING RULE (owner decision 2026-09-24). Every SMS and email that names a sensor calls it
-//   site + " " + label    (each with leading and trailing spaces and tabs removed, as the
-//                           daily-email script's trim() does; a blank part left out,
-//                           "Sensor" when both are blank)
+//   site + " " + label    (each with leading and trailing spaces and tabs removed; a blank
+//                           part left out, "Sensor" when both are blank)
 //   + " #<Display Number>" only when the Display Number is 1-255.
+// TRIMMING differs slightly between the three places that build a name. This file trims only
+// ASCII spaces and tabs at the ends and keeps inner runs. The daily-email Apps Script's
+// String.trim() also strips every other Unicode space and line break at the ends (NBSP, BOM,
+// CR/LF, ...). The JSONata route's $trim (per the JSONata docs) also turns inner tabs and line
+// breaks into spaces and collapses each run of them to one space. So the three agree for names
+// of printable text with single inner spaces (what the config page produces); a name with NBSP
+// at an end, or with inner tabs or doubled spaces, can differ by those characters between SMS
+// and the email routes.
+// UTF-8: each part is cut at a character boundary, and a part that already ends in an
+// incomplete multi-byte sequence (a client or older server stored it cut by bytes) loses that
+// partial character, so SMS and email never carry a broken character.
 // The internal sensor number (sensorIndex, "k") is never printed in an SMS or email: it is a
 // registry key, not something an operator set. Examples:
 //   "Silas Cox Wellhead high alarm 34.4 in"      (Display Number blank)
@@ -71,6 +81,38 @@ static inline size_t utf8FitLen(const char *s, size_t maxBytes) {
   return n;
 }
 
+// n, less an incomplete UTF-8 sequence at the end of s[0..n): when s[0..n) ends in a lead byte
+// followed by fewer continuation bytes than it announces (a lone C3, E2 82 or F0 9F 98), the
+// length before that lead byte; otherwise n. Needed because a stored site or label can end
+// mid-character (the client and the server copy them with strlcpy, which cuts by bytes), and
+// utf8FitLen keeps a string that fits whole. Malformed bytes elsewhere are left as they are.
+// Reads only s[0..n); a null s gives 0.
+static inline size_t utf8CompleteLen(const char *s, size_t n) {
+  if (s == NULL) {
+    return 0;
+  }
+  size_t i = n;
+  // Back over up to 3 continuation bytes (10xxxxxx) to the byte that should lead them.
+  while (i > 0 && n - i < 3 && (((unsigned char)s[i - 1]) & 0xC0u) == 0x80u) {
+    --i;
+  }
+  if (i == 0) {
+    return n;  // only continuation bytes: no lead byte to judge by
+  }
+  const unsigned char lead = (unsigned char)s[i - 1];
+  size_t need;  // bytes the sequence that starts at s[i - 1] should have
+  if ((lead & 0xE0u) == 0xC0u) {
+    need = 2;
+  } else if ((lead & 0xF0u) == 0xE0u) {
+    need = 3;
+  } else if ((lead & 0xF8u) == 0xF0u) {
+    need = 4;
+  } else {
+    return n;  // ASCII, a 4th continuation byte or an invalid byte: nothing cut here
+  }
+  return (n - (i - 1) < need) ? i - 1 : n;
+}
+
 // A space or a tab: the blanks trimmed from both ends of a site or a label (CR-8).
 static inline bool sensorNameBlank(char c) {
   return c == ' ' || c == '\t';
@@ -87,15 +129,23 @@ static inline const char *sensorNameSkipBlank(const char *s) {
   return s;
 }
 
-// Bytes of s to use when it may take at most maxBytes: cut at a UTF-8 boundary, then drop
-// trailing spaces and tabs (so a part of only blanks is empty). Leading blanks are skipped by
-// the caller (sensorNameSkipBlank) before the cap, so they never use up the part's bytes.
+// Bytes of s to use when it may take at most maxBytes: cut at a UTF-8 boundary, drop an
+// incomplete multi-byte sequence left at the end by an earlier byte cut (utf8CompleteLen), then
+// drop trailing spaces and tabs (so a part of only blanks is empty); repeated until neither
+// changes, so "Tank \xC3" gives "Tank". Leading blanks are skipped by the caller
+// (sensorNameSkipBlank) before the cap, so they never use up the part's bytes.
 static inline size_t sensorNamePartLen(const char *s, size_t maxBytes) {
   size_t n = utf8FitLen(s, maxBytes);
-  while (n > 0 && sensorNameBlank(s[n - 1])) {
-    --n;
+  for (;;) {
+    n = utf8CompleteLen(s, n);
+    const size_t before = n;
+    while (n > 0 && sensorNameBlank(s[n - 1])) {
+      --n;
+    }
+    if (n == before) {
+      return n;
+    }
   }
-  return n;
 }
 
 // Writes the sensor's name (the NAMING RULE above) into out and returns its length.
@@ -113,7 +163,8 @@ static inline size_t formatSensorName(char *out, size_t outLen, const char *site
     return 0;
   }
   const size_t room = outLen - 1;
-  // Leading spaces and tabs are skipped before the cap, so SMS matches the script's trim().
+  // Leading spaces and tabs are skipped before the cap, so they never use up a part's bytes
+  // (only spaces and tabs: see TRIMMING above for how the email routes differ).
   const char *s = (site != NULL) ? sensorNameSkipBlank(site) : "";
   const char *l = (label != NULL) ? sensorNameSkipBlank(label) : "";
   size_t sLen = sensorNamePartLen(s, SENSOR_NAME_PART_MAX);

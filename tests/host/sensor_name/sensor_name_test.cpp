@@ -119,6 +119,38 @@ static void testUtf8FitLen() {
   CHECK(utf8FitLen(kEmoji, 4) == 1);
   CHECK(utf8FitLen(kEmoji, 5) == 5);
   CHECK(utf8FitLen(kEmoji, 100) == 6);
+  // A string that fits whole is kept whole, even when it ends mid-character (utf8CompleteLen
+  // handles that).
+  CHECK(utf8FitLen("ab\xC3", 10) == 3);
+}
+
+static void testUtf8CompleteLen() {
+  CHECK(utf8CompleteLen(nullptr, 3) == 0);
+  CHECK(utf8CompleteLen("", 0) == 0);
+  CHECK(utf8CompleteLen("abc", 3) == 3);
+  CHECK(utf8CompleteLen("abc", 2) == 2);
+  // Complete sequences are kept.
+  CHECK(utf8CompleteLen("ab\xC3\xA9", 4) == 4);
+  CHECK(utf8CompleteLen("\xE2\x82\xAC", 3) == 3);
+  CHECK(utf8CompleteLen("x\xF0\x9F\x98\x80", 5) == 5);
+  // An incomplete sequence at the end is dropped: a lone C3, E2 82 and F0 9F 98 (also as a
+  // prefix of a longer string, since only s[0..n) is read).
+  CHECK(utf8CompleteLen("ab\xC3", 3) == 2);
+  CHECK(utf8CompleteLen("ab\xC3\xA9", 3) == 2);
+  CHECK(utf8CompleteLen("\xC3", 1) == 0);
+  CHECK(utf8CompleteLen("x\xE2", 2) == 1);
+  CHECK(utf8CompleteLen("x\xE2\x82", 3) == 1);
+  CHECK(utf8CompleteLen("\xE2\x82", 2) == 0);
+  CHECK(utf8CompleteLen("x\xF0", 2) == 1);
+  CHECK(utf8CompleteLen("x\xF0\x9F", 3) == 1);
+  CHECK(utf8CompleteLen("x\xF0\x9F\x98", 4) == 1);
+  CHECK(utf8CompleteLen("\xC3\xA9\xE2\x82", 4) == 2);  // only the last, incomplete one goes
+  // Malformed bytes that are not an incomplete tail are left alone.
+  CHECK(utf8CompleteLen("\x80\x80", 2) == 2);          // continuation bytes with no lead
+  CHECK(utf8CompleteLen("a\x80", 2) == 2);             // a stray continuation after ASCII
+  CHECK(utf8CompleteLen("\xC3\xA9\x80", 3) == 3);      // an extra continuation byte
+  CHECK(utf8CompleteLen("a\x80\x80\x80\x80", 5) == 5); // more than 3 continuation bytes
+  CHECK(utf8CompleteLen("a\xFF", 2) == 2);             // not a lead byte
 }
 
 static void checkName(const char *site, const char *label, uint8_t un, size_t outLen,
@@ -159,8 +191,8 @@ static void testFormatSensorName() {
   NAME("Silas Cox  ", "Wellhead ", 0, 64, "Silas Cox Wellhead");
   NAME("   ", "Wellhead", 0, 64, "Wellhead");
   NAME("   ", "   ", 1, 64, "Sensor #1");
-  // CR-8: leading spaces and tabs are trimmed too, and a tab counts as a space, as the daily
-  // email script's String.trim() does.
+  // CR-8: leading spaces and tabs are trimmed too, and a tab counts as a space. (Only those two:
+  // the email routes' trim() and $trim also strip other whitespace; see TRIMMING in the header.)
   NAME(" Silas Cox", "Wellhead", 0, 64, "Silas Cox Wellhead");
   NAME("Silas Cox", "  Wellhead", 7, 64, "Silas Cox Wellhead #7");
   NAME("  Silas Cox  ", "  Wellhead  ", 0, 64, "Silas Cox Wellhead");
@@ -207,6 +239,27 @@ static void testFormatSensorName() {
   NAME("Caf\xC3\xA9", "Tank", 0, 6, "Caf\xC3\xA9");
   NAME("Site", "\xC3\xA9\xC3\xA9", 0, 8, "Site \xC3\xA9");
   NAME("Site", "\xC3\xA9\xC3\xA9", 0, 7, "Site");         // "Site " + half a character -> "Site"
+  // A part stored cut mid-character (the client strlcpy's a 23-byte name by bytes) loses the
+  // partial character, with and without a Display Number: a lone C3, E2 82 and F0 9F 98.
+  NAME("Silas Cox", "ABCDEFGHIJKLMNOPQRSTUV\xC3", 0, 64, "Silas Cox ABCDEFGHIJKLMNOPQRSTUV");
+  NAME("Silas Cox", "ABCDEFGHIJKLMNOPQRSTUV\xC3", 7, 64, "Silas Cox ABCDEFGHIJKLMNOPQRSTUV #7");
+  NAME("Silas Cox", "Price ABCDEFGHIJKLMNO\xE2\x82", 0, 64, "Silas Cox Price ABCDEFGHIJKLMNO");
+  NAME("Silas Cox", "Price ABCDEFGHIJKLMNO\xE2\x82", 12, 64, "Silas Cox Price ABCDEFGHIJKLMNO #12");
+  NAME("Silas Cox", "Wellhead\xF0\x9F\x98", 0, 64, "Silas Cox Wellhead");
+  NAME("Silas Cox", "Wellhead\xF0\x9F\x98", 255, 64, "Silas Cox Wellhead #255");
+  // The same on the site, and a blank exposed by the drop is trimmed too.
+  NAME("Caf\xC3", "Tank", 0, 64, "Caf Tank");
+  NAME("Caf\xC3", "Tank", 3, 64, "Caf Tank #3");
+  NAME("Silas Cox", "Tank \xE2\x82", 0, 64, "Silas Cox Tank");
+  NAME("Silas Cox", "Tank \xF0\x9F\x98", 4, 64, "Silas Cox Tank #4");
+  // A part that was only a partial character is blank.
+  NAME("Silas Cox", "\xC3", 0, 64, "Silas Cox");
+  NAME("Silas Cox", "\xE2\x82", 7, 64, "Silas Cox #7");
+  NAME("\xF0\x9F\x98", "\xC3", 0, 64, "Sensor");
+  NAME("\xF0\x9F\x98", "\xC3", 2, 64, "Sensor #2");
+  // Shortening to fit still works from the completed part.
+  NAME("Silas Cox", "Wellhead\xC3", 7, 21, "Silas Cox Wellhea #7");
+  NAME("Silas Cox", "Wellhead\xC3", 7, 22, "Silas Cox Wellhead #7");
 
   // outLen 0 writes nothing; null out is safe.
   char guard[4] = {'Q', 'Q', 'Q', 'Q'};
@@ -218,7 +271,8 @@ static void testFormatSensorName() {
   // number is either whole or absent.
   static const char *const kSites[] = {"Silas Cox", "", "Caf\xC3\xA9 \xE2\x82\xAC Station Longname X", "   ",
                                         " \t Silas Cox \t"};
-  static const char *const kLabels[] = {"Wellhead", "", "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9 Tank"};
+  static const char *const kLabels[] = {"Wellhead", "", "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9 Tank",
+                                         "ABCDEFGHIJKLMNOPQRSTUV\xC3", "Tank \xE2\x82", "Wellhead\xF0\x9F\x98"};
   static const uint8_t kNums[] = {0, 7, 255};
   for (size_t si = 0; si < sizeof(kSites) / sizeof(kSites[0]); ++si) {
     for (size_t li = 0; li < sizeof(kLabels) / sizeof(kLabels[0]); ++li) {
@@ -290,6 +344,27 @@ static void testComposeSensorText() {
   CHECK_STR(msg, "Silas Cox Wellhead unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
   CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead", 7, tail));
   CHECK_STR(msg, "Silas Cox Wellhead #7 unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+
+  // A label the client stored cut mid-character (the 24-byte "Nord-Est Ouest Station" + e-acute
+  // cut to 23 by strlcpy, leaving a lone C3) never reaches a text as a broken character, with or
+  // without a Display Number.
+  tailf(tail, sizeof(tail), " %s alarm %.1f %s", "high", 34.4f, "in");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Reservoir", "Nord-Est Ouest Station\xC3", 0, tail));
+  CHECK_STR(msg, "Silas Reservoir Nord-Est Ouest Station high alarm 34.4 in");
+  CHECK(validUtf8(msg));
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Reservoir", "Nord-Est Ouest Station\xC3", 7, tail));
+  CHECK_STR(msg, "Silas Reservoir Nord-Est Ouest Station #7 high alarm 34.4 in");
+  CHECK(validUtf8(msg));
+  CHECK(composeSensorText(msg, sizeof(msg), "REMINDER: ", "Silas Cox", "Tank Price ABCDEFGHI\xE2\x82", 0, tail));
+  CHECK_STR(msg, "REMINDER: Silas Cox Tank Price ABCDEFGHI high alarm 34.4 in");
+  CHECK(composeSensorText(msg, sizeof(msg), "REMINDER: ", "Silas Cox", "Tank Price ABCDEFGHI\xE2\x82", 5, tail));
+  CHECK_STR(msg, "REMINDER: Silas Cox Tank Price ABCDEFGHI #5 high alarm 34.4 in");
+  tailf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)", 85.5f, "in", 90.0f, 4.5f);
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead Smile\xF0\x9F\x98", 0, tail));
+  CHECK_STR(msg, "Silas Cox Wellhead Smile unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+  CHECK(composeSensorText(msg, sizeof(msg), "", "Silas Cox", "Wellhead Smile\xF0\x9F\x98", 9, tail));
+  CHECK_STR(msg, "Silas Cox Wellhead Smile #9 unloaded: 85.5 in delivered (peak 90.0, now 4.5)");
+  CHECK(validUtf8(msg));
 
   // Max-length cases: 23-byte site, 23-byte label (both longer in the record), Display Number
   // 255, the longest alarm type/unit/who and a wide reading. strlen <= 159 and the reading is
@@ -593,13 +668,33 @@ static void testSketchText() {
   CHECK(dailyCall != nullptr);
   const char *sensorsLoop = findAfter("  JsonArray sensors = doc[\"sensors\"];\n  for (JsonObject t : sensors) {", daily);
   CHECK(sensorsLoop != nullptr && dailyCall != nullptr && sensorsLoop < dailyCall);
-  // Four call sites: telemetry, daily, alarm and unload (alarm and unload keep the number when
-  // "un" is missing: recovered/clear/fault alarm notes and unload notes never carry it).
-  CHECK(countOf(text, "noteDisplayNumber(") == 4);
+  // Five call sites: telemetry, daily, alarm and unload twice (the texts, then the record). Alarm
+  // and unload keep the number when "un" is missing: recovered/clear/fault alarm notes and
+  // unload notes never carry it.
+  CHECK(countOf(text, "noteDisplayNumber(") == 5);
   CHECK(foundBetween("  JsonVariantConst un = doc[\"un\"];\n"
-                     "  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,\n"
+                     "  const int32_t unValue = un.is<int32_t>() ? un.as<int32_t>() : -1;\n"
+                     "  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), unValue,\n"
                      "                                                  false, known != nullptr ? known->userNumber : 0);\n",
                      unload, unloadEnd));
+  // P326 (Copilot 4097040017): handleUnload's record update takes the number from the record
+  // itself and marks the registry dirty after its writes (site, label, Display Number, level,
+  // time), as handleTelemetry, handleAlarm and handleDaily do; an existing record's upsert does
+  // not mark it, so without this the update was lost at the next reboot.
+  {
+    const char *unloadRec = findAfter("  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n"
+                                      "  if (rec) {\n"
+                                      "    strlcpy(rec->site, siteName, sizeof(rec->site));\n", unload);
+    CHECK(unloadRec != nullptr && unloadEnd != nullptr && unloadRec < unloadEnd);
+    const char *unloadRecTail = findAfter(
+        "    rec->userNumber = noteDisplayNumber(!un.isNull(), unValue, false, rec->userNumber);\n"
+        "    rec->currentValue = emptyInches;\n"
+        "    rec->lastUpdateEpoch = eventEpoch;\n", unloadRec);
+    CHECK(unloadRecTail != nullptr && unloadRecTail < unloadEnd);
+    const char *unloadDirty = findAfter("    gSensorRegistryDirty = true;\n  }\n}\n", unloadRecTail);
+    CHECK(unloadDirty != nullptr && unloadDirty < unloadEnd);
+    CHECK(!foundBetween("rec->userNumber = displayNumber;", unload, unloadEnd));
+  }
   // R12: handleAlarm uses the helper with noteAlwaysCarriesUn = false and marks the registry dirty
   // on a change, like telemetry.
   CHECK(foundBetween("    JsonVariantConst un = doc[\"un\"];\n"
@@ -784,6 +879,7 @@ static void testSketchText() {
 int main() {
   testNoteDisplayNumber();
   testUtf8FitLen();
+  testUtf8CompleteLen();
   testFormatSensorName();
   testComposeSensorText();
   testComposeSnoozeText();
