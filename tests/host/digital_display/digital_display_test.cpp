@@ -215,19 +215,22 @@ static void testSketchText() {
                      "                               dailyMaInRange, dailyValuePresent)) {") != nullptr);
   CHECK(strstr(text, "    double sensorEpoch = t[\"t\"] | 0.0;") != nullptr);
   // R02: handleDaily's sensors[] loop never moves lastUpdateEpoch back. Its only write in the loop
-  // (from the per-sensor `t` to the history snapshot) is the guarded one.
+  // (from its upsert to the history snapshot) is the guarded one; a record the loop's own upsert
+  // just made (server clock, not a reading) takes `now` outright.
   CHECK(strstr(text, "    if (trustLevel) {\n      rec->currentValue = newLevel;\n    }\n") != nullptr);
-  CHECK(strstr(text, "\n    if (now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;\n    gSensorRegistryDirty = true;\n") != nullptr);
+  CHECK(strstr(text, "\n    if (recCreated || now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;\n    gSensorRegistryDirty = true;\n") != nullptr);
   CHECK(strstr(text, "\n    rec->lastUpdateEpoch = now;\n") == nullptr);
+  CHECK(strstr(text, "    bool recCreated = false;\n"
+                     "    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);\n") != nullptr);
   {
-    const char *loopBegin = strstr(text, "    double sensorEpoch = t[\"t\"] | 0.0;");
+    const char *loopBegin = strstr(text, "    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);\n");
     const char *loopEnd = loopBegin ? strstr(loopBegin, "      recordTelemetrySnapshot(clientUid, siteName, sensorIndex,") : nullptr;
     CHECK(loopBegin != nullptr && loopEnd != nullptr);
     if (loopBegin && loopEnd) {
       int writes = 0;
       int guarded = 0;
       static const char kWrite[] = "rec->lastUpdateEpoch = ";
-      static const char kGuard[] = "if (now > rec->lastUpdateEpoch) ";
+      static const char kGuard[] = "if (recCreated || now > rec->lastUpdateEpoch) ";
       for (const char *p = strstr(loopBegin, kWrite); p && p < loopEnd; p = strstr(p + 1, kWrite)) {
         ++writes;
         const size_t g = sizeof(kGuard) - 1;
@@ -237,6 +240,33 @@ static void testSketchText() {
       CHECK(guarded == 1);
     }
   }
+  // R02 (reconcile): the missed-alarm reconcile takes no reading, so it no longer stamps the
+  // report time over an existing record's time (the loop above could not lower it again). Its
+  // only lastUpdateEpoch write is for a record it just created: this part's `t` for k, else the
+  // report time.
+  CHECK(strstr(text, "\n          rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();\n") == nullptr);
+  CHECK(strstr(text, "              reportSensorEpoch = t[\"t\"] | 0.0;\n") != nullptr);
+  CHECK(strstr(text, "          if (recCreated) {\n"
+                     "            rec->lastUpdateEpoch = (reportSensorEpoch > 0.0)\n"
+                     "                                       ? reportSensorEpoch\n"
+                     "                                       : ((epoch > 0.0) ? epoch : currentEpoch());\n"
+                     "          }\n") != nullptr);
+  {
+    const char *recBegin = strstr(text, "        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;\n");
+    const char *recEnd = recBegin ? strstr(recBegin, "    // Reconciliation: clear alarms on server for sensors that the client") : nullptr;
+    CHECK(recBegin != nullptr && recEnd != nullptr);
+    if (recBegin && recEnd) {
+      int writes = 0;
+      static const char kWrite[] = "lastUpdateEpoch = ";
+      for (const char *p = strstr(recBegin, kWrite); p && p < recEnd; p = strstr(p + 1, kWrite)) ++writes;
+      CHECK(writes == 1);
+    }
+  }
+  // upsertSensorRecord reports a new record, set only on the creation path.
+  CHECK(strstr(text, "static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created = nullptr);") != nullptr);
+  CHECK(strstr(text, "static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created) {\n") != nullptr);
+  CHECK(strstr(text, "  if (created) *created = false;\n") != nullptr);
+  CHECK(strstr(text, "  insertSensorIntoHash(newIndex);\n  gSensorRegistryDirty = true;\n  if (created) *created = true;\n") != nullptr);
   // R11: handleDaily stores the raw mA, like handleTelemetry/handleAlarm; the >=4.0 clamp is gone.
   CHECK(strstr(text, "(mA >= 4.0f) ? mA : 0.0f") == nullptr);
   CHECK(strstr(text, "      mA = t[\"ma\"].as<float>();\n      rec->sensorMa = mA;\n") != nullptr);
@@ -246,7 +276,7 @@ static void testSketchText() {
   // R10: the missed-alarm reconcile creates a missing record (not a search-only lookup) and fills
   // an empty site from the note.
   CHECK(strstr(text, "search without upserting") == nullptr);
-  CHECK(strstr(text, "SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx) : nullptr;\n"
+  CHECK(strstr(text, "SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;\n"
                      "        if (rec && rec->site[0] == '\\0') {\n"
                      "          const char *noteSite = doc[\"s\"] | \"\";\n"
                      "          if (noteSite[0] != '\\0') strlcpy(rec->site, noteSite, sizeof(rec->site));\n"
