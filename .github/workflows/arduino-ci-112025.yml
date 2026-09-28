@@ -9,6 +9,7 @@ on:
       - 'TankAlarm-112025-FTPS_Server_Test/**'
       - 'TankAlarm-112025-Viewer-BluesOpta/**'
       - 'TankAlarm-112025-Common/**'
+      - 'TankAlarm-112025-OptaIO_Bench/**'
       - 'tests/host/**'
       - '.github/workflows/arduino-ci-112025.yml'
   pull_request:
@@ -18,6 +19,7 @@ on:
       - 'TankAlarm-112025-FTPS_Server_Test/**'
       - 'TankAlarm-112025-Viewer-BluesOpta/**'
       - 'TankAlarm-112025-Common/**'
+      - 'TankAlarm-112025-OptaIO_Bench/**'
       - 'tests/host/**'
       - '.github/workflows/arduino-ci-112025.yml'
   workflow_dispatch:
@@ -107,12 +109,23 @@ jobs:
             --libraries "$LIB_ROOT" \
             TankAlarm-112025-FTPS_Server_Test/TankAlarm-112025-FTPS_Server_Test.ino
 
+      # Bench stage 1 tool (CL-1): compiling it checks the TankAlarm_OptaIo.h pin tables
+      # against the installed core. Never released, so build-firmware does not build it.
+      - name: Compile TankAlarm-112025-OptaIO_Bench
+        id: compile-112025-optaio-bench
+        continue-on-error: true
+        run: |
+          arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --library TankAlarm-112025-Common \
+            TankAlarm-112025-OptaIO_Bench/TankAlarm-112025-OptaIO_Bench.ino
+
       - name: Create issue on compilation failure
         if: |
           steps.compile-112025-client.outcome == 'failure' ||
           steps.compile-112025-server.outcome == 'failure' ||
           steps.compile-112025-viewer.outcome == 'failure' ||
-          steps.compile-112025-ftps.outcome == 'failure'
+          steps.compile-112025-ftps.outcome == 'failure' ||
+          steps.compile-112025-optaio-bench.outcome == 'failure'
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -124,12 +137,14 @@ jobs:
             const server112025Failed = '${{ steps.compile-112025-server.outcome }}' === 'failure';
             const viewer112025Failed = '${{ steps.compile-112025-viewer.outcome }}' === 'failure';
             const ftps112025Failed = '${{ steps.compile-112025-ftps.outcome }}' === 'failure';
+            const benchFailed = '${{ steps.compile-112025-optaio-bench.outcome }}' === 'failure';
 
             const failedSketches = [];
             if (client112025Failed) failedSketches.push('TankAlarm-112025-Client-BluesOpta');
             if (server112025Failed) failedSketches.push('TankAlarm-112025-Server-BluesOpta');
             if (viewer112025Failed) failedSketches.push('TankAlarm-112025-Viewer-BluesOpta');
             if (ftps112025Failed) failedSketches.push('TankAlarm-112025-FTPS_Server_Test');
+            if (benchFailed) failedSketches.push('TankAlarm-112025-OptaIO_Bench');
 
             const sketchName = failedSketches.length === 1 ? failedSketches[0] : 
                                failedSketches.length > 1 ? 'Multiple Sketches (112025)' : 'Unknown';
@@ -151,6 +166,8 @@ jobs:
               `TankAlarm-112025-Viewer-BluesOpta.ino ${viewer112025Failed ? '❌' : '✅'}\n`;
             detailsSection += `- **FTPS Test Sketch:** TankAlarm-112025-FTPS_Server_Test/` +
               `TankAlarm-112025-FTPS_Server_Test.ino ${ftps112025Failed ? '❌' : '✅'}\n`;
+            detailsSection += `- **Opta I/O Bench Sketch:** TankAlarm-112025-OptaIO_Bench/` +
+              `TankAlarm-112025-OptaIO_Bench.ino ${benchFailed ? '❌' : '✅'}\n`;
             
             detailsSection += `\n**Board:**\n`;
             detailsSection += `- Arduino Opta (arduino:mbed_opta:opta)\n`;
@@ -217,7 +234,8 @@ jobs:
           steps.compile-112025-client.outcome == 'failure' ||
           steps.compile-112025-server.outcome == 'failure' ||
           steps.compile-112025-viewer.outcome == 'failure' ||
-          steps.compile-112025-ftps.outcome == 'failure'
+          steps.compile-112025-ftps.outcome == 'failure' ||
+          steps.compile-112025-optaio-bench.outcome == 'failure'
         run: exit 1
 
   check-web-pages:
