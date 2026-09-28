@@ -44,6 +44,7 @@
 #include <FtpsClient.h>
 #include <FtpsTypes.h>
 #include <FtpsErrors.h>
+#include "TankAlarm_DigitalDisplay.h"  // S3: float (digital) display rules (host-tested in tests/host/digital_display)
 
 // POSIX-compliant standard library headers
 #include <stdio.h>
@@ -2083,7 +2084,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 )HTML";
 
-static const char EMAIL_SETUP_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Email Setup - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Email Delivery Setup &mdash; Google Workspace</h2><p>The server never contacts an email provider directly. Alarm and daily-report emails are published as <code>email.qo</code> notes to the Notecard, which syncs them to Blues Notehub even across cellular outages. A Notehub <b>Route</b> then delivers each note by HTTP. This guide wires that route to your <b>Google Workspace (Gmail)</b> account through a free Apps Script bridge, so alerts are sent from your real company mailbox. Nothing on this page changes server behavior &mdash; all setup happens at script.google.com and notehub.io.</p><p style="color:var(--muted);font-size:0.85rem;">Prefer a transactional provider instead? The SendGrid variant is documented in the repository tutorial <code>NOTEHUB_ROUTES_SETUP.md</code>, Step 7. Only the Route destination differs &mdash; the firmware and this server's settings are identical either way.</p></div><div class="card"><h2>Step 1 &mdash; Create the Apps Script</h2><ol style="line-height:1.7;"><li>Sign in at <b>script.google.com</b> with the Workspace account that should send the mail (e.g. <code>alerts@yourcompany.com</code>).</li><li>Click <b>New project</b> and name it <i>TankAlarm Email Bridge</i>.</li><li>Replace the contents of <code>Code.gs</code> with the script below.</li><li>Change <code>SECRET</code> to a long random string &mdash; it shields the endpoint from strangers who discover the URL.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn" onclick="copyCode()">Copy Script</button></div><pre id="code" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;"><b>Repeated calls:</b> Notehub retries a route call that has not answered within the route timeout, even while the script is still sending, and the server retries a note it could not confirm. The script remembers each email for 6 hours by its Notehub event ID and the server's message <code>id</code>. A repeat of an email already sent is answered <code>duplicate</code> instead of being sent again (the run's log under <b>Executions</b> shows <i>duplicate, not sent</i>). A repeat that arrives while the email is still being sent waits up to 20 seconds for that send. If the send fails, the repeat sends the email. If it is still running after 20 seconds, the repeat sends it too (log: <i>still sending elsewhere after 20 s, sent anyway</i>), because a rare duplicate beats a lost alert. <b>Installed the script before this check?</b> If your copy has no <code>CacheService</code> line, paste this version over your old <code>SECRET</code> line and <code>doPost</code> function (keep any other functions in the project, such as <code>checkStopReplies</code>), set <code>SECRET</code> back to the value after <code>?key=</code> in your route URL, and save. Then use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New version &rarr; Deploy</b> so the <code>/exec</code> URL stays the same, and click <b>Send Test Email</b> (Step 4) to confirm.</p></div><div class="card"><h2>Step 2 &mdash; Deploy as a Web App</h2><ol style="line-height:1.7;"><li>Click <b>Deploy &rarr; New deployment</b>, choose type <b>Web app</b>.</li><li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>, then click <b>Deploy</b> and authorize when prompted.</li><li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>).</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Updating later:</b> use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New</b> so the URL stays the same. Creating a brand-new deployment issues a different URL and silently breaks the route.</p></div><div class="card"><h2>Step 3 &mdash; Create the Notehub Route</h2><ol style="line-height:1.7;"><li>In your Notehub project open <b>Routes &rarr; Create Route</b> and choose <b>General HTTP/HTTPS Request/Response</b>.</li><li>Name it <code>EmailRoute</code>.</li><li><b>URL:</b> paste the Web app URL and append <code>?key=YOUR_SECRET</code> (the same value as <code>SECRET</code> in the script).</li><li><b>Notefiles:</b> Selected Notefiles &rarr; <code>email.qo</code>.</li><li><b>Transform Data:</b> none required &mdash; the script reads the note <code>body</code> from the full event.</li><li>Optional: raise <b>Timeout</b> from the default 30 seconds to 60. Notehub retries a call that has not answered in time, and Apps Script sometimes takes longer than 30 seconds to send. The script skips a retry of an email it has already sent (see <b>Repeated calls</b> above), but a longer timeout avoids most retries.</li><li>Enable <b>Automatic reroute on failure</b> and save.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Route log shows HTTP 302?</b> That is normal &mdash; Apps Script answers every POST with a redirect. Actual send results live in the Apps Script editor under <b>Executions</b>.</p></div><div class="card"><h2>Step 4 &mdash; Verify</h2><ol style="line-height:1.7;"><li>Open <a href="/server-settings">Server Settings</a> and click <b>Send Test Email</b> (recipients need the <b>Email alerts</b> checkbox on the <a href="/contacts">Contacts</a> page).</li><li>Check the recipient inbox, the Apps Script <b>Executions</b> log, and the Notehub route log.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Quotas:</b> Google Workspace accounts may send to 1,500 recipients/day via Apps Script (consumer Gmail: 100/day) &mdash; far above normal alarm + daily-report volume. Daily-report layout options are on the <a href="/email-format">Daily Report Editor</a> page; the script receives them in the <code>fmt</code> field and the sample below prints company and server name from it.</p></div><div class="card"><h2>Optional &mdash; Reply-STOP unsubscribe handling</h2><p>Recipients can unsubscribe by replying <b>STOP</b> to any alert email. A second, time-driven Apps Script scans the sending mailbox and forwards STOP/START replies to this server, which maintains the <b>Email Opt-Out List</b> on the <a href="/contacts">Contacts</a> page and suppresses all email (including daily reports) to listed addresses. Without this, the admin manages the list manually on the Contacts page &mdash; fine for small teams.</p><ol style="line-height:1.7;"><li>In Notehub: <b>Settings &rarr; Programmatic API access</b> &rarr; create an OAuth client (or reuse the one from the SMS setup) and note the client ID and secret.</li><li>Add the function below to an Apps Script project on the <b>sending</b> account and fill in the four constants.</li><li>Add a trigger: <b>Triggers &rarr; Add Trigger &rarr; checkStopReplies &rarr; time-driven &rarr; every 15 minutes</b>.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn2" onclick="copyCode2()">Copy Script</button></div><pre id="code2" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;">Matched replies are marked read. STOP, UNSUBSCRIBE, CANCEL, END, QUIT, and REMOVE opt an address out; START, SUBSCRIBE, or YES opts it back in.</p></div></main><script>var CODE=["var SECRET = 'CHANGE-ME';","","function doPost(e) {","  try {","    if (!e || !e.parameter || e.parameter.key !== SECRET) {","      return ContentService.createTextOutput('forbidden');","    }","    var ev = JSON.parse(e.postData.contents);","    var b = ev.body || ev;","    var to = String(b.to || '').split(',').map(function(s){ return s.trim(); }).filter(String);","    if (!to.length) return ContentService.createTextOutput('no recipients');","    var subject = b.subject || 'TankAlarm';","    var text;","    if (b.message) {","      // Alarm / reminder / unload / test alert shape","      text = b.message;","    } else if (b.sensors && b.sensors.length) {","      // Daily report shape","      var lines = [];","      if (b.company) lines.push(b.company);","      if (b.serverName) lines.push(b.serverName);","      if (lines.length) lines.push('');","      b.sensors.forEach(function(s){","        var l = (s.site || '') + ' ' + (s.label || '') + ' #' + s.sensorIndex + ': ' + s.levelInches;","        if (s.sensorMa !== undefined) l += ' (' + s.sensorMa + ' mA)';","        if (s.alarm) l += '  ** ALARM: ' + (s.alarmType || '') + ' **';","        lines.push(l);","      });","      text = lines.join('\\n');","    } else {","      text = JSON.stringify(b, null, 2);","    }","    // Notehub retries a call that has not answered within the route timeout","    // (30 s by default) even while this script is still sending, and the server","    // retries a note it could not confirm. Remember each email for 6 hours (the","    // cache maximum) by Notehub event ID and server message id; skip repeats.","    var keys = [];","    if (ev.event) keys.push('ev:' + ev.event);","    if (b.id) keys.push('id:' + b.id);","    var cache = null;","    var lock = null;","    var lockWait = 10000;  // ms; 2 s once this call waits for another","    // Runs fn(cached values) under the script lock and returns its result;","    // undefined if the lock stays busy for lockWait or the lock or cache fails.","    var locked = function(fn) {","      var result;","      try {","        cache = cache || CacheService.getScriptCache();","        lock = lock || LockService.getScriptLock();","        if (lock.tryLock(lockWait)) {","          try {","            result = fn(cache.getAll(keys));","          } finally {","            lock.releaseLock();","          }","        }","      } catch (dedupeErr) {","        // lock or cache unavailable","      }","      return result;","    };","    var mark = function(value) {","      var values = {};","      keys.forEach(function(k){ values[k] = value; });","      cache.putAll(values, 21600);","    };","    // 'sent': a repeat of a sent email. 'sending': another call is sending it.","    // 'claimed': this call sends it.","    var check = function(found) {","      var seen = keys.map(function(k){ return found[k]; });","      if (seen.indexOf('sent') >= 0) return 'sent';","      if (seen.indexOf('sending') >= 0) return 'sending';","      mark('sending');","      return 'claimed';","    };","    var state;","    if (keys.length) {","      var waitUntil = Date.now() + 20000;","      state = locked(check);","      // Wait up to 20 s for the other call, so this one still answers within","      // the route timeout. If that send fails, its claim goes and this call sends.","      // Each check waits 2 s at most for the lock, and a check that fails counts","      // as still sending.","      if (state === 'sending') lockWait = 2000;","      while (state === 'sending' && Date.now() < waitUntil) {","        Utilities.sleep(1000);","        state = locked(check) || 'sending';","      }","      if (state === 'sent') {","        console.log('duplicate, not sent: ' + keys.join(' '));","        return ContentService.createTextOutput('duplicate');","      }","      if (state === 'sending') {","        console.log('still sending elsewhere after 20 s, sent anyway: ' + keys.join(' '));","      }","    }","    // Lock busy, lock or cache service failing, or the other call still sending:","    // send anyway. A rare duplicate beats a lost alert.","    var mail = { to: to.join(','), subject: subject, body: text };","    try {","      try {","        MailApp.sendEmail(mail);","      } catch (firstErr) {","        // MailApp fails now and then, and Notehub does not retry a call that","        // answered in time: try once more.","        Utilities.sleep(2000);","        MailApp.sendEmail(mail);","      }","    } catch (sendErr) {","      if (state === 'claimed') {","        // Let a waiting or later repeat send it, unless one already has.","        locked(function(found){","          var mine = keys.filter(function(k){ return found[k] === 'sending'; });","          if (mine.length) cache.removeAll(mine);","        });","      }","      throw sendErr;","    }","    if (state === 'claimed' || state === 'sending') {","      locked(function(){ mark('sent'); });  // repeats from now on are duplicates","    }","    return ContentService.createTextOutput('ok');","  } catch (err) {","    return ContentService.createTextOutput('error: ' + String(err));","  }","}"];document.getElementById('code').textContent=CODE.join("\n");function copyCode(){var t=document.createElement('textarea');t.value=CODE.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}var CODE2=["// Optional: scan the sending mailbox for STOP/START replies and forward them","// to the TankAlarm server via Blues Notehub (time-driven trigger, every 15 min).","var CLIENT_ID = 'your-notehub-oauth-client-id';","var CLIENT_SECRET = 'your-notehub-oauth-client-secret';","var PROJECT_UID = 'app:00000000-0000-0000-0000-000000000000';","var DEVICE_UID = 'dev:000000000000000';","","function checkStopReplies() {","  var threads = GmailApp.search('in:inbox is:unread newer_than:2d');","  threads.forEach(function (t) {","    t.getMessages().forEach(function (m) {","      if (!m.isUnread()) return;","      var word = (m.getPlainBody() || '').trim().toUpperCase().split(/\\s+/)[0] || '';","      var keywords = ['STOP','UNSUBSCRIBE','CANCEL','END','QUIT','REMOVE','START','SUBSCRIBE','YES'];","      if (keywords.indexOf(word) >= 0) {","        var from = m.getFrom();","        var email = from.indexOf('<') >= 0 ? from.replace(/^.*</, '').replace(/>.*$/, '') : from;","        forwardToNotehub(email.trim(), word);","        m.markRead();","      }","    });","  });","}","","function forwardToNotehub(from, word) {","  var tok = UrlFetchApp.fetch('https://notehub.io/oauth2/token', {","    method: 'post',","    payload: { grant_type: 'client_credentials', client_id: CLIENT_ID, client_secret: CLIENT_SECRET }","  });","  var access = JSON.parse(tok.getContentText()).access_token;","  UrlFetchApp.fetch('https://api.notehub.io/v1/projects/' + PROJECT_UID +","      '/devices/' + DEVICE_UID + '/notes/email_inbound.qi', {","    method: 'post',","    contentType: 'application/json',","    headers: { Authorization: 'Bearer ' + access },","    payload: JSON.stringify({ body: { from: from, body: word } })","  });","}"];document.getElementById('code2').textContent=CODE2.join("\n");function copyCode2(){var t=document.createElement('textarea');t.value=CODE2.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn2');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}</script></body></html>)HTML";
+static const char EMAIL_SETUP_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Email Setup - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Email Delivery Setup &mdash; Google Workspace</h2><p>The server never contacts an email provider directly. Alarm and daily-report emails are published as <code>email.qo</code> notes to the Notecard, which syncs them to Blues Notehub even across cellular outages. A Notehub <b>Route</b> then delivers each note by HTTP. This guide wires that route to your <b>Google Workspace (Gmail)</b> account through a free Apps Script bridge, so alerts are sent from your real company mailbox. Nothing on this page changes server behavior &mdash; all setup happens at script.google.com and notehub.io.</p><p style="color:var(--muted);font-size:0.85rem;">Prefer a transactional provider instead? The SendGrid variant is documented in the repository tutorial <code>NOTEHUB_ROUTES_SETUP.md</code>, Step 7. Only the Route destination differs &mdash; the firmware and this server's settings are identical either way.</p></div><div class="card"><h2>Step 1 &mdash; Create the Apps Script</h2><ol style="line-height:1.7;"><li>Sign in at <b>script.google.com</b> with the Workspace account that should send the mail (e.g. <code>alerts@yourcompany.com</code>).</li><li>Click <b>New project</b> and name it <i>TankAlarm Email Bridge</i>.</li><li>Replace the contents of <code>Code.gs</code> with the script below.</li><li>Change <code>SECRET</code> to a long random string &mdash; it shields the endpoint from strangers who discover the URL.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn" onclick="copyCode()">Copy Script</button></div><pre id="code" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;"><b>Repeated calls:</b> Notehub retries a route call that has not answered within the route timeout, even while the script is still sending, and the server retries a note it could not confirm. The script remembers each email for 6 hours by its Notehub event ID and the server's message <code>id</code>. A repeat of an email already sent is answered <code>duplicate</code> instead of being sent again (the run's log under <b>Executions</b> shows <i>duplicate, not sent</i>). A repeat that arrives while the email is still being sent waits up to 20 seconds for that send. If the send fails, the repeat sends the email. If it is still running after 20 seconds, the repeat sends it too (log: <i>still sending elsewhere after 20 s, sent anyway</i>), because a rare duplicate beats a lost alert. <b>Installed the script before this check?</b> If your copy has no <code>CacheService</code> line, paste this version over your old <code>SECRET</code> line and <code>doPost</code> function (keep any other functions in the project, such as <code>checkStopReplies</code>), set <code>SECRET</code> back to the value after <code>?key=</code> in your route URL, and save. Then use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New version &rarr; Deploy</b> so the <code>/exec</code> URL stays the same, and click <b>Send Test Email</b> (Step 4) to confirm.</p></div><div class="card"><h2>Step 2 &mdash; Deploy as a Web App</h2><ol style="line-height:1.7;"><li>Click <b>Deploy &rarr; New deployment</b>, choose type <b>Web app</b>.</li><li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>, then click <b>Deploy</b> and authorize when prompted.</li><li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>).</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Updating later:</b> use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New</b> so the URL stays the same. Creating a brand-new deployment issues a different URL and silently breaks the route.</p></div><div class="card"><h2>Step 3 &mdash; Create the Notehub Route</h2><ol style="line-height:1.7;"><li>In your Notehub project open <b>Routes &rarr; Create Route</b> and choose <b>General HTTP/HTTPS Request/Response</b>.</li><li>Name it <code>EmailRoute</code>.</li><li><b>URL:</b> paste the Web app URL and append <code>?key=YOUR_SECRET</code> (the same value as <code>SECRET</code> in the script).</li><li><b>Notefiles:</b> Selected Notefiles &rarr; <code>email.qo</code>.</li><li><b>Transform Data:</b> none required &mdash; the script reads the note <code>body</code> from the full event.</li><li>Optional: raise <b>Timeout</b> from the default 30 seconds to 60. Notehub retries a call that has not answered in time, and Apps Script sometimes takes longer than 30 seconds to send. The script skips a retry of an email it has already sent (see <b>Repeated calls</b> above), but a longer timeout avoids most retries.</li><li>Enable <b>Automatic reroute on failure</b> and save.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Route log shows HTTP 302?</b> That is normal &mdash; Apps Script answers every POST with a redirect. Actual send results live in the Apps Script editor under <b>Executions</b>.</p></div><div class="card"><h2>Step 4 &mdash; Verify</h2><ol style="line-height:1.7;"><li>Open <a href="/server-settings">Server Settings</a> and click <b>Send Test Email</b> (recipients need the <b>Email alerts</b> checkbox on the <a href="/contacts">Contacts</a> page).</li><li>Check the recipient inbox, the Apps Script <b>Executions</b> log, and the Notehub route log.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Quotas:</b> Google Workspace accounts may send to 1,500 recipients/day via Apps Script (consumer Gmail: 100/day) &mdash; far above normal alarm + daily-report volume. Daily-report layout options are on the <a href="/email-format">Daily Report Editor</a> page; the script receives them in the <code>fmt</code> field and the sample below prints company and server name from it.</p></div><div class="card"><h2>Optional &mdash; Reply-STOP unsubscribe handling</h2><p>Recipients can unsubscribe by replying <b>STOP</b> to any alert email. A second, time-driven Apps Script scans the sending mailbox and forwards STOP/START replies to this server, which maintains the <b>Email Opt-Out List</b> on the <a href="/contacts">Contacts</a> page and suppresses all email (including daily reports) to listed addresses. Without this, the admin manages the list manually on the Contacts page &mdash; fine for small teams.</p><ol style="line-height:1.7;"><li>In Notehub: <b>Settings &rarr; Programmatic API access</b> &rarr; create an OAuth client (or reuse the one from the SMS setup) and note the client ID and secret.</li><li>Add the function below to an Apps Script project on the <b>sending</b> account and fill in the four constants.</li><li>Add a trigger: <b>Triggers &rarr; Add Trigger &rarr; checkStopReplies &rarr; time-driven &rarr; every 15 minutes</b>.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn2" onclick="copyCode2()">Copy Script</button></div><pre id="code2" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;">Matched replies are marked read. STOP, UNSUBSCRIBE, CANCEL, END, QUIT, and REMOVE opt an address out; START, SUBSCRIBE, or YES opts it back in.</p></div></main><script>var CODE=["var SECRET = 'CHANGE-ME';","","function doPost(e) {","  try {","    if (!e || !e.parameter || e.parameter.key !== SECRET) {","      return ContentService.createTextOutput('forbidden');","    }","    var ev = JSON.parse(e.postData.contents);","    var b = ev.body || ev;","    var to = String(b.to || '').split(',').map(function(s){ return s.trim(); }).filter(String);","    if (!to.length) return ContentService.createTextOutput('no recipients');","    var subject = b.subject || 'TankAlarm';","    var text;","    if (b.message) {","      // Alarm / reminder / unload / test alert shape","      text = b.message;","    } else if (b.sensors && b.sensors.length) {","      // Daily report shape","      var lines = [];","      if (b.company) lines.push(b.company);","      if (b.serverName) lines.push(b.serverName);","      if (lines.length) lines.push('');","      b.sensors.forEach(function(s){","        var digital = s.sensorType === 'digital';","        var l = (s.site || '') + ' ' + (s.label || '') + ' #' + s.sensorIndex + ': ' + (digital ? (s.levelInches > 0.5 ? 'ON' : 'OFF') : s.levelInches);","        if (!digital && s.sensorMa !== undefined) l += ' (' + s.sensorMa + ' mA)';","        if (s.alarm) l += '  ** ALARM: ' + (s.alarmType || '') + ' **';","        lines.push(l);","      });","      text = lines.join('\\n');","    } else {","      text = JSON.stringify(b, null, 2);","    }","    // Notehub retries a call that has not answered within the route timeout","    // (30 s by default) even while this script is still sending, and the server","    // retries a note it could not confirm. Remember each email for 6 hours (the","    // cache maximum) by Notehub event ID and server message id; skip repeats.","    var keys = [];","    if (ev.event) keys.push('ev:' + ev.event);","    if (b.id) keys.push('id:' + b.id);","    var cache = null;","    var lock = null;","    var lockWait = 10000;  // ms; 2 s once this call waits for another","    // Runs fn(cached values) under the script lock and returns its result;","    // undefined if the lock stays busy for lockWait or the lock or cache fails.","    var locked = function(fn) {","      var result;","      try {","        cache = cache || CacheService.getScriptCache();","        lock = lock || LockService.getScriptLock();","        if (lock.tryLock(lockWait)) {","          try {","            result = fn(cache.getAll(keys));","          } finally {","            lock.releaseLock();","          }","        }","      } catch (dedupeErr) {","        // lock or cache unavailable","      }","      return result;","    };","    var mark = function(value) {","      var values = {};","      keys.forEach(function(k){ values[k] = value; });","      cache.putAll(values, 21600);","    };","    // 'sent': a repeat of a sent email. 'sending': another call is sending it.","    // 'claimed': this call sends it.","    var check = function(found) {","      var seen = keys.map(function(k){ return found[k]; });","      if (seen.indexOf('sent') >= 0) return 'sent';","      if (seen.indexOf('sending') >= 0) return 'sending';","      mark('sending');","      return 'claimed';","    };","    var state;","    if (keys.length) {","      var waitUntil = Date.now() + 20000;","      state = locked(check);","      // Wait up to 20 s for the other call, so this one still answers within","      // the route timeout. If that send fails, its claim goes and this call sends.","      // Each check waits 2 s at most for the lock, and a check that fails counts","      // as still sending.","      if (state === 'sending') lockWait = 2000;","      while (state === 'sending' && Date.now() < waitUntil) {","        Utilities.sleep(1000);","        state = locked(check) || 'sending';","      }","      if (state === 'sent') {","        console.log('duplicate, not sent: ' + keys.join(' '));","        return ContentService.createTextOutput('duplicate');","      }","      if (state === 'sending') {","        console.log('still sending elsewhere after 20 s, sent anyway: ' + keys.join(' '));","      }","    }","    // Lock busy, lock or cache service failing, or the other call still sending:","    // send anyway. A rare duplicate beats a lost alert.","    var mail = { to: to.join(','), subject: subject, body: text };","    try {","      try {","        MailApp.sendEmail(mail);","      } catch (firstErr) {","        // MailApp fails now and then, and Notehub does not retry a call that","        // answered in time: try once more.","        Utilities.sleep(2000);","        MailApp.sendEmail(mail);","      }","    } catch (sendErr) {","      if (state === 'claimed') {","        // Let a waiting or later repeat send it, unless one already has.","        locked(function(found){","          var mine = keys.filter(function(k){ return found[k] === 'sending'; });","          if (mine.length) cache.removeAll(mine);","        });","      }","      throw sendErr;","    }","    if (state === 'claimed' || state === 'sending') {","      locked(function(){ mark('sent'); });  // repeats from now on are duplicates","    }","    return ContentService.createTextOutput('ok');","  } catch (err) {","    return ContentService.createTextOutput('error: ' + String(err));","  }","}"];document.getElementById('code').textContent=CODE.join("\n");function copyCode(){var t=document.createElement('textarea');t.value=CODE.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}var CODE2=["// Optional: scan the sending mailbox for STOP/START replies and forward them","// to the TankAlarm server via Blues Notehub (time-driven trigger, every 15 min).","var CLIENT_ID = 'your-notehub-oauth-client-id';","var CLIENT_SECRET = 'your-notehub-oauth-client-secret';","var PROJECT_UID = 'app:00000000-0000-0000-0000-000000000000';","var DEVICE_UID = 'dev:000000000000000';","","function checkStopReplies() {","  var threads = GmailApp.search('in:inbox is:unread newer_than:2d');","  threads.forEach(function (t) {","    t.getMessages().forEach(function (m) {","      if (!m.isUnread()) return;","      var word = (m.getPlainBody() || '').trim().toUpperCase().split(/\\s+/)[0] || '';","      var keywords = ['STOP','UNSUBSCRIBE','CANCEL','END','QUIT','REMOVE','START','SUBSCRIBE','YES'];","      if (keywords.indexOf(word) >= 0) {","        var from = m.getFrom();","        var email = from.indexOf('<') >= 0 ? from.replace(/^.*</, '').replace(/>.*$/, '') : from;","        forwardToNotehub(email.trim(), word);","        m.markRead();","      }","    });","  });","}","","function forwardToNotehub(from, word) {","  var tok = UrlFetchApp.fetch('https://notehub.io/oauth2/token', {","    method: 'post',","    payload: { grant_type: 'client_credentials', client_id: CLIENT_ID, client_secret: CLIENT_SECRET }","  });","  var access = JSON.parse(tok.getContentText()).access_token;","  UrlFetchApp.fetch('https://api.notehub.io/v1/projects/' + PROJECT_UID +","      '/devices/' + DEVICE_UID + '/notes/email_inbound.qi', {","    method: 'post',","    contentType: 'application/json',","    headers: { Authorization: 'Bearer ' + access },","    payload: JSON.stringify({ body: { from: from, body: word } })","  });","}"];document.getElementById('code2').textContent=CODE2.join("\n");function copyCode2(){var t=document.createElement('textarea');t.value=CODE2.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn2');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}</script></body></html>)HTML";
 
 static const char SMS_SETUP_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SMS Setup - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>SMS Delivery Setup &mdash; Twilio</h2><p>The server never talks to Twilio directly. Each alert is published as one <code>sms.qo</code> note per recipient (<code>{message, to}</code>) to the Notecard, which syncs to Blues Notehub even across cellular outages. A Notehub <b>Twilio route</b> then delivers each note as a text message. This guide covers the outbound route, the inbound <b>STOP/START/HELP</b> reply webhook, and the automatic <b>welcome message</b> sent to newly enrolled recipients. Nothing on this page changes server behavior &mdash; setup happens at twilio.com and notehub.io.</p><p style="color:var(--muted);font-size:0.85rem;">If Twilio rejects your account or campaign, drop-in alternatives (Telnyx, Vonage, Plivo, AWS SNS) are cataloged in the repository doc <code>CODE REVIEW/EMAIL_DELIVERY_OPTIONS_07082026.md</code> &sect;A7 &mdash; only the Notehub route changes, never the firmware.</p></div><div class="card"><h2>Step 1 &mdash; Twilio account &amp; phone number</h2><ol style="line-height:1.7;"><li>Create an account at <b>twilio.com</b> and open the Console.</li><li>Buy an SMS-capable phone number. For automated alarm traffic a <b>Toll-Free number</b> is recommended: submit its <b>Toll-Free Verification</b> (a single use-case form, typically approved in days). Unverified/unregistered numbers get carrier-filtered in the US.</li><li>Note your <b>Account SID</b> and <b>Auth Token</b> from the Console home page.</li></ol></div><div class="card"><h2>Step 2 &mdash; Outbound route in Notehub (Route #4)</h2><ol style="line-height:1.7;"><li>In your Notehub project open <b>Routes &rarr; Create Route</b> and choose the <b>Twilio</b> route type.</li><li>Name it <code>TwilioSMS</code>.</li><li><b>Account SID</b> / <b>Auth Token</b>: from Step 1.</li><li><b>From Number:</b> your Twilio number in E.164 form (e.g. <code>+18005551234</code>).</li><li><b>To Number:</b> <code>[.body.to]</code> &nbsp;&mdash;&nbsp; <b>Message:</b> <code>[.body.message]</code> (the leading dot is required &mdash; without it Notehub passes the text through literally and Twilio fails with error 21265)</li><li><b>Notefiles:</b> Selected Notefiles &rarr; <code>sms.qo</code>.</li><li>Enable <b>Automatic reroute on failure</b> and save.</li></ol><p style="color:var(--muted);font-size:0.85rem;">The server queues <b>one note per recipient</b>, so <code>[.body.to]</code> fans out correctly &mdash; do not put a fixed number in the To field.</p></div><div class="card"><h2>Step 3 &mdash; Inbound replies (STOP / START / HELP)</h2><p>Replies to your Twilio number reach this server through a small <b>Twilio Function</b> that forwards each message to the Blues Notehub API, which drops it into <code>sms_inbound.qi</code> on this device.</p><ol style="line-height:1.7;"><li>In Notehub: <b>Settings &rarr; Programmatic API access</b> &rarr; create an OAuth client and copy the <b>client ID</b> and <b>client secret</b>.</li><li>In Twilio Console: <b>Functions &amp; Assets &rarr; Services &rarr; Create Service</b> (name it <i>tankalarm</i>), add a Function at path <code>/sms-inbound</code>, paste the code below, fill in the four constants, then <b>Deploy All</b>.</li><li>Under <b>Phone Numbers &rarr; your number &rarr; Messaging Configuration</b>, set <b>"A message comes in"</b> to <b>Function</b> and pick the service/function. Save.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn" onclick="copyCode()">Copy Function Code</button></div><pre id="code" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;"><code>PROJECT_UID</code> is on the Notehub project settings page (<code>app:...</code>); <code>DEVICE_UID</code> is <b>this server's</b> device UID (<code>dev:...</code>).</p></div><div class="card"><h2>Step 4 &mdash; What happens automatically</h2><ul style="line-height:1.8;"><li><b>Welcome message:</b> every newly enrolled SMS recipient (checkbox on <a href="/contacts">Contacts</a>, or a viewer-added contact) is texted: <i>&quot;You are now receiving alerts from TankAlarm. For help, reply HELP. To opt-out, reply STOP.&quot;</i></li><li><b>STOP</b> (also STOPALL/UNSUBSCRIBE/CANCEL/END/QUIT): Twilio blocks the number at the platform level, and this server adds it to the <b>SMS Opt-Out List</b> &mdash; the contact shows an <b>OPTED OUT</b> badge and all SMS to them is suppressed.</li><li><b>START</b> (also UNSTOP/YES): the server removes them from the list and re-sends the welcome message.</li><li><b>HELP</b>: answered by Twilio &mdash; set the reply text in Twilio Console &rarr; <b>Messaging &rarr; Opt-out management</b>. The server logs it.</li><li><b>SNOOZE / UNSNOOZE</b>: pauses/resumes the recurring reminder texts for every active alarm that texts the sender's number (alarm recipients only &mdash; unknown numbers are ignored). All of the alarm's recipients are notified of the change, and a snooze auto-resets when the sensor returns to normal.</li><li>The opt-out list is managed at the bottom of the <a href="/contacts">Contacts</a> page (admin can manually remove an entry).</li></ul></div><div class="card"><h2>Step 5 &mdash; Verify</h2><ol style="line-height:1.7;"><li>Open <a href="/server-settings">Server Settings</a> and click <b>Send Test SMS</b>.</li><li>Add your own number as a contact and tick its <b>SMS alerts</b> checkbox &mdash; the welcome text should arrive.</li><li>Reply <b>STOP</b>: within about a minute the <b>OPTED OUT</b> badge appears on the <a href="/contacts">Contacts</a> page and the number joins the opt-out list.</li><li>Reply <b>START</b>: the badge clears and the welcome message arrives again.</li></ol></div></main><script>var CODE=["// Twilio Function: forward inbound SMS to the TankAlarm server via Blues Notehub","// Wire it to your number's 'A message comes in' webhook (see Step 3).","const PROJECT_UID = 'app:00000000-0000-0000-0000-000000000000';","const DEVICE_UID = 'dev:000000000000000';","const CLIENT_ID = 'your-notehub-oauth-client-id';","const CLIENT_SECRET = 'your-notehub-oauth-client-secret';","","exports.handler = async function (context, event, callback) {","  const twiml = new Twilio.twiml.MessagingResponse();","  try {","    const tokenRes = await fetch('https://notehub.io/oauth2/token', {","      method: 'POST',","      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },","      body: 'grant_type=client_credentials&client_id=' + CLIENT_ID +","            '&client_secret=' + CLIENT_SECRET","    });","    const token = (await tokenRes.json()).access_token;","    await fetch('https://api.notehub.io/v1/projects/' + PROJECT_UID +","                '/devices/' + DEVICE_UID + '/notes/sms_inbound.qi', {","      method: 'POST',","      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },","      body: JSON.stringify({ body: { from: event.From, body: event.Body } })","    });","  } catch (err) {","    console.error('Notehub forward failed:', err);","  }","  return callback(null, twiml); // empty response - Twilio's opt-out engine sends STOP/HELP replies","};"];document.getElementById('code').textContent=CODE.join("\n");function copyCode(){var t=document.createElement('textarea');t.value=CODE.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Function Code';},2000);}catch(e){}document.body.removeChild(t);}</script></body></html>)HTML";
 
@@ -2627,7 +2628,7 @@ static void addServerSerialLog(const char *message, const char *level = "info", 
 static ClientSerialBuffer *findOrCreateClientSerialBuffer(const char *clientUid);
 static void addClientSerialLog(const char *clientUid, const char *message, double timestamp, const char *level = "info", const char *source = "client");
 static SerialRequestResult requestClientSerialLogs(const char *clientUid, String &errorMessage);
-static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex);
+static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created = nullptr);
 static uint8_t sendSmsAlert(const char *message, const char *alarmId = nullptr, const char *listKey = "smsAlertRecipients");
 static uint8_t sendServerSmsAlert(const char *message);
 static uint8_t sendEmailAlert(const char *subject, const char *message, const char *alarmId = nullptr);
@@ -12975,8 +12976,9 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // stale and is cleared without requiring a config re-push. Scoped to the stuck-disabled
   // case so a genuine stuck condition under active detection is never masked.
   if (rec->alarmActive && strcmp(rec->alarmType, "sensor-stuck") == 0) {
-    bool stuckDisabledInConfig = false;
-    const ClientConfigSnapshot *stuckSnap = findClientConfigSnapshot(clientUid);
+    // S3 (C-A04 B5): a float is exempt whether or not a config snapshot is cached.
+    bool stuckDisabledInConfig = isDigitalSensorType(rec->sensorType);
+    const ClientConfigSnapshot *stuckSnap = stuckDisabledInConfig ? nullptr : findClientConfigSnapshot(clientUid);
     if (stuckSnap && stuckSnap->payload[0] != '\0') {
       JsonDocument stuckCfg;
       if (deserializeJson(stuckCfg, stuckSnap->payload) == DeserializationError::Ok) {
@@ -12985,8 +12987,10 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
           for (JsonObjectConst ct : cfgSensors) {
             uint8_t ctn = ct["number"] | 0;
             if (ctn == sensorIndex) {
-              // Client default is opt-in/off, so a missing field also counts as disabled.
-              stuckDisabledInConfig = !(ct["stuckDetection"] | false);
+              // A missing flag counts as disabled (unchanged). S3 (C-A04 B5): a float is exempt
+              // from stuck detection, since holding its state is normal, so its stale
+              // sensor-stuck alarm always clears on fresh telemetry.
+              stuckDisabledInConfig = configSensorStuckDisabled(ct);
               break;
             }
           }
@@ -13259,7 +13263,11 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     const bool alarmOnFreshValue = ((doc["ru"] | 0) == 0) && ((doc["sf"] | 0) == 0) && doc["fault"].isNull();
     logAlarmEvent(clientUid, siteName, sensorIndex, level, isHigh, alarmOnFreshValue ? alarmEventEpoch : 0.0);
   }
-  rec->currentValue = level;
+  // S3 (C-A04 B6): diagnostic, sensor-recovered and config-push clear notes carry no reading, and
+  // resolveLevel() returns 0 for them; keep the last value instead of blanking it.
+  if (alarmNoteCarriesValue(doc.as<JsonObjectConst>())) {
+    rec->currentValue = level;
+  }
   // S-D03: an alarm note adds no history snapshot. Its "t" can be when the note was sent,
   // not when the value was read (seconds later on a current-loop client, hours later for a
   // config-push clear), and the note does not say which. The reading enters history from
@@ -13303,8 +13311,13 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     } else if (isDigitalAlarm) {
       const char *stateDesc = (strcmp(type, "triggered") == 0) ? "ACTIVATED" : "NOT ACTIVATED";
       snprintf(message, sizeof(message), "%s%s%d Float Switch %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, stateDesc);
+    } else if (strcmp(type, "clear") == 0 && isDigitalSensorType(rec->sensorType)) {
+      // S3 (C-A04 B7): a float clear shows the switch state, not "clear alarm 0.0 in" ("1.0 in" for a
+      // not_activated float).
+      snprintf(message, sizeof(message), "%s%s%d Float Switch clear (%s)", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, digitalStateText(rec->currentValue));
     } else {
-      snprintf(message, sizeof(message), "%s%s%d %s alarm %.1f %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, rec->alarmType, level, rec->measurementUnit[0] ? rec->measurementUnit : "in");
+      // S3: rec->currentValue is this note's reading, or the last one when the note carries none.
+      snprintf(message, sizeof(message), "%s%s%d %s alarm %.1f %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, rec->alarmType, rec->currentValue, rec->measurementUnit[0] ? rec->measurementUnit : "in");
     }
     // CONTACT-2a: pass the alarm id so contacts with alarmAssociations only receive
     // the alarms they opted into (id format matches handleContactsGet).
@@ -13381,6 +13394,28 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
   meta->cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
   gClientMetadataDirty = true;
   return meta;
+}
+
+// S3 (C-A04 B4): sensor k's "sensor" and "digitalTrigger" in the client's cached config, from one
+// parse, copied into sensorOut and triggerOut ("" when there is no snapshot, no such sensor or no
+// field). Both lengths must be non-zero.
+static void configSensorAndTriggerFor(const char *clientUid, uint8_t sensorIdx, char *sensorOut, size_t sensorLen,
+                                      char *triggerOut, size_t triggerLen) {
+  if (sensorLen == 0 || triggerLen == 0) return;
+  sensorOut[0] = '\0';
+  triggerOut[0] = '\0';
+  const ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (!snap || snap->payload[0] == '\0') return;
+  JsonDocument cfg;
+  if (deserializeJson(cfg, snap->payload) != DeserializationError::Ok) return;
+  for (JsonObjectConst ct : cfg["sensors"].as<JsonArrayConst>()) {
+    uint8_t ctn = ct["number"] | 0;
+    if (ctn == sensorIdx) {
+      strlcpy(sensorOut, ct["sensor"] | "", sensorLen);
+      strlcpy(triggerOut, ct["digitalTrigger"] | "", triggerLen);
+      return;
+    }
+  }
 }
 
 static void handleDaily(JsonDocument &doc, double epoch) {
@@ -13489,13 +13524,15 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       bool hiAlarm = a["hi"] | false;
       bool loAlarm = a["lo"] | false;
       if (hiAlarm || loAlarm) {
-        // Check if server already knows about this alarm (search without upserting)
-        SensorRecord *rec = nullptr;
-        for (uint8_t ri = 0; ri < gSensorRecordCount; ++ri) {
-          if (strcmp(gSensorRecords[ri].clientUid, clientUid) == 0 && gSensorRecords[ri].sensorIndex == sensorIdx) {
-            rec = &gSensorRecords[ri];
-            break;
-          }
+        // Check if server already knows about this alarm. R10: a latched alarm for a sensor the
+        // server has no record of yet (never reached the server, or a lost registry) creates the
+        // record here, as handleAlarm does, instead of being skipped until tomorrow's report. The
+        // sensors[] loop below fills in the rest. k is 1-based (see the sensors[] loop).
+        bool recCreated = false;
+        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;
+        if (rec && rec->site[0] == '\0') {
+          const char *noteSite = doc["s"] | "";
+          if (noteSite[0] != '\0') strlcpy(rec->site, noteSite, sizeof(rec->site));
         }
         if (rec && !rec->alarmActive) {
           Serial.print(F("WARNING: Client "));
@@ -13507,8 +13544,41 @@ static void handleDaily(JsonDocument &doc, double epoch) {
           addServerSerialLog("Missed alarm detected via daily report", "warn", "alarm");
           // Update server's alarm state from daily report backup data
           rec->alarmActive = true;
-          strlcpy(rec->alarmType, hiAlarm ? "high" : "low", sizeof(rec->alarmType));
-          rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+          // S3 (C-A04 B4): a float latches on "hi"; record its real type: "y" from newer clients,
+          // else the float's trigger from the cached config. rec->sensorType can be empty or stale
+          // here (this report's sensors[] loop below refreshes it), so classify by this part's "st"
+          // for k, then the config's "sensor", then the record, without storing the result.
+          const char *reportSt = "";
+          double reportSensorEpoch = 0.0;  // this part's reading time for k (R02 below)
+          for (JsonObjectConst t : doc["sensors"].as<JsonArrayConst>()) {
+            if (t["k"].is<int>() && t["k"].as<int>() == sensorIdx) {
+              reportSt = t["st"] | "";
+              reportSensorEpoch = t["t"] | 0.0;
+              break;
+            }
+          }
+          if (strcmp(reportSt, "rpm") == 0) reportSt = "pulse";  // as the sensors[] loop stores it
+          // The snapshot is the last pushed config and can be ahead of the client until its ACK. A
+          // wrong float label heals when the client applies the config (it clears its latches and
+          // sends clear notes); CL-5's "y" is the real fix.
+          char cfgSensor[16] = "";
+          char cfgTrigger[16] = "";
+          configSensorAndTriggerFor(clientUid, sensorIdx, cfgSensor, sizeof(cfgSensor), cfgTrigger,
+                                    sizeof(cfgTrigger));
+          const char *effType = dailyReconcileSensorType(reportSt, cfgSensor, rec->sensorType);
+          strlcpy(rec->alarmType, dailyReconcileAlarmType(a["y"] | "", effType, hiAlarm, cfgTrigger),
+                  sizeof(rec->alarmType));
+          // R02: the reconcile takes no reading, so an existing record keeps its time; the
+          // sensors[] loop below sets it from this report's reading for k. (A report-time stamp
+          // here would hide that reading's age and could clear an update request's badge, since
+          // the loop never moves the time back.) A record created just above holds only the
+          // server clock from upsertSensorRecord, so it takes the time the loop would give it:
+          // this part's `t` for k, else the report time.
+          if (recCreated) {
+            rec->lastUpdateEpoch = (reportSensorEpoch > 0.0)
+                                       ? reportSensorEpoch
+                                       : ((epoch > 0.0) ? epoch : currentEpoch());
+          }
           gSensorRegistryDirty = true;
         }
       }
@@ -13565,11 +13635,12 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       continue;
     }
     uint8_t sensorIndex = t["k"].as<uint8_t>();
-    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
+    bool recCreated = false;
+    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);
     if (!rec) {
       continue;
     }
-    
+
     // Store optional user-assigned display number (0 = unset)
     if (t.containsKey("un")) {
       rec->userNumber = t["un"].as<uint8_t>();
@@ -13618,12 +13689,14 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     float mA = 0.0f;
     float voltage = 0.0f;
     
+    // R11: store the raw mA as handleTelemetry/handleAlarm do (Fix 13 dropped the legacy >=4.0
+    // gate there); a valid 3.6-3.99 mA live-zero reading is shown, not wiped to 0.
     if (t["ma"]) {
       mA = t["ma"].as<float>();
-      rec->sensorMa = (mA >= 4.0f) ? mA : 0.0f;
+      rec->sensorMa = mA;
     } else if (t["sensorMa"]) {
       mA = t["sensorMa"].as<float>();
-      rec->sensorMa = (mA >= 4.0f) ? mA : 0.0f;
+      rec->sensorMa = mA;
     } else if (strcmp(rec->sensorType, "currentLoop") == 0) {
       // Fix 13: a current-loop daily with NO raw mA means the last acquisition had no valid
       // reading — clear any stored mA so a stale value (e.g. a pegged 18.02) cannot linger.
@@ -13668,7 +13741,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     if (trustLevel) {
       rec->currentValue = newLevel;
     }
-    rec->lastUpdateEpoch = now;
+    // R02: the per-sensor `t` is the last acquisition minute and can be at or before a telemetry
+    // reply already stored here (pollNotecard runs handleTelemetry before handleDaily), so it
+    // never moves the time back: that would bring back an update request's badge. A record made
+    // by this loop's upsert holds only the server clock, not a reading, so it takes `now`.
+    if (recCreated || now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
@@ -13677,8 +13754,13 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     // the value is that reading (ru/sf mean no newer one, not a value from another
     // time), so it is filed at `t` and the ring's dedupe drops a copy telemetry already
     // brought. A current-loop value enters only from 4-20 mA, as in handleTelemetry.
-    const bool dailyMaInRange = !isCurrentLoopSensor || (mA >= 4.0f && mA <= 20.0f);
-    if (trustLevel && dailyMaInRange && newLevel > 0.0f) {
+    // R03: admission tests that a value is present, never the value itself: a real 0 (empty
+    // tank, 0 psi, float OFF, engine stopped) is data; a missing reading is a gap.
+    const bool dailyMaPresent = !t["ma"].isNull() || !t["sensorMa"].isNull();
+    const bool dailyMaInRange = (mA >= 4.0f && mA <= 20.0f);
+    const bool dailyValuePresent = !t["lvl"].isNull() || !t["fl"].isNull() || !t["rm"].isNull();
+    if (dailyReadingAdmissible(rec->sensorType, sensorEpoch > 0.0, trustLevel, dailyMaPresent,
+                               dailyMaInRange, dailyValuePresent)) {
       // Use client-reported capacity (cap) as the immutable tank height, never the level.
       float dailyCap = t["cap"] | 0.0f;
       if (dailyCap <= 0.0f) dailyCap = 48.0f;
@@ -13896,7 +13978,10 @@ static void sendUnloadEmail(const UnloadLogEntry &entry) {
   sendEmailAlert("TankAlarm Unload Report", message, alarmId);
 }
 
-static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex) {
+static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorIndex, bool *created) {
+  // *created is set only when a new record is made. Its lastUpdateEpoch is then the server clock,
+  // not a reading time (handleDaily uses this; see R02 there).
+  if (created) *created = false;
   // Validate UID length to prevent silent truncation issues
   if (!isValidClientUid(clientUid)) {
     Serial.println(F("ERROR: Invalid client UID, skipping sensor record"));
@@ -13992,7 +14077,8 @@ static SensorRecord *upsertSensorRecord(const char *clientUid, uint8_t sensorInd
   // Insert into hash table
   insertSensorIntoHash(newIndex);
   gSensorRegistryDirty = true;
-  
+  if (created) *created = true;
+
   return &rec;
 }
 
@@ -14909,15 +14995,27 @@ static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const c
   char shortSite[24];
   strlcpy(shortSite, rec.site, sizeof(shortSite));
   char message[160];
-  snprintf(message, sizeof(message),
-           "%s: %s%s%d reminders %s by %s. Still in %s alarm (%.1f %s).%s",
-           snoozed ? "SNOOZED" : "RESUMED",
-           shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-           rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
-           snoozed ? "paused" : "active again", who,
-           rec.alarmType, rec.currentValue,
-           rec.measurementUnit[0] ? rec.measurementUnit : "in",
-           snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+  if (isDigitalSensorType(rec.sensorType)) {
+    // S3 (C-A04 B7): a float has no value or unit, only a state.
+    snprintf(message, sizeof(message),
+             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%s).%s",
+             snoozed ? "SNOOZED" : "RESUMED",
+             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+             snoozed ? "paused" : "active again", who,
+             rec.alarmType, digitalStateText(rec.currentValue),
+             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+  } else {
+    snprintf(message, sizeof(message),
+             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%.1f %s).%s",
+             snoozed ? "SNOOZED" : "RESUMED",
+             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+             snoozed ? "paused" : "active again", who,
+             rec.alarmType, rec.currentValue,
+             rec.measurementUnit[0] ? rec.measurementUnit : "in",
+             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+  }
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
   sendSmsAlert(message, alarmId);
@@ -15029,11 +15127,19 @@ static void checkAlarmReminders() {
     char shortSite[24];
     strlcpy(shortSite, rec.site, sizeof(shortSite));
     char message[160];
-    snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%.1f %s)",
-             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
-             type, rec.currentValue,
-             rec.measurementUnit[0] ? rec.measurementUnit : "in");
+    if (isDigitalSensorType(rec.sensorType)) {
+      // S3 (C-A04 B7): a float has no value or unit, only a state.
+      snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%s)",
+               shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+               rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+               type, digitalStateText(rec.currentValue));
+    } else {
+      snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%.1f %s)",
+               shortSite, rec.userNumber > 0 ? " #" : " sensor ",
+               rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+               type, rec.currentValue,
+               rec.measurementUnit[0] ? rec.measurementUnit : "in");
+    }
 
     char alarmId[64];
     snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
@@ -15229,6 +15335,10 @@ static void sendDailyEmail() {
     obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);
     obj["alarm"] = gSensorRecords[i].alarmActive;
     obj["alarmType"] = gSensorRecords[i].alarmType;
+    // S3 (C-A04 B8): the email bridge prints ON/OFF for floats.
+    if (isDigitalSensorType(gSensorRecords[i].sensorType)) {
+      obj["sensorType"] = "digital";
+    }
   }
 
   // Check if JSON document overflowed during population
