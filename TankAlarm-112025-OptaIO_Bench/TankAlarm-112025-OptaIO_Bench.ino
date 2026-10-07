@@ -510,6 +510,8 @@ static void handleCommand(char *words[], uint8_t n) {
       return;
     }
     for (uint8_t r = 0; r < OPTA_RELAY_COUNT; ++r) {
+      // pinMode never writes a level on this core; clear the latch first so OUTPUT drives LOW.
+      digitalWrite(optaRelayCoilPin(r), LOW);
       pinMode(optaRelayCoilPin(r), v ? INPUT_PULLUP : OUTPUT);
       if (!v) digitalWrite(optaRelayCoilPin(r), LOW);
     }
