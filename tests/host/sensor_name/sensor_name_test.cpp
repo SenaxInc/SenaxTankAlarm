@@ -593,7 +593,8 @@ static bool endsWith(const char *s, const char *suffix) {
 }
 
 // CR-8: broadcastSnoozeChange's SNOOZED/RESUMED text. The long hint when it fits; otherwise the
-// short hint, which keeps "Reply UNSNOOZE" whole.
+// short hint, which keeps "Reply UNSNOOZE" whole; when even that does not fit (P326), the text
+// without the reading, which always fits.
 static void testComposeSnoozeText() {
   char msg[160];
   CHECK(strcmp(SNOOZE_HINT, " Auto-resumes on recovery; reply UNSNOOZE to resume now.") == 0);
@@ -631,11 +632,47 @@ static void testComposeSnoozeText() {
                  "TTTTTTTTTTTTTTTTTTTTTTT alarm (-12345.6 gallons). Reply UNSNOOZE to resume.");
   CHECK(strlen(msg) == 159);
 
+  // P326: the widest reading broadcastSnoozeChange can build is 47 bytes (char reading[48]:
+  // "%.1f %s" of -FLT_MAX is 42 bytes, then a space and a 7-byte unit, cut at 47). With a 23-byte
+  // who and alarm type even the short text (161 bytes of tail) does not fit, so the reading is
+  // left out and the text still ends with the UNSNOOZE instruction.
+  static const char kReading47[] = "-340282346638528859811704183484516925440.0 gall";
+  CHECK(strlen(kReading47) == 47);
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "SSSSSSSSSSSSSSSSSSSSSSS", "LLLLLLLLLLLLLLLLLLLLLLL", 255,
+                          "WWWWWWWWWWWWWWWWWWWWWWW", "TTTTTTTTTTTTTTTTTTTTTTT", kReading47));
+  CHECK_STR(msg, "SNOOZED: SSSSSSSSSSSSSSSSSSSSSSS LLLLLLLLLL #255 reminders paused by "
+                 "WWWWWWWWWWWWWWWWWWWWWWW. Still in TTTTTTTTTTTTTTTTTTTTTTT alarm. Reply UNSNOOZE to resume.");
+  CHECK(strlen(msg) == 159);
+  // ... the same with not_triggered and a 23-byte contact name (the case in the review comment).
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "Johnson Ranch North Sta", "High Float Switch North", 255,
+                          kWho23, "not_triggered", kReading47));
+  CHECK_STR(msg, "SNOOZED: Johnson Ranch North Sta High Float Switch No #255 reminders paused by "
+                 "Christopher Worthington. Still in not_triggered alarm. Reply UNSNOOZE to resume.");
+  // A who or alarm type longer than any caller passes is capped at 23 bytes (at a UTF-8 boundary)
+  // in that last form, so the instruction still fits; null who, type and reading read as empty.
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "Silas Cox", "Wellhead", 7,
+                          "WWWWWWWWWWWWWWWWWWWWWW\xC3\xA9WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+                          "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT", kReading47));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellhead #7 reminders paused by WWWWWWWWWWWWWWWWWWWWWW. Still in "
+                 "TTTTTTTTTTTTTTTTTTTTTTT alarm. Reply UNSNOOZE to resume.");
+  // RESUMED has no hint, but its reading is left out the same way rather than cut mid-number.
+  CHECK(composeSnoozeText(msg, sizeof(msg), false, "SSSSSSSSSSSSSSSSSSSSSSS", "LLLLLLLLLLLLLLLLLLLLLLL", 255,
+                          "WWWWWWWWWWWWWWWWWWWWWWW", "TTTTTTTTTTTTTTTTTTTTTTT", kReading47));
+  CHECK_STR(msg, "RESUMED: SSSSSSSSSSSSSSSSSSSSSSS LLLLLLLLLLLLLLLLLLLLLLL #255 reminders active again by "
+                 "WWWWWWWWWWWWWWWWWWWWWWW. Still in TTTTTTTTTTTTTTTTTTTTTTT alarm.");
+  CHECK(composeSnoozeText(msg, sizeof(msg), true, "Silas Cox", "Wellhead", 0, nullptr, nullptr, nullptr));
+  CHECK_STR(msg, "SNOOZED: Silas Cox Wellhead reminders paused by . Still in  alarm (). "
+                 "Auto-resumes on recovery; reply UNSNOOZE to resume now.");
+
   // Every who length 0-23 with each alarm type and reading: the SNOOZED text always fits, ends with
-  // one of the two hints (the long one whenever it fits) and keeps "UNSNOOZE"; RESUMED has no hint.
+  // one of the two hints (the long one whenever it fits) and keeps "UNSNOOZE"; the reading is left
+  // out only when the short text with it does not fit; RESUMED has no hint.
   static const char *const kTypes[] = {"high", "low", "triggered", "not_triggered", "sensor-fault",
                                        "sensor-stuck", "relay_timeout", "TTTTTTTTTTTTTTTTTTTTTTT"};
-  static const char *const kReadings[] = {"ON", "OFF", "0.0 in", "34.4 in", "-12345.6 gallons", "-99999.9 gallons"};
+  static const char *const kReadings[] = {"ON", "OFF", "0.0 in", "34.4 in", "-12345.6 gallons", "-99999.9 gallons",
+                                          "nan gallons", "-inf gallons",
+                                          "-1000000015047466219876688855040.0 gallons",
+                                          "340282346638528859811704183484516925440.0 gallo", kReading47};
   static const char *const kSitesS[] = {"Silas Cox", "Johnson Ranch North", "SSSSSSSSSSSSSSSSSSSSSSSxxxxxxxx", ""};
   char who[24];
   for (size_t w = 0; w <= 23; ++w) {
@@ -662,9 +699,27 @@ static void testComposeSnoozeText() {
                                                   "LLLLLLLLLLLLLLLLLLLLLLL", 255, longTail);
           CHECK(longFits == endsWith(msg, SNOOZE_HINT));
           CHECK(!longFits || strcmp(probe, msg) == 0);
-          composeSnoozeText(msg, sizeof(msg), false, kSitesS[si], "LLLLLLLLLLLLLLLLLLLLLLL", 255, who, kTypes[ti],
-                            kReadings[ri]);
-          CHECK(strncmp(msg, "RESUMED: ", 9) == 0 && strstr(msg, "UNSNOOZE") == nullptr && endsWith(msg, ").") );
+          // The reading is left out only when the short text with it does not fit.
+          char shortTail[200];
+          tailf(shortTail, sizeof(shortTail), " reminders paused by %s. Still in %s alarm (%s).%s", who, kTypes[ti],
+                kReadings[ri], SNOOZE_HINT_SHORT);
+          const bool shortFits = composeSensorText(probe, sizeof(probe), "SNOOZED: ", kSitesS[si],
+                                                   "LLLLLLLLLLLLLLLLLLLLLLL", 255, shortTail);
+          char withReading[64];
+          snprintf(withReading, sizeof(withReading), "(%s).", kReadings[ri]);
+          CHECK((longFits || shortFits) == (strstr(msg, withReading) != nullptr));
+          CHECK(longFits || !shortFits || strcmp(probe, msg) == 0);
+          // RESUMED: whole, with the reading when it fits, otherwise without it (never cut).
+          CHECK(composeSnoozeText(msg, sizeof(msg), false, kSitesS[si], "LLLLLLLLLLLLLLLLLLLLLLL", 255, who,
+                                  kTypes[ti], kReadings[ri]));
+          CHECK(strlen(msg) <= 159);
+          tailf(longTail, sizeof(longTail), " reminders active again by %s. Still in %s alarm (%s).", who, kTypes[ti],
+                kReadings[ri]);
+          const bool resumedFits = composeSensorText(probe, sizeof(probe), "RESUMED: ", kSitesS[si],
+                                                     "LLLLLLLLLLLLLLLLLLLLLLL", 255, longTail);
+          CHECK(strncmp(msg, "RESUMED: ", 9) == 0 && strstr(msg, "UNSNOOZE") == nullptr &&
+                endsWith(msg, resumedFits ? ")." : " alarm."));
+          CHECK(!resumedFits || strcmp(probe, msg) == 0);
         }
       }
     }

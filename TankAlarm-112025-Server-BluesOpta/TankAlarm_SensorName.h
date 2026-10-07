@@ -313,23 +313,43 @@ static inline bool composeSensorText(char *out, size_t outLen, const char *prefi
 //   "RESUMED: " + NAME + " reminders active again by <who>. Still in <type> alarm (<reading>)."
 // reading is "34.4 in" for an analog sensor or the state ("ON"/"OFF") for a float. When the
 // SNOOZED text with SNOOZE_HINT does not fit outLen it is composed again with SNOOZE_HINT_SHORT.
-// Returns true when the whole text fit (composeSensorText's result).
+// When that (or the RESUMED text) does not fit either (P326: a 47-byte reading, the widest a
+// stored float and a 7-byte unit give, with a 23-byte who and alarm type), the reading is left
+// out and who and the alarm type are capped at SENSOR_NAME_PART_MAX bytes:
+//   "SNOOZED: " + NAME + " reminders paused by <who>. Still in <type> alarm." + SNOOZE_HINT_SHORT
+//   "RESUMED: " + NAME + " reminders active again by <who>. Still in <type> alarm."
+// Those tails are at most 111 and 91 bytes, so with the 9-byte prefix and the name's 16-byte
+// minimum they always fit when outLen >= 137 (the SMS buffer is 160): the SNOOZED text always
+// ends with the UNSNOOZE instruction. Returns true when the whole text fit (composeSensorText's
+// result).
 static inline bool composeSnoozeText(char *out, size_t outLen, bool snoozed, const char *site,
                                      const char *label, uint8_t userNumber, const char *who,
                                      const char *alarmType, const char *reading) {
   char tail[160];
   const char *prefix = snoozed ? "SNOOZED: " : "RESUMED: ";
-  snprintf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s",
-           snoozed ? "paused" : "active again", (who != NULL) ? who : "",
-           (alarmType != NULL) ? alarmType : "", (reading != NULL) ? reading : "",
-           snoozed ? SNOOZE_HINT : "");
-  const bool fit = composeSensorText(out, outLen, prefix, site, label, userNumber, tail);
-  if (fit || !snoozed) {
-    return fit;
+  const char *action = snoozed ? "paused" : "active again";
+  const char *w = (who != NULL) ? who : "";
+  const char *type = (alarmType != NULL) ? alarmType : "";
+  const char *r = (reading != NULL) ? reading : "";
+  // A tail cut by snprintf counts as not fitting, so the next form is tried.
+  int len = snprintf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s", action, w,
+                     type, r, snoozed ? SNOOZE_HINT : "");
+  if (composeSensorText(out, outLen, prefix, site, label, userNumber, tail) && len >= 0 &&
+      (size_t)len < sizeof(tail)) {
+    return true;
   }
-  snprintf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s", "paused",
-           (who != NULL) ? who : "", (alarmType != NULL) ? alarmType : "",
-           (reading != NULL) ? reading : "", SNOOZE_HINT_SHORT);
+  if (snoozed) {
+    len = snprintf(tail, sizeof(tail), " reminders %s by %s. Still in %s alarm (%s).%s", action, w,
+                   type, r, SNOOZE_HINT_SHORT);
+    if (composeSensorText(out, outLen, prefix, site, label, userNumber, tail) && len >= 0 &&
+        (size_t)len < sizeof(tail)) {
+      return true;
+    }
+  }
+  const size_t wLen = utf8CompleteLen(w, utf8FitLen(w, SENSOR_NAME_PART_MAX));
+  const size_t typeLen = utf8CompleteLen(type, utf8FitLen(type, SENSOR_NAME_PART_MAX));
+  snprintf(tail, sizeof(tail), " reminders %s by %.*s. Still in %.*s alarm.%s", action, (int)wLen,
+           w, (int)typeLen, type, snoozed ? SNOOZE_HINT_SHORT : "");
   return composeSensorText(out, outLen, prefix, site, label, userNumber, tail);
 }
 

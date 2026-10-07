@@ -15092,7 +15092,8 @@ static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const c
              rec.measurementUnit[0] ? rec.measurementUnit : "in");
   }
   // CR-8: when the SNOOZED text does not fit, it is rebuilt with the short " Reply UNSNOOZE to
-  // resume." hint so the command is never the part that is cut (TankAlarm_SensorName.h).
+  // resume." hint, and then also without the reading (P326), so the command is never the part
+  // that is cut (TankAlarm_SensorName.h).
   char message[160];
   composeSnoozeText(message, sizeof(message), snoozed, rec.site, rec.label, rec.userNumber, who,
                     rec.alarmType, reading);
