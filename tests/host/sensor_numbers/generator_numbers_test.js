@@ -728,6 +728,18 @@ check('commissioning restarts numbering at 1',
     !post.includes('sensorNumbersCachedHigh(') && post.split('sensorNumbersCachedState(').length === 2);
   check('reuseRetired is read only at the top level',
     post.split('doc["reuseRetired"]').length === 3 && !post.includes('["config"]["reuseRetired"]'));
+  // C323 review: dispatchClientConfig caches a post whole, so a config without its "sensors" list
+  // would empty the snapshot's list and disarm the 409. The check refuses a missing or null list
+  // (host-tested in sensor_numbers_test.cpp) and runs for every client config, not behind a guard.
+  const header = fs.readFileSync(path.join(path.dirname(SKETCH), 'TankAlarm_SensorNumbers.h'), 'utf8').replace(/\r\n/g, '\n');
+  check('the number check refuses a config without its sensors list',
+    header.includes('  if (sensorsValue.isNull()) {\n' +
+      '    if (msg && msgLen) snprintf(msg, msgLen, "the config must include its sensors list");\n' +
+      '    return SENSOR_NUMBERS_INVALID;\n  }\n'));
+  const uidAt = post.indexOf('    if (clientUid && strlen(clientUid) > 0) {\n');
+  const beforeCheck = uidAt >= 0 && checkAt > uidAt ? post.slice(uidAt, checkAt) : null;
+  check('the number check runs for every client config post',
+    beforeCheck !== null && !/\["sensors"\]\.isNull\(\)|containsKey\("sensors"\)|\["sensors"\]\.is<|cfgSensors\.isNull\(\)/.test(beforeCheck.replace('if (!cfgSensors.isNull() && cfgSensors.size() > 8) {', '')));
   check('409 has its reason phrase',
     sketch.includes('  } else if (status == 409) {\n    client.println(F("Conflict"));\n'));
 }

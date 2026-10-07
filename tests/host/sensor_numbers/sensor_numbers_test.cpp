@@ -50,8 +50,6 @@ static void expectResult(const char *json, uint8_t wantCode, const char *wantMsg
 static void expectOk(const char *json) { expectResult(json, SENSOR_NUMBERS_OK, ""); }
 
 static void testAccepted() {
-  expectOk("{}");                                   // no sensors key: a null array
-  expectOk("{\"sensors\":null}");
   expectOk("{\"sensors\":[]}");
   expectOk("{\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":3}]}");
   expectOk("{\"sensors\":[{\"number\":2},{\"number\":1},{\"number\":3}]}");
@@ -106,6 +104,13 @@ static void testInvalid() {
                "sensor 2 is not an object");
   expectResult("{\"sensors\":[null]}", SENSOR_NUMBERS_INVALID, "sensor 1 is not an object");
   expectResult("{\"sensors\":[[]]}", SENSOR_NUMBERS_INVALID, "sensor 1 is not an object");
+  // A config without its sensors list: the server caches a post whole, so a partial one would
+  // replace the snapshot's list (C323 review).
+  expectResult("{}", SENSOR_NUMBERS_INVALID, "the config must include its sensors list");
+  expectResult("{\"sensors\":null}", SENSOR_NUMBERS_INVALID, "the config must include its sensors list");
+  expectResult("{\"site\":\"x\"}", SENSOR_NUMBERS_INVALID, "the config must include its sensors list");
+  expectResult("{\"site\":\"x\",\"snh\":5,\"Sensors\":[{\"number\":1}]}", SENSOR_NUMBERS_INVALID,
+               "the config must include its sensors list");
   // A present "sensors" that is not a list: converting it to an array would give a null array.
   static const char *const kNotLists[] = {"{\"number\":0}", "{}", "\"1\"", "5", "true", "false"};
   for (size_t i = 0; i < sizeof(kNotLists) / sizeof(kNotLists[0]); ++i) {
@@ -340,6 +345,47 @@ static void testRetiredReuse() {
   CHECK(big[0] == '\0');
 }
 
+// handleConfigPost's order for one post against the cached snapshot text: the number check (400),
+// then the retired-number guard (409) unless reuseRetired, then the post is cached whole (as
+// dispatchClientConfig does). Returns the status; snapshot is replaced only on 200.
+static int simulatePost(char *snapshot, size_t snapshotLen, const char *postedJson, bool reuseRetired) {
+  JsonDocument doc;
+  CHECK(!deserializeJson(doc, postedJson));
+  char msg[80];
+  if (sensorNumbersCheck(doc["sensors"], msg, sizeof(msg)) != SENSOR_NUMBERS_OK) return 400;
+  uint8_t high = 0;
+  uint8_t active[32];
+  const bool known = sensorNumbersCachedState(snapshot[0] ? snapshot : nullptr, high, active);
+  if (known && !reuseRetired && sensorNumbersRetiredReuse(doc["sensors"], active, high, nullptr, 0) > 0) {
+    return 409;
+  }
+  const uint8_t mark = sensorNumbersHighMark(doc["snh"], high, doc["sensors"]);
+  if (mark > 0) doc["snh"] = mark;
+  const size_t len = serializeJson(doc, snapshot, snapshotLen);
+  CHECK(len > 0 && len < snapshotLen);
+  return 200;
+}
+
+// C323 review: a partial post ({"site":"x"}) must not replace the cached sensors list, or the next
+// post of [1,2,3] would reuse retired #3 without the 409.
+static void testPartialPost() {
+  char snapshot[256];
+  snprintf(snapshot, sizeof(snapshot), "%s",
+           "{\"site\":\"North Yard\",\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":4}],\"snh\":5}");
+  CHECK(simulatePost(snapshot, sizeof(snapshot), "{\"site\":\"x\"}", false) == 400);
+  CHECK(simulatePost(snapshot, sizeof(snapshot), "{\"site\":\"x\",\"sensors\":null}", false) == 400);
+  CHECK(strstr(snapshot, "\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":4}]") != nullptr);
+  const char kReuse3[] = "{\"site\":\"x\",\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":3}]}";
+  CHECK(simulatePost(snapshot, sizeof(snapshot), kReuse3, false) == 409);
+  CHECK(simulatePost(snapshot, sizeof(snapshot), kReuse3, true) == 200);  // the operator confirmed
+  CHECK(strcmp(snapshot, "{\"site\":\"x\",\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":3}],\"snh\":5}") == 0);
+  // An empty list is a full config with no sensors: accepted, and the mark stays.
+  CHECK(simulatePost(snapshot, sizeof(snapshot), "{\"site\":\"x\",\"sensors\":[]}", false) == 200);
+  CHECK(strcmp(snapshot, "{\"site\":\"x\",\"sensors\":[],\"snh\":5}") == 0);
+  CHECK(simulatePost(snapshot, sizeof(snapshot), "{\"sensors\":[{\"number\":6}]}", false) == 200);
+  CHECK(simulatePost(snapshot, sizeof(snapshot), "{\"sensors\":[{\"number\":6},{\"number\":5}]}", false) == 409);
+}
+
 int main() {
   testAccepted();
   testDuplicates();
@@ -347,6 +393,7 @@ int main() {
   testMessageBuffer();
   testHighMark();
   testRetiredReuse();
+  testPartialPost();
   printf("sensor_numbers: %lu checks, %lu failures\n", gChecks, gFailures);
   return gFailures == 0 ? 0 : 1;
 }

@@ -23,18 +23,24 @@
 #include <ArduinoJson.h>
 
 #define SENSOR_NUMBERS_OK        0
-#define SENSOR_NUMBERS_INVALID   1  // "sensors" is not a list, an entry is not an object, or its number is
-                                    // missing or not an integer 1-255
+#define SENSOR_NUMBERS_INVALID   1  // "sensors" is missing or not a list, an entry is not an object, or its
+                                    // number is missing or not an integer 1-255
 #define SENSOR_NUMBERS_DUPLICATE 2  // two sensors resolve to the same number
 
 // Checks a config's "sensors" value, passed as it is in the document (not converted to an array,
 // which would turn an object or a string into a null array and let it through). Every entry needs a
 // "number"; a missing or null one is INVALID (see above). Returns SENSOR_NUMBERS_OK, or an error
 // with a short reason in msg (always NUL-terminated when msgLen > 0; msg may be null). A missing or
-// null "sensors" is OK: a config without sensors changes none. Any other non-list value is INVALID.
+// null "sensors" is INVALID too, and so is any other non-list value; an empty list is OK. The server
+// caches a posted config whole as the client's snapshot, which the Config Generator loads and the
+// retired-number check reads, so a post must be a full config: a partial one without its sensors
+// would replace the snapshot's list and let the next post reuse a retired number unconfirmed.
 static inline uint8_t sensorNumbersCheck(JsonVariantConst sensorsValue, char *msg, size_t msgLen) {
   if (msg && msgLen) msg[0] = '\0';
-  if (sensorsValue.isNull()) return SENSOR_NUMBERS_OK;
+  if (sensorsValue.isNull()) {
+    if (msg && msgLen) snprintf(msg, msgLen, "the config must include its sensors list");
+    return SENSOR_NUMBERS_INVALID;
+  }
   if (!sensorsValue.is<JsonArrayConst>()) {
     if (msg && msgLen) snprintf(msg, msgLen, "sensors must be a list");
     return SENSOR_NUMBERS_INVALID;

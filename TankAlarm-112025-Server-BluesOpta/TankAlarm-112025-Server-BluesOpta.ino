@@ -11014,7 +11014,10 @@ static void handleConfigPost(EthernetClient &client, const String &body) {
       }
       // S-T01/S1: a sensor's number is its identity (config "number", note "k", registry,
       // calibration, alarm contacts, Clear Relay). Refuse 0, >255, non-integers and duplicates
-      // before anything is cached or sent; the client would accept them silently.
+      // before anything is cached or sent; the client would accept them silently. A config without
+      // its "sensors" list is refused too: dispatchClientConfig caches the post whole, so a partial
+      // one would empty the snapshot's list, and the next post could reuse a retired number without
+      // the 409 below (the Config Generator always sends the full config).
       {
         char numbersMsg[80];
         // The raw value, not cfgSensors: as<JsonArrayConst>() turns a non-list into a null array.
