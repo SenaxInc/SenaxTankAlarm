@@ -258,7 +258,7 @@ static void testSketchText() {
                      "                                       : ((epoch > 0.0) ? epoch : currentEpoch());\n"
                      "          }\n") != nullptr);
   {
-    const char *recBegin = strstr(text, "        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;\n");
+    const char *recBegin = strstr(text, "        SensorRecord *rec = upsertSensorRecord(clientUid, sensorIdx, &recCreated);\n");
     const char *recEnd = recBegin ? strstr(recBegin, "    // Reconciliation: clear alarms on server for sensors that the client") : nullptr;
     CHECK(recBegin != nullptr && recEnd != nullptr);
     if (recBegin && recEnd) {
@@ -288,7 +288,10 @@ static void testSketchText() {
   // R10: the missed-alarm reconcile creates a missing record (not a search-only lookup) and fills
   // an empty site from the note.
   CHECK(strstr(text, "search without upserting") == nullptr);
-  CHECK(strstr(text, "SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;\n"
+  // P326: sensorIdx is already 1-255 here (noteSensorNumber skips other entries), so the old
+  // `(sensorIdx >= 1) ?` test is gone.
+  CHECK(strstr(text, "(sensorIdx >= 1) ?") == nullptr);
+  CHECK(strstr(text, "SensorRecord *rec = upsertSensorRecord(clientUid, sensorIdx, &recCreated);\n"
                      "        if (rec && rec->site[0] == '\\0') {\n"
                      "          const char *noteSite = doc[\"s\"] | \"\";\n"
                      "          if (noteSite[0] != '\\0') strlcpy(rec->site, noteSite, sizeof(rec->site));\n"

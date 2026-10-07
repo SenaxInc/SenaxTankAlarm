@@ -36,6 +36,11 @@
 // and later cleared must go back to 0 on the server. Writing only when "un" is present left the
 // old number in the registry (and in "#N" on emails and the dashboard) forever.
 // Alarm and unload notes do not always carry "un", so there a missing "un" keeps the number.
+//
+// NO PLACEHOLDER LABEL. The server stores a note's label ("n") only when it is non-empty and
+// never writes one of its own (P326: telemetry and daily notes used to store "Tank" for an
+// empty name). A label already stored as "Tank" is left as is: it cannot be told apart from
+// the client and Config Generator default of the same text.
 
 #ifndef TANKALARM_SENSOR_NAME_H
 #define TANKALARM_SENSOR_NAME_H
@@ -57,6 +62,14 @@ static inline uint8_t noteDisplayNumber(bool hasUn, int32_t un, bool noteAlwaysC
     return (0 <= un && un <= 255) ? (uint8_t)un : current;
   }
   return noteAlwaysCarriesUn ? (uint8_t)0 : current;
+}
+
+// A note's sensor number k (#323: permanent, 1..255). Callers pass k.is<int32_t>() and its
+// value. Missing, non-integer, < 1 or > 255 gives 0 and the caller drops the note (or skips
+// the entry). The range test has to come before any uint8_t conversion: as<uint8_t>() turns
+// 256 into 0 (a phantom sensor-0 record), and `| 0` into a uint8_t wraps 257 to sensor 1.
+static inline uint8_t noteSensorNumber(bool isInt32, int32_t k) {
+  return (isInt32 && k >= 1 && k <= 255) ? (uint8_t)k : (uint8_t)0;
 }
 
 // Longest part of a site or a label that goes into a name (the SMS budget is 160 bytes).

@@ -95,6 +95,26 @@ static void testNoteDisplayNumber() {
   CHECK(noteDisplayNumber(true, INT32_MAX, true, 9) == 9);
 }
 
+// P326 (Copilot 4105954637): a note's k is a sensor number 1-255 or the note names no sensor.
+// as<uint8_t>() turned 256 into 0 (a phantom sensor-0 record), and `a["k"] | 0` wrapped 257 and
+// -255 to sensor 1 in the daily alarms[] reconcile.
+static void testNoteSensorNumber() {
+  CHECK(noteSensorNumber(true, 1) == 1);  // range ends
+  CHECK(noteSensorNumber(true, 255) == 255);
+  CHECK(noteSensorNumber(true, 7) == 7);
+  CHECK(noteSensorNumber(true, 0) == 0);
+  CHECK(noteSensorNumber(true, 256) == 0);
+  CHECK(noteSensorNumber(true, 257) == 0);
+  CHECK(noteSensorNumber(true, 511) == 0);
+  CHECK(noteSensorNumber(true, 65537) == 0);
+  CHECK(noteSensorNumber(true, -1) == 0);
+  CHECK(noteSensorNumber(true, -255) == 0);
+  CHECK(noteSensorNumber(true, INT32_MIN) == 0);
+  CHECK(noteSensorNumber(true, INT32_MAX) == 0);
+  CHECK(noteSensorNumber(false, 1) == 0);  // missing or not an integer (1.0, "1", true, null)
+  CHECK(noteSensorNumber(false, 0) == 0);
+}
+
 static void testUtf8FitLen() {
   CHECK(utf8FitLen(nullptr, 10) == 0);
   CHECK(utf8FitLen("", 10) == 0);
@@ -756,25 +776,66 @@ static void testSketchText() {
   CHECK(strstr(text, "[\"un\"].as<uint8_t>()") == nullptr);
 
   // CR-7: handleAlarm's sensor path and handleUnload drop a note whose "k" is missing, not an
-  // integer or < 1 (the telemetry guard), before any record, log, SMS or email work.
+  // integer or not 1-255 (the telemetry guard), before any record, log, SMS or email work.
+  // P326 (Copilot 4105954637): the range is checked by noteSensorNumber before any uint8_t
+  // conversion; the old `as<int>() < 1` guard let 256 through as sensor 0.
   static const char kAlarmGuard[] =
-      "  if (!doc[\"k\"].is<int>() || doc[\"k\"].as<int>() < 1) {\n"
-      "    Serial.println(F(\"Alarm dropped: missing/invalid sensor index k\"));\n"
+      "  JsonVariantConst kv = doc[\"k\"];\n"
+      "  const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);\n"
+      "  if (sensorIndex == 0) {\n"
+      "    Serial.println(F(\"Alarm dropped: missing/invalid sensor index k (1-255)\"));\n"
       "    return;\n"
       "  }\n"
-      "  uint8_t sensorIndex = doc[\"k\"].as<uint8_t>();\n"
       "  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n";
   static const char kUnloadGuard[] =
-      "  if (!doc[\"k\"].is<int>() || doc[\"k\"].as<int>() < 1) {\n"
-      "    Serial.println(F(\"Unload dropped: missing/invalid sensor index k\"));\n"
+      "  JsonVariantConst kv = doc[\"k\"];\n"
+      "  const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);\n"
+      "  if (sensorIndex == 0) {\n"
+      "    Serial.println(F(\"Unload dropped: missing/invalid sensor index k (1-255)\"));\n"
+      "    return;\n"
+      "  }\n";
+  static const char kTelemetryGuard[] =
+      "  JsonVariantConst kv = doc[\"k\"];\n"
+      "  const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);\n"
+      "  if (sensorIndex == 0) {\n"
+      "    Serial.println(F(\"Telemetry dropped: missing/invalid sensor index k (1-255)\"));\n"
       "    return;\n"
       "  }\n"
-      "  uint8_t sensorIndex = doc[\"k\"].as<uint8_t>();\n";
+      "  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n";
+  static const char kDailySensorGuard[] =
+      "    JsonVariantConst kv = t[\"k\"];\n"
+      "    const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);\n"
+      "    if (sensorIndex == 0) {\n"
+      "      Serial.println(F(\"Daily sensor entry skipped: missing/invalid sensor index k (1-255)\"));\n"
+      "      continue;\n"
+      "    }\n"
+      "    bool recCreated = false;\n"
+      "    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);\n";
   const char *alarmGuard = findAfter(kAlarmGuard, alarm);
   const char *systemReturn = findAfter("  if (isSystemAlarm) {\n", alarm);
   CHECK(alarmGuard != nullptr && alarmEnd != nullptr && alarmGuard < alarmEnd);
   CHECK(systemReturn != nullptr && alarmGuard != nullptr && systemReturn < alarmGuard);  // system alarms carry no k
-  CHECK(countOf(text, "uint8_t sensorIndex = doc[\"k\"].as<uint8_t>();") == 3);  // telemetry, alarm, unload
+  const char *telemetryGuard = findAfter(kTelemetryGuard, telemetry);
+  CHECK(telemetryGuard != nullptr && telemetryGuard < alarm);
+  const char *dailySensorGuard = findAfter(kDailySensorGuard, daily);
+  CHECK(dailySensorGuard != nullptr && sensorsLoop != nullptr && sensorsLoop < dailySensorGuard &&
+        dailySensorGuard < unload);
+  // Four note guards (telemetry, alarm, unload, daily sensors[]) and the two daily alarms[] reads
+  // (missed-alarm reconcile, orphan clear); no k is narrowed to uint8_t before its range check.
+  CHECK(countOf(text, "noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);") == 4);
+  CHECK(countOf(text, "noteSensorNumber(ak.is<int32_t>(), ak.is<int32_t>() ? ak.as<int32_t>() : 0);") == 2);
+  CHECK(countOf(text, "noteSensorNumber(") == 6);
+  CHECK(strstr(text, "[\"k\"].as<uint8_t>()") == nullptr);
+  CHECK(strstr(text, "[\"k\"].is<int>() || ") == nullptr);
+  CHECK(!foundBetween("a[\"k\"] | 0", daily, unload));
+  CHECK(foundBetween("      JsonVariantConst ak = a[\"k\"];\n"
+                     "      const uint8_t sensorIdx = noteSensorNumber(ak.is<int32_t>(), ak.is<int32_t>() ? ak.as<int32_t>() : 0);\n"
+                     "      if (sensorIdx == 0) continue;\n"
+                     "      bool hiAlarm = a[\"hi\"] | false;\n", daily, sensorsLoop));
+  CHECK(foundBetween("        JsonVariantConst ak = a[\"k\"];\n"
+                     "        const uint8_t dailyIdx = noteSensorNumber(ak.is<int32_t>(), ak.is<int32_t>() ? ak.as<int32_t>() : 0);\n"
+                     "        if (dailyIdx == 0) continue;",
+                     daily, sensorsLoop));
   const char *unloadGuard = findAfter(kUnloadGuard, unload);
   CHECK(unloadGuard != nullptr && unloadEnd != nullptr && unloadGuard < unloadEnd);
   const char *unloadUidCheck = findAfter("  if (!isValidClientUid(clientUid)) {\n", unload);
@@ -783,7 +844,7 @@ static void testSketchText() {
   CHECK(unloadUidCheck != nullptr && unloadGuard != nullptr && unloadUidCheck < unloadGuard);
   CHECK(unloadGuard != nullptr && unloadLookup != nullptr && unloadLog != nullptr && unloadGuard < unloadLookup &&
         unloadLookup < unloadLog);
-  CHECK(!foundBetween("doc[\"k\"].as<uint8_t>()", unload, unloadGuard));  // no read before the guard
+  CHECK(!foundBetween("doc[\"k\"]", unload, unloadGuard));  // no read before the guard
 
   // sendDailyEmail still sends sensorIndex (old pasted scripts print '#undefined' without it) and
   // userNumber only when set.
@@ -882,6 +943,22 @@ static void testSketchText() {
                      "  uint8_t userNumber;          // Display Number (0 = none); names the sensor as \" #N\" in texts\n") != nullptr);
   CHECK(foundBetween("  const char *noteLabel = doc[\"n\"] | \"\";", unload, unloadEnd));
   CHECK(strstr(text, "doc[\"n\"] | \"Tank\"") == nullptr);
+  // P326 (Copilot 4157714734, 4105954696): handleTelemetry and handleDaily no longer write a "Tank"
+  // placeholder into an empty label either. They copy only a non-empty "n", so an empty one
+  // never clears a stored label.
+  CHECK(countOf(text, "strlcpy(rec->label, \"Tank\"") == 0);
+  CHECK(countOf(text, "} else if (rec->label[0] == '\\0') {") == 0);
+  CHECK(foundBetween("  const char *label = doc[\"n\"] | \"\";\n"
+                     "  if (label && strlen(label) > 0) {\n"
+                     "    strlcpy(rec->label, label, sizeof(rec->label));\n"
+                     "  }\n", telemetry, alarm));
+  CHECK(foundBetween("    const char *label = t[\"n\"] | \"\";\n"
+                     "    if (label && strlen(label) > 0) {\n"
+                     "      strlcpy(rec->label, label, sizeof(rec->label));\n"
+                     "    }\n", sensorsLoop, unload));
+  // The contacts manager's alarm list names a sensor with no label "Sensor", as the dashboard does.
+  CHECK(countOf(text, "alarm.label||'Sensor'") == 3);
+  CHECK(strstr(text, "${escapeHtml(alarm.label)}") == nullptr && strstr(text, "${alarm.label}") == nullptr);
   CHECK(foundBetween("  const SensorRecord *known = findSensorByHash(clientUid, sensorIndex);\n"
                      "  const char *tankLabel = noteLabel;\n"
                      "  if (tankLabel[0] == '\\0' && known != nullptr) {\n"
@@ -945,6 +1022,7 @@ static void testSketchText() {
 
 int main() {
   testNoteDisplayNumber();
+  testNoteSensorNumber();
   testUtf8FitLen();
   testUtf8CompleteLen();
   testUtf8CompleteCopy();
