@@ -78,6 +78,9 @@ static inline uint8_t sensorNumbersCheck(JsonVariantConst sensorsValue, char *ms
 // removed sensor's number is never handed out again. The client does not keep snh; the server's
 // cached config snapshot is the only copy. handleConfigPost therefore never lets a post lower it:
 // an imported old file without snh (or with a lower one) must not let a retired number come back.
+// Until S6 the snapshot itself can lose or lower snh: eviction at the 20-entry cap, DELETE
+// /api/client and restoring an older FTP backup. A deleted client's mark is forgotten by design
+// (owner, 2026-10-07: no tombstone).
 
 // The value of an "snh" or "number" when it is an integer 0-255, else 0 (missing, null, 256, -1,
 // 1.5, "5", true, lists and objects count as no value).
@@ -98,19 +101,84 @@ static inline uint8_t sensorNumbersMaxNumber(JsonVariantConst sensorsValue) {
   return high;
 }
 
-// The high mark a cached config payload (the snapshot's JSON text) carries: the larger of its "snh"
-// and its highest sensor number. Snapshots saved before snh existed carry only their numbers.
-// Parses only those two fields, so it needs little memory. 0 for a null, empty or unreadable payload.
-static inline uint8_t sensorNumbersCachedHigh(const char *payload) {
-  if (!payload || payload[0] == '\0') return 0;
+// What a cached config payload (the snapshot's JSON text) says about the client's numbers. high is
+// its high mark: the larger of its "snh" and its highest sensor number (snapshots saved before snh
+// existed carry only their numbers); 0 for a null, empty or unreadable payload. active gets one bit
+// per usable "number" (1-255) in its "sensors" (bit n&7 of active[n>>3]). Parses only those two
+// fields, so it needs little memory. Returns true when the payload has a "sensors" list, so the
+// numbers in use are known; false (high still set, active empty) for a null, empty or unreadable
+// payload or one without a "sensors" list.
+static inline bool sensorNumbersCachedState(const char *payload, uint8_t &high, uint8_t active[32]) {
+  high = 0;
+  memset(active, 0, 32);
+  if (!payload || payload[0] == '\0') return false;
   JsonDocument filter;
   filter["snh"] = true;
   filter["sensors"][0]["number"] = true;
   JsonDocument doc;
-  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) return 0;
+  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) return false;
   const uint8_t snh = sensorNumbersByteValue(doc["snh"]);
   const uint8_t top = sensorNumbersMaxNumber(doc["sensors"]);
-  return snh > top ? snh : top;
+  high = snh > top ? snh : top;
+  JsonVariantConst sensors = doc["sensors"];
+  if (!sensors.is<JsonArrayConst>()) return false;
+  for (JsonVariantConst t : sensors.as<JsonArrayConst>()) {
+    if (!t.is<JsonObjectConst>()) continue;
+    const uint8_t n = sensorNumbersByteValue(t["number"]);
+    if (n > 0) active[n >> 3] |= (uint8_t)(1u << (n & 7u));
+  }
+  return true;
+}
+
+// The high mark a cached config payload carries (see sensorNumbersCachedState).
+static inline uint8_t sensorNumbersCachedHigh(const char *payload) {
+  uint8_t high = 0;
+  uint8_t active[32];
+  sensorNumbersCachedState(payload, high, active);
+  return high;
+}
+
+// ---- Reusing a retired number (C323, owner 2026-10-07) ---------------------------------------
+// A posted number at or below the cached high mark that the cached config no longer holds belonged
+// to a removed sensor; its history, alarm contacts and learned calibration are still keyed by it.
+// handleConfigPost refuses such a post (409) unless the operator confirmed the reuse.
+
+// Counts the posted "sensors" numbers n with 1 <= n <= cachedHigh that are not in active (the
+// cached set, from sensorNumbersCachedState), and writes them in ascending order as "3, 5" into
+// list. Only whole numbers are written: one that does not fit ends the list there. list is always
+// NUL-terminated when listLen > 0 and may be null. Entries that are not objects or carry no usable
+// number are skipped (sensorNumbersCheck refuses them first). Returns the count (0: none).
+static inline size_t sensorNumbersRetiredReuse(JsonVariantConst postedSensors, const uint8_t active[32],
+                                               uint8_t cachedHigh, char *list, size_t listLen) {
+  if (list && listLen) list[0] = '\0';
+  if (!postedSensors.is<JsonArrayConst>()) return 0;
+  uint8_t retired[32];
+  memset(retired, 0, sizeof(retired));
+  for (JsonVariantConst t : postedSensors.as<JsonArrayConst>()) {
+    if (!t.is<JsonObjectConst>()) continue;
+    const uint8_t n = sensorNumbersByteValue(t["number"]);
+    const uint8_t bit = (uint8_t)(1u << (n & 7u));
+    if (n == 0 || n > cachedHigh || (active[n >> 3] & bit)) continue;
+    retired[n >> 3] |= bit;
+  }
+  size_t count = 0;
+  size_t used = 0;
+  bool full = !list || listLen == 0;
+  for (unsigned n = 1; n <= 255; ++n) {
+    if (!(retired[n >> 3] & (1u << (n & 7u)))) continue;
+    ++count;
+    if (full) continue;
+    char token[16];
+    const int len = count > 1 ? snprintf(token, sizeof(token), ", %u", n)
+                              : snprintf(token, sizeof(token), "%u", n);
+    if (len <= 0 || used + (size_t)len >= listLen) {
+      full = true;
+      continue;
+    }
+    memcpy(list + used, token, (size_t)len + 1);
+    used += (size_t)len;
+  }
+  return count;
 }
 
 // The snh to store with a posted config: the largest of the posted "snh" (ignored unless an integer

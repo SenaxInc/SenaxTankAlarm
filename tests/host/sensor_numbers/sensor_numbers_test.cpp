@@ -233,12 +233,120 @@ static void testHighMark() {
   CHECK(sensorNumbersHighMark(doc["missing"], 0, doc["missing"]) == 0);
 }
 
+// C323: the retired numbers a posted config reuses, as handleConfigPost finds them: one parse of
+// the cached payload (sensorNumbersCachedState), then sensorNumbersRetiredReuse on the posted
+// "sensors". wantKnown false means no usable snapshot, so handleConfigPost does not guard.
+static void expectRetired(const char *postedJson, const char *cachedPayload, bool wantKnown,
+                          unsigned wantHigh, size_t wantCount, const char *wantList) {
+  JsonDocument doc;
+  CHECK(!deserializeJson(doc, postedJson));
+  uint8_t high = 77;
+  uint8_t active[32];
+  memset(active, 0xA5, sizeof(active));
+  const bool known = sensorNumbersCachedState(cachedPayload, high, active);
+  char list[64];
+  memset(list, 'x', sizeof(list));
+  const size_t count = known ? sensorNumbersRetiredReuse(doc["sensors"], active, high, list, sizeof(list)) : 0;
+  if (!known) list[0] = '\0';
+  ++gChecks;
+  if (known != wantKnown || high != wantHigh || count != wantCount || strcmp(list, wantList) != 0) {
+    ++gFailures;
+    printf("FAIL retired of %s with cache %s: got %d/%u/%u \"%s\", expected %d/%u/%u \"%s\"\n", postedJson,
+           cachedPayload ? cachedPayload : "(none)", (int)known, (unsigned)high, (unsigned)count, list,
+           (int)wantKnown, wantHigh, (unsigned)wantCount, wantList);
+  }
+  // The cached high mark is the one sensorNumbersHighMark gets: the same as sensorNumbersCachedHigh.
+  CHECK(high == sensorNumbersCachedHigh(cachedPayload));
+  // An unknown snapshot leaves the active set empty.
+  if (!known) {
+    bool empty = true;
+    for (size_t i = 0; i < sizeof(active); ++i) empty = empty && active[i] == 0;
+    CHECK(empty);
+  }
+}
+
+static void testRetiredReuse() {
+  // The cached config holds #1, #2, #4 and once used #5 (snh 5): #3 and #5 are retired.
+  static const char kCached[] = "{\"site\":\"North Yard\",\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":4}],\"snh\":5}";
+  expectRetired("{\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":3}]}", kCached, true, 5, 1, "3");
+  expectRetired("{\"sensors\":[{\"number\":5},{\"number\":1},{\"number\":2},{\"number\":3}]}", kCached, true, 5, 2, "3, 5");
+  // New numbers past the mark, a subset of the active set, and an empty list are not reuse.
+  expectRetired("{\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":4},{\"number\":6}]}", kCached, true, 5, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1},{\"number\":2}]}", kCached, true, 5, 0, "");
+  expectRetired("{\"sensors\":[]}", kCached, true, 5, 0, "");
+  expectRetired("{}", kCached, true, 5, 0, "");
+  expectRetired("{\"sensors\":{\"number\":3}}", kCached, true, 5, 0, "");
+  // Unusable posted entries are skipped (sensorNumbersCheck refuses them first).
+  expectRetired("{\"sensors\":[5,{\"number\":0},{\"number\":3.5},{\"number\":\"3\"},{\"number\":300},{}]}", kCached,
+                true, 5, 0, "");
+  // A snapshot saved before snh existed: its highest number is the mark, gaps below it are retired.
+  expectRetired("{\"sensors\":[{\"number\":1},{\"number\":2}]}", "{\"sensors\":[{\"number\":1},{\"number\":3}]}",
+                true, 3, 1, "2");
+  // Every sensor removed: all numbers up to the mark are retired.
+  expectRetired("{\"sensors\":[{\"number\":2},{\"number\":1}]}", "{\"sensors\":[],\"snh\":4}", true, 4, 2, "1, 2");
+  // Unusable cached entries count as not in use.
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "{\"sensors\":[{\"number\":\"1\"},{\"number\":2}],\"snh\":2}",
+                true, 2, 1, "1");
+  // No usable snapshot: no guard (commissioning), but the mark is still read where there is one.
+  expectRetired("{\"sensors\":[{\"number\":1}]}", nullptr, false, 0, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "", false, 0, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "not json", false, 0, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "{\"sensors\":[{\"number\":4}", false, 0, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "{\"site\":\"x\",\"snh\":6}", false, 6, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "{\"sensors\":\"1,2\",\"snh\":6}", false, 6, 0, "");
+  expectRetired("{\"sensors\":[{\"number\":1}]}", "{\"sensors\":null,\"snh\":3}", false, 3, 0, "");
+  // A full snapshot with calibration injected.
+  expectRetired("{\"sensors\":[{\"number\":1},{\"number\":2},{\"number\":7}]}",
+                "{\"productUid\":\"com.example.tankalarm\",\"sensors\":[{\"number\":1,\"name\":\"Tank\","
+                "\"calibration\":{\"points\":[[1,2],[3,4]]}},{\"number\":6}],\"snh\":8,\"cv\":\"abc\"}",
+                true, 8, 2, "2, 7");
+  // At 255: the numbers above 248 are retired, listed in ascending order whatever the posted order.
+  expectRetired("{\"sensors\":[{\"number\":255},{\"number\":250},{\"number\":1}]}",
+                "{\"sensors\":[{\"number\":1}],\"snh\":255}", true, 255, 2, "250, 255");
+
+  // The list buffer: whole numbers only, always NUL-terminated, never past listLen.
+  uint8_t high = 0;
+  uint8_t active[32];
+  CHECK(sensorNumbersCachedState("{\"sensors\":[],\"snh\":255}", high, active));
+  CHECK(high == 255);
+  JsonDocument posted;
+  CHECK(!deserializeJson(posted, "{\"sensors\":[{\"number\":100},{\"number\":7},{\"number\":255},{\"number\":12},"
+                                 "{\"number\":1},{\"number\":200},{\"number\":30},{\"number\":254}]}"));
+  char big[64];
+  memset(big, 'x', sizeof(big));
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, high, big, sizeof(big)) == 8);
+  CHECK(strcmp(big, "1, 7, 12, 30, 100, 200, 254, 255") == 0);
+  // Exact-size heap buffers, so AddressSanitizer reports any write past listLen.
+  volatile size_t fitLen = 9;  // "1, 7, 12" is 8 bytes plus the NUL
+  char *fit = new char[fitLen];
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, high, fit, fitLen) == 8);
+  CHECK(strcmp(fit, "1, 7, 12") == 0);
+  delete[] fit;
+  volatile size_t shortLen = 8;  // one byte short of "1, 7, 12": ", 12" is left out whole
+  char *shortList = new char[shortLen];
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, high, shortList, shortLen) == 8);
+  CHECK(strcmp(shortList, "1, 7") == 0);
+  delete[] shortList;
+  char one[1] = {'x'};
+  volatile size_t oneLen = 1;
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, high, one, oneLen) == 8);
+  CHECK(one[0] == '\0');
+  char untouched[4] = {'x', 'x', 'x', 'x'};
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, high, untouched, 0) == 8);
+  CHECK(untouched[0] == 'x');
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, high, nullptr, 0) == 8);
+  // A cached high of 0 (no mark) retires nothing.
+  CHECK(sensorNumbersRetiredReuse(posted["sensors"], active, 0, big, sizeof(big)) == 0);
+  CHECK(big[0] == '\0');
+}
+
 int main() {
   testAccepted();
   testDuplicates();
   testInvalid();
   testMessageBuffer();
   testHighMark();
+  testRetiredReuse();
   printf("sensor_numbers: %lu checks, %lu failures\n", gChecks, gFailures);
   return gFailures == 0 ? 0 : 1;
 }

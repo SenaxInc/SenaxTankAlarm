@@ -2239,7 +2239,7 @@ sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monito
 const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
 /* SUBMIT & DOWNLOAD */
 const retryBtn=document.getElementById('retryConfigBtn');
-async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}if(res.status===200||res.status===202){const h=await cachedSensorHigh(clientUid);sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);}}catch(err){showToast('Error: '+err.message,true);}}
+async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;/* C323: the server refuses (409) a sensor number this client used before and removed, until the operator confirms; the confirmed resend carries reuseRetired outside "config", so it is never stored or sent to the device. A number reused at 255 is refused and confirmed the same way. */const send=async(reuseRetired)=>{const body={client:clientUid,config:cfg};if(reuseRetired)body.reuseRetired=true;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return {res:r,text:await r.text()};};const retiredPrefix='Retired sensor numbers: ';let sent=await send(false);if(sent.res.status===409&&sent.text.startsWith(retiredPrefix)){if(!confirm('Sensor number(s) '+sent.text.slice(retiredPrefix.length)+' belonged to sensors removed from this client. If you reuse them, the history, alarm contacts and learned calibration of the removed sensors attach to the new sensors with the same numbers. Send anyway?')){showToast('Not sent: '+sent.text,true);return;}sent=await send(true);}const res=sent.res;const resText=sent.text;if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}if(res.status===200||res.status===202){const h=await cachedSensorHigh(clientUid);sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);}}catch(err){showToast('Error: '+err.message,true);}}
 async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
 if(retryBtn)retryBtn.addEventListener('click',retryConfig);
 const syncBtn=document.getElementById('syncRequestBtn');
@@ -10363,6 +10363,8 @@ static void respondStatus(EthernetClient &client, int status, const char *messag
     client.println(F("Bad Request"));
   } else if (status == 404) {
     client.println(F("Not Found"));
+  } else if (status == 409) {
+    client.println(F("Conflict"));
   } else if (status == 500) {
     client.println(F("Internal Server Error"));
   } else {
@@ -11029,7 +11031,24 @@ static void handleConfigPost(EthernetClient &client, const String &body) {
       // the cached snapshot's mark and the highest posted sensor number.
       if (doc["config"].is<JsonObject>()) {
         const ClientConfigSnapshot *prevSnap = findClientConfigSnapshot(clientUid);
-        const uint8_t cachedHigh = prevSnap ? sensorNumbersCachedHigh(prevSnap->payload) : 0;
+        uint8_t cachedHigh = 0;
+        uint8_t cachedActive[32] = {0};
+        const bool cachedKnown = prevSnap && sensorNumbersCachedState(prevSnap->payload, cachedHigh, cachedActive);
+        // C323 (owner, 2026-10-07): a posted number at or below the cached mark that the snapshot no
+        // longer holds belonged to a removed sensor, whose history, alarm contacts and learned
+        // calibration are keyed by it. Refuse it unless the operator confirmed the reuse: the page
+        // resends with the top-level "reuseRetired": true, outside "config", so it is never cached or
+        // sent to the client. Without a usable snapshot there is nothing to compare (commissioning).
+        const bool reuseRetired = doc["reuseRetired"].is<bool>() && doc["reuseRetired"].as<bool>();
+        if (cachedKnown && !reuseRetired) {
+          char retired[64];
+          if (sensorNumbersRetiredReuse(doc["config"]["sensors"], cachedActive, cachedHigh, retired, sizeof(retired)) > 0) {
+            char body[96];
+            snprintf(body, sizeof(body), "Retired sensor numbers: %s", retired);
+            respondStatus(client, 409, body);
+            return;
+          }
+        }
         const uint8_t highMark = sensorNumbersHighMark(doc["config"]["snh"], cachedHigh, doc["config"]["sensors"]);
         if (highMark > 0) {
           doc["config"]["snh"] = highMark;

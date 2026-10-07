@@ -315,13 +315,19 @@ let flowTests = null;
   let postStatus = 200;
   let postText = 'OK';
   let onGet = null;       // runs while a GET is in flight
+  let postReply = null;   // (body) => [status, text], in place of postStatus and postText
+  let confirmAnswer = false;
+  const confirms = [];
   const gets = [];
   const posts = [];
   ctx.showToast = (msg, kind) => toasts.push({ msg: String(msg), kind });
+  ctx.confirm = (msg) => { confirms.push(String(msg)); return confirmAnswer; };
   ctx.fetch = async (url, opts) => {
     if (url === '/api/config') {
-      posts.push(JSON.parse(opts.body));
-      return { status: postStatus, statusText: '', text: async () => postText };
+      const body = JSON.parse(opts.body);
+      posts.push(body);
+      const [status, text] = postReply ? postReply(body) : [postStatus, postText];
+      return { status, statusText: '', text: async () => text };
     }
     const prefix = '/api/client?uid=';
     if (!url.startsWith(prefix)) throw new Error('unexpected fetch ' + url);
@@ -352,6 +358,7 @@ let flowTests = null;
   const submit = () => ctx.submitConfig({ preventDefault() {} });
   const reset = () => {
     stored = {}; getFails = false; postStatus = 200; postText = 'OK'; onGet = null;
+    postReply = null; confirmAnswer = false; confirms.length = 0;
     gets.length = 0; posts.length = 0; toasts.length = 0;
     cards = []; setHigh(0); ctx.els.clientUid.value = 'dev:A';
   };
@@ -491,6 +498,105 @@ let flowTests = null;
     ctx.els.clientUid.value = 'dev:new';
     await onUidChange();
     checkEq('typed UID of a new client leaves the mark', high(), 2);
+
+    // C323 (owner, 2026-10-07): the server refuses (409) a number the client used before and
+    // removed, unless the resend carries the top-level reuseRetired: true. A stub server applies
+    // handleConfigPost's guard to the stored config (sensorNumbersRetiredReuse in C++).
+    const guard = (body) => {
+      const c = stored[body.client] && stored[body.client].config;
+      if (!c || !Array.isArray(c.sensors) || body.reuseRetired === true) return [200, 'OK'];
+      const active = new Set(c.sensors.map((t) => t.number));
+      const high = Math.max(Number.isInteger(c.snh) ? c.snh : 0, ...active);
+      const retired = body.config.sensors.map((t) => t.number).filter((n) => n <= high && !active.has(n))
+        .sort((a, b) => a - b);
+      return retired.length ? [409, 'Retired sensor numbers: ' + retired.join(', ')] : [200, 'OK'];
+    };
+    const lastToast = () => toasts[toasts.length - 1] || {};
+    // Client A holds #1, #2, #4 with mark 5; the page sends #1, #2, #3 (#3 was removed).
+    for (const answer of [false, true]) {
+      const label = answer ? 'confirmed' : 'cancelled';
+      reset();
+      stored = { 'dev:A': clientA };
+      postReply = guard;
+      confirmAnswer = answer;
+      ctx.__setCards([1, 2, 3]);
+      setHigh(5);
+      await submit();
+      checkEq('retired reuse ' + label + ': one confirm', confirms.length, 1);
+      check('retired reuse ' + label + ': confirm names the number and the consequences',
+        confirms.length === 1 && confirms[0].includes(' 3 ') &&
+        confirms[0].includes('history, alarm contacts and learned calibration'), confirms[0]);
+      check('retired reuse ' + label + ': first post has no override',
+        posts.length >= 1 && !('reuseRetired' in posts[0]) && !('reuseRetired' in posts[0].config));
+      if (!answer) {
+        checkEq('retired reuse cancelled: no second post', posts.length, 1);
+        checkEq('retired reuse cancelled: refusal toast', lastToast(),
+          { msg: 'Not sent: Retired sensor numbers: 3', kind: true });
+        checkEq('retired reuse cancelled: mark unchanged, no GET', [high(), gets.length], [5, 0]);
+      } else {
+        checkEq('retired reuse confirmed: resent once', posts.length, 2);
+        check('retired reuse confirmed: resend carries reuseRetired outside the config',
+          posts.length === 2 && posts[1].reuseRetired === true && posts[1].client === 'dev:A' &&
+          !('reuseRetired' in posts[1].config) && JSON.stringify(posts[1].config) === JSON.stringify(posts[0].config));
+        checkEq('retired reuse confirmed: saved toast', lastToast().msg, 'Configuration saved and queued for device');
+        checkEq('retired reuse confirmed: mark read after the send', [high(), gets.length], [5, 1]);
+      }
+    }
+    // No retired number (new numbers past the mark): no confirm, one post.
+    reset();
+    stored = { 'dev:A': clientA };
+    postReply = guard;
+    ctx.__setCards([1, 2, 4, 6]);
+    setHigh(6);
+    await submit();
+    checkEq('no retired number: no confirm, one post', [confirms.length, posts.length, lastToast().msg],
+      [0, 1, 'Configuration saved and queued for device']);
+    // Two retired numbers are listed together.
+    reset();
+    stored = { 'dev:A': clientA };
+    postReply = guard;
+    ctx.__setCards([1, 3, 5]);
+    setHigh(5);
+    await submit();
+    check('two retired numbers in one confirm', confirms.length === 1 && confirms[0].includes(' 3, 5 '), confirms[0]);
+    checkEq('two retired numbers: refusal toast', lastToast().msg, 'Not sent: Retired sensor numbers: 3, 5');
+    // A 409 that is not the retired-number refusal is an ordinary error: no confirm.
+    reset();
+    stored = { 'dev:A': clientA };
+    postStatus = 409;
+    postText = 'Something else';
+    ctx.__setCards([1, 2]);
+    await submit();
+    checkEq('other 409: error toast, no confirm', [confirms.length, posts.length, lastToast()],
+      [0, 1, { msg: 'Error: Something else', kind: true }]);
+    // A confirmed resend that fails is reported like any failed send.
+    reset();
+    stored = { 'dev:A': clientA };
+    postReply = (body) => (body.reuseRetired ? [500, 'Failed to queue config'] : guard(body));
+    confirmAnswer = true;
+    ctx.__setCards([1, 2, 3]);
+    setHigh(5);
+    await submit();
+    checkEq('confirmed resend fails: error toast, mark unchanged', [posts.length, lastToast(), high(), gets.length],
+      [2, { msg: 'Error: Failed to queue config', kind: true }, 5, 0]);
+    // The page's own reuse fallback at 255 (loadSensorNumbers) goes through the same confirm.
+    for (const answer of [false, true]) {
+      reset();
+      stored = { 'dev:A': { config: { snh: 255, sensors: [{ number: 255 }, { number: 3 }] } } };
+      postReply = guard;
+      confirmAnswer = answer;
+      await importFile(JSON.stringify({ deviceUid: 'dev:A', snh: 255, sensors: [{ number: 3 }, { number: 3 }] }));
+      checkEq('255 fallback ' + answer + ': the loader reuses #1', nums(), [3, 1]);
+      await submit();
+      check('255 fallback ' + answer + ': confirm names #1', confirms.length === 1 && confirms[0].includes(' 1 '), confirms[0]);
+      checkEq('255 fallback ' + answer + ': posts', posts.map((b) => b.reuseRetired === true), answer ? [false, true] : [false]);
+    }
+    // No stored config (commissioning): the server has nothing to compare, so no confirm.
+    reset();
+    postReply = guard;
+    ctx.__setCards([1, 2]);
+    await submit();
+    checkEq('commissioning: no confirm, one post', [confirms.length, posts.length], [0, 1]);
   };
 }
 
@@ -539,6 +645,14 @@ check('sensor name is trimmed',
 check('import handler loads with the server\'s mark',
   page.includes("r.onload=async(evt)=>{let c;try{c=JSON.parse(evt.target.result);}catch(err){showToast('Invalid JSON',true);return;}" +
     "const floor=await cachedSensorHigh(String((c&&c.deviceUid)||'').trim());try{loadConfig(c,floor);}catch(err){showToast('Invalid JSON',true);}};"));
+{
+  const submitSrc = extractFunction(page, 'submitConfig');
+  check('submitConfig confirms a retired number and resends with the override outside the config',
+    submitSrc.includes("const send=async(reuseRetired)=>{const body={client:clientUid,config:cfg};if(reuseRetired)body.reuseRetired=true;") &&
+    submitSrc.includes('if(sent.res.status===409&&sent.text.startsWith(retiredPrefix)){if(!confirm(') &&
+    submitSrc.includes("{showToast('Not sent: '+sent.text,true);return;}sent=await send(true);}") &&
+    submitSrc.split("fetch('/api/config'").length === 2);
+}
 check('submitConfig raises the mark after 200 or 202',
   extractFunction(page, 'submitConfig').includes(
     'if(res.status===200||res.status===202){const h=await cachedSensorHigh(clientUid);sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);}'));
@@ -583,18 +697,39 @@ check('commissioning restarts numbering at 1',
   check('handleConfigPost found', at >= 0 && sketch.indexOf(sig, at + 1) < 0 && end > at);
   const post = end > at ? sketch.slice(at, end) : '';
   const checkAt = post.indexOf('if (sensorNumbersCheck(doc["config"]["sensors"], numbersMsg, sizeof(numbersMsg)) != SENSOR_NUMBERS_OK) {');
-  const markAt = post.indexOf(
+  // C323: one parse of the snapshot gives the mark and the numbers in use; with a usable snapshot
+  // and no top-level "reuseRetired": true, a retired number is refused (409) before dispatch.
+  const stateAt = post.indexOf(
     '      if (doc["config"].is<JsonObject>()) {\n' +
     '        const ClientConfigSnapshot *prevSnap = findClientConfigSnapshot(clientUid);\n' +
-    '        const uint8_t cachedHigh = prevSnap ? sensorNumbersCachedHigh(prevSnap->payload) : 0;\n' +
+    '        uint8_t cachedHigh = 0;\n' +
+    '        uint8_t cachedActive[32] = {0};\n' +
+    '        const bool cachedKnown = prevSnap && sensorNumbersCachedState(prevSnap->payload, cachedHigh, cachedActive);\n');
+  const guardAt = post.indexOf(
+    '        const bool reuseRetired = doc["reuseRetired"].is<bool>() && doc["reuseRetired"].as<bool>();\n' +
+    '        if (cachedKnown && !reuseRetired) {\n' +
+    '          char retired[64];\n' +
+    '          if (sensorNumbersRetiredReuse(doc["config"]["sensors"], cachedActive, cachedHigh, retired, sizeof(retired)) > 0) {\n' +
+    '            char body[96];\n' +
+    '            snprintf(body, sizeof(body), "Retired sensor numbers: %s", retired);\n' +
+    '            respondStatus(client, 409, body);\n' +
+    '            return;\n' +
+    '          }\n' +
+    '        }\n' +
     '        const uint8_t highMark = sensorNumbersHighMark(doc["config"]["snh"], cachedHigh, doc["config"]["sensors"]);\n' +
     '        if (highMark > 0) {\n' +
     '          doc["config"]["snh"] = highMark;\n' +
     '        }\n' +
     '      }\n' +
     '      ConfigDispatchStatus status = dispatchClientConfig(clientUid, doc["config"]);');
-  check('config post keeps the high mark, after the number check and before dispatch',
-    checkAt >= 0 && markAt > checkAt && post.split('dispatchClientConfig(').length === 2);
+  check('config post refuses a retired number, after the number check and before dispatch',
+    checkAt >= 0 && stateAt > checkAt && guardAt > stateAt && post.split('dispatchClientConfig(').length === 2);
+  check('config post keeps the high mark from the same snapshot parse',
+    !post.includes('sensorNumbersCachedHigh(') && post.split('sensorNumbersCachedState(').length === 2);
+  check('reuseRetired is read only at the top level',
+    post.split('doc["reuseRetired"]').length === 3 && !post.includes('["config"]["reuseRetired"]'));
+  check('409 has its reason phrase',
+    sketch.includes('  } else if (status == 409) {\n    client.println(F("Conflict"));\n'));
 }
 
 flowTests().then(() => {
