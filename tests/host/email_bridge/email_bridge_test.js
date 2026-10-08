@@ -423,31 +423,115 @@ try {
     'Acme Oil',
     'Tank Alarm Server',
     '',
-    'Silas Cox Wellhead #1: 43.8 (8.2 mA)',
-    'North Tank 2 #2: 10  ** ALARM: high **',
+    'Silas Cox Wellhead: 43.8 (8.2 mA)',
+    'North Tank 2: 10  ** ALARM: high **',
   ].join('\n'));
   checkEq('(i) two emails', br.sent.length, 2);
 }
 
-// (i2) S3: a float (sensorType "digital") prints ON/OFF and no mA; analog lines are unchanged
+// (i2) S3: a float (sensorType "digital") prints ON/OFF and no mA; analog lines are unchanged.
+// R13: the server sends sensorMa only for a current-loop sensor, so these rows are what it sends
+// now: floats and a pulse (RPM) sensor carry no sensorMa and print no ' (0 mA)'; a current-loop
+// sensor with no valid reading at the last report still prints ' (0 mA)'.
 {
   const br = makeBridge(source);
   checkEq('(i2) daily with floats ok', br.post(routed('ev-0502', {
     to: 'ops@example.com', subject: 'Daily Sensor Summary - 2026-09-24', id: 'dev:1-1790000420-9',
     sensors: [
       { client: 'dev:4', site: 'East', label: 'High Float', sensorIndex: 3, levelInches: 1,
-        sensorMa: 0, alarm: true, alarmType: 'triggered', sensorType: 'digital' },
+        alarm: true, alarmType: 'triggered', sensorType: 'digital' },
       { client: 'dev:4', site: 'East', label: 'Low Float', sensorIndex: 4, levelInches: 0,
-        sensorMa: 0, alarm: false, alarmType: 'clear', sensorType: 'digital' },
+        alarm: false, alarmType: 'clear', sensorType: 'digital' },
       { client: 'dev:2', site: 'Silas', label: 'Cox Wellhead', sensorIndex: 1, levelInches: 43.8,
         sensorMa: 8.2, alarm: false, alarmType: 'clear' },
+      { client: 'dev:2', site: 'Silas', label: 'Generator RPM', sensorIndex: 2, levelInches: 1800,
+        alarm: false, alarmType: 'clear' },
+      { client: 'dev:2', site: 'Silas', label: 'Tank 3', sensorIndex: 3, levelInches: 0,
+        sensorMa: 0, alarm: false, alarmType: 'clear' },
     ],
   })), 'ok');
   checkEq('(i2) float lines', (br.sent[0] || {}).body, [
-    'East High Float #3: ON  ** ALARM: triggered **',
-    'East Low Float #4: OFF',
-    'Silas Cox Wellhead #1: 43.8 (8.2 mA)',
+    'East High Float: ON  ** ALARM: triggered **',
+    'East Low Float: OFF',
+    'Silas Cox Wellhead: 43.8 (8.2 mA)',
+    'Silas Generator RPM: 1800',
+    'Silas Tank 3: 0 (0 mA)',
   ].join('\n'));
+}
+
+// (i2b) R13: the server's sendDailyEmail sends sensorMa only for current-loop sensors (plus an
+// untyped record holding a reading); the script itself is unchanged.
+{
+  const page = fs.readFileSync(SKETCH, 'utf8');
+  check('(i2b) sensorMa only for current-loop sensors',
+        page.indexOf('    if (strcmp(gSensorRecords[i].sensorType, "currentLoop") == 0 ||\n' +
+                     "        (gSensorRecords[i].sensorType[0] == '\\0' && gSensorRecords[i].sensorMa > 0.0f)) {\n" +
+                     '      obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);\n' +
+                     '    }\n') >= 0, 'sendDailyEmail sensorMa gate missing');
+}
+
+// (i3) the daily line names a sensor by site and label (trimmed, blanks left out, 'Sensor' when
+// both are blank) and adds '#N' only for a Display Number (userNumber > 0). It never prints the
+// internal sensorIndex, which the server still sends for scripts pasted before v2.2.17.
+{
+  const br = makeBridge(source);
+  const line = (s) => {
+    br.sent.length = 0;
+    const answer = br.post(routed(undefined, {
+      to: 'ops@example.com', subject: 'Daily Sensor Summary - 2026-09-24',
+      sensors: [Object.assign({ client: 'dev:2', sensorIndex: 1, levelInches: 43.8, sensorMa: 8.2,
+                                alarm: false, alarmType: 'clear' }, s)],
+    }));
+    return answer === 'ok' ? (br.sent[0] || {}).body : 'answer ' + answer;
+  };
+  checkEq('(i3) Display Number 7', line({ site: 'Silas', label: 'Cox Wellhead', userNumber: 7 }),
+          'Silas Cox Wellhead #7: 43.8 (8.2 mA)');
+  checkEq('(i3) no Display Number', line({ site: 'Silas', label: 'Cox Wellhead' }),
+          'Silas Cox Wellhead: 43.8 (8.2 mA)');
+  checkEq('(i3) Display Number 0', line({ site: 'Silas', label: 'Cox Wellhead', userNumber: 0 }),
+          'Silas Cox Wellhead: 43.8 (8.2 mA)');
+  checkEq('(i3) sensorIndex 5 is not printed', line({ site: 'Silas', label: 'Cox Wellhead', sensorIndex: 5 }),
+          'Silas Cox Wellhead: 43.8 (8.2 mA)');
+  checkEq('(i3) empty label: no double space', line({ site: 'Silas', label: '' }), 'Silas: 43.8 (8.2 mA)');
+  checkEq('(i3) missing label', line({ site: 'Silas' }), 'Silas: 43.8 (8.2 mA)');
+  checkEq('(i3) empty site', line({ site: '', label: 'Cox Wellhead', userNumber: 4 }),
+          'Cox Wellhead #4: 43.8 (8.2 mA)');
+  checkEq('(i3) label with a trailing space', line({ site: 'Silas', label: 'Cox Wellhead ', userNumber: 7 }),
+          'Silas Cox Wellhead #7: 43.8 (8.2 mA)');
+  checkEq('(i3) padded site and label', line({ site: ' Silas ', label: '  Cox Wellhead' }),
+          'Silas Cox Wellhead: 43.8 (8.2 mA)');
+  checkEq('(i3) blank site and label with Display Number 3', line({ site: '', label: '', userNumber: 3 }),
+          'Sensor #3: 43.8 (8.2 mA)');
+  checkEq('(i3) whitespace-only site and label', line({ site: ' ', label: ' ' }), 'Sensor: 43.8 (8.2 mA)');
+  checkEq('(i3) float with Display Number 2',
+          line({ site: 'East', label: 'High Float', userNumber: 2, sensorType: 'digital', levelInches: 1, sensorMa: 0 }),
+          'East High Float #2: ON');
+  checkEq('(i3) float without Display Number',
+          line({ site: 'East', label: 'Low Float', sensorType: 'digital', levelInches: 0, sensorMa: 0 }),
+          'East Low Float: OFF');
+  checkEq('(i3) alarm part unchanged',
+          line({ site: 'North', label: 'Tank 2', userNumber: 9, levelInches: 10, sensorMa: undefined,
+                 alarm: true, alarmType: 'high' }),
+          'North Tank 2 #9: 10  ** ALARM: high **');
+}
+
+// (v) the script starts with its version line (the /email-setup page tells operators to re-paste
+// when their copy lacks it) and never prints the internal sensor number
+{
+  const lines = source.split('\n');
+  checkEq('(v) CODE[0] is the version line', lines[0],
+          '// TankAlarm email bridge v2.2.17 (Display Number, float ON/OFF)');
+  checkEq('(v) CODE[1] is the SECRET line', lines[1], "var SECRET = 'CHANGE-ME';");
+  check('(v) no s.sensorIndex in the script', source.indexOf('s.sensorIndex') < 0, 'found s.sensorIndex');
+  check('(v) #N comes from s.userNumber',
+        source.indexOf("if (s.userNumber > 0) name += ' #' + s.userNumber;") >= 0, 'userNumber line missing');
+  const page = fs.readFileSync(SKETCH, 'utf8');
+  check('(v) /email-setup page names the version line',
+        page.indexOf('does not contain that line, paste this version over your old <code>SECRET</code> line') >= 0 &&
+        page.indexOf('This version starts with the line <code>// TankAlarm email bridge v2.2.17 (Display Number, float ON/OFF)</code>') >= 0,
+        're-paste guidance missing');
+  check('(v) /email-setup page says New version, not New deployment',
+        page.indexOf('Version: New version &rarr; Deploy</b> (not <b>New deployment</b>)') >= 0, 'redeploy guidance missing');
 }
 
 // (k) a repeat that arrives while the first call is sending waits, and is a duplicate

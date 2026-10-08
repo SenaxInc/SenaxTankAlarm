@@ -287,10 +287,16 @@ static void testSketchText() {
   CHECK(strstr(text, "strlcpy(sensorOut, ct[\"sensor\"] | \"\", sensorLen);") != nullptr);
   CHECK(strstr(text, "strlcpy(triggerOut, ct[\"digitalTrigger\"] | \"\", triggerLen);") != nullptr);
   CHECK(strstr(text, "obj[\"sensorType\"] = \"digital\";") != nullptr);
-  CHECK(strstr(text, "Float Switch clear (%s)") != nullptr);
-  CHECK(strstr(text, "type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
-  CHECK(strstr(text, "Still in %s alarm (%s).%s") != nullptr);                  // snooze/resume notice
-  CHECK(strstr(text, "rec.alarmType, digitalStateText(rec.currentValue),") != nullptr);
+  // Float texts show the switch state (ON/OFF), not a reading and unit. The name before each
+  // tail comes from composeSensorText (pinned in tests/host/sensor_name).
+  CHECK(strstr(text, "snprintf(tail, sizeof(tail), \" Float Switch clear (%s)\", digitalStateText(rec->currentValue));") != nullptr);
+  CHECK(strstr(text, "snprintf(tail, sizeof(tail), \" still in %s alarm (%s)\",\n"
+                     "               type, digitalStateText(rec.currentValue));") != nullptr);  // reminder
+  // Snooze/resume notice: the float's state is the reading composeSnoozeText prints in "(%s)"
+  // (TankAlarm_SensorName.h, tested in tests/host/sensor_name).
+  CHECK(strstr(text, "    strlcpy(reading, digitalStateText(rec.currentValue), sizeof(reading));\n") != nullptr);
+  CHECK(strstr(text, "composeSnoozeText(message, sizeof(message), snoozed, rec.site, rec.label, rec.userNumber, who,\n"
+                     "                    rec.alarmType, reading);") != nullptr);
   CHECK(strstr(text, "  rec->currentValue = level;\n  // S-D03") == nullptr);  // the unconditional write is gone
   // R03: handleDaily admits a daily reading by value presence (the helper above), never by value.
   CHECK(strstr(text, "newLevel > 0.0f") == nullptr);
@@ -353,7 +359,7 @@ static void testSketchText() {
     CHECK(uses == 7);
   }
   {
-    const char *recBegin = strstr(text, "        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;\n");
+    const char *recBegin = strstr(text, "        SensorRecord *rec = upsertSensorRecord(clientUid, sensorIdx, &recCreated);\n");
     const char *recEnd = recBegin ? strstr(recBegin, "    // Reconciliation: clear alarms on server for sensors that the client") : nullptr;
     CHECK(recBegin != nullptr && recEnd != nullptr);
     if (recBegin && recEnd) {
@@ -383,7 +389,10 @@ static void testSketchText() {
   // R10: the missed-alarm reconcile creates a missing record (not a search-only lookup) and fills
   // an empty site from the note.
   CHECK(strstr(text, "search without upserting") == nullptr);
-  CHECK(strstr(text, "SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;\n"
+  // P326: sensorIdx is already 1-255 here (noteSensorNumber skips other entries), so the old
+  // `(sensorIdx >= 1) ?` test is gone.
+  CHECK(strstr(text, "(sensorIdx >= 1) ?") == nullptr);
+  CHECK(strstr(text, "SensorRecord *rec = upsertSensorRecord(clientUid, sensorIdx, &recCreated);\n"
                      "        if (rec && rec->site[0] == '\\0') {\n"
                      "          const char *noteSite = doc[\"s\"] | \"\";\n"
                      "          if (noteSite[0] != '\\0') strlcpy(rec->site, noteSite, sizeof(rec->site));\n"

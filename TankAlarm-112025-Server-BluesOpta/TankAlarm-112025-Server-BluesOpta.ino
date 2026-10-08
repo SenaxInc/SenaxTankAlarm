@@ -45,6 +45,7 @@
 #include <FtpsTypes.h>
 #include <FtpsErrors.h>
 #include "TankAlarm_DigitalDisplay.h"  // S3: float (digital) display rules (host-tested in tests/host/digital_display)
+#include "TankAlarm_SensorName.h"      // Sensor names in SMS/email text; Display Number ("un") updates (host-tested in tests/host/sensor_name)
 
 // POSIX-compliant standard library headers
 #include <stdio.h>
@@ -742,6 +743,7 @@ struct UnloadLogEntry {
   char clientUid[48];         // Client UID
   char tankLabel[24];         // Tank label/name
   uint8_t sensorIndex;         // Internal sensor index
+  uint8_t userNumber;          // Display Number (0 = none); names the sensor as " #N" in texts
   float peakInches;           // Peak level before unload
   float emptyInches;          // Level after unload (empty reading)
   float peakSensorMa;         // Sensor reading at peak (for diagnostics)
@@ -760,6 +762,7 @@ static void handleUnload(JsonDocument &doc, double epoch);
 static void logUnloadEvent(const UnloadLogEntry &entry);
 static void sendUnloadSms(const UnloadLogEntry &entry);
 static void sendUnloadEmail(const UnloadLogEntry &entry);
+static void buildUnloadText(char *out, size_t outLen, const UnloadLogEntry &entry);
 
 // Structure for hourly telemetry snapshots (hot tier)
 #ifndef MAX_HOURLY_HISTORY_PER_SENSOR
@@ -2089,7 +2092,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 )HTML";
 
-static const char EMAIL_SETUP_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Email Setup - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Email Delivery Setup &mdash; Google Workspace</h2><p>The server never contacts an email provider directly. Alarm and daily-report emails are published as <code>email.qo</code> notes to the Notecard, which syncs them to Blues Notehub even across cellular outages. A Notehub <b>Route</b> then delivers each note by HTTP. This guide wires that route to your <b>Google Workspace (Gmail)</b> account through a free Apps Script bridge, so alerts are sent from your real company mailbox. Nothing on this page changes server behavior &mdash; all setup happens at script.google.com and notehub.io.</p><p style="color:var(--muted);font-size:0.85rem;">Prefer a transactional provider instead? The SendGrid variant is documented in the repository tutorial <code>NOTEHUB_ROUTES_SETUP.md</code>, Step 7. Only the Route destination differs &mdash; the firmware and this server's settings are identical either way.</p></div><div class="card"><h2>Step 1 &mdash; Create the Apps Script</h2><ol style="line-height:1.7;"><li>Sign in at <b>script.google.com</b> with the Workspace account that should send the mail (e.g. <code>alerts@yourcompany.com</code>).</li><li>Click <b>New project</b> and name it <i>TankAlarm Email Bridge</i>.</li><li>Replace the contents of <code>Code.gs</code> with the script below.</li><li>Change <code>SECRET</code> to a long random string &mdash; it shields the endpoint from strangers who discover the URL.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn" onclick="copyCode()">Copy Script</button></div><pre id="code" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;"><b>Repeated calls:</b> Notehub retries a route call that has not answered within the route timeout, even while the script is still sending, and the server retries a note it could not confirm. The script remembers each email for 6 hours by its Notehub event ID and the server's message <code>id</code>. A repeat of an email already sent is answered <code>duplicate</code> instead of being sent again (the run's log under <b>Executions</b> shows <i>duplicate, not sent</i>). A repeat that arrives while the email is still being sent waits up to 20 seconds for that send. If the send fails, the repeat sends the email. If it is still running after 20 seconds, the repeat sends it too (log: <i>still sending elsewhere after 20 s, sent anyway</i>), because a rare duplicate beats a lost alert. <b>Installed the script before this check?</b> If your copy has no <code>CacheService</code> line, paste this version over your old <code>SECRET</code> line and <code>doPost</code> function (keep any other functions in the project, such as <code>checkStopReplies</code>), set <code>SECRET</code> back to the value after <code>?key=</code> in your route URL, and save. Then use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New version &rarr; Deploy</b> so the <code>/exec</code> URL stays the same, and click <b>Send Test Email</b> (Step 4) to confirm.</p></div><div class="card"><h2>Step 2 &mdash; Deploy as a Web App</h2><ol style="line-height:1.7;"><li>Click <b>Deploy &rarr; New deployment</b>, choose type <b>Web app</b>.</li><li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>, then click <b>Deploy</b> and authorize when prompted.</li><li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>).</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Updating later:</b> use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New</b> so the URL stays the same. Creating a brand-new deployment issues a different URL and silently breaks the route.</p></div><div class="card"><h2>Step 3 &mdash; Create the Notehub Route</h2><ol style="line-height:1.7;"><li>In your Notehub project open <b>Routes &rarr; Create Route</b> and choose <b>General HTTP/HTTPS Request/Response</b>.</li><li>Name it <code>EmailRoute</code>.</li><li><b>URL:</b> paste the Web app URL and append <code>?key=YOUR_SECRET</code> (the same value as <code>SECRET</code> in the script).</li><li><b>Notefiles:</b> Selected Notefiles &rarr; <code>email.qo</code>.</li><li><b>Transform Data:</b> none required &mdash; the script reads the note <code>body</code> from the full event.</li><li>Optional: raise <b>Timeout</b> from the default 30 seconds to 60. Notehub retries a call that has not answered in time, and Apps Script sometimes takes longer than 30 seconds to send. The script skips a retry of an email it has already sent (see <b>Repeated calls</b> above), but a longer timeout avoids most retries.</li><li>Enable <b>Automatic reroute on failure</b> and save.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Route log shows HTTP 302?</b> That is normal &mdash; Apps Script answers every POST with a redirect. Actual send results live in the Apps Script editor under <b>Executions</b>.</p></div><div class="card"><h2>Step 4 &mdash; Verify</h2><ol style="line-height:1.7;"><li>Open <a href="/server-settings">Server Settings</a> and click <b>Send Test Email</b> (recipients need the <b>Email alerts</b> checkbox on the <a href="/contacts">Contacts</a> page).</li><li>Check the recipient inbox, the Apps Script <b>Executions</b> log, and the Notehub route log.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Quotas:</b> Google Workspace accounts may send to 1,500 recipients/day via Apps Script (consumer Gmail: 100/day) &mdash; far above normal alarm + daily-report volume. Daily-report layout options are on the <a href="/email-format">Daily Report Editor</a> page; the script receives them in the <code>fmt</code> field and the sample below prints company and server name from it.</p></div><div class="card"><h2>Optional &mdash; Reply-STOP unsubscribe handling</h2><p>Recipients can unsubscribe by replying <b>STOP</b> to any alert email. A second, time-driven Apps Script scans the sending mailbox and forwards STOP/START replies to this server, which maintains the <b>Email Opt-Out List</b> on the <a href="/contacts">Contacts</a> page and suppresses all email (including daily reports) to listed addresses. Without this, the admin manages the list manually on the Contacts page &mdash; fine for small teams.</p><ol style="line-height:1.7;"><li>In Notehub: <b>Settings &rarr; Programmatic API access</b> &rarr; create an OAuth client (or reuse the one from the SMS setup) and note the client ID and secret.</li><li>Add the function below to an Apps Script project on the <b>sending</b> account and fill in the four constants.</li><li>Add a trigger: <b>Triggers &rarr; Add Trigger &rarr; checkStopReplies &rarr; time-driven &rarr; every 15 minutes</b>.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn2" onclick="copyCode2()">Copy Script</button></div><pre id="code2" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;">Matched replies are marked read. STOP, UNSUBSCRIBE, CANCEL, END, QUIT, and REMOVE opt an address out; START, SUBSCRIBE, or YES opts it back in.</p></div></main><script>var CODE=["var SECRET = 'CHANGE-ME';","","function doPost(e) {","  try {","    if (!e || !e.parameter || e.parameter.key !== SECRET) {","      return ContentService.createTextOutput('forbidden');","    }","    var ev = JSON.parse(e.postData.contents);","    var b = ev.body || ev;","    var to = String(b.to || '').split(',').map(function(s){ return s.trim(); }).filter(String);","    if (!to.length) return ContentService.createTextOutput('no recipients');","    var subject = b.subject || 'TankAlarm';","    var text;","    if (b.message) {","      // Alarm / reminder / unload / test alert shape","      text = b.message;","    } else if (b.sensors && b.sensors.length) {","      // Daily report shape","      var lines = [];","      if (b.company) lines.push(b.company);","      if (b.serverName) lines.push(b.serverName);","      if (lines.length) lines.push('');","      b.sensors.forEach(function(s){","        var digital = s.sensorType === 'digital';","        var l = (s.site || '') + ' ' + (s.label || '') + ' #' + s.sensorIndex + ': ' + (digital ? (s.levelInches > 0.5 ? 'ON' : 'OFF') : s.levelInches);","        if (!digital && s.sensorMa !== undefined) l += ' (' + s.sensorMa + ' mA)';","        if (s.alarm) l += '  ** ALARM: ' + (s.alarmType || '') + ' **';","        lines.push(l);","      });","      text = lines.join('\\n');","    } else {","      text = JSON.stringify(b, null, 2);","    }","    // Notehub retries a call that has not answered within the route timeout","    // (30 s by default) even while this script is still sending, and the server","    // retries a note it could not confirm. Remember each email for 6 hours (the","    // cache maximum) by Notehub event ID and server message id; skip repeats.","    var keys = [];","    if (ev.event) keys.push('ev:' + ev.event);","    if (b.id) keys.push('id:' + b.id);","    var cache = null;","    var lock = null;","    var lockWait = 10000;  // ms; 2 s once this call waits for another","    // Runs fn(cached values) under the script lock and returns its result;","    // undefined if the lock stays busy for lockWait or the lock or cache fails.","    var locked = function(fn) {","      var result;","      try {","        cache = cache || CacheService.getScriptCache();","        lock = lock || LockService.getScriptLock();","        if (lock.tryLock(lockWait)) {","          try {","            result = fn(cache.getAll(keys));","          } finally {","            lock.releaseLock();","          }","        }","      } catch (dedupeErr) {","        // lock or cache unavailable","      }","      return result;","    };","    var mark = function(value) {","      var values = {};","      keys.forEach(function(k){ values[k] = value; });","      cache.putAll(values, 21600);","    };","    // 'sent': a repeat of a sent email. 'sending': another call is sending it.","    // 'claimed': this call sends it.","    var check = function(found) {","      var seen = keys.map(function(k){ return found[k]; });","      if (seen.indexOf('sent') >= 0) return 'sent';","      if (seen.indexOf('sending') >= 0) return 'sending';","      mark('sending');","      return 'claimed';","    };","    var state;","    if (keys.length) {","      var waitUntil = Date.now() + 20000;","      state = locked(check);","      // Wait up to 20 s for the other call, so this one still answers within","      // the route timeout. If that send fails, its claim goes and this call sends.","      // Each check waits 2 s at most for the lock, and a check that fails counts","      // as still sending.","      if (state === 'sending') lockWait = 2000;","      while (state === 'sending' && Date.now() < waitUntil) {","        Utilities.sleep(1000);","        state = locked(check) || 'sending';","      }","      if (state === 'sent') {","        console.log('duplicate, not sent: ' + keys.join(' '));","        return ContentService.createTextOutput('duplicate');","      }","      if (state === 'sending') {","        console.log('still sending elsewhere after 20 s, sent anyway: ' + keys.join(' '));","      }","    }","    // Lock busy, lock or cache service failing, or the other call still sending:","    // send anyway. A rare duplicate beats a lost alert.","    var mail = { to: to.join(','), subject: subject, body: text };","    try {","      try {","        MailApp.sendEmail(mail);","      } catch (firstErr) {","        // MailApp fails now and then, and Notehub does not retry a call that","        // answered in time: try once more.","        Utilities.sleep(2000);","        MailApp.sendEmail(mail);","      }","    } catch (sendErr) {","      if (state === 'claimed') {","        // Let a waiting or later repeat send it, unless one already has.","        locked(function(found){","          var mine = keys.filter(function(k){ return found[k] === 'sending'; });","          if (mine.length) cache.removeAll(mine);","        });","      }","      throw sendErr;","    }","    if (state === 'claimed' || state === 'sending') {","      locked(function(){ mark('sent'); });  // repeats from now on are duplicates","    }","    return ContentService.createTextOutput('ok');","  } catch (err) {","    return ContentService.createTextOutput('error: ' + String(err));","  }","}"];document.getElementById('code').textContent=CODE.join("\n");function copyCode(){var t=document.createElement('textarea');t.value=CODE.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}var CODE2=["// Optional: scan the sending mailbox for STOP/START replies and forward them","// to the TankAlarm server via Blues Notehub (time-driven trigger, every 15 min).","var CLIENT_ID = 'your-notehub-oauth-client-id';","var CLIENT_SECRET = 'your-notehub-oauth-client-secret';","var PROJECT_UID = 'app:00000000-0000-0000-0000-000000000000';","var DEVICE_UID = 'dev:000000000000000';","","function checkStopReplies() {","  var threads = GmailApp.search('in:inbox is:unread newer_than:2d');","  threads.forEach(function (t) {","    t.getMessages().forEach(function (m) {","      if (!m.isUnread()) return;","      var word = (m.getPlainBody() || '').trim().toUpperCase().split(/\\s+/)[0] || '';","      var keywords = ['STOP','UNSUBSCRIBE','CANCEL','END','QUIT','REMOVE','START','SUBSCRIBE','YES'];","      if (keywords.indexOf(word) >= 0) {","        var from = m.getFrom();","        var email = from.indexOf('<') >= 0 ? from.replace(/^.*</, '').replace(/>.*$/, '') : from;","        forwardToNotehub(email.trim(), word);","        m.markRead();","      }","    });","  });","}","","function forwardToNotehub(from, word) {","  var tok = UrlFetchApp.fetch('https://notehub.io/oauth2/token', {","    method: 'post',","    payload: { grant_type: 'client_credentials', client_id: CLIENT_ID, client_secret: CLIENT_SECRET }","  });","  var access = JSON.parse(tok.getContentText()).access_token;","  UrlFetchApp.fetch('https://api.notehub.io/v1/projects/' + PROJECT_UID +","      '/devices/' + DEVICE_UID + '/notes/email_inbound.qi', {","    method: 'post',","    contentType: 'application/json',","    headers: { Authorization: 'Bearer ' + access },","    payload: JSON.stringify({ body: { from: from, body: word } })","  });","}"];document.getElementById('code2').textContent=CODE2.join("\n");function copyCode2(){var t=document.createElement('textarea');t.value=CODE2.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn2');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}</script></body></html>)HTML";
+static const char EMAIL_SETUP_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Email Setup - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Email Delivery Setup &mdash; Google Workspace</h2><p>The server never contacts an email provider directly. Alarm and daily-report emails are published as <code>email.qo</code> notes to the Notecard, which syncs them to Blues Notehub even across cellular outages. A Notehub <b>Route</b> then delivers each note by HTTP. This guide wires that route to your <b>Google Workspace (Gmail)</b> account through a free Apps Script bridge, so alerts are sent from your real company mailbox. Nothing on this page changes server behavior &mdash; all setup happens at script.google.com and notehub.io.</p><p style="color:var(--muted);font-size:0.85rem;">Prefer a transactional provider instead? The SendGrid variant is documented in the repository tutorial <code>NOTEHUB_ROUTES_SETUP.md</code>, Step 7. Only the Route destination differs &mdash; the firmware and this server's settings are identical either way.</p></div><div class="card"><h2>Step 1 &mdash; Create the Apps Script</h2><ol style="line-height:1.7;"><li>Sign in at <b>script.google.com</b> with the Workspace account that should send the mail (e.g. <code>alerts@yourcompany.com</code>).</li><li>Click <b>New project</b> and name it <i>TankAlarm Email Bridge</i>.</li><li>Replace the contents of <code>Code.gs</code> with the script below.</li><li>Change <code>SECRET</code> to a long random string &mdash; it shields the endpoint from strangers who discover the URL.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn" onclick="copyCode()">Copy Script</button></div><pre id="code" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;"><b>Repeated calls:</b> Notehub retries a route call that has not answered within the route timeout, even while the script is still sending, and the server retries a note it could not confirm. The script remembers each email for 6 hours by its Notehub event ID and the server's message <code>id</code>. A repeat of an email already sent is answered <code>duplicate</code> instead of being sent again (the run's log under <b>Executions</b> shows <i>duplicate, not sent</i>). A repeat that arrives while the email is still being sent waits up to 20 seconds for that send. If the send fails, the repeat sends the email. If it is still running after 20 seconds, the repeat sends it too (log: <i>still sending elsewhere after 20 s, sent anyway</i>), because a rare duplicate beats a lost alert.</p><p style="color:var(--muted);font-size:0.85rem;"><b>Already installed the script?</b> This version starts with the line <code>// TankAlarm email bridge v2.2.17 (Display Number, float ON/OFF)</code>. If your Apps Script project does not contain that line, paste this version over your old <code>SECRET</code> line and <code>doPost</code> function (keep any other functions in the project, such as <code>checkStopReplies</code>), set <code>SECRET</code> back to the value after <code>?key=</code> in your route URL, and save. Then use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New version &rarr; Deploy</b> (not <b>New deployment</b>) so the <code>/exec</code> URL stays the same, and click <b>Send Test Email</b> (Step 4) to confirm. This version prints a sensor's <b>Display Number</b> as <b>#N</b> in the daily report only when one is set, shows float switches as ON or OFF, and skips repeated calls (above).</p></div><div class="card"><h2>Step 2 &mdash; Deploy as a Web App</h2><ol style="line-height:1.7;"><li>Click <b>Deploy &rarr; New deployment</b>, choose type <b>Web app</b>.</li><li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>, then click <b>Deploy</b> and authorize when prompted.</li><li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>).</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Updating later:</b> use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; Version: New</b> so the URL stays the same. Creating a brand-new deployment issues a different URL and silently breaks the route.</p></div><div class="card"><h2>Step 3 &mdash; Create the Notehub Route</h2><ol style="line-height:1.7;"><li>In your Notehub project open <b>Routes &rarr; Create Route</b> and choose <b>General HTTP/HTTPS Request/Response</b>.</li><li>Name it <code>EmailRoute</code>.</li><li><b>URL:</b> paste the Web app URL and append <code>?key=YOUR_SECRET</code> (the same value as <code>SECRET</code> in the script).</li><li><b>Notefiles:</b> Selected Notefiles &rarr; <code>email.qo</code>.</li><li><b>Transform Data:</b> none required &mdash; the script reads the note <code>body</code> from the full event.</li><li>Optional: raise <b>Timeout</b> from the default 30 seconds to 60. Notehub retries a call that has not answered in time, and Apps Script sometimes takes longer than 30 seconds to send. The script skips a retry of an email it has already sent (see <b>Repeated calls</b> above), but a longer timeout avoids most retries.</li><li>Enable <b>Automatic reroute on failure</b> and save.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Route log shows HTTP 302?</b> That is normal &mdash; Apps Script answers every POST with a redirect. Actual send results live in the Apps Script editor under <b>Executions</b>.</p></div><div class="card"><h2>Step 4 &mdash; Verify</h2><ol style="line-height:1.7;"><li>Open <a href="/server-settings">Server Settings</a> and click <b>Send Test Email</b> (recipients need the <b>Email alerts</b> checkbox on the <a href="/contacts">Contacts</a> page).</li><li>Check the recipient inbox, the Apps Script <b>Executions</b> log, and the Notehub route log.</li></ol><p style="color:var(--muted);font-size:0.85rem;"><b>Quotas:</b> Google Workspace accounts may send to 1,500 recipients/day via Apps Script (consumer Gmail: 100/day) &mdash; far above normal alarm + daily-report volume. Daily-report layout options are on the <a href="/email-format">Daily Report Editor</a> page; the script receives them in the <code>fmt</code> field and the sample below prints company and server name from it.</p></div><div class="card"><h2>Optional &mdash; Reply-STOP unsubscribe handling</h2><p>Recipients can unsubscribe by replying <b>STOP</b> to any alert email. A second, time-driven Apps Script scans the sending mailbox and forwards STOP/START replies to this server, which maintains the <b>Email Opt-Out List</b> on the <a href="/contacts">Contacts</a> page and suppresses all email (including daily reports) to listed addresses. Without this, the admin manages the list manually on the Contacts page &mdash; fine for small teams.</p><ol style="line-height:1.7;"><li>In Notehub: <b>Settings &rarr; Programmatic API access</b> &rarr; create an OAuth client (or reuse the one from the SMS setup) and note the client ID and secret.</li><li>Add the function below to an Apps Script project on the <b>sending</b> account and fill in the four constants.</li><li>Add a trigger: <b>Triggers &rarr; Add Trigger &rarr; checkStopReplies &rarr; time-driven &rarr; every 15 minutes</b>.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn2" onclick="copyCode2()">Copy Script</button></div><pre id="code2" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;">Matched replies are marked read. STOP, UNSUBSCRIBE, CANCEL, END, QUIT, and REMOVE opt an address out; START, SUBSCRIBE, or YES opts it back in.</p></div></main><script>var CODE=["// TankAlarm email bridge v2.2.17 (Display Number, float ON/OFF)","var SECRET = 'CHANGE-ME';","","function doPost(e) {","  try {","    if (!e || !e.parameter || e.parameter.key !== SECRET) {","      return ContentService.createTextOutput('forbidden');","    }","    var ev = JSON.parse(e.postData.contents);","    var b = ev.body || ev;","    var to = String(b.to || '').split(',').map(function(s){ return s.trim(); }).filter(String);","    if (!to.length) return ContentService.createTextOutput('no recipients');","    var subject = b.subject || 'TankAlarm';","    var text;","    if (b.message) {","      // Alarm / reminder / unload / test alert shape","      text = b.message;","    } else if (b.sensors && b.sensors.length) {","      // Daily report shape","      var lines = [];","      if (b.company) lines.push(b.company);","      if (b.serverName) lines.push(b.serverName);","      if (lines.length) lines.push('');","      b.sensors.forEach(function(s){","        var digital = s.sensorType === 'digital';","        // Site and label, blanks left out; #N only for a Display Number (never the internal sensorIndex)","        var name = [s.site, s.label].map(function(p){ return String(p || '').trim(); }).filter(String).join(' ') || 'Sensor';","        if (s.userNumber > 0) name += ' #' + s.userNumber;","        var l = name + ': ' + (digital ? (s.levelInches > 0.5 ? 'ON' : 'OFF') : s.levelInches);","        if (!digital && s.sensorMa !== undefined) l += ' (' + s.sensorMa + ' mA)';","        if (s.alarm) l += '  ** ALARM: ' + (s.alarmType || '') + ' **';","        lines.push(l);","      });","      text = lines.join('\\n');","    } else {","      text = JSON.stringify(b, null, 2);","    }","    // Notehub retries a call that has not answered within the route timeout","    // (30 s by default) even while this script is still sending, and the server","    // retries a note it could not confirm. Remember each email for 6 hours (the","    // cache maximum) by Notehub event ID and server message id; skip repeats.","    var keys = [];","    if (ev.event) keys.push('ev:' + ev.event);","    if (b.id) keys.push('id:' + b.id);","    var cache = null;","    var lock = null;","    var lockWait = 10000;  // ms; 2 s once this call waits for another","    // Runs fn(cached values) under the script lock and returns its result;","    // undefined if the lock stays busy for lockWait or the lock or cache fails.","    var locked = function(fn) {","      var result;","      try {","        cache = cache || CacheService.getScriptCache();","        lock = lock || LockService.getScriptLock();","        if (lock.tryLock(lockWait)) {","          try {","            result = fn(cache.getAll(keys));","          } finally {","            lock.releaseLock();","          }","        }","      } catch (dedupeErr) {","        // lock or cache unavailable","      }","      return result;","    };","    var mark = function(value) {","      var values = {};","      keys.forEach(function(k){ values[k] = value; });","      cache.putAll(values, 21600);","    };","    // 'sent': a repeat of a sent email. 'sending': another call is sending it.","    // 'claimed': this call sends it.","    var check = function(found) {","      var seen = keys.map(function(k){ return found[k]; });","      if (seen.indexOf('sent') >= 0) return 'sent';","      if (seen.indexOf('sending') >= 0) return 'sending';","      mark('sending');","      return 'claimed';","    };","    var state;","    if (keys.length) {","      var waitUntil = Date.now() + 20000;","      state = locked(check);","      // Wait up to 20 s for the other call, so this one still answers within","      // the route timeout. If that send fails, its claim goes and this call sends.","      // Each check waits 2 s at most for the lock, and a check that fails counts","      // as still sending.","      if (state === 'sending') lockWait = 2000;","      while (state === 'sending' && Date.now() < waitUntil) {","        Utilities.sleep(1000);","        state = locked(check) || 'sending';","      }","      if (state === 'sent') {","        console.log('duplicate, not sent: ' + keys.join(' '));","        return ContentService.createTextOutput('duplicate');","      }","      if (state === 'sending') {","        console.log('still sending elsewhere after 20 s, sent anyway: ' + keys.join(' '));","      }","    }","    // Lock busy, lock or cache service failing, or the other call still sending:","    // send anyway. A rare duplicate beats a lost alert.","    var mail = { to: to.join(','), subject: subject, body: text };","    try {","      try {","        MailApp.sendEmail(mail);","      } catch (firstErr) {","        // MailApp fails now and then, and Notehub does not retry a call that","        // answered in time: try once more.","        Utilities.sleep(2000);","        MailApp.sendEmail(mail);","      }","    } catch (sendErr) {","      if (state === 'claimed') {","        // Let a waiting or later repeat send it, unless one already has.","        locked(function(found){","          var mine = keys.filter(function(k){ return found[k] === 'sending'; });","          if (mine.length) cache.removeAll(mine);","        });","      }","      throw sendErr;","    }","    if (state === 'claimed' || state === 'sending') {","      locked(function(){ mark('sent'); });  // repeats from now on are duplicates","    }","    return ContentService.createTextOutput('ok');","  } catch (err) {","    return ContentService.createTextOutput('error: ' + String(err));","  }","}"];document.getElementById('code').textContent=CODE.join("\n");function copyCode(){var t=document.createElement('textarea');t.value=CODE.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}var CODE2=["// Optional: scan the sending mailbox for STOP/START replies and forward them","// to the TankAlarm server via Blues Notehub (time-driven trigger, every 15 min).","var CLIENT_ID = 'your-notehub-oauth-client-id';","var CLIENT_SECRET = 'your-notehub-oauth-client-secret';","var PROJECT_UID = 'app:00000000-0000-0000-0000-000000000000';","var DEVICE_UID = 'dev:000000000000000';","","function checkStopReplies() {","  var threads = GmailApp.search('in:inbox is:unread newer_than:2d');","  threads.forEach(function (t) {","    t.getMessages().forEach(function (m) {","      if (!m.isUnread()) return;","      var word = (m.getPlainBody() || '').trim().toUpperCase().split(/\\s+/)[0] || '';","      var keywords = ['STOP','UNSUBSCRIBE','CANCEL','END','QUIT','REMOVE','START','SUBSCRIBE','YES'];","      if (keywords.indexOf(word) >= 0) {","        var from = m.getFrom();","        var email = from.indexOf('<') >= 0 ? from.replace(/^.*</, '').replace(/>.*$/, '') : from;","        forwardToNotehub(email.trim(), word);","        m.markRead();","      }","    });","  });","}","","function forwardToNotehub(from, word) {","  var tok = UrlFetchApp.fetch('https://notehub.io/oauth2/token', {","    method: 'post',","    payload: { grant_type: 'client_credentials', client_id: CLIENT_ID, client_secret: CLIENT_SECRET }","  });","  var access = JSON.parse(tok.getContentText()).access_token;","  UrlFetchApp.fetch('https://api.notehub.io/v1/projects/' + PROJECT_UID +","      '/devices/' + DEVICE_UID + '/notes/email_inbound.qi', {","    method: 'post',","    contentType: 'application/json',","    headers: { Authorization: 'Bearer ' + access },","    payload: JSON.stringify({ body: { from: from, body: word } })","  });","}"];document.getElementById('code2').textContent=CODE2.join("\n");function copyCode2(){var t=document.createElement('textarea');t.value=CODE2.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn2');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Script';},2000);}catch(e){}document.body.removeChild(t);}</script></body></html>)HTML";
 
 static const char SMS_SETUP_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SMS Setup - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>SMS Delivery Setup &mdash; Twilio</h2><p>The server never talks to Twilio directly. Each alert is published as one <code>sms.qo</code> note per recipient (<code>{message, to}</code>) to the Notecard, which syncs to Blues Notehub even across cellular outages. A Notehub <b>Twilio route</b> then delivers each note as a text message. This guide covers the outbound route, the inbound <b>STOP/START/HELP</b> reply webhook, and the automatic <b>welcome message</b> sent to newly enrolled recipients. Nothing on this page changes server behavior &mdash; setup happens at twilio.com and notehub.io.</p><p style="color:var(--muted);font-size:0.85rem;">If Twilio rejects your account or campaign, drop-in alternatives (Telnyx, Vonage, Plivo, AWS SNS) are cataloged in the repository doc <code>CODE REVIEW/EMAIL_DELIVERY_OPTIONS_07082026.md</code> &sect;A7 &mdash; only the Notehub route changes, never the firmware.</p></div><div class="card"><h2>Step 1 &mdash; Twilio account &amp; phone number</h2><ol style="line-height:1.7;"><li>Create an account at <b>twilio.com</b> and open the Console.</li><li>Buy an SMS-capable phone number. For automated alarm traffic a <b>Toll-Free number</b> is recommended: submit its <b>Toll-Free Verification</b> (a single use-case form, typically approved in days). Unverified/unregistered numbers get carrier-filtered in the US.</li><li>Note your <b>Account SID</b> and <b>Auth Token</b> from the Console home page.</li></ol></div><div class="card"><h2>Step 2 &mdash; Outbound route in Notehub (Route #4)</h2><ol style="line-height:1.7;"><li>In your Notehub project open <b>Routes &rarr; Create Route</b> and choose the <b>Twilio</b> route type.</li><li>Name it <code>TwilioSMS</code>.</li><li><b>Account SID</b> / <b>Auth Token</b>: from Step 1.</li><li><b>From Number:</b> your Twilio number in E.164 form (e.g. <code>+18005551234</code>).</li><li><b>To Number:</b> <code>[.body.to]</code> &nbsp;&mdash;&nbsp; <b>Message:</b> <code>[.body.message]</code> (the leading dot is required &mdash; without it Notehub passes the text through literally and Twilio fails with error 21265)</li><li><b>Notefiles:</b> Selected Notefiles &rarr; <code>sms.qo</code>.</li><li>Enable <b>Automatic reroute on failure</b> and save.</li></ol><p style="color:var(--muted);font-size:0.85rem;">The server queues <b>one note per recipient</b>, so <code>[.body.to]</code> fans out correctly &mdash; do not put a fixed number in the To field.</p></div><div class="card"><h2>Step 3 &mdash; Inbound replies (STOP / START / HELP)</h2><p>Replies to your Twilio number reach this server through a small <b>Twilio Function</b> that forwards each message to the Blues Notehub API, which drops it into <code>sms_inbound.qi</code> on this device.</p><ol style="line-height:1.7;"><li>In Notehub: <b>Settings &rarr; Programmatic API access</b> &rarr; create an OAuth client and copy the <b>client ID</b> and <b>client secret</b>.</li><li>In Twilio Console: <b>Functions &amp; Assets &rarr; Services &rarr; Create Service</b> (name it <i>tankalarm</i>), add a Function at path <code>/sms-inbound</code>, paste the code below, fill in the four constants, then <b>Deploy All</b>.</li><li>Under <b>Phone Numbers &rarr; your number &rarr; Messaging Configuration</b>, set <b>"A message comes in"</b> to <b>Function</b> and pick the service/function. Save.</li></ol><div class="actions" style="margin-bottom:8px;"><button type="button" class="secondary" id="copyBtn" onclick="copyCode()">Copy Function Code</button></div><pre id="code" style="background:var(--panel,#f6f8fa);border:1px solid var(--border,#d0d7de);padding:12px;border-radius:8px;overflow:auto;font-size:0.78rem;line-height:1.5;max-height:420px;"></pre><p style="color:var(--muted);font-size:0.85rem;"><code>PROJECT_UID</code> is on the Notehub project settings page (<code>app:...</code>); <code>DEVICE_UID</code> is <b>this server's</b> device UID (<code>dev:...</code>).</p></div><div class="card"><h2>Step 4 &mdash; What happens automatically</h2><ul style="line-height:1.8;"><li><b>Welcome message:</b> every newly enrolled SMS recipient (checkbox on <a href="/contacts">Contacts</a>, or a viewer-added contact) is texted: <i>&quot;You are now receiving alerts from TankAlarm. For help, reply HELP. To opt-out, reply STOP.&quot;</i></li><li><b>STOP</b> (also STOPALL/UNSUBSCRIBE/CANCEL/END/QUIT): Twilio blocks the number at the platform level, and this server adds it to the <b>SMS Opt-Out List</b> &mdash; the contact shows an <b>OPTED OUT</b> badge and all SMS to them is suppressed.</li><li><b>START</b> (also UNSTOP/YES): the server removes them from the list and re-sends the welcome message.</li><li><b>HELP</b>: answered by Twilio &mdash; set the reply text in Twilio Console &rarr; <b>Messaging &rarr; Opt-out management</b>. The server logs it.</li><li><b>SNOOZE / UNSNOOZE</b>: pauses/resumes the recurring reminder texts for every active alarm that texts the sender's number (alarm recipients only &mdash; unknown numbers are ignored). All of the alarm's recipients are notified of the change, and a snooze auto-resets when the sensor returns to normal.</li><li>The opt-out list is managed at the bottom of the <a href="/contacts">Contacts</a> page (admin can manually remove an entry).</li></ul></div><div class="card"><h2>Step 5 &mdash; Verify</h2><ol style="line-height:1.7;"><li>Open <a href="/server-settings">Server Settings</a> and click <b>Send Test SMS</b>.</li><li>Add your own number as a contact and tick its <b>SMS alerts</b> checkbox &mdash; the welcome text should arrive.</li><li>Reply <b>STOP</b>: within about a minute the <b>OPTED OUT</b> badge appears on the <a href="/contacts">Contacts</a> page and the number joins the opt-out list.</li><li>Reply <b>START</b>: the badge clears and the welcome message arrives again.</li></ol></div></main><script>var CODE=["// Twilio Function: forward inbound SMS to the TankAlarm server via Blues Notehub","// Wire it to your number's 'A message comes in' webhook (see Step 3).","const PROJECT_UID = 'app:00000000-0000-0000-0000-000000000000';","const DEVICE_UID = 'dev:000000000000000';","const CLIENT_ID = 'your-notehub-oauth-client-id';","const CLIENT_SECRET = 'your-notehub-oauth-client-secret';","","exports.handler = async function (context, event, callback) {","  const twiml = new Twilio.twiml.MessagingResponse();","  try {","    const tokenRes = await fetch('https://notehub.io/oauth2/token', {","      method: 'POST',","      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },","      body: 'grant_type=client_credentials&client_id=' + CLIENT_ID +","            '&client_secret=' + CLIENT_SECRET","    });","    const token = (await tokenRes.json()).access_token;","    await fetch('https://api.notehub.io/v1/projects/' + PROJECT_UID +","                '/devices/' + DEVICE_UID + '/notes/sms_inbound.qi', {","      method: 'POST',","      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },","      body: JSON.stringify({ body: { from: event.From, body: event.Body } })","    });","  } catch (err) {","    console.error('Notehub forward failed:', err);","  }","  return callback(null, twiml); // empty response - Twilio's opt-out engine sends STOP/HELP replies","};"];document.getElementById('code').textContent=CODE.join("\n");function copyCode(){var t=document.createElement('textarea');t.value=CODE.join("\n");document.body.appendChild(t);t.select();try{document.execCommand('copy');var btn=document.getElementById('copyBtn');btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy Function Code';},2000);}catch(e){}document.body.removeChild(t);}</script></body></html>)HTML";
 
@@ -2357,10 +2360,10 @@ funct)HTML" R"HTML(ion renderPauseBtn(){const btn=pause_els.btn;if(!btn)return;i
 async funct)HTML" R"HTML(ion togglePauseFlow(){const targetPaused=!pause_state.paused;try{const res=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:targetPaused})});if(!res.ok){const text=await res.text();throw new Error(text||'Pause toggle failed');}const data=await res.json();pause_state.paused=!!data.paused;renderPauseBtn();showPauseToast(pause_state.paused?'Paused for maintenance':'Resumed');}catch(err){showPauseToast(err.message||'Pause toggle failed',true);}}let contacts = [];let dailyReportRecipients = [];let smsAlertRecipients = [];let emailAlertRecipients = [];let sites = [];let alarms = [];let editingContactId = null;let smsOptOut = [];let emailOptOut = [];let dailySchedule={hour:5,minute:0,tzOffsetMinutes:0,dst:false};function renderDailySchedule(){const t=document.getElementById('dailyTimeInput');const z=document.getElementById('dailyTzSelect');const d=document.getElementById('dailyDstToggle');if(!t||!z||!d)return;t.value=String(dailySchedule.hour||0).padStart(2,'0')+':'+String(dailySchedule.minute||0).padStart(2,'0');z.value=String(dailySchedule.tzOffsetMinutes||0);if(z.selectedIndex<0)z.value='0';d.checked=!!dailySchedule.dst;}function scheduleChanged(){const t=document.getElementById('dailyTimeInput');const z=document.getElementById('dailyTzSelect');const d=document.getElementById('dailyDstToggle');const parts=(t.value||'05:00').split(':');dailySchedule={hour:Math.min(23,Math.max(0,parseInt(parts[0],10)||0)),minute:Math.min(59,Math.max(0,parseInt(parts[1],10)||0)),tzOffsetMinutes:parseInt(z.value,10)||0,dst:!!d.checked};saveData();}function normEmail(e){return String(e||'').trim().toLowerCase();}function isEmailOptedOutJs(e){return emailOptOut.some(o=>normEmail(o)===normEmail(e));}function renderEmailOptOutList(){const container=document.getElementById('emailOptOutList');if(!container)return;if(emailOptOut.length===0){container.innerHTML='<div class="empty-state">No opted-out addresses.</div>';return;}container.innerHTML=emailOptOut.map(adr=>{const c=contacts.find(x=>x.email&&normEmail(x.email)===normEmail(adr));return ` <div class="daily-report-item"><div><strong>${escapeHtml(adr)}</strong>${c?` - ${escapeHtml(c.name)}`:''}</div><button class="btn btn-small btn-danger" data-optout-email="${escapeHtml(adr)}" data-action="remove-email-optout">Remove</button></div> `;}).join('');container.querySelectorAll('[data-action="remove-email-optout"]').forEach(btn=>{btn.addEventListener('click',()=>removeEmailOptOut(btn.dataset.optoutEmail));});}function removeEmailOptOut(email){if(!confirm('Remove '+email+' from the email opt-out list?'))return;fetch('/api/email/optout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',email:email})}).then(r=>r.json()).then(d=>{if(d&&d.success){showToast('Removed from email opt-out list');loadData();}else{showToast('Failed to update email opt-out list',true);}}).catch(e=>showToast('Failed:'+(e&&e.message?e.message:e),true));}function normPhone(p){return String(p||'').replace(/[^+0-9]/g,'');}function isOptedOut(p){return smsOptOut.some(o=>normPhone(o)===normPhone(p));}function renderOptOutList(){const container=document.getElementById('optOutList');if(!container)return;if(smsOptOut.length===0){container.innerHTML='<div class="empty-state">No opted-out numbers.</div>';return;}container.innerHTML=smsOptOut.map(num=>{const c=contacts.find(x=>x.phone&&normPhone(x.phone)===normPhone(num));return ` <div class="daily-report-item"><div><strong>${escapeHtml(num)}</strong>${c?` - ${escapeHtml(c.name)}`:''}</div><button class="btn btn-small btn-danger" data-optout-phone="${escapeHtml(num)}" data-action="remove-optout">Remove</button></div> `;}).join('');container.querySelectorAll('[data-action="remove-optout"]').forEach(btn=>{btn.addEventListener('click',()=>removeOptOut(btn.dataset.optoutPhone));});}function removeOptOut(phone){if(!confirm('Remove '+phone+' from the opt-out list? If they texted STOP, they must also text START before Twilio resumes delivery.'))return;fetch('/api/sms/optout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',phone:phone})}).then(r=>r.json()).then(d=>{if(d&&d.success){showToast('Removed from opt-out list');loadData();}else{showToast('Failed to update opt-out list',true);}}).catch(e=>showToast('Failed:'+(e&&e.message?e.message:e),true));}funct)HTML" R"HTML(ion showToast(message,isError){const toast = document.getElementById('toast');toast.textContent = message;toast.style.background=isError?'#dc2626':'#0284c7';toast.classList.add('show');setTimeout(()=>{toast.classList.remove('show');},3000);}
 funct)HTML" R"HTML(ion loadData(){fetch('/api/contacts').then(response => response.json()).then(data =>{contacts = data.contacts || [];dailyReportRecipients = data.dailyReportRecipients || [];smsAlertRecipients = data.smsAlertRecipients || [];emailAlertRecipients = data.emailAlertRecipients || [];smsOptOut = data.smsOptOut || [];emailOptOut = data.emailOptOut || [];dailySchedule = data.dailySchedule || dailySchedule;sites = data.sites || [];alarms = data.alarms || [];renderContacts();renderDailyReportRecipients();renderOptOutList();renderEmailOptOutList();renderDailySchedule();updateFilters();}).catch(err =>{console.error('Failed to load contacts:',err);showToast('Failed to load contacts data:' +(err && err.message ? err.message:err)+ '. Please check your network connection and try again.',true);});}
 funct)HTML" R"HTML(ion saveData(){fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:contacts,dailyReportRecipients:dailyReportRecipients,smsAlertRecipients:smsAlertRecipients,emailAlertRecipients:emailAlertRecipients,dailySchedule:dailySchedule})}).then(response => response.json()).then(data =>{if(data.success){if(data.saved===false){showToast('Saved in memory only: writing to flash failed, so these changes will be lost at the next reboot',true);}else{showToast('Changes saved successfully');}loadData();}else{showToast('Failed to save changes:' +(data.error || 'Unknown error'),true);}}).catch(err =>{console.error('Failed to save contacts:',err);showToast('Failed to save changes:' +(err && err.message ? err.message:err),true);});}document.getElementById('viewFilter').addEventListener('change',(e)=>{const view = e.target.value;document.getElementById('siteFilterGroup').style.display = view === 'site' ? 'block':'none';document.getElementById('alarmFilterGroup').style.display = view === 'alarm' ? 'block':'none';renderContacts();});document.getElementById('siteSelect').addEventListener('change',()=> renderContacts());document.getElementById('alarmSelect').addEventListener('change',()=> renderContacts());
-funct)HTML" R"HTML(ion updateFilters(){const siteSelect = document.getElementById('siteSelect');const alarmSelect = document.getElementById('alarmSelect');siteSelect.innerHTML = '<option value="">All Sites</option>';sites.forEach(site =>{const option = document.createElement('option');option.value = site;option.textContent = site;siteSelect.appendChild(option);});alarmSelect.innerHTML = '<option value="">All Alarms</option>';alarms.forEach(alarm =>{const option = document.createElement('option');option.value = alarm.id;option.textContent = `${alarm.site}- ${alarm.label}(${alarm.type})`;alarmSelect.appendChild(option);});}
-funct)HTML" R"HTML(ion renderContacts(){const container = document.getElementById('contactsList');const viewFilter = document.getElementById('viewFilter').value;const siteFilter = document.getElementById('siteSelect').value;const alarmFilter = document.getElementById('alarmSelect').value;let filteredContacts = contacts;if(viewFilter === 'site' && siteFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.some(a =>{const alarm = alarms.find(al => al.id === a);return alarm && alarm.site === siteFilter;}));}else if(viewFilter === 'alarm' && alarmFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.includes(alarmFilter));}if(filteredContacts.length === 0){container.innerHTML = '<div class="empty-state">No contacts match the current filter.</div>';return;}const rows = filteredContacts.map(contact =>{const associatedAlarms =(contact.alarmAssociations || []).map(alarmId => alarms.find(a => a.id === alarmId)).filter(a => a);return `<tr><td class="ct-name"><span>${escapeHtml(contact.name)}${contact.cat==='viewer'?' <span style="font-size:0.65rem;background:var(--chip);padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">VIEWER</span>':''}${contact.phone&&isOptedOut(contact.phone)?' <span style="font-size:0.65rem;background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">SMS OPT-OUT</span>':''}${contact.email&&isEmailOptedOutJs(contact.email)?' <span style="font-size:0.65rem;background:#ffedd5;color:#9a3412;padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">EMAIL OPT-OUT</span>':''}</span></td><td>${contact.phone?escapeHtml(contact.phone):'<span class="ct-muted">&mdash;</span>'}</td><td class="ct-email">${contact.email?escapeHtml(contact.email):'<span class="ct-muted">&mdash;</span>'}</td><td class="ct-center"><input type="checkbox" class="chan-sms" title="SMS alerts" data-contact-id="${escapeHtml(contact.id)}"${smsAlertRecipients.includes(contact.id)?' checked':''}${contact.phone?'':' disabled'}></td><td class="ct-center"><input type="checkbox" class="chan-email" title="Email alerts" data-contact-id="${escapeHtml(contact.id)}"${emailAlertRecipients.includes(contact.id)?' checked':''}${contact.email?'':' disabled'}></td><td class="ct-center"><button class="icon-btn" title="Edit contact" aria-label="Edit contact" data-contact-id="${escapeHtml(contact.id)}" data-action="edit">&#x270F;&#xFE0F;</button></td><td class="ct-center"><button class="icon-btn icon-btn-danger" title="Delete contact" aria-label="Delete contact" data-contact-id="${escapeHtml(contact.id)}" data-action="delete">&#x1F5D1;&#xFE0F;</button></td></tr>${associatedAlarms.length > 0 ? `<tr class="ct-assoc-row"><td colspan="7"><div class="ct-assoc">${associatedAlarms.map(alarm => `<span class="association-tag">${escapeHtml(alarm.site)} &mdash; ${escapeHtml(alarm.label)} (${escapeHtml(alarm.type)})<button class="remove-tag" title="Stop sending this alarm to this contact" aria-label="Remove alarm association" data-contact-id="${escapeHtml(contact.id)}" data-alarm-id="${escapeHtml(alarm.id)}">&times;</button></span>`).join('')}</div></td></tr>`:''}`;}).join('');container.innerHTML='<table class="contact-table"><thead><tr><th>Name</th><th>Phone</th><th class="ct-email">Email</th><th class="ct-center">SMS</th><th class="ct-center">Email Alerts</th><th class="ct-center">Edit</th><th class="ct-center">Delete</th></tr></thead><tbody>'+rows+'</tbody></table>';container.querySelectorAll('[data-action="edit"]').forEach(btn =>{btn.addEventListener('click',()=> editContact(btn.dataset.contactId));});container.querySelectorAll('[data-action="delete"]').forEach(btn =>{btn.addEventListener('click',()=> deleteContact(btn.dataset.contactId));});container.querySelectorAll('.chan-sms').forEach(cb =>{cb.addEventListener('change',()=>{const id=cb.dataset.contactId;if(cb.checked){if(!smsAlertRecipients.includes(id))smsAlertRecipients.push(id);}else{smsAlertRecipients=smsAlertRecipients.filter(r=>r!==id);}saveData();});});container.querySelectorAll('.chan-email').forEach(cb =>{cb.addEventListener('change',()=>{const id=cb.dataset.contactId;if(cb.checked){if(!emailAlertRecipients.includes(id))emailAlertRecipients.push(id);}else{emailAlertRecipients=emailAlertRecipients.filter(r=>r!==id);}saveData();});});container.querySelectorAll('.remove-tag').forEach(btn =>{btn.addEventListener('click',funct)HTML" R"HTML(ion(){removeAlarmAssociation(this.dataset.contactId,this.dataset.alarmId);});});}
+funct)HTML" R"HTML(ion updateFilters(){const siteSelect = document.getElementById('siteSelect');const alarmSelect = document.getElementById('alarmSelect');siteSelect.innerHTML = '<option value="">All Sites</option>';sites.forEach(site =>{const option = document.createElement('option');option.value = site;option.textContent = site;siteSelect.appendChild(option);});alarmSelect.innerHTML = '<option value="">All Alarms</option>';alarms.forEach(alarm =>{const option = document.createElement('option');option.value = alarm.id;option.textContent = `${alarm.site}- ${alarm.label||'Sensor'}(${alarm.type})`;alarmSelect.appendChild(option);});}
+funct)HTML" R"HTML(ion renderContacts(){const container = document.getElementById('contactsList');const viewFilter = document.getElementById('viewFilter').value;const siteFilter = document.getElementById('siteSelect').value;const alarmFilter = document.getElementById('alarmSelect').value;let filteredContacts = contacts;if(viewFilter === 'site' && siteFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.some(a =>{const alarm = alarms.find(al => al.id === a);return alarm && alarm.site === siteFilter;}));}else if(viewFilter === 'alarm' && alarmFilter){filteredContacts = contacts.filter(c => c.alarmAssociations && c.alarmAssociations.includes(alarmFilter));}if(filteredContacts.length === 0){container.innerHTML = '<div class="empty-state">No contacts match the current filter.</div>';return;}const rows = filteredContacts.map(contact =>{const associatedAlarms =(contact.alarmAssociations || []).map(alarmId => alarms.find(a => a.id === alarmId)).filter(a => a);return `<tr><td class="ct-name"><span>${escapeHtml(contact.name)}${contact.cat==='viewer'?' <span style="font-size:0.65rem;background:var(--chip);padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">VIEWER</span>':''}${contact.phone&&isOptedOut(contact.phone)?' <span style="font-size:0.65rem;background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">SMS OPT-OUT</span>':''}${contact.email&&isEmailOptedOutJs(contact.email)?' <span style="font-size:0.65rem;background:#ffedd5;color:#9a3412;padding:2px 8px;border-radius:10px;vertical-align:middle;letter-spacing:0.5px;">EMAIL OPT-OUT</span>':''}</span></td><td>${contact.phone?escapeHtml(contact.phone):'<span class="ct-muted">&mdash;</span>'}</td><td class="ct-email">${contact.email?escapeHtml(contact.email):'<span class="ct-muted">&mdash;</span>'}</td><td class="ct-center"><input type="checkbox" class="chan-sms" title="SMS alerts" data-contact-id="${escapeHtml(contact.id)}"${smsAlertRecipients.includes(contact.id)?' checked':''}${contact.phone?'':' disabled'}></td><td class="ct-center"><input type="checkbox" class="chan-email" title="Email alerts" data-contact-id="${escapeHtml(contact.id)}"${emailAlertRecipients.includes(contact.id)?' checked':''}${contact.email?'':' disabled'}></td><td class="ct-center"><button class="icon-btn" title="Edit contact" aria-label="Edit contact" data-contact-id="${escapeHtml(contact.id)}" data-action="edit">&#x270F;&#xFE0F;</button></td><td class="ct-center"><button class="icon-btn icon-btn-danger" title="Delete contact" aria-label="Delete contact" data-contact-id="${escapeHtml(contact.id)}" data-action="delete">&#x1F5D1;&#xFE0F;</button></td></tr>${associatedAlarms.length > 0 ? `<tr class="ct-assoc-row"><td colspan="7"><div class="ct-assoc">${associatedAlarms.map(alarm => `<span class="association-tag">${escapeHtml(alarm.site)} &mdash; ${escapeHtml(alarm.label||'Sensor')} (${escapeHtml(alarm.type)})<button class="remove-tag" title="Stop sending this alarm to this contact" aria-label="Remove alarm association" data-contact-id="${escapeHtml(contact.id)}" data-alarm-id="${escapeHtml(alarm.id)}">&times;</button></span>`).join('')}</div></td></tr>`:''}`;}).join('');container.innerHTML='<table class="contact-table"><thead><tr><th>Name</th><th>Phone</th><th class="ct-email">Email</th><th class="ct-center">SMS</th><th class="ct-center">Email Alerts</th><th class="ct-center">Edit</th><th class="ct-center">Delete</th></tr></thead><tbody>'+rows+'</tbody></table>';container.querySelectorAll('[data-action="edit"]').forEach(btn =>{btn.addEventListener('click',()=> editContact(btn.dataset.contactId));});container.querySelectorAll('[data-action="delete"]').forEach(btn =>{btn.addEventListener('click',()=> deleteContact(btn.dataset.contactId));});container.querySelectorAll('.chan-sms').forEach(cb =>{cb.addEventListener('change',()=>{const id=cb.dataset.contactId;if(cb.checked){if(!smsAlertRecipients.includes(id))smsAlertRecipients.push(id);}else{smsAlertRecipients=smsAlertRecipients.filter(r=>r!==id);}saveData();});});container.querySelectorAll('.chan-email').forEach(cb =>{cb.addEventListener('change',()=>{const id=cb.dataset.contactId;if(cb.checked){if(!emailAlertRecipients.includes(id))emailAlertRecipients.push(id);}else{emailAlertRecipients=emailAlertRecipients.filter(r=>r!==id);}saveData();});});container.querySelectorAll('.remove-tag').forEach(btn =>{btn.addEventListener('click',funct)HTML" R"HTML(ion(){removeAlarmAssociation(this.dataset.contactId,this.dataset.alarmId);});});}
 funct)HTML" R"HTML(ion renderDailyReportRecipients(){const container = document.getElementById('dailyReportList');if(dailyReportRecipients.length === 0){container.innerHTML = '<div class="empty-state">No daily report recipients configured.</div>';return;}container.innerHTML = dailyReportRecipients.map(recipientId =>{const contact = contacts.find(c => c.id === recipientId);if(!contact)return '';return ` <div class="daily-report-item"><div><strong>${escapeHtml(contact.name)}</strong> ${contact.email ? ` - ${escapeHtml(contact.email)}`:''}</div><button class="btn btn-small btn-danger" data-recipient-id="${escapeHtml(recipientId)}" data-action="remove-recipient">Remove</button></div> `;}).filter(Boolean).join('');container.querySelectorAll('[data-action="remove-recipient"]').forEach(btn =>{btn.addEventListener('click',()=> removeDailyReportRecipient(btn.dataset.recipientId));});}
-window.openAddContactModal = funct)HTML" R"HTML(ion(){editingContactId = null;document.getElementById('modalTitle').textContent = 'Add Contact';document.getElementById('contactName').value = '';document.getElementById('contactPhone').value = '';document.getElementById('contactEmail').value = '';renderAlarmAssociations([]);document.getElementById('contactModal').classList.remove('hidden');};window.editContact = funct)HTML" R"HTML(ion(contactId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;editingContactId = contactId;document.getElementById('modalTitle').textContent = 'Edit Contact';document.getElementById('contactName').value = contact.name;document.getElementById('contactPhone').value = contact.phone || '';document.getElementById('contactEmail').value = contact.email || '';renderAlarmAssociations(contact.alarmAssociations || []);document.getElementById('contactModal').classList.remove('hidden');};window.closeContactModal = funct)HTML" R"HTML(ion(){document.getElementById('contactModal').classList.add('hidden');};funct)HTML" R"HTML(ion renderAlarmAssociations(selectedAlarms){const container = document.getElementById('alarmAssociations');if(alarms.length === 0){container.innerHTML = '<p style="color:var(--muted);font-style:italic;">No alarms configured in the system.</p>';return;}const groupedBySite ={};alarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});container.innerHTML = Object.keys(groupedBySite).map(site => ` <div style="grid-column:1 / -1;"><strong style="display:block;margin-bottom:8px;">${escapeHtml(site)}</strong> ${groupedBySite[site].map((alarm,idx)=>{const checkboxId = 'alarm_' + escapeHtml(alarm.id)+ '_' + idx;return ` <label for="${checkboxId}" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" id="${checkboxId}" name="alarmAssoc" value="${escapeHtml(alarm.id)}" ${selectedAlarms.includes(alarm.id)? 'checked':''}><span>${escapeHtml(alarm.label)}(${escapeHtml(alarm.ty)HTML" R"HTML(pe)})</span></label> `;}).join('')}</div> `).join('');}document.getElementById('contactForm').addEventListener('submit',(e)=>{e.preventDefault();const name = document.getElementById('contactName').value.trim();const phone = document.getElementById('contactPhone').value.trim();const email = document.getElementById('contactEmail').value.trim();if(!name){showToast('Contact name is required',true);return;}if(!phone && !email){showToast('Either phone or email is required',true);return;}const alarmAssociations = Array.from(document.querySelectorAll('input[name="alarmAssoc"]:checked')).map(cb => cb.value);if(editingContactId){const contact = contacts.find(c => c.id === editingContactId);if(contact){contact.name = name;contact.phone = phone;contact.email = email;contact.alarmAssociations = alarmAssociations;}}else{const newContact ={id:'contact_' + Date.now()+ '_' + Math.random().toString(36).substr(2,9),name:name,phone:phone,email:email,alarmAssociations:alarmAssociations};contacts.push(newContact);}saveData();closeContactModal();});window.deleteContact = funct)HTML" R"HTML(ion(contactId){if(!confirm('Are you sure you want to delete this contact?'))return;contacts = contacts.filter(c => c.id !== contactId);dailyReportRecipients = dailyReportRecipients.filter(r => r !== contactId);smsAlertRecipients = smsAlertRecipients.filter(r => r !== contactId);emailAlertRecipients = emailAlertRecipients.filter(r => r !== contactId);saveData();};window.removeAlarmAssociation = funct)HTML" R"HTML(ion(contactId,alarmId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;contact.alarmAssociations =(contact.alarmAssociations || []).filter(a => a !== alarmId);saveData();};window.openAddDailyReportModal = funct)HTML" R"HTML(ion(){const select = document.getElementById('dailyReportContactSelect');select.innerHTML = '<option value="">Choose a contact...</option>';contacts.forEach(contact =>{if(contact.email && !dailyReportRecipients.includes(contact.id)){const option = document.createElement('option');option.value = contact.id;option.textContent = `${contact.name}(${contact.email})`;select.appendChild(option);}});if(select.options.length === 1){showToast('No contacts with email addresses available',true);return;}document.getElementById('dailyReportModal').classList.remove('hidden');};window.closeDailyReportModal = funct)HTML" R"HTML(ion(){document.getElementById('dailyReportModal').classList.add('hidden');};document.getElementById('dailyReportForm').addEventListener('submit',(e)=>{e.preventDefault();const contactId = document.getElementById('dailyReportContactSelect').value;if(!contactId){showToast('Please select a contact',true);return;}if(!dailyReportRecipients.includes(contactId)){dailyReportRecipients.push(contactId);saveData();loadData();}closeDailyReportModal();});window.removeDailyReportRecipient = funct)HTML" R"HTML(ion(recipientId){dailyReportRecipients = dailyReportRecipients.filter(r => r !== recipientId);saveData();};funct)HTML" R"HTML(ion escapeHtml(text){const div = document.createElement('div');div.textContent = text;return div.innerHTML;}['dailyTimeInput','dailyTzSelect','dailyDstToggle'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',scheduleChanged);});loadData();})();
+window.openAddContactModal = funct)HTML" R"HTML(ion(){editingContactId = null;document.getElementById('modalTitle').textContent = 'Add Contact';document.getElementById('contactName').value = '';document.getElementById('contactPhone').value = '';document.getElementById('contactEmail').value = '';renderAlarmAssociations([]);document.getElementById('contactModal').classList.remove('hidden');};window.editContact = funct)HTML" R"HTML(ion(contactId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;editingContactId = contactId;document.getElementById('modalTitle').textContent = 'Edit Contact';document.getElementById('contactName').value = contact.name;document.getElementById('contactPhone').value = contact.phone || '';document.getElementById('contactEmail').value = contact.email || '';renderAlarmAssociations(contact.alarmAssociations || []);document.getElementById('contactModal').classList.remove('hidden');};window.closeContactModal = funct)HTML" R"HTML(ion(){document.getElementById('contactModal').classList.add('hidden');};funct)HTML" R"HTML(ion renderAlarmAssociations(selectedAlarms){const container = document.getElementById('alarmAssociations');if(alarms.length === 0){container.innerHTML = '<p style="color:var(--muted);font-style:italic;">No alarms configured in the system.</p>';return;}const groupedBySite ={};alarms.forEach(alarm =>{if(!groupedBySite[alarm.site]){groupedBySite[alarm.site] = [];}groupedBySite[alarm.site].push(alarm);});container.innerHTML = Object.keys(groupedBySite).map(site => ` <div style="grid-column:1 / -1;"><strong style="display:block;margin-bottom:8px;">${escapeHtml(site)}</strong> ${groupedBySite[site].map((alarm,idx)=>{const checkboxId = 'alarm_' + escapeHtml(alarm.id)+ '_' + idx;return ` <label for="${checkboxId}" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" id="${checkboxId}" name="alarmAssoc" value="${escapeHtml(alarm.id)}" ${selectedAlarms.includes(alarm.id)? 'checked':''}><span>${escapeHtml(alarm.label||'Sensor')}(${escapeHtml(alarm.ty)HTML" R"HTML(pe)})</span></label> `;}).join('')}</div> `).join('');}document.getElementById('contactForm').addEventListener('submit',(e)=>{e.preventDefault();const name = document.getElementById('contactName').value.trim();const phone = document.getElementById('contactPhone').value.trim();const email = document.getElementById('contactEmail').value.trim();if(!name){showToast('Contact name is required',true);return;}if(!phone && !email){showToast('Either phone or email is required',true);return;}const alarmAssociations = Array.from(document.querySelectorAll('input[name="alarmAssoc"]:checked')).map(cb => cb.value);if(editingContactId){const contact = contacts.find(c => c.id === editingContactId);if(contact){contact.name = name;contact.phone = phone;contact.email = email;contact.alarmAssociations = alarmAssociations;}}else{const newContact ={id:'contact_' + Date.now()+ '_' + Math.random().toString(36).substr(2,9),name:name,phone:phone,email:email,alarmAssociations:alarmAssociations};contacts.push(newContact);}saveData();closeContactModal();});window.deleteContact = funct)HTML" R"HTML(ion(contactId){if(!confirm('Are you sure you want to delete this contact?'))return;contacts = contacts.filter(c => c.id !== contactId);dailyReportRecipients = dailyReportRecipients.filter(r => r !== contactId);smsAlertRecipients = smsAlertRecipients.filter(r => r !== contactId);emailAlertRecipients = emailAlertRecipients.filter(r => r !== contactId);saveData();};window.removeAlarmAssociation = funct)HTML" R"HTML(ion(contactId,alarmId){const contact = contacts.find(c => c.id === contactId);if(!contact)return;contact.alarmAssociations =(contact.alarmAssociations || []).filter(a => a !== alarmId);saveData();};window.openAddDailyReportModal = funct)HTML" R"HTML(ion(){const select = document.getElementById('dailyReportContactSelect');select.innerHTML = '<option value="">Choose a contact...</option>';contacts.forEach(contact =>{if(contact.email && !dailyReportRecipients.includes(contact.id)){const option = document.createElement('option');option.value = contact.id;option.textContent = `${contact.name}(${contact.email})`;select.appendChild(option);}});if(select.options.length === 1){showToast('No contacts with email addresses available',true);return;}document.getElementById('dailyReportModal').classList.remove('hidden');};window.closeDailyReportModal = funct)HTML" R"HTML(ion(){document.getElementById('dailyReportModal').classList.add('hidden');};document.getElementById('dailyReportForm').addEventListener('submit',(e)=>{e.preventDefault();const contactId = document.getElementById('dailyReportContactSelect').value;if(!contactId){showToast('Please select a contact',true);return;}if(!dailyReportRecipients.includes(contactId)){dailyReportRecipients.push(contactId);saveData();loadData();}closeDailyReportModal();});window.removeDailyReportRecipient = funct)HTML" R"HTML(ion(recipientId){dailyReportRecipients = dailyReportRecipients.filter(r => r !== recipientId);saveData();};funct)HTML" R"HTML(ion escapeHtml(text){const div = document.createElement('div');div.textContent = text;return div.innerHTML;}['dailyTimeInput','dailyTzSelect','dailyDstToggle'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',scheduleChanged);});loadData();})();
 </script></body></html>)HTML";
 
 static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Dashboard - TankAlarm</title><link rel="stylesheet" href="/style.css"><style>
@@ -10475,6 +10478,9 @@ static void sendUnloadLogJson(EthernetClient &client) {
     obj["c"] = entry.clientUid;              // Client UID
     obj["n"] = entry.tankLabel;              // Tank label
     obj["k"] = entry.sensorIndex;             // Sensor index
+    if (entry.userNumber > 0) {
+      obj["un"] = entry.userNumber;          // Display Number (left out when blank)
+    }
     obj["pk"] = entry.peakInches;            // Peak height
     obj["em"] = entry.emptyInches;           // Empty height
     obj["dl"] = entry.peakInches - entry.emptyInches;  // Delivered amount
@@ -10732,8 +10738,11 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
     if ((double)recUpdate > previousUpdate) {
       if (useCfgName) { clientObj["n"] = cfgDisp.name; } else { clientObj["n"] = rec.label; }
       clientObj["k"] = rec.sensorIndex;
+      // "un" follows the same sensor as "n"/"k": drop an older sensor's number when this one has none.
       if (rec.userNumber > 0) {
         clientObj["un"] = rec.userNumber;
+      } else {
+        clientObj.remove("un");
       }
       clientObj["l"] = rec.currentValue;
       // Fix 13 (v2.0.52): emit any non-zero mA (gate dropped from >=4.0).
@@ -12776,21 +12785,30 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // Fix #313-1a: reject notes that do not identify a sensor. Client sensor
   // indexes are 1-based; a missing "k" used to default to 0 and create a
   // phantom sensor-0 record that polluted history/trend charts forever.
-  if (!doc["k"].is<int>() || doc["k"].as<int>() < 1) {
-    Serial.println(F("Telemetry dropped: missing/invalid sensor index k"));
+  // P326: k must be 1-255 (noteSensorNumber); 256 used to pass the old guard and read as 0.
+  JsonVariantConst kv = doc["k"];
+  const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);
+  if (sensorIndex == 0) {
+    Serial.println(F("Telemetry dropped: missing/invalid sensor index k (1-255)"));
     return;
   }
-  uint8_t sensorIndex = doc["k"].as<uint8_t>();
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   if (!rec) {
     return;
   }
-  
-  // Store optional user-assigned display number (0 = unset)
-  if (doc.containsKey("un")) {
-    rec->userNumber = doc["un"].as<uint8_t>();
+
+  // Optional user-assigned Display Number (0 = unset). Telemetry carries "un" whenever it is set,
+  // so a note without it clears a number removed on the client config page (TankAlarm_SensorName.h).
+  {
+    JsonVariantConst un = doc["un"];
+    const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
+                                                    true, rec->userNumber);
+    if (displayNumber != rec->userNumber) {
+      rec->userNumber = displayNumber;
+      gSensorRegistryDirty = true;
+    }
   }
-  
+
   // Track client firmware version and reconcile against any expected OTA target.
   noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
@@ -12841,12 +12859,12 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
 
   strlcpy(rec->site, doc["s"] | "", sizeof(rec->site));
   
-  // Only update label if provided in message (optional field)
+  // Only update label if provided in message (optional field). An empty "n" neither clears a
+  // stored label nor writes a placeholder: a sensor with no label is named by its site (and
+  // Display Number) alone (TankAlarm_SensorName.h).
   const char *label = doc["n"] | "";
   if (label && strlen(label) > 0) {
     strlcpy(rec->label, label, sizeof(rec->label));
-  } else if (rec->label[0] == '\0') {
-    strlcpy(rec->label, "Tank", sizeof(rec->label)); // Default only if empty
   }
   
   // Store contents if provided - optional field (not used for RPM/engine monitors)
@@ -13164,17 +13182,33 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     return;
   }
 
-  uint8_t sensorIndex = doc["k"].as<uint8_t>();
+  // CR-7: a sensor alarm must name its sensor. The same guard as handleTelemetry (Fix #313-1a):
+  // a missing, non-integer or < 1 "k" would read as 0 and alert on a phantom sensor-0 record.
+  // System alarms (no "k") have already been handled above. P326: k must be 1-255.
+  JsonVariantConst kv = doc["k"];
+  const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);
+  if (sensorIndex == 0) {
+    Serial.println(F("Alarm dropped: missing/invalid sensor index k (1-255)"));
+    return;
+  }
   SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   if (!rec) {
     return;
   }
-  
-  // Store optional user-assigned display number (0 = unset)
-  if (doc.containsKey("un")) {
-    rec->userNumber = doc["un"].as<uint8_t>();
+
+  // Optional user-assigned Display Number (0 = unset). R12: alarm notes carry "un" only when set,
+  // and recovered/clear/fault notes never carry it, so a note without "un" keeps the stored number
+  // (TankAlarm_SensorName.h); a malformed value is ignored rather than clearing it.
+  {
+    JsonVariantConst un = doc["un"];
+    const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
+                                                    false, rec->userNumber);
+    if (displayNumber != rec->userNumber) {
+      rec->userNumber = displayNumber;
+      gSensorRegistryDirty = true;
+    }
   }
-  
+
   // Track client firmware version and reconcile against any expected OTA target.
   noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
@@ -13222,6 +13256,12 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   if (stField && stField[0] != '\0' && rec->sensorType[0] == '\0') {
     if (strcmp(stField, "rpm") == 0) strlcpy(rec->sensorType, "pulse", sizeof(rec->sensorType));
     else strlcpy(rec->sensorType, stField, sizeof(rec->sensorType));
+  }
+
+  // A record first created by this alarm has no site yet (telemetry, daily and unload notes
+  // set it). Fill it from the note's "s" so the alarm text names the site; never overwrite.
+  if (rec->site[0] == '\0') {
+    strlcpy(rec->site, doc["s"] | "", sizeof(rec->site));
   }
 
   // Resolve the display level (trusts the client's self-describing "lvl" unless its
@@ -13308,24 +13348,26 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   bool bypassMinimumInterval = (strcmp(type, "clear") == 0) || isRecovery;
   bool suppressSmsForDiagnostic = isDiagnostic && !isRecovery;
   if (!suppressSmsForDiagnostic && clientWantsSms && smsAllowedByServer && checkSmsRateLimit(rec, bypassMinimumInterval)) {
-    // BugFix v1.6.2 (M-16): Pre-truncate site name to leave room for alarm details.
-    // Long site names can consume the entire 160-char SMS budget.
-    char shortSite[24];
-    strlcpy(shortSite, rec->site, sizeof(shortSite));
-    char message[160];
+    // The text is NAME + tail (TankAlarm_SensorName.h): site and label, plus " #N" only for a
+    // Display Number; never the internal sensorIndex. composeSensorText caps the site and
+    // label (BugFix v1.6.2 M-16: a long site must not eat the 160-char SMS budget) and keeps
+    // the tail's reading.
+    char tail[160];
     if (isRelayTimeout) {
-      snprintf(message, sizeof(message), "%s%s%d Relay safety timeout - relay forced OFF", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex);
+      snprintf(tail, sizeof(tail), " Relay safety timeout - relay forced OFF");
     } else if (isDigitalAlarm) {
       const char *stateDesc = (strcmp(type, "triggered") == 0) ? "ACTIVATED" : "NOT ACTIVATED";
-      snprintf(message, sizeof(message), "%s%s%d Float Switch %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, stateDesc);
+      snprintf(tail, sizeof(tail), " Float Switch %s", stateDesc);
     } else if (strcmp(type, "clear") == 0 && isDigitalSensorType(rec->sensorType)) {
       // S3 (C-A04 B7): a float clear shows the switch state, not "clear alarm 0.0 in" ("1.0 in" for a
       // not_activated float).
-      snprintf(message, sizeof(message), "%s%s%d Float Switch clear (%s)", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, digitalStateText(rec->currentValue));
+      snprintf(tail, sizeof(tail), " Float Switch clear (%s)", digitalStateText(rec->currentValue));
     } else {
       // S3: rec->currentValue is this note's reading, or the last one when the note carries none.
-      snprintf(message, sizeof(message), "%s%s%d %s alarm %.1f %s", shortSite, rec->userNumber > 0 ? " #" : " sensor ", rec->userNumber > 0 ? rec->userNumber : rec->sensorIndex, rec->alarmType, rec->currentValue, rec->measurementUnit[0] ? rec->measurementUnit : "in");
+      snprintf(tail, sizeof(tail), " %s alarm %.1f %s", rec->alarmType, rec->currentValue, rec->measurementUnit[0] ? rec->measurementUnit : "in");
     }
+    char message[160];
+    composeSensorText(message, sizeof(message), "", rec->site, rec->label, rec->userNumber, tail);
     // CONTACT-2a: pass the alarm id so contacts with alarmAssociations only receive
     // the alarms they opted into (id format matches handleContactsGet).
     char alarmId[64];
@@ -13527,7 +13569,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   bool runAlarmReconcile = isFirstPart && (dailyAlarms || dailySchema >= 2);
   if (runAlarmReconcile) {
     for (JsonObject a : dailyAlarms) {
-      uint8_t sensorIdx = a["k"] | 0;
+      // P326: an entry whose k is not 1-255 names no sensor (noteSensorNumber). The old `| 0`
+      // read into a uint8_t wrapped 257 and -255 to sensor 1.
+      JsonVariantConst ak = a["k"];
+      const uint8_t sensorIdx = noteSensorNumber(ak.is<int32_t>(), ak.is<int32_t>() ? ak.as<int32_t>() : 0);
+      if (sensorIdx == 0) continue;
       bool hiAlarm = a["hi"] | false;
       bool loAlarm = a["lo"] | false;
       if (hiAlarm || loAlarm) {
@@ -13536,7 +13582,7 @@ static void handleDaily(JsonDocument &doc, double epoch) {
         // record here, as handleAlarm does, instead of being skipped until tomorrow's report. The
         // sensors[] loop below fills in the rest. k is 1-based (see the sensors[] loop).
         bool recCreated = false;
-        SensorRecord *rec = (sensorIdx >= 1) ? upsertSensorRecord(clientUid, sensorIdx, &recCreated) : nullptr;
+        SensorRecord *rec = upsertSensorRecord(clientUid, sensorIdx, &recCreated);
         if (rec && rec->site[0] == '\0') {
           const char *noteSite = doc["s"] | "";
           if (noteSite[0] != '\0') strlcpy(rec->site, noteSite, sizeof(rec->site));
@@ -13612,7 +13658,9 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       // Check if this sensorIndex has an active alarm in the daily report
       bool foundInDaily = false;
       for (JsonObject a : dailyAlarms) {
-        uint8_t dailyIdx = a["k"] | 0;
+        JsonVariantConst ak = a["k"];
+        const uint8_t dailyIdx = noteSensorNumber(ak.is<int32_t>(), ak.is<int32_t>() ? ak.as<int32_t>() : 0);
+        if (dailyIdx == 0) continue;  // P326: not a sensor number 1-255 (see the reconcile above)
         if (dailyIdx == gSensorRecords[ri].sensorIndex) {
           bool hiAlarm = a["hi"] | false;
           bool loAlarm = a["lo"] | false;
@@ -13640,28 +13688,36 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   // Process sensor records in the daily report
   JsonArray sensors = doc["sensors"];
   for (JsonObject t : sensors) {
-    // Fix #313-1a: skip entries without a valid 1-based sensor index (see handleTelemetry)
-    if (!t["k"].is<int>() || t["k"].as<int>() < 1) {
+    // Fix #313-1a: skip entries without a valid sensor index 1-255 (see handleTelemetry)
+    JsonVariantConst kv = t["k"];
+    const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);
+    if (sensorIndex == 0) {
+      Serial.println(F("Daily sensor entry skipped: missing/invalid sensor index k (1-255)"));
       continue;
     }
-    uint8_t sensorIndex = t["k"].as<uint8_t>();
     bool recCreated = false;
     SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);
     if (!rec) {
       continue;
     }
 
-    // Store optional user-assigned display number (0 = unset)
-    if (t.containsKey("un")) {
-      rec->userNumber = t["un"].as<uint8_t>();
+    // Optional user-assigned Display Number (0 = unset). Each daily sensors[] entry carries "un"
+    // whenever it is set, so an entry without it clears a removed number (TankAlarm_SensorName.h).
+    {
+      JsonVariantConst un = t["un"];
+      const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), un.is<int32_t>() ? un.as<int32_t>() : -1,
+                                                      true, rec->userNumber);
+      if (displayNumber != rec->userNumber) {
+        rec->userNumber = displayNumber;
+        gSensorRegistryDirty = true;
+      }
     }
 
     strlcpy(rec->site, siteName, sizeof(rec->site));
+    // Only a non-empty "n" replaces the label; no placeholder (see handleTelemetry).
     const char *label = t["n"] | "";
     if (label && strlen(label) > 0) {
       strlcpy(rec->label, label, sizeof(rec->label));
-    } else if (rec->label[0] == '\0') {
-      strlcpy(rec->label, "Tank", sizeof(rec->label)); // Default only if empty
     }
     
     // Store contents if provided - optional field (not used for RPM/engine monitors)
@@ -13848,9 +13904,8 @@ static void handleDaily(JsonDocument &doc, double epoch) {
 static void handleUnload(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   const char *siteName = doc["s"] | "";
-  const char *tankLabel = doc["n"] | "Tank";
-  uint8_t sensorIndex = doc["k"].as<uint8_t>();
-  
+  const char *noteLabel = doc["n"] | "";  // the client's unload note does not send "n" today
+
   if (!clientUid || strlen(clientUid) == 0) {
     Serial.println(F("Unload event missing client UID"));
     return;
@@ -13858,7 +13913,16 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   if (!isValidClientUid(clientUid)) {
     return;  // rejected and logged by the validator before any state or notification
   }
-  
+  // CR-7: the same guard as handleTelemetry (Fix #313-1a). A missing, non-integer or < 1 "k"
+  // would read as 0: an unload text/email routed as "<uid>_0" and a phantom sensor-0 record.
+  // P326: k must be 1-255 (noteSensorNumber).
+  JsonVariantConst kv = doc["k"];
+  const uint8_t sensorIndex = noteSensorNumber(kv.is<int32_t>(), kv.is<int32_t>() ? kv.as<int32_t>() : 0);
+  if (sensorIndex == 0) {
+    Serial.println(F("Unload dropped: missing/invalid sensor index k (1-255)"));
+    return;
+  }
+
   // Extract unload event data
   float peakInches = doc["pk"].as<float>();
   float emptyInches = doc["em"].as<float>();
@@ -13878,7 +13942,25 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   
   // Get measurement unit if provided
   const char *unit = doc["mu"] | "inches";
-  
+
+  // Name the sensor from what the server already knows: the unload note carries neither "n"
+  // nor "un", so take the label and the Display Number from the sensor record when the note
+  // lacks them. CR-7: an unknown label stays empty (no "Tank" placeholder); the text then names
+  // the sensor by site (and Display Number) alone, and the unload log's "n" is empty too.
+  // P326: resolve the record once, before the log entry, with upsertSensorRecord: its linear scan
+  // recovers a record the hash table has lost (a bare findSensorByHash would miss it and log and
+  // notify without the stored label and number), and the same record takes the update below.
+  // It is null only when the registry cannot hold the sensor; the event is still logged and sent.
+  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
+  const char *tankLabel = noteLabel;
+  if (tankLabel[0] == '\0' && rec != nullptr) {
+    tankLabel = rec->label;
+  }
+  JsonVariantConst un = doc["un"];
+  const int32_t unValue = un.is<int32_t>() ? un.as<int32_t>() : -1;
+  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), unValue,
+                                                  false, rec != nullptr ? rec->userNumber : 0);
+
   Serial.print(F("Unload event received: "));
   Serial.print(siteName);
   Serial.print(F(" #"));
@@ -13901,6 +13983,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   strlcpy(entry.clientUid, clientUid, sizeof(entry.clientUid));
   strlcpy(entry.tankLabel, tankLabel, sizeof(entry.tankLabel));
   entry.sensorIndex = sensorIndex;
+  entry.userNumber = displayNumber;
   entry.peakInches = peakInches;
   entry.emptyInches = emptyInches;
   entry.peakSensorMa = peakSensorMa;
@@ -13927,14 +14010,23 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     sendUnloadEmail(entry);
   }
   
-  // Update sensor record with current level
-  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
+  // Update sensor record with current level (the record resolved above)
   if (rec) {
     strlcpy(rec->site, siteName, sizeof(rec->site));
-    strlcpy(rec->label, tankLabel, sizeof(rec->label));
+    // Only a real label from the note replaces the record's (the unload note has no "n" today);
+    // an empty label is never filled with a placeholder, so the dashboard keeps the client's name.
+    if (noteLabel[0] != '\0') {
+      strlcpy(rec->label, noteLabel, sizeof(rec->label));
+    }
+    // A future note with a valid "un" sets the number; a missing or malformed one keeps the
+    // record's own.
+    rec->userNumber = noteDisplayNumber(!un.isNull(), unValue, false, rec->userNumber);
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;
     rec->dailyTimePending = false;
+    // Every field written above is saved in the registry, so mark it dirty as handleTelemetry,
+    // handleAlarm and handleDaily do (an existing record's upsert does not).
+    gSensorRegistryDirty = true;
   }
 }
 
@@ -13956,16 +14048,21 @@ static void logUnloadEvent(const UnloadLogEntry &entry) {
   Serial.println(entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "inches");
 }
 
-static void sendUnloadSms(const UnloadLogEntry &entry) {
-  char message[160];
+// Unload SMS and email text: NAME + " unloaded: ..." (TankAlarm_SensorName.h: site and label,
+// plus " #N" only for a Display Number; never the internal sensorIndex).
+static void buildUnloadText(char *out, size_t outLen, const UnloadLogEntry &entry) {
   float delivered = entry.peakInches - entry.emptyInches;
   const char *u = entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "in";
-  
-  snprintf(message, sizeof(message), 
-           "%s #%d unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
-           entry.siteName, entry.sensorIndex, delivered, u,
-           entry.peakInches, entry.emptyInches);
-  
+  char tail[160];
+  snprintf(tail, sizeof(tail), " unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
+           delivered, u, entry.peakInches, entry.emptyInches);
+  composeSensorText(out, outLen, "", entry.siteName, entry.tankLabel, entry.userNumber, tail);
+}
+
+static void sendUnloadSms(const UnloadLogEntry &entry) {
+  char message[160];
+  buildUnloadText(message, sizeof(message), entry);
+
   // CONTACT-2a: unload SMS respects per-contact alarm associations for this sensor.
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", entry.clientUid, (int)entry.sensorIndex);
@@ -13978,13 +14075,7 @@ static void sendUnloadSms(const UnloadLogEntry &entry) {
 // unload note was parsed but never acted on). Mirrors sendUnloadSms via the email channel.
 static void sendUnloadEmail(const UnloadLogEntry &entry) {
   char message[160];
-  float delivered = entry.peakInches - entry.emptyInches;
-  const char *u = entry.measurementUnit[0] != '\0' ? entry.measurementUnit : "in";
-
-  snprintf(message, sizeof(message),
-           "%s #%d unloaded: %.1f %s delivered (peak %.1f, now %.1f)",
-           entry.siteName, entry.sensorIndex, delivered, u,
-           entry.peakInches, entry.emptyInches);
+  buildUnloadText(message, sizeof(message), entry);
 
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", entry.clientUid, (int)entry.sensorIndex);
@@ -15005,30 +15096,22 @@ static bool phoneReceivesAlarm(JsonDocument &contactsDoc, const char *phone, con
 // One-time notice to the alarm's subscribed recipients when reminders are paused/resumed —
 // without it, reminder silence is indistinguishable from "fixed".
 static void broadcastSnoozeChange(const SensorRecord &rec, bool snoozed, const char *who) {
-  char shortSite[24];
-  strlcpy(shortSite, rec.site, sizeof(shortSite));
-  char message[160];
+  // Runs on the SMS reply path (handleSmsInbound -> applyReminderSnooze) on the main-thread
+  // stack: a 48-byte reading, one 160-byte message and composeSnoozeText's 160-byte tail.
+  char reading[48];
   if (isDigitalSensorType(rec.sensorType)) {
     // S3 (C-A04 B7): a float has no value or unit, only a state.
-    snprintf(message, sizeof(message),
-             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%s).%s",
-             snoozed ? "SNOOZED" : "RESUMED",
-             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
-             snoozed ? "paused" : "active again", who,
-             rec.alarmType, digitalStateText(rec.currentValue),
-             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+    strlcpy(reading, digitalStateText(rec.currentValue), sizeof(reading));
   } else {
-    snprintf(message, sizeof(message),
-             "%s: %s%s%d reminders %s by %s. Still in %s alarm (%.1f %s).%s",
-             snoozed ? "SNOOZED" : "RESUMED",
-             shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-             rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
-             snoozed ? "paused" : "active again", who,
-             rec.alarmType, rec.currentValue,
-             rec.measurementUnit[0] ? rec.measurementUnit : "in",
-             snoozed ? " Auto-resumes on recovery; reply UNSNOOZE to resume now." : "");
+    snprintf(reading, sizeof(reading), "%.1f %s", rec.currentValue,
+             rec.measurementUnit[0] ? rec.measurementUnit : "in");
   }
+  // CR-8: when the SNOOZED text does not fit, it is rebuilt with the short " Reply UNSNOOZE to
+  // resume." hint, and then also without the reading (P326), so the command is never the part
+  // that is cut (TankAlarm_SensorName.h).
+  char message[160];
+  composeSnoozeText(message, sizeof(message), snoozed, rec.site, rec.label, rec.userNumber, who,
+                    rec.alarmType, reading);
   char alarmId[64];
   snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
   sendSmsAlert(message, alarmId);
@@ -15137,22 +15220,18 @@ static void checkAlarmReminders() {
     if (isHighLike && !gConfig.smsOnHigh) continue;
     if (isLow && !gConfig.smsOnLow) continue;
 
-    char shortSite[24];
-    strlcpy(shortSite, rec.site, sizeof(shortSite));
-    char message[160];
+    char tail[160];
     if (isDigitalSensorType(rec.sensorType)) {
       // S3 (C-A04 B7): a float has no value or unit, only a state.
-      snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%s)",
-               shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-               rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+      snprintf(tail, sizeof(tail), " still in %s alarm (%s)",
                type, digitalStateText(rec.currentValue));
     } else {
-      snprintf(message, sizeof(message), "REMINDER: %s%s%d still in %s alarm (%.1f %s)",
-               shortSite, rec.userNumber > 0 ? " #" : " sensor ",
-               rec.userNumber > 0 ? rec.userNumber : rec.sensorIndex,
+      snprintf(tail, sizeof(tail), " still in %s alarm (%.1f %s)",
                type, rec.currentValue,
                rec.measurementUnit[0] ? rec.measurementUnit : "in");
     }
+    char message[160];
+    composeSensorText(message, sizeof(message), "REMINDER: ", rec.site, rec.label, rec.userNumber, tail);
 
     char alarmId[64];
     snprintf(alarmId, sizeof(alarmId), "%s_%d", rec.clientUid, (int)rec.sensorIndex);
@@ -15335,8 +15414,14 @@ static void sendDailyEmail() {
   for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
     JsonObject obj = sensors.add<JsonObject>();
     obj["client"] = gSensorRecords[i].clientUid;
-    obj["site"] = gSensorRecords[i].site;
-    obj["label"] = gSensorRecords[i].label;
+    // P326: the email routes name the sensor from site and label, so each goes without a partial
+    // UTF-8 character left at its end by a byte cut, as in SMS (TankAlarm_SensorName.h).
+    char dailySite[sizeof(gSensorRecords[i].site)];
+    char dailyLabel[sizeof(gSensorRecords[i].label)];
+    utf8CompleteCopy(dailySite, sizeof(dailySite), gSensorRecords[i].site);
+    utf8CompleteCopy(dailyLabel, sizeof(dailyLabel), gSensorRecords[i].label);
+    obj["site"] = dailySite;    // char[] assignment copies into the document
+    obj["label"] = dailyLabel;
     obj["sensorIndex"] = gSensorRecords[i].sensorIndex;
     if (gSensorRecords[i].userNumber > 0) {
       obj["userNumber"] = gSensorRecords[i].userNumber;
@@ -15345,7 +15430,13 @@ static void sendDailyEmail() {
     // even though the internal C++ field was renamed to `currentValue`. Renaming this wire
     // field would break existing SendGrid/SMTP email templates referencing {{levelInches}}.
     obj["levelInches"] = roundTo(gSensorRecords[i].currentValue, 1);
-    obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);
+    // R13: raw mA only for a current-loop sensor, where " (0 mA)" means no valid reading at the
+    // last report, plus a record with no stored type that holds a reading. Voltage, pulse and float
+    // sensors have no mA: without the key the email bridge prints no " (0 mA)".
+    if (strcmp(gSensorRecords[i].sensorType, "currentLoop") == 0 ||
+        (gSensorRecords[i].sensorType[0] == '\0' && gSensorRecords[i].sensorMa > 0.0f)) {
+      obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);
+    }
     obj["alarm"] = gSensorRecords[i].alarmActive;
     obj["alarmType"] = gSensorRecords[i].alarmType;
     // S3 (C-A04 B8): the email bridge prints ON/OFF for floats.
