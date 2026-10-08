@@ -78,6 +78,9 @@
 - [D] **S-D07 (P3) (S)** A late alarm cannot raise a day's alarm count once some of that day's readings have left the hot ring — _Copilot 2026-09-24 R05 (first Copilot review R3)_
   - `warmDecideVisitor()` keeps the stored row whenever its `n` is larger (`WarmTierStore.h:792`), so a recomputed row with a higher `al` is dropped, and a day with no readings left emits no row. Practically unreachable with default settings (about one history reading per day). Only the warm-history alarm count is affected; levels, emails and texts are not.
   - Fix: when the stored `n` is larger but the new `al` is higher, rewrite the stored row raising only `al`; allow an alarm-only raise on an existing row for a day with no readings left; never create a row (no fabricated levels). Tests with partial and empty rings; repeat delivery must be idempotent.
+- [ ] **S-D08 (P2) (S)** A later daily-report part can run the first-part alarm reconcile — _Copilot 2026-09-08 independent review R-01; re-checked in the #325 review of 2026-10-08_
+  - `handleDaily` sets `isFirstPart = (part == 0 || part == 1)` (kept for old 1-based clients), and `runAlarmReconcile = isFirstPart && (dailyAlarms || dailySchema >= 2)`. Current clients number parts from 0, send `alarms[]` only in part 0 and stamp `_sv` = `NOTEFILE_SCHEMA_VERSION` = 1, so part 1 does not run the reconcile today and part 0's alarms survive. Dormant: it turns on as soon as the schema version is raised to 2, when part 1 would clear every high/low alarm part 0 just confirmed (and their snooze state).
+  - Fix (server only, small): `isFirstPart = (dailySchema >= 1) ? (part == 0) : (part == 0 || part == 1)`, after checking which client versions stamp `_sv` and how they number parts. Host test: part 1 does not clear an alarm part 0 confirmed. Recommended before the relay/float release, and required before any schema bump.
 
 ### Server — Alarms, Delivery, and Remote Commands
 
