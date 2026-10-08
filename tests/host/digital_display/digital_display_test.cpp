@@ -163,6 +163,92 @@ static void testDailyAdmission() {
   CHECK(dailyReadingAdmissible(nullptr, true, true, false, false, true));
 }
 
+// R02 across daily-report parts. Mirrors the sketch (pinned in testSketchText): the reconcile
+// stamps a record it creates with dailyReconcileCreatedTime; the sensors[] loop writes when
+// dailyUpdateTimeWins and then clears the mark; telemetry/alarm/unload write and clear.
+struct PartRec {
+  double last;
+  bool pending;
+};
+static PartRec reconcileCreate(double serverClock, double sensorTimeInPart, double reportTime) {
+  PartRec r = {serverClock, false};  // upsertSensorRecord: server clock
+  r.last = dailyReconcileCreatedTime(sensorTimeInPart, reportTime, &r.pending);
+  return r;
+}
+static void loopWrite(PartRec &r, bool created, double now) {
+  if (dailyUpdateTimeWins(created, r.pending, now, r.last)) r.last = now;
+  r.pending = false;
+}
+// The dashboard's sensorUpdatePending test: the badge stays until lastUpdate > the request time.
+static bool badgeStays(const PartRec &r, double requested) { return r.last <= requested; }
+
+static void testDailyPartTimes() {
+  const double R = 1759900000.0;       // report "t" (all parts carry the same one)
+  const double S = R + 40.0;           // server clock when part 0 is handled
+  const double reading = R - 3 * 3600.0;  // k's last acquisition, older than the report
+  const double requested = R - 3600.0;    // an update request made after that reading
+
+  // Copilot's case: the client sends a metadata-only part 0 (alarms[] has k=2) and puts k=2 in
+  // part 1. The reconcile creates the record with no t for k, so it holds the report time until
+  // part 1 writes the older reading time; the update-request badge is not cleared.
+  {
+    PartRec r = reconcileCreate(S, 0.0, R);
+    CHECK(r.last == R && r.pending);
+    loopWrite(r, false, reading);  // part 1: the loop's upsert finds the record (created = false)
+    CHECK(r.last == reading && !r.pending);
+    CHECK(badgeStays(r, requested));
+    loopWrite(r, false, reading - 60.0);  // a redelivered older part never moves it back again
+    CHECK(r.last == reading);
+  }
+  // k is in part 0 with its t: the record takes it at once, nothing is pending.
+  {
+    PartRec r = reconcileCreate(S, reading, R);
+    CHECK(r.last == reading && !r.pending);
+    loopWrite(r, false, reading);
+    CHECK(r.last == reading);
+  }
+  // k is in part 0 without a t (pre-2.0.53 client): the loop gives it the report time.
+  {
+    PartRec r = reconcileCreate(S, 0.0, R);
+    loopWrite(r, false, R);
+    CHECK(r.last == R && !r.pending);
+  }
+  // A telemetry reply for k arrives between part 0 and part 1: its time is a reading, newer than
+  // part 1's t, and is kept.
+  {
+    PartRec r = reconcileCreate(S, 0.0, R);
+    const double telemetry = R + 600.0;
+    r.last = telemetry;  // handleTelemetry
+    r.pending = false;
+    loopWrite(r, false, reading);
+    CHECK(r.last == telemetry);
+  }
+  // Part 1 never arrives: the record keeps the report time (not 0, which the orphan prune and
+  // the registry eviction treat as never reported) and stays pending until a reading writes.
+  {
+    PartRec r = reconcileCreate(S, 0.0, R);
+    CHECK(r.last == R && r.pending);
+  }
+  // Existing records are unchanged: the loop never moves a time back, and only writes a newer one.
+  {
+    PartRec r = {R + 300.0, false};
+    loopWrite(r, false, reading);
+    CHECK(r.last == R + 300.0);
+    loopWrite(r, false, R + 900.0);
+    CHECK(r.last == R + 900.0);
+  }
+  // A record the loop's own upsert makes takes `now` (server clock is not a reading).
+  {
+    PartRec r = {S, false};
+    loopWrite(r, true, reading);
+    CHECK(r.last == reading);
+  }
+  CHECK(dailyReconcileCreatedTime(0.0, R, nullptr) == R);
+  CHECK(dailyReconcileCreatedTime(reading, R, nullptr) == reading);
+  CHECK(!dailyUpdateTimeWins(false, false, R, R));
+  CHECK(dailyUpdateTimeWins(false, true, R - 1.0, R));
+}
+
 static void testStuckDisabled() {
   CHECK(stuckOff("{\"sensor\":\"digital\",\"stuckDetection\":true}"));
   CHECK(stuckOff("{\"sensor\":\"digital\"}"));
@@ -224,7 +310,9 @@ static void testSketchText() {
   // (from its upsert to the history snapshot) is the guarded one; a record the loop's own upsert
   // just made (server clock, not a reading) takes `now` outright.
   CHECK(strstr(text, "    if (trustLevel) {\n      rec->currentValue = newLevel;\n    }\n") != nullptr);
-  CHECK(strstr(text, "\n    if (recCreated || now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;\n    gSensorRegistryDirty = true;\n") != nullptr);
+  CHECK(strstr(text, "\n    if (dailyUpdateTimeWins(recCreated, rec->dailyTimePending, now, rec->lastUpdateEpoch)) rec->lastUpdateEpoch = now;\n"
+                     "    rec->dailyTimePending = false;\n    gSensorRegistryDirty = true;\n") != nullptr);
+  CHECK(strstr(text, "if (recCreated || now > rec->lastUpdateEpoch)") == nullptr);
   CHECK(strstr(text, "\n    rec->lastUpdateEpoch = now;\n") == nullptr);
   CHECK(strstr(text, "    bool recCreated = false;\n"
                      "    SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex, &recCreated);\n") != nullptr);
@@ -236,7 +324,7 @@ static void testSketchText() {
       int writes = 0;
       int guarded = 0;
       static const char kWrite[] = "rec->lastUpdateEpoch = ";
-      static const char kGuard[] = "if (recCreated || now > rec->lastUpdateEpoch) ";
+      static const char kGuard[] = "if (dailyUpdateTimeWins(recCreated, rec->dailyTimePending, now, rec->lastUpdateEpoch)) ";
       for (const char *p = strstr(loopBegin, kWrite); p && p < loopEnd; p = strstr(p + 1, kWrite)) {
         ++writes;
         const size_t g = sizeof(kGuard) - 1;
@@ -253,10 +341,23 @@ static void testSketchText() {
   CHECK(strstr(text, "\n          rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();\n") == nullptr);
   CHECK(strstr(text, "              reportSensorEpoch = t[\"t\"] | 0.0;\n") != nullptr);
   CHECK(strstr(text, "          if (recCreated) {\n"
-                     "            rec->lastUpdateEpoch = (reportSensorEpoch > 0.0)\n"
-                     "                                       ? reportSensorEpoch\n"
-                     "                                       : ((epoch > 0.0) ? epoch : currentEpoch());\n"
+                     "            rec->lastUpdateEpoch = dailyReconcileCreatedTime(reportSensorEpoch,\n"
+                     "                                                             (epoch > 0.0) ? epoch : currentEpoch(),\n"
+                     "                                                             &rec->dailyTimePending);\n"
                      "          }\n") != nullptr);
+  // ...and the pending mark it can set is RAM-only and cleared by every other writer of the time:
+  // telemetry, alarm notes and unload events (a reading newer than the daily part's t).
+  CHECK(strstr(text, "  bool dailyTimePending;\n") != nullptr);
+  CHECK(strstr(text, "  rec->currentValue = newLevel;\n  rec->lastUpdateEpoch = now;\n  rec->dailyTimePending = false;\n") != nullptr);
+  CHECK(strstr(text, "  rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();\n  rec->dailyTimePending = false;\n") != nullptr);
+  CHECK(strstr(text, "    rec->lastUpdateEpoch = eventEpoch;\n    rec->dailyTimePending = false;\n") != nullptr);
+  {
+    // The field appears only in the declaration, the reconcile, the loop (guard and clear) and
+    // the three clears above: never in the registry save/load.
+    size_t uses = 0;
+    for (const char *p = strstr(text, "dailyTimePending"); p != nullptr; p = strstr(p + 1, "dailyTimePending")) ++uses;
+    CHECK(uses == 7);
+  }
   {
     const char *recBegin = strstr(text, "        SensorRecord *rec = upsertSensorRecord(clientUid, sensorIdx, &recCreated);\n");
     const char *recEnd = recBegin ? strstr(recBegin, "    // Reconciliation: clear alarms on server for sensors that the client") : nullptr;
@@ -306,6 +407,7 @@ int main() {
   testNoteValue();
   testStuckDisabled();
   testDailyAdmission();
+  testDailyPartTimes();
   testSketchText();
   if (gFailures) {
     printf("digital_display: %lu of %lu checks FAILED\n", gFailures, gChecks);
