@@ -13947,15 +13947,19 @@ static void handleUnload(JsonDocument &doc, double epoch) {
   // nor "un", so take the label and the Display Number from the sensor record when the note
   // lacks them. CR-7: an unknown label stays empty (no "Tank" placeholder); the text then names
   // the sensor by site (and Display Number) alone, and the unload log's "n" is empty too.
-  const SensorRecord *known = findSensorByHash(clientUid, sensorIndex);
+  // P326: resolve the record once, before the log entry, with upsertSensorRecord: its linear scan
+  // recovers a record the hash table has lost (a bare findSensorByHash would miss it and log and
+  // notify without the stored label and number), and the same record takes the update below.
+  // It is null only when the registry cannot hold the sensor; the event is still logged and sent.
+  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
   const char *tankLabel = noteLabel;
-  if (tankLabel[0] == '\0' && known != nullptr) {
-    tankLabel = known->label;
+  if (tankLabel[0] == '\0' && rec != nullptr) {
+    tankLabel = rec->label;
   }
   JsonVariantConst un = doc["un"];
   const int32_t unValue = un.is<int32_t>() ? un.as<int32_t>() : -1;
   const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), unValue,
-                                                  false, known != nullptr ? known->userNumber : 0);
+                                                  false, rec != nullptr ? rec->userNumber : 0);
 
   Serial.print(F("Unload event received: "));
   Serial.print(siteName);
@@ -14006,8 +14010,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     sendUnloadEmail(entry);
   }
   
-  // Update sensor record with current level
-  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);
+  // Update sensor record with current level (the record resolved above)
   if (rec) {
     strlcpy(rec->site, siteName, sizeof(rec->site));
     // Only a real label from the note replaces the record's (the unload note has no "n" today);
@@ -14016,8 +14019,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
       strlcpy(rec->label, noteLabel, sizeof(rec->label));
     }
     // A future note with a valid "un" sets the number; a missing or malformed one keeps the
-    // record's own (read from rec, not `known`, so a hash miss that the upsert's linear scan
-    // recovers cannot clear it).
+    // record's own.
     rec->userNumber = noteDisplayNumber(!un.isNull(), unValue, false, rec->userNumber);
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;

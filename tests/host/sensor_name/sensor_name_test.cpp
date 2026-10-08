@@ -796,14 +796,14 @@ static void testSketchText() {
   CHECK(foundBetween("  JsonVariantConst un = doc[\"un\"];\n"
                      "  const int32_t unValue = un.is<int32_t>() ? un.as<int32_t>() : -1;\n"
                      "  const uint8_t displayNumber = noteDisplayNumber(!un.isNull(), unValue,\n"
-                     "                                                  false, known != nullptr ? known->userNumber : 0);\n",
+                     "                                                  false, rec != nullptr ? rec->userNumber : 0);\n",
                      unload, unloadEnd));
   // P326 (Copilot 4097040017): handleUnload's record update takes the number from the record
   // itself and marks the registry dirty after its writes (site, label, Display Number, level,
   // time), as handleTelemetry, handleAlarm and handleDaily do; an existing record's upsert does
   // not mark it, so without this the update was lost at the next reboot.
   {
-    const char *unloadRec = findAfter("  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n"
+    const char *unloadRec = findAfter("  // Update sensor record with current level (the record resolved above)\n"
                                       "  if (rec) {\n"
                                       "    strlcpy(rec->site, siteName, sizeof(rec->site));\n", unload);
     CHECK(unloadRec != nullptr && unloadEnd != nullptr && unloadRec < unloadEnd);
@@ -894,11 +894,29 @@ static void testSketchText() {
   const char *unloadGuard = findAfter(kUnloadGuard, unload);
   CHECK(unloadGuard != nullptr && unloadEnd != nullptr && unloadGuard < unloadEnd);
   const char *unloadUidCheck = findAfter("  if (!isValidClientUid(clientUid)) {\n", unload);
-  const char *unloadLookup = findAfter("findSensorByHash(clientUid, sensorIndex)", unload);
+  // P326 (Copilot, review overview): the record is resolved once with upsertSensorRecord (whose
+  // linear scan recovers a record the hash table lost) after the guard and before the log entry is
+  // built; a bare findSensorByHash there named the sensor without its stored label and number.
+  const char *unloadLookup = findAfter("  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n"
+                                       "  const char *tankLabel = noteLabel;\n", unload);
+  const char *unloadEntry = findAfter("  UnloadLogEntry entry;\n", unload);
   const char *unloadLog = findAfter("  logUnloadEvent(entry);\n", unload);
   CHECK(unloadUidCheck != nullptr && unloadGuard != nullptr && unloadUidCheck < unloadGuard);
-  CHECK(unloadGuard != nullptr && unloadLookup != nullptr && unloadLog != nullptr && unloadGuard < unloadLookup &&
-        unloadLookup < unloadLog);
+  CHECK(unloadGuard != nullptr && unloadLookup != nullptr && unloadEntry != nullptr && unloadLog != nullptr &&
+        unloadGuard < unloadLookup && unloadLookup < unloadEntry && unloadEntry < unloadLog);
+  CHECK(!foundBetween("findSensorByHash(", unload, unloadEnd));
+  CHECK(foundBetween("upsertSensorRecord(", unload, unloadEnd));
+  CHECK(!foundBetween("upsertSensorRecord(", unloadEntry, unloadEnd));  // one resolve, shared by the update
+  CHECK(countOf(text, "upsertSensorRecord(clientUid, sensorIndex);") == 3);  // telemetry, alarm, unload
+  CHECK(!foundBetween("known->", unload, unloadEnd) && !foundBetween("*known", unload, unloadEnd));
+  // upsertSensorRecord keeps its linear-scan recovery (and hash rebuild) after a hash miss.
+  const char *upsertEnd = findAfter("\n}\n", upsert);
+  CHECK(foundBetween("  SensorRecord *existing = findSensorByHash(clientUid, sensorIndex);\n"
+                     "  if (existing) {\n"
+                     "    return existing;\n"
+                     "  }\n", upsert, upsertEnd));
+  CHECK(foundBetween("      rebuildSensorHashTable();\n"
+                     "      return &gSensorRecords[i];\n", upsert, upsertEnd));
   CHECK(!foundBetween("doc[\"k\"]", unload, unloadGuard));  // no read before the guard
 
   // sendDailyEmail still sends sensorIndex (old pasted scripts print '#undefined' without it) and
@@ -1014,10 +1032,10 @@ static void testSketchText() {
   // The contacts manager's alarm list names a sensor with no label "Sensor", as the dashboard does.
   CHECK(countOf(text, "alarm.label||'Sensor'") == 3);
   CHECK(strstr(text, "${escapeHtml(alarm.label)}") == nullptr && strstr(text, "${alarm.label}") == nullptr);
-  CHECK(foundBetween("  const SensorRecord *known = findSensorByHash(clientUid, sensorIndex);\n"
+  CHECK(foundBetween("  SensorRecord *rec = upsertSensorRecord(clientUid, sensorIndex);\n"
                      "  const char *tankLabel = noteLabel;\n"
-                     "  if (tankLabel[0] == '\\0' && known != nullptr) {\n"
-                     "    tankLabel = known->label;\n"
+                     "  if (tankLabel[0] == '\\0' && rec != nullptr) {\n"
+                     "    tankLabel = rec->label;\n"
                      "  }\n"
                      "  JsonVariantConst un = doc[\"un\"];\n", unload, unloadEnd));
   CHECK(!foundBetween("\"Tank\";", unload, unloadEnd) && !foundBetween("\"Tank\",", unload, unloadEnd) &&
