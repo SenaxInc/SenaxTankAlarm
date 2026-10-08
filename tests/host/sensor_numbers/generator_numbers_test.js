@@ -7,7 +7,8 @@
 // server sketch, runs its numbering helpers (nextSensorNumber, sensorNumbersValid,
 // loadSensorNumbers, cardSensorNumber) in a vm context, runs addSensor and startCommissioning
 // against a small fake DOM, runs cachedSensorHigh, the import handler, submitConfig and the Device
-// UID change handler against a stub fetch, and checks that the page uses the helpers where a
+// UID change handler against a stub fetch (including a client switch while a request is in flight,
+// so a late mark never raises another client's), and checks that the page uses the helpers where a
 // sensor's number is created, sent, loaded and turned into an alarm-contact id.
 
 const fs = require('fs');
@@ -315,6 +316,7 @@ let flowTests = null;
   let postStatus = 200;
   let postText = 'OK';
   let onGet = null;       // runs while a GET is in flight
+  let onPost = null;      // runs while a POST is in flight
   let postReply = null;   // (body) => [status, text], in place of postStatus and postText
   let confirmAnswer = false;
   const confirms = [];
@@ -326,6 +328,7 @@ let flowTests = null;
     if (url === '/api/config') {
       const body = JSON.parse(opts.body);
       posts.push(body);
+      if (onPost) { const f = onPost; onPost = null; f(); }
       const [status, text] = postReply ? postReply(body) : [postStatus, postText];
       return { status, statusText: '', text: async () => text };
     }
@@ -343,9 +346,12 @@ let flowTests = null;
   ctx.retryBtn = { style: {} };
   ctx.syncBtn = { style: {} };
   vm.runInContext(extractAsyncFunction(page, 'cachedSensorHigh'), ctx);
+  for (const n of ['currentClientUid', 'raiseSensorHighFor']) vm.runInContext(extractFunction(page, n), ctx);
   vm.runInContext(extractAsyncFunction(page, 'submitConfig'), ctx);
-  // The loader's numbering, as window.loadConfig runs it (pinned below); null throws like the page.
+  // The loader's Device UID and numbering, as window.loadConfig runs them (pinned below); null
+  // throws like the page.
   vm.runInContext('var loadConfig=function(c,floor){if(c===null)throw new TypeError("null config");' +
+    "if(els.clientUid)els.clientUid.value=c.deviceUid||'';" +
     'const loadedNumbers=loadSensorNumbers(c.sensors,c.snh,floor);sensorNumberHigh=loadedNumbers.high;' +
     '__setCards(loadedNumbers.nums);};', ctx);
   // collectConfig's number handling: each card's number, snh = max(mark, numbers in use).
@@ -357,7 +363,7 @@ let flowTests = null;
   const importFile = (text) => onload({ target: { result: text } });
   const submit = () => ctx.submitConfig({ preventDefault() {} });
   const reset = () => {
-    stored = {}; getFails = false; postStatus = 200; postText = 'OK'; onGet = null;
+    stored = {}; getFails = false; postStatus = 200; postText = 'OK'; onGet = null; onPost = null;
     postReply = null; confirmAnswer = false; confirms.length = 0;
     gets.length = 0; posts.length = 0; toasts.length = 0;
     cards = []; setHigh(0); ctx.els.clientUid.value = 'dev:A';
@@ -498,6 +504,94 @@ let flowTests = null;
     ctx.els.clientUid.value = 'dev:new';
     await onUidChange();
     checkEq('typed UID of a new client leaves the mark', high(), 2);
+
+    // C323 review (Copilot 4211390806): a mark is applied only while the Device UID box (trimmed)
+    // still names the client it was read or sent for. The operator switches to client B while the
+    // request for A is in flight; B's mark must not move.
+    checkEq('current client is the trimmed Device UID', (ctx.els.clientUid.value = ' dev:A ', ctx.currentClientUid()), 'dev:A');
+    checkEq('no Device UID box is no client', (() => {
+      const box = ctx.els.clientUid; ctx.els.clientUid = null;
+      try { return ctx.currentClientUid(); } finally { ctx.els.clientUid = box; }
+    })(), '');
+    {
+      reset();
+      setHigh(4);
+      checkEq('raise for the current client', [ctx.raiseSensorHighFor('dev:A', 9), high()], [true, 9]);
+      checkEq('raise never lowers', [ctx.raiseSensorHighFor('dev:A', 3), high()], [true, 9]);
+      checkEq('raise for another client is dropped', [ctx.raiseSensorHighFor('dev:B', 200), high()], [false, 9]);
+      checkEq('raise without a UID is dropped', [ctx.raiseSensorHighFor('', 200), high()], [false, 9]);
+      for (const bad of [256, 12.5, '20', null, undefined, NaN]) {
+        ctx.raiseSensorHighFor('dev:A', bad);
+        checkEq('raise ignores mark ' + String(bad), high(), 9);
+      }
+    }
+    // Client B, loaded with mark 2; client A's server mark is 255.
+    const clientA255 = { config: { snh: 255, sensors: [{ number: 1 }, { number: 2 }] } };
+    const switchToB = () => { ctx.els.clientUid.value = 'dev:B'; ctx.__setCards([1, 2]); setHigh(2); };
+    for (const [label, arm] of [
+      ['during the POST', () => { onPost = switchToB; }],
+      ['during the GET after the POST', () => { onGet = switchToB; }],
+    ]) {
+      reset();
+      stored = { 'dev:A': clientA255, 'dev:B': { config: { snh: 2, sensors: [{ number: 1 }, { number: 2 }] } } };
+      ctx.__setCards([1, 2]);
+      setHigh(255);
+      arm();
+      await submit();
+      checkEq('submit for A, switched to B ' + label + ': sent to A', posts.map((b) => b.client), ['dev:A']);
+      checkEq('submit for A, switched to B ' + label + ': B keeps its mark', [ctx.els.clientUid.value, high()], ['dev:B', 2]);
+      ctx.addSensor();
+      checkEq('submit for A, switched to B ' + label + ': Add Sensor on B is #3', nums(), [1, 2, 3]);
+    }
+    // Switched to B and back to A (with spaces) before the reply: the reply is A's, so it applies.
+    reset();
+    stored = { 'dev:A': clientA };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    onPost = () => { ctx.els.clientUid.value = 'dev:B'; onGet = () => { ctx.els.clientUid.value = ' dev:A '; }; };
+    await submit();
+    checkEq('submit for A, switched away and back: A\'s mark applies', high(), 5);
+    // Unchanged client: the reply applies (the raise this guard must keep).
+    reset();
+    stored = { 'dev:A': clientA255 };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    await submit();
+    checkEq('submit for A, unchanged: raised to A\'s mark', high(), 255);
+    // A client started (no stored config) while A's send is in flight starts at #1, not past A's mark.
+    reset();
+    stored = { 'dev:A': clientA255 };
+    ctx.__setCards([1, 2]);
+    setHigh(255);
+    onGet = () => ctx.startCommissioning('dev:C');
+    await submit();
+    checkEq('submit for A, client C started meanwhile: C keeps its mark', [ctx.els.clientUid.value, high()], ['dev:C', 2]);
+    ctx.addSensor();
+    checkEq('submit for A, client C started meanwhile: Add Sensor on C is #3', nums(), [1, 2, 3]);
+    // The Device UID change handler: A typed in, then B loaded before A's mark arrives.
+    reset();
+    stored = { 'dev:A': clientA255 };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    ctx.els.clientUid.value = 'dev:A';
+    onGet = switchToB;
+    await onUidChange();
+    checkEq('typed A, switched to B before the reply: B keeps its mark', [gets, high()], [['/api/client?uid=dev%3AA'], 2]);
+    reset();
+    stored = { 'dev:A': clientA255 };
+    ctx.__setCards([1, 2]);
+    setHigh(2);
+    ctx.els.clientUid.value = 'dev:A';
+    await onUidChange();
+    checkEq('typed A, unchanged: raised to A\'s mark', high(), 255);
+    // The import handler cannot cross clients: the mark it reads is for the file's UID, and the
+    // loader sets the Device UID box to that same UID together with the mark.
+    reset();
+    stored = { 'dev:A': clientA };
+    onGet = switchToB;
+    await importFile(JSON.stringify({ deviceUid: 'dev:A', sensors: [{ number: 1 }, { number: 2 }] }));
+    checkEq('import of A, switched to B meanwhile: the page holds A with A\'s mark',
+      [ctx.els.clientUid.value, nums(), high()], ['dev:A', [1, 2], 5]);
 
     // C323 (owner, 2026-10-07): the server refuses (409) a number the client used before and
     // removed, unless the resend carries the top-level reuseRetired: true. A stub server applies
@@ -653,18 +747,36 @@ check('import handler loads with the server\'s mark',
     submitSrc.includes("{showToast('Not sent: '+sent.text,true);return;}sent=await send(true);}") &&
     submitSrc.split("fetch('/api/config'").length === 2);
 }
-check('submitConfig raises the mark after 200 or 202',
+// C323 review (Copilot 4211390806): the current client is the trimmed Device UID box, and every
+// mark that arrives after an await goes through raiseSensorHighFor, which drops it when the box
+// no longer names the client it was read or sent for.
+check('current client is the trimmed Device UID box',
+  extractFunction(page, 'currentClientUid') ===
+    "function currentClientUid(){return (els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();}");
+check('a late mark applies only to the client it was read for',
+  extractFunction(page, 'raiseSensorHighFor') ===
+    'function raiseSensorHighFor(uid,high){if(!uid||currentClientUid()!==uid)return false;' +
+    'if(Number.isInteger(high)&&high>sensorNumberHigh&&high<=255)sensorNumberHigh=high;return true;}');
+check('submitConfig captures the client before its awaits',
+  extractFunction(page, 'submitConfig').startsWith(
+    'function submitConfig(e){e.preventDefault();try{const clientUid=currentClientUid();if(!clientUid){'));
+check('submitConfig raises the mark after 200 or 202, for the client it sent to',
   extractFunction(page, 'submitConfig').includes(
-    'if(res.status===200||res.status===202){const h=await cachedSensorHigh(clientUid);sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);}'));
-check('Device UID change raises the mark',
-  page.includes("if(els.clientUid)els.clientUid.addEventListener('change',async()=>{const h=await cachedSensorHigh(els.clientUid.value.trim());if(h>sensorNumberHigh)sensorNumberHigh=h;});"));
+    'if(res.status===200||res.status===202){const h=await cachedSensorHigh(clientUid);raiseSensorHighFor(clientUid,Math.max(cfg.snh,h));}'));
+check('Device UID change raises the mark, for the client it read',
+  page.includes("if(els.clientUid)els.clientUid.addEventListener('change',async()=>{const uid=currentClientUid();const h=await cachedSensorHigh(uid);raiseSensorHighFor(uid,h);});"));
+check('the loader sets the Device UID with the mark (the import reads the file UID\'s mark)',
+  page.includes("window.loadConfig=function(c,floor){if(els.siteName)els.siteName.value=c.site||'';if(els.clientUid)els.clientUid.value=c.deviceUid||'';"));
+check('every read of the server\'s mark is applied through the guard or with its own UID',
+  page.split('await cachedSensorHigh(').length === 4 &&
+  page.split('raiseSensorHighFor(').length === 4);
 check('loading from the server passes no floor',
   page.includes('if(c&&c.config)loadConfig(c.config);else startCommissioning(uid);') && page.split('loadConfig(').length === 3);
 // Every place the mark is set: only the declaration and commissioning can lower it; a new one
 // must be added here after checking that it never reuses a number.
 checkEq('every assignment of the mark',
   (page.match(/sensorNumberHigh=(?!=)[^;]*;/g) || []).sort(),
-  ['sensorNumberHigh=0;', 'sensorNumberHigh=Math.max(sensorNumberHigh,cfg.snh,h);', 'sensorNumberHigh=h;',
+  ['sensorNumberHigh=0;', 'sensorNumberHigh=high;',
     'sensorNumberHigh=loadedNumbers.high;', 'sensorNumberHigh=num;', 'sensorNumberHigh=tpl.length;'].sort());
 check('commissioning restarts numbering at 1',
   page.includes("function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;") &&
