@@ -481,6 +481,11 @@ struct SensorRecord {
   bool alarmActive;
   char alarmType[24];
   double lastUpdateEpoch;
+  // R02: RAM-only, not persisted (like sensorFault). Set when handleDaily's missed-alarm reconcile
+  // created this record from a part without this sensor's reading time (the client can defer a
+  // monitor to a later part), so lastUpdateEpoch holds the report time until the sensors[] loop
+  // writes the reading's own time, even an older one. Every other lastUpdateEpoch writer clears it.
+  bool dailyTimePending;
   double firstSeenEpoch;        // When this record was first created (for archive naming)
   // 24-hour change tracking (computed server-side)
   float previousValue;        // Reading from ~24h ago, in the sensor's own measurement unit
@@ -12964,6 +12969,7 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   
   rec->currentValue = newLevel;
   rec->lastUpdateEpoch = now;
+  rec->dailyTimePending = false;
   gSensorRegistryDirty = true;
 
   // Self-clear a stale latched "sensor-stuck" alarm. A sensor-stuck alarm is only set by
@@ -13273,6 +13279,7 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // config-push clear), and the note does not say which. The reading enters history from
   // telemetry or the daily report at its own time.
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+  rec->dailyTimePending = false;
   gSensorRegistryDirty = true;
 
   // Check rate limit before sending SMS
@@ -13572,12 +13579,15 @@ static void handleDaily(JsonDocument &doc, double epoch) {
           // sensors[] loop below sets it from this report's reading for k. (A report-time stamp
           // here would hide that reading's age and could clear an update request's badge, since
           // the loop never moves the time back.) A record created just above holds only the
-          // server clock from upsertSensorRecord, so it takes the time the loop would give it:
-          // this part's `t` for k, else the report time.
+          // server clock from upsertSensorRecord, so it takes this part's `t` for k. Without one
+          // (the client can send a metadata-only part 0 and defer k to a later part) it holds
+          // the report time and is marked pending, so the sensors[] loop for k, in this part or
+          // a later one, writes the reading's time even when older. (0 would read as "never
+          // reported" to the orphan prune and the registry eviction, which drop such a record.)
           if (recCreated) {
-            rec->lastUpdateEpoch = (reportSensorEpoch > 0.0)
-                                       ? reportSensorEpoch
-                                       : ((epoch > 0.0) ? epoch : currentEpoch());
+            rec->lastUpdateEpoch = dailyReconcileCreatedTime(reportSensorEpoch,
+                                                             (epoch > 0.0) ? epoch : currentEpoch(),
+                                                             &rec->dailyTimePending);
           }
           gSensorRegistryDirty = true;
         }
@@ -13744,8 +13754,10 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     // R02: the per-sensor `t` is the last acquisition minute and can be at or before a telemetry
     // reply already stored here (pollNotecard runs handleTelemetry before handleDaily), so it
     // never moves the time back: that would bring back an update request's badge. A record made
-    // by this loop's upsert holds only the server clock, not a reading, so it takes `now`.
-    if (recCreated || now > rec->lastUpdateEpoch) rec->lastUpdateEpoch = now;
+    // by this loop's upsert holds only the server clock, not a reading, so it takes `now`, as
+    // does one the missed-alarm reconcile made from a part without k's reading (report time).
+    if (dailyUpdateTimeWins(recCreated, rec->dailyTimePending, now, rec->lastUpdateEpoch)) rec->lastUpdateEpoch = now;
+    rec->dailyTimePending = false;
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
@@ -13922,6 +13934,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     strlcpy(rec->label, tankLabel, sizeof(rec->label));
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;
+    rec->dailyTimePending = false;
   }
 }
 

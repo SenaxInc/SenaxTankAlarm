@@ -77,6 +77,26 @@ static inline bool dailyReadingAdmissible(const char *sensorType, bool hasT, boo
   return valuePresent;
 }
 
+// R02: lastUpdateEpoch for a record the daily missed-alarm reconcile has just created (it holds
+// only the server clock). sensorTime is this part's "t" for the alarm's k (0 when this part has
+// no t for k: the client can send a metadata-only part 0 and put k in a later part); reportTime
+// is the report time. Without a sensorTime the record holds reportTime and *pending is set, so
+// the sensors[] loop for k writes the reading's own time even when older (dailyUpdateTimeWins).
+static inline double dailyReconcileCreatedTime(double sensorTime, double reportTime, bool *pending) {
+  const bool known = sensorTime > 0.0;
+  if (pending != nullptr) *pending = !known;
+  return known ? sensorTime : reportTime;
+}
+
+// R02: whether handleDaily's sensors[] loop writes a reading time `now` over a record's
+// lastUpdateEpoch `last`. A reading time never moves the time back (a telemetry reply handled
+// first can be newer, and going back would bring back an update request's badge), except over a
+// time that is not a reading's: a record the loop's own upsert just made (created: server clock)
+// or one the reconcile made without k's time (pending: report time).
+static inline bool dailyUpdateTimeWins(bool created, bool pending, double now, double last) {
+  return created || pending || now > last;
+}
+
 // True when an alarm note carries a reading. Diagnostic, sensor-recovered and config-push clear
 // notes carry none; resolveLevel() returns 0 for them, which must not overwrite the last value.
 static inline bool alarmNoteCarriesValue(JsonObjectConst note) {
