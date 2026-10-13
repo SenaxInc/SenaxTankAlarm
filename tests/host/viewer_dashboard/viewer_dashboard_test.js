@@ -42,6 +42,7 @@ class El {
     this.disabled = false;
     this.style = {};
     this.attrs = {};
+    this.dataset = {};
     this.children = [];
     this.listeners = {};
     const self = this;
@@ -57,11 +58,15 @@ class El {
   appendChild(c) { this.children.push(c); return c; }
   setAttribute(k, v) { this.attrs[k] = String(v); }
   addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
+  focus() { focused = this; }
+  // Class selectors only ('.name'), which is all the page asks for.
+  querySelectorAll(sel) { const c = sel.replace(/^\./, ''); return this.all().slice(1).filter((e) => e.classList.contains(c)); }
   click() { (this.listeners.click || []).forEach((fn) => fn.call(this, {})); }
   html() { return this._html + this.textContent + this.children.map((c) => c.html()).join(''); }
   all() { return [this].concat(...this.children.map((c) => c.all())); }
 }
 
+let focused = null;
 const NOW = 1_800_000_000;  // fixed clock (seconds)
 const sensors = [
   // Site A: one client with a float in alarm (reminders snoozed), a gas sensor and a tank.
@@ -160,6 +165,7 @@ vm.runInContext(scripts[scripts.length - 1], ctx);
   check('site B dot is yellow (stale)', siteB.children[0].children[1].children[0].className === 'cdot yellow');
   dots[0].click();
   const infoA = elements.siteSections.children[0].children[1].innerHTML;
+  check('focus stays on the clicked dot', focused && focused.dataset.key === 'Site A|dev:A1' && focused.attrs['aria-expanded'] === 'true');
   check('dot opens client details', infoA.includes('dev:A1') && infoA.includes('3 sensors') && infoA.includes('VIN: 12.60 V'), infoA);
   elements.siteSections.children[0].children[0].children[1].children[0].click();
   check('dot click again closes details', elements.siteSections.children[0].children[1].innerHTML === '', elements.siteSections.children[0].children[1].innerHTML);
@@ -176,6 +182,13 @@ vm.runInContext(scripts[scripts.length - 1], ctx);
   for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
   check('Request Update posts', fetched.some((f) => f.url === '/api/request-update' && f.method === 'POST'));
   check('Request Update confirms', elements.toast.textContent.startsWith('Update requested'), elements.toast.textContent);
+
+  // A snooze set before the server's clock synced is stored as epoch 1: no age is shown for it.
+  apiSensors.sensors = [Object.assign({}, sensors[0], { sz: 1 })];
+  vm.runInContext(scripts[scripts.length - 1], ctx);
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  const pre = elements.alarmGrid.children.map((c) => c.innerHTML).join('');
+  check('pre-sync snooze shows no age', pre.includes('ALARM: triggered - reminders snoozed</div>'), pre);
 
   // A summary older than two publish periods is flagged.
   apiSensors.ge = NOW - 3 * 21600;
