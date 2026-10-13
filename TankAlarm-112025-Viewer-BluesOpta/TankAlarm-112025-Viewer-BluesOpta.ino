@@ -32,6 +32,7 @@
 #endif
 #include <math.h>
 #include <string.h>
+#include "TankAlarm_ViewerPrint.h"  // daily report value lines (same rules as the dashboard)
 
 // Debug mode - controls Serial output and Notecard debug logging
 // For PRODUCTION: Leave commented out (default) to save power consumption
@@ -2156,22 +2157,27 @@ static bool sendDailyPrintJob() {
       }
       printer.println();
 
-      // Level in feet and inches
-      if (rec.currentValue >= 0.0f && isfinite(rec.currentValue)) {
-        int feet = (int)(rec.currentValue / 12.0f);
-        float remIn = rec.currentValue - (float)(feet * 12);
-        char levelBuf[16];
-        snprintf(levelBuf, sizeof(levelBuf), "%d' %.1f\"", feet, remIn);
-        printer.print(F("   Level:  "));
-        printer.println(levelBuf);
-      } else {
-        printer.println(F("   Level:  --"));
+      // Contents (e.g. Diesel), when configured
+      if (rec.contents[0]) {
+        printer.print(F("   "));
+        printer.println(rec.contents);
       }
 
+      // Reading, by the dashboard's card rules (TankAlarm_ViewerPrint.h): FAULT, float
+      // switch ON/OFF, tank level in feet and inches, or value and unit.
+      char valueLabel[12];
+      char valueBuf[40];
+      viewerPrintValueLine(rec.objectType, rec.sensorType, rec.measurementUnit, rec.currentValue,
+                           rec.fault, valueLabel, sizeof(valueLabel), valueBuf, sizeof(valueBuf));
+      printer.print(F("   "));
+      printer.print(valueLabel);
+      printer.println(valueBuf);
+
       // 24-hour change
-      if (rec.hasChange24h) {
-        char changeBuf[16];
-        snprintf(changeBuf, sizeof(changeBuf), "%+.1f\"", rec.change24h);
+      char changeBuf[32];
+      if (rec.hasChange24h &&
+          viewerPrintChangeLine(rec.objectType, rec.sensorType, rec.measurementUnit, rec.change24h,
+                                changeBuf, sizeof(changeBuf))) {
         printer.print(F("   Change: "));
         printer.println(changeBuf);
       }
@@ -2180,7 +2186,11 @@ static bool sendDailyPrintJob() {
       printer.print(F("   Status: "));
       if (rec.alarmActive) {
         printer.print(rec.alarmType[0] ? rec.alarmType : "ALARM");
-        printer.println(F("  *ALARM*"));
+        printer.print(F("  *ALARM*"));
+        if (rec.snoozeEpoch > 0) {
+          printer.print(F(" (reminders snoozed)"));
+        }
+        printer.println();
       } else {
         printer.println(F("Normal"));
       }
