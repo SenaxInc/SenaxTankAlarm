@@ -1136,10 +1136,11 @@ See [Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md) for detailed network diagn
     "client": "dev:864475044012345",
     "config": {
       "sampleSeconds": 1800,
-      "tanks": [...]
+      "sensors": [...]
     }
   }
   ```
+- `config` is the full client config: it must include its `sensors` list, each sensor with its `number` (1-255)
 
 **`POST /api/relay`**
 - Activate/deactivate relay
