@@ -59,6 +59,7 @@ class El {
   setAttribute(k, v) { this.attrs[k] = String(v); }
   addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
   focus() { focused = this; }
+  contains(el) { return this.all().includes(el); }
   // Class selectors only ('.name'), which is all the page asks for.
   querySelectorAll(sel) { const c = sel.replace(/^\./, ''); return this.all().slice(1).filter((e) => e.classList.contains(c)); }
   click() { (this.listeners.click || []).forEach((fn) => fn.call(this, {})); }
@@ -82,6 +83,7 @@ const elements = {};
 const document = {
   getElementById: (id) => (elements[id] = elements[id] || new El(id)),
   createElement: () => new El(),
+  get activeElement() { return focused; },
 };
 const fetched = [];
 function fetchStub(url, opts) {
@@ -93,13 +95,14 @@ function fetchStub(url, opts) {
   return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
 }
 const timers = [];
+const intervals = [];
 const ctx = {
   document,
   fetch: fetchStub,
   AbortController: class { constructor() { this.signal = {}; } abort() {} },
   setTimeout: (fn) => { timers.push(fn); return timers.length; },
   clearTimeout: () => {},
-  setInterval: () => 0,
+  setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
   Date: class extends Date { static now() { return NOW * 1000; } },
   console,
   Promise,
@@ -169,6 +172,21 @@ vm.runInContext(scripts[scripts.length - 1], ctx);
   check('dot opens client details', infoA.includes('dev:A1') && infoA.includes('3 sensors') && infoA.includes('VIN: 12.60 V'), infoA);
   elements.siteSections.children[0].children[0].children[1].children[0].click();
   check('dot click again closes details', elements.siteSections.children[0].children[1].innerHTML === '', elements.siteSections.children[0].children[1].innerHTML);
+
+  // The 60 s refresh re-renders every dot; a dot that had focus hands it to its replacement.
+  const refresh = intervals.find((t) => t.ms === 60000);
+  check('page refreshes every 60 s', !!refresh);
+  const before = elements.siteSections.children[1].children[0].children[1].children[0];
+  before.focus();
+  refresh.fn();
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  check('auto-refresh keeps focus on the same client dot', focused !== before && focused.dataset.key === 'Site B|dev:B1' &&
+    elements.siteSections.contains(focused), focused && focused.dataset.key);
+  // Focus elsewhere on the page is left alone.
+  elements.requestUpdateBtn.focus();
+  refresh.fn();
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  check('auto-refresh leaves other focus alone', focused === elements.requestUpdateBtn);
 
   check('alarm section visible', elements.alarmSection.classList.contains('visible'));
   const alarmCards = elements.alarmGrid.children.map((c) => c.innerHTML);
