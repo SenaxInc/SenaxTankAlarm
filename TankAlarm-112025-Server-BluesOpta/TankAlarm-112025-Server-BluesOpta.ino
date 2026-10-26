@@ -15372,10 +15372,16 @@ static void publishViewerSummary() {
 
   JsonArray arr = doc["sensors"].to<JsonArray>();
   for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
+    // Name, site, type, unit and contents come from the client's configuration when it has
+    // one, exactly as sendClientDataJson() resolves them for the server dashboard: a client
+    // keeps reporting its factory defaults until it applies the operator's configuration.
+    ConfiguredSensorDisplay cfgDisp;
+    getConfiguredSensorDisplay(gSensorRecords[i].clientUid, gSensorRecords[i].sensorIndex, cfgDisp);
+    const ClientConfigSnapshot *cfgSnap = findClientConfigSnapshot(gSensorRecords[i].clientUid);
     JsonObject obj = arr.add<JsonObject>();
     obj["c"] = gSensorRecords[i].clientUid;
-    obj["s"] = gSensorRecords[i].site;
-    obj["n"] = gSensorRecords[i].label;
+    obj["s"] = (cfgSnap && cfgSnap->site[0] != '\0') ? cfgSnap->site : gSensorRecords[i].site;
+    obj["n"] = (cfgDisp.found && cfgDisp.name[0] != '\0') ? cfgDisp.name : gSensorRecords[i].label;
     obj["k"] = gSensorRecords[i].sensorIndex;
     if (gSensorRecords[i].userNumber > 0) {
       obj["un"] = gSensorRecords[i].userNumber;
@@ -15390,8 +15396,14 @@ static void publishViewerSummary() {
     if (gSensorRecords[i].sensorVoltage > 0.0f) {
       obj["vt"] = roundTo(gSensorRecords[i].sensorVoltage, 3);
     }
+    // Transient current-loop fault string (the dashboard shows FAULT instead of a value)
+    if (gSensorRecords[i].sensorFault[0] != '\0') {
+      obj["flt"] = gSensorRecords[i].sensorFault;
+    }
     // Include object type if known (tank, engine, pump, gas, flow)
-    if (gSensorRecords[i].objectType[0] != '\0') {
+    if (cfgDisp.found && cfgDisp.monitorType[0] != '\0') {
+      obj["ot"] = cfgDisp.monitorType;
+    } else if (gSensorRecords[i].objectType[0] != '\0') {
       obj["ot"] = gSensorRecords[i].objectType;
     }
     // Include sensor interface type if known (digital, analog, currentLoop, pulse)
@@ -15399,8 +15411,16 @@ static void publishViewerSummary() {
       obj["st"] = gSensorRecords[i].sensorType;
     }
     // Include measurement unit if known (inches, rpm, psi, gpm, etc.)
-    if (gSensorRecords[i].measurementUnit[0] != '\0') {
+    if (cfgDisp.found && cfgDisp.measurementUnit[0] != '\0') {
+      obj["mu"] = cfgDisp.measurementUnit;
+    } else if (gSensorRecords[i].measurementUnit[0] != '\0') {
       obj["mu"] = gSensorRecords[i].measurementUnit;
+    }
+    // Include contents if known (Diesel, Water, Propane, ...)
+    if (cfgDisp.found && cfgDisp.contents[0] != '\0') {
+      obj["ct"] = cfgDisp.contents;
+    } else if (gSensorRecords[i].contents[0] != '\0') {
+      obj["ct"] = gSensorRecords[i].contents;
     }
     // Include 24hr change if available
     if (gSensorRecords[i].previousLevelEpoch > 0.0) {
@@ -15408,13 +15428,21 @@ static void publishViewerSummary() {
     }
     obj["a"] = gSensorRecords[i].alarmActive;
     obj["at"] = gSensorRecords[i].alarmType;
+    if (gSensorRecords[i].reminderSnoozeEpoch > 0.0) {
+      obj["sz"] = (uint32_t)gSensorRecords[i].reminderSnoozeEpoch;
+    }
     // Integer epoch: a double that fits a float would be written with only 7 digits.
     obj["u"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;
     
-    // Add VIN voltage from client metadata if available
+    // Add VIN voltage from client metadata under the dashboard's rule (sendClientDataJson):
+    // only a plausible battery voltage (>= 6.0 V, never the Notecard ~5 V rail) reported
+    // within the last 48 hours.
     ClientMetadata *meta = findClientMetadata(gSensorRecords[i].clientUid);
-    if (meta && meta->vinVoltage > 0.0f) {
-      obj["v"] = roundTo(meta->vinVoltage, 2);
+    if (meta && meta->vinVoltage >= 6.0f && meta->vinVoltageEpoch > 0.0) {
+      double vAge = (now > 0.0) ? (now - meta->vinVoltageEpoch) : 0.0;
+      if (vAge >= 0.0 && vAge < 172800.0) {  // 48 hours
+        obj["v"] = roundTo(meta->vinVoltage, 2);
+      }
     }
   }
 
