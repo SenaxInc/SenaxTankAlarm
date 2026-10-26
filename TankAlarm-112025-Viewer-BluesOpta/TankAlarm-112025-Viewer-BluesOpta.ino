@@ -2182,18 +2182,12 @@ static bool sendDailyPrintJob() {
         printer.println(changeBuf);
       }
 
-      // Alarm status
+      // Alarm status ("Sensor fault" while the reading is a fault and no alarm is active)
+      char statusBuf[64];
+      viewerPrintStatusLine(rec.alarmActive, rec.alarmType, rec.snoozeEpoch > 0, rec.fault,
+                            statusBuf, sizeof(statusBuf));
       printer.print(F("   Status: "));
-      if (rec.alarmActive) {
-        printer.print(rec.alarmType[0] ? rec.alarmType : "ALARM");
-        printer.print(F("  *ALARM*"));
-        if (rec.snoozeEpoch > 0) {
-          printer.print(F(" (reminders snoozed)"));
-        }
-        printer.println();
-      } else {
-        printer.println(F("Normal"));
-      }
+      printer.println(statusBuf);
 
       // Last updated
       char updBuf[28];
