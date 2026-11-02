@@ -488,7 +488,7 @@ Notehub's retries by event ID, but not the server's own `note.add` retry.
 
 **JSONata expression** — converts both body shapes into a SendGrid v3 payload (splits the
 comma-joined `to` list and builds a plain-text body from either the alarm `message` or the
-daily `sensors` array):
+daily `sensors` array; a float switch, sent with `sensorType: "digital"`, prints ON or OFF):
 
 ```jsonata
 {
@@ -501,7 +501,8 @@ daily `sensors` array):
       ? body.message
       : $join($map(body.sensors, function($s) {
           $s.site & " " & $s.label & " #" & $string($s.sensorIndex) & ": " &
-          $string($s.levelInches) & ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
+          ($s.sensorType = "digital" ? ($s.levelInches > 0.5 ? "ON" : "OFF") : $string($s.levelInches)) &
+          ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
         }), "\n")
   }]
 }
