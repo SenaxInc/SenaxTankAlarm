@@ -110,17 +110,21 @@ The server exposes a simple REST API:
 - `POST /api/ftp-backup` - Backup configs to FTP (PIN required)
 - `POST /api/ftp-restore` - Restore configs from FTP (PIN required)
 
-Example: Push config to client
+Example: Push config to client. The server stores `config` whole as the client's cached config, so send the
+full config with its `sensors` list (the Config Generator always does); every sensor needs its permanent
+`number` (1-255). A config without `sensors` is refused (400).
 ```bash
 curl -X POST http://server-ip/api/config \
   -H "Content-Type: application/json" \
   -d '{
+    "pin": "1234",
     "client": "dev:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     "config": {
       "sampleSeconds": 1800,
-      "tanks": [
+      "sensors": [
         {
           "id": "A",
+          "number": 1,
           "name": "North Tank",
           "highAlarm": 110.0,
           "lowAlarm": 18.0
