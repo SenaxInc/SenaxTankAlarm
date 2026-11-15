@@ -232,6 +232,38 @@ taken (S-D03):
   reload up to 512 s off; on the first boot after the update, such a snapshot within
   512 s of a UTC midnight is dropped, since its day is not known.
 
+### Outdoor Temperature (VIN chart)
+The History page's VIN Voltage History chart can show the outdoor air temperature next
+to the voltage. The server looks it up from the National Weather Service
+(`api.weather.gov`, HTTPS, no key) and keeps it per client in
+`/fs/history/outdoor_temp.json`; the code is `NwsTemperature.h`, host-tested in
+`tests/host/nws_temp`.
+- **Location.** The client's location comes from its Notecard (`card.location`, which
+  gives the cell-tower fix while GPS is off). The server asks a client that has no
+  location for it, at most once a day and only while it has readings that need a
+  temperature (`location_request` / `location_response`).
+- **Stations.** From the location the server asks NWS for the two nearest observation
+  stations (`/points/{lat},{lon}`, then its station list), keeps them, and looks them up
+  again after 30 days or when the location changes. A location NWS does not cover
+  (outside the US) is asked again weekly.
+- **Matching.** For each reading at least 20 minutes old, it asks the nearest station for
+  its observations from an hour before to an hour after the reading and keeps the
+  nearest one with a usable temperature (quality flag not `X` or `B`), at the
+  observation's own time. When that station has none, it asks the second one. A reading
+  within an hour of a kept sample needs no lookup of its own. With the default daily
+  report that is one or two lookups per client per day.
+- **No fill-in.** A reading NWS has no observation for within an hour stays without a
+  temperature (after 3 hours of retrying). NWS keeps about seven days of observations, so
+  readings from before the feature was installed, or older than 6.5 days when first
+  seen, never get one. Nothing is interpolated or estimated.
+- **Limits.** At most one lookup every 30 s across all clients; failed requests back off
+  (5 minutes doubling to 6 hours). Up to 90 samples per client (about 13 KB of RAM for 20
+  clients; the file is at most about 33 KB).
+- **API.** `/api/history` returns `temperature: [{client, stations, points: [[epoch, °F], ...]}]`
+  and lists each client's VIN reading once (not once per sensor). `/api/location` also
+  returns `weatherStations`.
+- **Not used for calibration** yet (S-D05): calibration still records no temperature.
+
 ### Archived Clients Manifest
 When a client is removed and archived to FTP, an entry (client UID, site, display label,
 first/last seen, archive time, FTP path, sensor count) is added to
@@ -314,7 +346,9 @@ For Arduino Opta with SD card shield:
 - Color-coded by status
 
 ### 5. VIN Voltage Trends (Line Chart)
-- Battery/power supply voltage over time
+- Battery/power supply voltage over time, one client at a time (site picker)
+- Optional outdoor temperature on a second axis ("Show outdoor temperature"; see
+  Outdoor Temperature above)
 - Early warning for power issues
 
 ## UI Organization
