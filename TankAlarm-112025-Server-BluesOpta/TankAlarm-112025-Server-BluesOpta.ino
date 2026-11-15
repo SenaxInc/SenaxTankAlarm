@@ -392,6 +392,22 @@
 #define NWS_SERVICE_INTERVAL_MS 30000UL  // at most one api.weather.gov request per 30 s
 #endif
 
+// A request starts only at a quiet moment: within NWS_QUIET_AFTER_POLL_MS of a Notecard
+// poll (incoming alarms were just handled) and with no web connection for
+// NWS_QUIET_WEB_MS. Temperatures can wait (NWS keeps 7 days), but once a request has
+// waited NWS_QUIET_MAX_WAIT_MS, web traffic no longer holds it up.
+#ifndef NWS_QUIET_AFTER_POLL_MS
+#define NWS_QUIET_AFTER_POLL_MS 3000UL
+#endif
+
+#ifndef NWS_QUIET_WEB_MS
+#define NWS_QUIET_WEB_MS 10000UL
+#endif
+
+#ifndef NWS_QUIET_MAX_WAIT_MS
+#define NWS_QUIET_MAX_WAIT_MS 600000UL
+#endif
+
 #ifndef NWS_NET_RETRY_BASE_SEC
 #define NWS_NET_RETRY_BASE_SEC 300.0  // after DNS/connect/TLS fails, no request for 5 min, doubling to 6 h
 #endif
@@ -1197,6 +1213,7 @@ static double gNextViewerSummaryEpoch = 0.0;
 static double gLastViewerSummaryEpoch = 0.0;
 
 static unsigned long gLastPollMillis = 0;
+static unsigned long gLastWebRequestMs = 0;  // when the web server last accepted a connection (0 = none yet)
 static unsigned long gLastLinkCheckMillis = 0;
 static bool gLastLinkState = false;
 // v1.9.22 autonomous Ethernet recovery (the Opta LAN8742 PHY often fails to relink after a
@@ -6717,7 +6734,8 @@ static int nwsTlsRead(void *ctx, uint8_t *buf, size_t len) {
 // NWS_GET_BAD_RESPONSE or NWS_GET_THROTTLED. On 200 the body is parsed into doc through
 // filter, and jsonErr is Ok only when the whole JSON value arrived and the body ended as
 // its framing says. At most one request per NWS_SERVICE_INTERVAL_MS is sent, whoever asks.
-static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument &doc, DeserializationError &jsonErr) {
+// Callers use nwsHttpsGetJson(), which also logs it.
+static int nwsHttpsRequest(const char *path, JsonDocument &filter, JsonDocument &doc, DeserializationError &jsonErr) {
   jsonErr = DeserializationError::EmptyInput;
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
   const unsigned long startMs = millis();
@@ -6811,6 +6829,23 @@ static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument 
   (void)doc;
   return NWS_GET_NETWORK;
 #endif
+}
+
+// nwsHttpsRequest(), plus one log line per request with its result and how long it held
+// up loop() (the bench check for the blocking time)
+static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument &doc, DeserializationError &jsonErr) {
+  const unsigned long t0 = millis();
+  const int status = nwsHttpsRequest(path, filter, doc, jsonErr);
+  if (status == NWS_GET_THROTTLED) return status;
+  char result[24];
+  if (status >= 0) {
+    snprintf(result, sizeof(result), "HTTP %d%s", status,
+             (status == 200 && jsonErr != DeserializationError::Ok) ? ", incomplete" : "");
+  } else {
+    snprintf(result, sizeof(result), "%s", status == NWS_GET_NETWORK ? "no answer" : "not HTTP");
+  }
+  nwsLog("info", "GET %.100s: %s in %lu ms", path, result, (unsigned long)(millis() - t0));
+  return status;
 }
 
 static uint8_t gNwsCursor = 0;          // round-robin position in gClientMetadata
@@ -6990,22 +7025,30 @@ static void nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t sta
   if (nwsNoteNoMatch(wx, target, now)) gNwsTempDirty = true;
 }
 
-// At most one api.weather.gov request per call, and per NWS_SERVICE_INTERVAL_MS: the
-// pending second request of a step (gNwsNext), or the next client's step: ask it for
-// its location (a Notecard note), find its weather stations, or fetch the observation
-// for one of its readings.
+// At most one api.weather.gov request per call, and per NWS_SERVICE_INTERVAL_MS, and only
+// at a quiet moment (NWS_QUIET_*): the pending second request of a step (gNwsNext), or
+// the next client's step: ask it for its location (a Notecard note), find its weather
+// stations, or fetch the observation for one of its readings.
 static void serviceOutdoorTemperature() {
 #if NWS_TEMP_ENABLED
   static unsigned long lastRunMs = 0;
+  static unsigned long dueSinceMs = 0;  // when a call first had to wait for a quiet moment
   const unsigned long nowMs = millis();
   if (nowMs < 120000UL) return;  // let the network, the clock and the first notes settle after boot
   if (lastRunMs != 0 && nowMs - lastRunMs < NWS_SERVICE_INTERVAL_MS) return;
   if (gNwsLastRequestMs != 0 && nowMs - gNwsLastRequestMs < NWS_SERVICE_INTERVAL_MS) return;
-  lastRunMs = nowMs;
   if (gPaused || gDfuInProgress || gClientMetadataCount == 0) return;
   if (Ethernet.linkStatus() != LinkON) return;
   const double now = currentEpoch();
   if (!(now >= NWS_MIN_VALID_EPOCH) || now < gNwsNetRetryAfter) return;
+
+  if (dueSinceMs == 0) dueSinceMs = nowMs ? nowMs : 1;
+  const bool justPolled = gLastPollMillis != 0 && nowMs - gLastPollMillis <= NWS_QUIET_AFTER_POLL_MS;
+  const bool webQuiet = gLastWebRequestMs == 0 || nowMs - gLastWebRequestMs >= NWS_QUIET_WEB_MS;
+  const bool waitedLong = nowMs - dueSinceMs >= NWS_QUIET_MAX_WAIT_MS;
+  if (!justPolled || (!webQuiet && !waitedLong)) return;
+  dueSinceMs = 0;
+  lastRunMs = nowMs;
 
   if (gNwsNext.kind != NWS_NEXT_NONE) {
     const uint8_t kind = gNwsNext.kind;
@@ -9766,6 +9809,7 @@ static void handleWebRequests() {
   if (!client) {
     return;
   }
+  gLastWebRequestMs = millis();  // outdoor temperature lookups wait for a quiet moment
 
   // While an FTP backup is running, drop new web requests immediately so
   // browser polling does not pin LWIP socket slots that the FTPS data

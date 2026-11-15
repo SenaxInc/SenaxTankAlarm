@@ -264,8 +264,10 @@ to the voltage. The server looks it up from the National Weather Service
   request each, 30 s apart. A response counts only when its JSON and its HTTP framing
   (Content-Length or last chunk) are both complete. A request blocks the server's main
   loop while it runs (about 1-2 s; at most 3 s per socket step and 10 s for the
-  response, plus DNS once an hour), and failed requests back off (5 minutes doubling to
-  6 hours). Up to 90 samples per client (about 14 KB of RAM for 20 clients; the file is
+  response, plus DNS once an hour), so it starts only at a quiet moment: right after a
+  Notecard poll, with no web connection for 10 s (after 10 minutes of waiting, web
+  traffic no longer holds it up). Each request is logged (source `weather`) with its
+  result and duration. Failed requests back off (5 minutes doubling to 6 hours). Up to 90 samples per client (about 14 KB of RAM for 20 clients; the file is
   at most about 33 KB).
 - **API.** `/api/history` returns `temperature: [{client, stations, points: [[epoch, °F], ...]}]`
   and lists each client's VIN reading once (not once per sensor). `/api/location` also
