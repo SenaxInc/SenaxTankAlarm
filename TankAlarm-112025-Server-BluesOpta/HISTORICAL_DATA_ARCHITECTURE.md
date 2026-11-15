@@ -253,12 +253,20 @@ to the voltage. The server looks it up from the National Weather Service
   within an hour of a kept sample needs no lookup of its own. With the default daily
   report that is one or two lookups per client per day.
 - **No fill-in.** A reading NWS has no observation for within an hour stays without a
-  temperature (after 3 hours of retrying). NWS keeps about seven days of observations, so
-  readings from before the feature was installed, or older than 6.5 days when first
-  seen, never get one. Nothing is interpolated or estimated.
-- **Limits.** At most one lookup every 30 s across all clients; failed requests back off
-  (5 minutes doubling to 6 hours). Up to 90 samples per client (about 13 KB of RAM for 20
-  clients; the file is at most about 33 KB).
+  temperature (after 3 hours of retrying); it is marked settled, and so are readings
+  within 30 minutes of it. Each such reading is marked on its own, so an older reading
+  that arrives later is still looked up; past 16 marks within NWS's seven days the oldest
+  becomes a cutoff before which nothing is looked up. NWS keeps about seven days of
+  observations, so readings from before the feature was installed, or older than 6.5
+  days when first seen, never get one. Nothing is interpolated or estimated.
+- **Limits.** At most one api.weather.gov request every 30 s across all clients: finding
+  the stations (`/points`, then the station list) and asking the second station take one
+  request each, 30 s apart. A response counts only when its JSON and its HTTP framing
+  (Content-Length or last chunk) are both complete. A request blocks the server's main
+  loop while it runs (about 1-2 s; at most 3 s per socket step and 10 s for the
+  response, plus DNS once an hour), and failed requests back off (5 minutes doubling to
+  6 hours). Up to 90 samples per client (about 14 KB of RAM for 20 clients; the file is
+  at most about 33 KB).
 - **API.** `/api/history` returns `temperature: [{client, stations, points: [[epoch, °F], ...]}]`
   and lists each client's VIN reading once (not once per sensor). `/api/location` also
   returns `weatherStations`.

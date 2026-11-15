@@ -45,6 +45,9 @@
 #define NWS_UID_MAX 48                 // as SensorRecord::clientUid
 #define NWS_STATION_ID_MAX 12          // ICAO ids are 4 characters; some networks use up to 11
 #define NWS_STATIONS 2                 // nearest first; the second is asked when the first has no report
+#ifndef NWS_SETTLED_MARKS
+#define NWS_SETTLED_MARKS 16           // per client: readings NWS had nothing for (see NwsClientTemp)
+#endif
 #define NWS_PATH_MAX 128
 #ifndef NWS_HTTP_BUF
 #define NWS_HTTP_BUF 256               // bytes read from the socket at a time
@@ -67,6 +70,9 @@
 #endif
 #ifndef NWS_OBS_SETTLE_SEC
 #define NWS_OBS_SETTLE_SEC 1200.0      // wait this long after a reading: observations are published late
+#endif
+#ifndef NWS_SETTLED_COVER_SEC
+#define NWS_SETTLED_COVER_SEC 1800.0   // a reading this close to one NWS had nothing for is not asked about
 #endif
 #ifndef NWS_OBS_EMPTY_RETRY_SEC
 #define NWS_OBS_EMPTY_RETRY_SEC 10800.0  // a reading younger than this with no observation yet is asked again
@@ -526,7 +532,24 @@ struct NwsHttpReader {
     }
     return i;
   }
+
+  // Reads what is left of the body and reports whether it ended where its framing
+  // says: Content-Length reached, the last chunk read, or the peer closing.
+  bool finishBody() {
+    while (read() >= 0) {
+    }
+    return bodyDone && !bodyError;
+  }
 };
+
+// Parses the body through filter. Ok only when the JSON value is complete and the
+// body then ends as its framing says: a JSON value can close before a cut-off
+// Content-Length body or a chunked body without its last chunk does.
+static inline DeserializationError nwsParseBody(NwsHttpReader &r, JsonDocument &filter, JsonDocument &doc) {
+  DeserializationError err = deserializeJson(doc, r, DeserializationOption::Filter(filter));
+  if (err == DeserializationError::Ok && !r.finishBody()) err = DeserializationError::IncompleteInput;
+  return err;
+}
 
 // ============================================================================
 // NWS responses (parsed with these filters so only the needed fields are kept)
@@ -617,8 +640,13 @@ struct NwsClientTemp {
   uint16_t count;                                   // samples, oldest first
   uint32_t sampleEpoch[NWS_TEMP_SAMPLES];           // observation time
   int16_t sampleTenthsF[NWS_TEMP_SAMPLES];          // tenths of a degree F
-  // Readings at or before this time need no more lookups: NWS had no observation for
-  // them, or their sample could not be kept. Readings are handled oldest first.
+  // Readings that need no more lookups: NWS had no observation for them, or their
+  // sample could not be kept. Each mark settles the readings within
+  // NWS_SETTLED_COVER_SEC of it, so a reading that arrives late (older than ones
+  // already settled) is still looked up. When the marks are full the oldest one is
+  // folded into settledThrough, which settles every reading at or before it; that
+  // takes more than NWS_SETTLED_MARKS unmatched readings within NWS's seven days.
+  uint32_t settled[NWS_SETTLED_MARKS];  // 0 = free
   uint32_t settledThrough;
   // RAM only: scheduling
   uint8_t failStreak;
@@ -731,19 +759,43 @@ static inline bool nwsSampleNear(const NwsClientTemp &c, double t, double within
   return false;
 }
 
-static inline void nwsSettle(NwsClientTemp &c, double t) {
-  if (t > (double)c.settledThrough && t < NWS_MAX_VALID_EPOCH) c.settledThrough = (uint32_t)t;
+static inline bool nwsIsSettled(const NwsClientTemp &c, double t) {
+  if (t <= (double)c.settledThrough) return true;
+  for (uint8_t i = 0; i < NWS_SETTLED_MARKS; ++i) {
+    if (c.settled[i] != 0 && fabs((double)c.settled[i] - t) <= NWS_SETTLED_COVER_SEC) return true;
+  }
+  return false;
+}
+
+// Marks reading time t as needing no more lookups. A mark older than NWS keeps
+// observations is reused first; otherwise, when all are taken, the oldest mark is
+// folded into settledThrough.
+static inline void nwsSettle(NwsClientTemp &c, double t, double now) {
+  if (!(t >= NWS_MIN_VALID_EPOCH && t < NWS_MAX_VALID_EPOCH) || nwsIsSettled(c, t)) return;
+  uint8_t slot = NWS_SETTLED_MARKS;
+  uint8_t oldest = 0;
+  for (uint8_t i = 0; i < NWS_SETTLED_MARKS; ++i) {
+    const uint32_t m = c.settled[i];
+    if (m == 0 || (double)m <= (double)c.settledThrough || now - (double)m > NWS_OBS_MAX_AGE_SEC + NWS_SETTLED_COVER_SEC) {
+      slot = i;  // free, already under the watermark, or too old to matter
+      break;
+    }
+    if (m < c.settled[oldest]) oldest = i;
+  }
+  if (slot == NWS_SETTLED_MARKS) {
+    if (c.settled[oldest] > c.settledThrough) c.settledThrough = c.settled[oldest];
+    slot = oldest;
+  }
+  c.settled[slot] = (uint32_t)t;
 }
 
 // A reading at time t should be matched now: observations for it have had time to
-// be published, NWS still keeps them, no stored sample covers it, and it is after
-// settledThrough.
+// be published, NWS still keeps them, no stored sample covers it, and it is not settled.
 static inline bool nwsReadingNeedsTemp(const NwsClientTemp &c, double t, double now) {
   if (!(t >= NWS_MIN_VALID_EPOCH && t < NWS_MAX_VALID_EPOCH) || !(now >= NWS_MIN_VALID_EPOCH)) return false;
-  if (t <= (double)c.settledThrough) return false;
   const double age = now - t;
   if (!(age >= NWS_OBS_SETTLE_SEC && age <= NWS_OBS_MAX_AGE_SEC)) return false;
-  return !nwsSampleNear(c, t, NWS_OBS_MATCH_SEC);
+  return !nwsIsSettled(c, t) && !nwsSampleNear(c, t, NWS_OBS_MATCH_SEC);
 }
 
 // ============================================================================
@@ -803,32 +855,37 @@ static inline void nwsNoteLocationChanged(NwsClientTemp &c) {
 // The observation at obsEpoch matched reading time t. Returns true when the store
 // changed. A sample the store cannot keep (full of newer ones) settles t instead,
 // so the reading is not asked about again.
-static inline bool nwsNoteMatched(NwsClientTemp &c, double t, uint32_t obsEpoch, float tempF) {
+static inline bool nwsNoteMatched(NwsClientTemp &c, double t, uint32_t obsEpoch, float tempF, double now) {
   c.failStreak = 0;
   c.retryAfter = 0;
-  const bool changed = nwsAddSample(c, obsEpoch, tempF);
-  if (!nwsSampleNear(c, t, NWS_OBS_MATCH_SEC)) nwsSettle(c, t);
+  bool changed = nwsAddSample(c, obsEpoch, tempF);
+  if (!nwsSampleNear(c, t, NWS_OBS_MATCH_SEC)) {
+    nwsSettle(c, t, now);
+    changed = true;
+  }
   return changed;
 }
 
 // The observations came back but none matched reading time t. A young reading
 // is asked again later (observations are published late); an older one is left
-// without a temperature.
-static inline void nwsNoteNoMatch(NwsClientTemp &c, double t, double now) {
+// without a temperature. Returns true when t was settled (the store changed).
+static inline bool nwsNoteNoMatch(NwsClientTemp &c, double t, double now) {
   c.failStreak = 0;
   if (now - t < NWS_OBS_EMPTY_RETRY_SEC) {
     c.retryAfter = (uint32_t)(now + NWS_OBS_EMPTY_WAIT_SEC);
-  } else {
-    c.retryAfter = 0;
-    nwsSettle(c, t);
+    return false;
   }
+  c.retryAfter = 0;
+  nwsSettle(c, t, now);
+  return true;
 }
 
 // ============================================================================
 // Saved file:
-//   [{"c":uid,"st":["KDCA","KCGS"],"sl":[lat,lon],"se":epoch,"sb":epoch,"t":[[epoch,tenthsF],...]},...]
+//   [{"c":uid,"st":["KDCA","KCGS"],"sl":[lat,lon],"se":epoch,"sb":epoch,"sd":[epoch,...],
+//     "t":[[epoch,tenthsF],...]},...]
 // st/sl/se: the stations, the location they were found for and when; sb: settledThrough;
-// t: the samples, oldest first.
+// sd: the settled marks; t: the samples, oldest first.
 // ============================================================================
 
 struct NwsOut {
@@ -847,7 +904,7 @@ struct NwsOut {
 
 // Writes the store as JSON into out (NUL-terminated when cap > 0) and returns the
 // full length, as snprintf does; call with out = nullptr to measure. Clients with
-// nothing to keep (no stations, samples or settled time) are left out.
+// nothing to keep (no stations, samples or settled readings) are left out.
 static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t cap) {
   NwsOut o = {out, cap, 0};
   if (out && cap > 0) out[0] = '\0';
@@ -856,7 +913,9 @@ static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t 
   for (uint8_t i = 0; i < s.count; ++i) {
     const NwsClientTemp &c = s.clients[i];
     const uint8_t ns = nwsStationCount(c);
-    if (!nwsValidUid(c.uid) || (ns == 0 && c.count == 0 && c.settledThrough == 0)) continue;
+    uint8_t marks = 0;
+    for (uint8_t k = 0; k < NWS_SETTLED_MARKS; ++k) marks += (c.settled[k] != 0) ? 1 : 0;
+    if (!nwsValidUid(c.uid) || (ns == 0 && c.count == 0 && c.settledThrough == 0 && marks == 0)) continue;
     o.putf("%s{\"c\":\"%s\"", first ? "" : ",", c.uid);
     first = false;
     if (ns > 0) {
@@ -866,6 +925,16 @@ static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t 
              (unsigned long)c.stationsEpoch);
     }
     if (c.settledThrough != 0) o.putf(",\"sb\":%lu", (unsigned long)c.settledThrough);
+    if (marks > 0) {
+      o.putf(",\"sd\":[");
+      bool firstMark = true;
+      for (uint8_t k = 0; k < NWS_SETTLED_MARKS; ++k) {
+        if (c.settled[k] == 0) continue;
+        o.putf("%s%lu", firstMark ? "" : ",", (unsigned long)c.settled[k]);
+        firstMark = false;
+      }
+      o.putf("]");
+    }
     o.putf(",\"t\":[");
     for (uint16_t k = 0; k < c.count; ++k) {
       o.putf("%s[%lu,%d]", k ? "," : "", (unsigned long)c.sampleEpoch[k], (int)c.sampleTenthsF[k]);
@@ -901,6 +970,15 @@ static inline uint8_t nwsLoadStore(NwsTempStore &s, JsonArrayConst arr, double n
     const double sb = e["sb"] | 0.0;
     if (sb >= NWS_MIN_VALID_EPOCH && sb < NWS_MAX_VALID_EPOCH && !(now > 0.0 && sb > now + 3600.0)) {
       c->settledThrough = (uint32_t)sb;
+    }
+    uint8_t marks = 0;
+    for (JsonVariantConst m : e["sd"].as<JsonArrayConst>()) {
+      if (marks >= NWS_SETTLED_MARKS) break;
+      if (!m.is<uint32_t>()) continue;
+      const double v = (double)m.as<uint32_t>();
+      if (v >= NWS_MIN_VALID_EPOCH && v < NWS_MAX_VALID_EPOCH && !(now > 0.0 && v > now + 3600.0)) {
+        c->settled[marks++] = (uint32_t)v;
+      }
     }
     for (JsonVariantConst p : e["t"].as<JsonArrayConst>()) {
       if (!p[0].is<uint32_t>() || !p[1].is<int>()) continue;

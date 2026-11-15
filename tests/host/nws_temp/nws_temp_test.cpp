@@ -487,7 +487,53 @@ static DeserializationError parseResponse(const std::string &resp, size_t step, 
   if (!r.readHead()) return DeserializationError::InvalidInput;
   JsonDocument filter;
   fillFilter(filter);
-  return deserializeJson(doc, r, DeserializationOption::Filter(filter));
+  return nwsParseBody(r, filter, doc);
+}
+
+static DeserializationError parseFramed(const std::string &resp, long closeAt, long failAt) {
+  Source s;
+  s.data = resp;
+  s.step = 3;
+  s.closeAt = closeAt;
+  s.failAt = failAt;
+  NwsHttpReader r;
+  r.begin(sourceRead, &s, 4096);
+  if (!r.readHead()) return DeserializationError::InvalidInput;
+  JsonDocument filter, doc;
+  nwsStationsFilter(filter);
+  return nwsParseBody(r, filter, doc);
+}
+
+// A JSON value can close before its body does; the framing must still complete
+static void testBodyFraming() {
+  const std::string json = "{\"features\":[{\"properties\":{\"stationIdentifier\":\"KDCA\"}}]}";
+  const std::string len = std::to_string(json.size());
+  const std::string chunkedHead = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+  // Complete bodies, also with whitespace after the JSON value
+  CHECK(parseFramed("HTTP/1.1 200 OK\r\nContent-Length: " + len + "\r\n\r\n" + json, -1, -1) == DeserializationError::Ok);
+  CHECK(parseFramed("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(json.size() + 1) + "\r\n\r\n" + json + "\n", -1, -1) ==
+        DeserializationError::Ok);
+  CHECK(parseFramed(chunkedHead + chunk(json + "\n", 7, false), -1, -1) == DeserializationError::Ok);
+  CHECK(parseFramed("HTTP/1.1 200 OK\r\n\r\n" + json, -1, -1) == DeserializationError::Ok);
+
+  // Content-Length promises more than arrives
+  const std::string longer = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(json.size() + 10) + "\r\n\r\n" + json;
+  CHECK(parseFramed(longer, -1, -1) == DeserializationError::IncompleteInput);
+  // Chunked body without its last chunk, cut at every point after the JSON value
+  const std::string full = chunkedHead + chunk(json, json.size(), false);
+  const std::string noLast = chunkedHead + fmtStr("%zx\r\n", json.size()) + json + "\r\n";
+  CHECK(parseFramed(noLast, -1, -1) == DeserializationError::IncompleteInput);
+  const size_t jsonEnd = full.find(json) + json.size();
+  const size_t lastChunkEnd = full.find("0\r\n", jsonEnd) + 3;
+  for (size_t cut = jsonEnd; cut < lastChunkEnd; ++cut) {
+    CHECK_MSG(parseFramed(full, (long)cut, -1) == DeserializationError::IncompleteInput, "cut %zu", cut);
+    CHECK_MSG(parseFramed(full, -1, (long)cut) == DeserializationError::IncompleteInput, "fail %zu", cut);
+  }
+  CHECK(parseFramed(full, (long)lastChunkEnd, -1) == DeserializationError::Ok);  // trailers are not needed
+  // A close-delimited body ended by an error rather than a close
+  const std::string closeDelim = "HTTP/1.1 200 OK\r\n\r\n" + json + "   ";
+  CHECK(parseFramed(closeDelim, -1, (long)closeDelim.size() - 1) == DeserializationError::IncompleteInput);
 }
 
 static void testResponses() {
@@ -628,25 +674,50 @@ static void testStore() {
   CHECK(!nwsReadingNeedsTemp(*a, base + 300.0 + NWS_OBS_MATCH_SEC, now));  // covered by a sample
   CHECK(nwsReadingNeedsTemp(*a, base + 301.0 + NWS_OBS_MATCH_SEC, now));
   CHECK(!nwsReadingNeedsTemp(*a, 0.0, now) && !nwsReadingNeedsTemp(*a, now - 5000.0, 0.0));
-  // Settled readings are never asked about again; settling only moves forward
-  nwsSettle(*a, now - 5000.0);
-  CHECK(!nwsReadingNeedsTemp(*a, now - 5000.0, now) && !nwsReadingNeedsTemp(*a, now - 9000.0, now));
-  CHECK(nwsReadingNeedsTemp(*a, now - 4999.0, now));
-  nwsSettle(*a, now - 9000.0);
-  CHECK(a->settledThrough == (uint32_t)(now - 5000.0));
+  // A settled reading, and readings near it, are not asked about again
+  nwsSettle(*a, now - 20000.0, now);
+  CHECK(!nwsReadingNeedsTemp(*a, now - 20000.0, now));
+  CHECK(!nwsReadingNeedsTemp(*a, now - 20000.0 + NWS_SETTLED_COVER_SEC, now));
+  CHECK(nwsReadingNeedsTemp(*a, now - 20000.0 + NWS_SETTLED_COVER_SEC + 1, now));
+  CHECK(a->settledThrough == 0);
+
+  // Out-of-order delivery: a reading older than a settled one, arriving after it, is still looked up
+  CHECK(nwsReadingNeedsTemp(*a, now - 86400.0, now));
+  CHECK(nwsReadingNeedsTemp(*a, now - 3.0 * 86400.0, now));
 
   // A match is always covered afterwards, even at the edge of the window
   NwsClientTemp m;
   memset(&m, 0, sizeof(m));
   const double t = now - 20000.0;
-  CHECK(nwsNoteMatched(m, t, (uint32_t)(t - NWS_OBS_MATCH_SEC), 40.0f));
-  CHECK(!nwsReadingNeedsTemp(m, t, now) && m.settledThrough == 0);
+  CHECK(nwsNoteMatched(m, t, (uint32_t)(t - NWS_OBS_MATCH_SEC), 40.0f, now));
+  CHECK(!nwsReadingNeedsTemp(m, t, now) && !nwsIsSettled(m, t));
   // A match the full store cannot keep settles the reading, so it is not fetched forever
   for (uint32_t i = 0; i < NWS_TEMP_SAMPLES; ++i) nwsAddSample(m, (uint32_t)(now - 10000.0) + i * 60u, 50.0f);
   const double old = now - 400000.0;
   CHECK(nwsReadingNeedsTemp(m, old, now));
-  CHECK(!nwsNoteMatched(m, old, (uint32_t)old, 41.0f));
-  CHECK(!nwsReadingNeedsTemp(m, old, now) && m.settledThrough == (uint32_t)old);
+  CHECK(nwsNoteMatched(m, old, (uint32_t)old, 41.0f, now));  // changed: settled
+  CHECK(!nwsReadingNeedsTemp(m, old, now) && nwsIsSettled(m, old) && m.settledThrough == 0);
+
+  // More unmatched readings than marks: the oldest mark folds into settledThrough, so
+  // nothing is asked about twice and newer marks stay individual
+  NwsClientTemp o;
+  memset(&o, 0, sizeof(o));
+  const double first = now - 500000.0;
+  for (int i = 0; i < NWS_SETTLED_MARKS + 3; ++i) nwsSettle(o, first + i * 10000.0, now);
+  CHECK(o.settledThrough == (uint32_t)(first + 2 * 10000.0));
+  for (int i = 0; i < NWS_SETTLED_MARKS + 3; ++i) CHECK(nwsIsSettled(o, first + i * 10000.0));
+  CHECK(!nwsIsSettled(o, first + (NWS_SETTLED_MARKS + 3) * 10000.0));
+  CHECK(nwsIsSettled(o, first - 50000.0));                                     // under the watermark
+  // Marks older than NWS keeps observations are reused before anything is folded
+  NwsClientTemp p;
+  memset(&p, 0, sizeof(p));
+  for (int i = 0; i < NWS_SETTLED_MARKS; ++i) p.settled[i] = (uint32_t)(now - 900000.0 + i * 4000.0);  // all expired
+  nwsSettle(p, now - 30000.0, now);
+  CHECK(p.settledThrough == 0 && nwsIsSettled(p, now - 30000.0));
+  // Settling an invalid time does nothing
+  nwsSettle(p, 0.0, now);
+  nwsSettle(p, NAN, now);
+  CHECK(p.settledThrough == 0);
 
   // Forget compacts the table
   NwsClientTemp *c = nwsFindOrAddClient(gStore, "dev:3");
@@ -695,11 +766,13 @@ static void testScheduling() {
 
   // No match: a young reading is asked again later; an old one is settled
   const double young = now - 3600.0, old = now - NWS_OBS_EMPTY_RETRY_SEC;
-  nwsNoteNoMatch(c, young, now);
-  CHECK(c.retryAfter == (uint32_t)(now + NWS_OBS_EMPTY_WAIT_SEC) && c.settledThrough == 0);
+  CHECK(!nwsNoteNoMatch(c, young, now));
+  CHECK(c.retryAfter == (uint32_t)(now + NWS_OBS_EMPTY_WAIT_SEC) && !nwsIsSettled(c, young));
   CHECK(nwsReadingNeedsTemp(c, young, now));
-  nwsNoteNoMatch(c, old, now);
-  CHECK(c.retryAfter == 0 && c.settledThrough == (uint32_t)old && !nwsReadingNeedsTemp(c, old, now));
+  CHECK(nwsNoteNoMatch(c, old, now));
+  CHECK(c.retryAfter == 0 && nwsIsSettled(c, old) && !nwsReadingNeedsTemp(c, old, now));
+  // Reversed delivery order: a day-old reading that arrives after that no-match is still looked up
+  CHECK(nwsReadingNeedsTemp(c, now - 86400.0, now));
 
   // Uncovered: weekly; a new location clears it at once
   nwsNoteUncovered(c, now);
@@ -718,7 +791,9 @@ static void testSaveLoad() {
   nwsAddSample(*a, (uint32_t)now - 7200, 45.3f);
   nwsAddSample(*a, (uint32_t)now - 3600, -3.7f);
   a->failStreak = 4;  // RAM only: not saved
-  nwsSettle(*a, now - 9000.0);
+  nwsSettle(*a, now - 9000.0, now);
+  nwsSettle(*a, now - 90000.0, now);
+  a->settledThrough = (uint32_t)(now - 400000.0);
   NwsClientTemp *b = nwsFindOrAddClient(gStore, "dev:2");
   nwsAddSample(*b, (uint32_t)now - 100, 70.0f);
   nwsFindOrAddClient(gStore, "dev:empty");  // nothing to save
@@ -727,7 +802,8 @@ static void testSaveLoad() {
   std::vector<char> buf(need + 1);
   CHECK(nwsSerializeStore(gStore, buf.data(), buf.size()) == need && strlen(buf.data()) == need);
   CHECK(strstr(buf.data(), "\"dev:empty\"") == nullptr);
-  CHECK(strstr(buf.data(), "\"st\":[\"KDCA\",\"KCGS\"],\"sl\":[38.8894,-77.0352],\"se\":1762913600,\"sb\":1762991000,") != nullptr);
+  CHECK(strstr(buf.data(), "\"st\":[\"KDCA\",\"KCGS\"],\"sl\":[38.8894,-77.0352],\"se\":1762913600,"
+                           "\"sb\":1762600000,\"sd\":[1762991000,1762910000],") != nullptr);
   CHECK(strstr(buf.data(), "\"t\":[[1762992800,453],[1762996400,-37]]") != nullptr);
   CHECK(strstr(buf.data(), "{\"c\":\"dev:2\",\"t\":[[1762999900,700]]}") != nullptr);
 
@@ -743,7 +819,8 @@ static void testSaveLoad() {
   CHECK(la && la->count == 2 && la->sampleTenthsF[0] == 453 && la->sampleTenthsF[1] == -37);
   CHECK(la && nwsStationCount(*la) == 2 && la->stationsEpoch == (uint32_t)(now - 86400.0));
   CHECK(la && nwsStationsCurrent(*la, 38.8894f, -77.0352f, now));
-  CHECK(la && la->failStreak == 0 && la->settledThrough == (uint32_t)(now - 9000.0));
+  CHECK(la && la->failStreak == 0 && la->settledThrough == (uint32_t)(now - 400000.0));
+  CHECK(la && nwsIsSettled(*la, now - 9000.0) && nwsIsSettled(*la, now - 90000.0) && !nwsIsSettled(*la, now - 50000.0));
   const size_t again = nwsSerializeStore(loaded, nullptr, 0);
   std::vector<char> buf2(again + 1);
   nwsSerializeStore(loaded, buf2.data(), buf2.size());
@@ -754,6 +831,7 @@ static void testSaveLoad() {
   deserializeJson(messy,
                   "[{\"c\":\"bad uid\",\"t\":[[1763000000,1]]},"
                   "{\"c\":\"dev:a\",\"st\":[\"KDCA\",\"no/pe\",\"KCGS\"],\"sl\":[38.9,-77.0],\"se\":1762000000,\"sb\":1762990000,"
+                  "\"sd\":[1762950000,\"x\",1000,1763090000,1762960000],"
                   "\"t\":[[1763000000,453],[\"x\",1],[1000,2],[1762999000,\"y\"],[1763090000,9],[1762990000,-1500],[1762980000,100]]},"
                   "{\"c\":\"dev:a\",\"t\":[[1763000000,1]]},"
                   "{\"c\":\"dev:b\",\"st\":[\"KDCA\"],\"se\":1762000000,\"sb\":1763090000,\"t\":[]},"
@@ -765,6 +843,7 @@ static void testSaveLoad() {
   const NwsClientTemp *mb = nwsFindClient(loaded, "dev:b");
   CHECK(mb && nwsStationCount(*mb) == 0);  // no location saved with it
   CHECK(ma && ma->settledThrough == 1762990000u);
+  CHECK(ma && ma->settled[0] == 1762950000u && ma->settled[1] == 1762960000u && ma->settled[2] == 0);  // bad marks skipped
   CHECK(mb && mb->settledThrough == 0);    // later than now + 1 h
   JsonDocument notArray;
   deserializeJson(notArray, "{\"c\":\"dev:a\"}");
@@ -814,6 +893,7 @@ int main() {
   testHttpFraming();
   testHttpFailures();
   testResponses();
+  testBodyFraming();
   testStore();
   testScheduling();
   testSaveLoad();

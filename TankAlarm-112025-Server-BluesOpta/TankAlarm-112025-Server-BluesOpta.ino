@@ -378,16 +378,18 @@
 #define NWS_TEMP_ENABLED 1
 #endif
 
+// A request blocks loop() (web pages, Notecard polling) while it runs: about 1-2 s
+// normally. These bound the worst case; failures then back off for 5 min or more.
 #ifndef NWS_SOCKET_TIMEOUT_MS
-#define NWS_SOCKET_TIMEOUT_MS 5000  // per socket operation; the watchdog is fed between operations
+#define NWS_SOCKET_TIMEOUT_MS 3000  // per socket operation; the watchdog is fed between operations
 #endif
 
 #ifndef NWS_REQUEST_BUDGET_MS
-#define NWS_REQUEST_BUDGET_MS 20000UL  // reading one response; the 30 s watchdog is fed on every read
+#define NWS_REQUEST_BUDGET_MS 10000UL  // a response must arrive within this of the request starting
 #endif
 
 #ifndef NWS_SERVICE_INTERVAL_MS
-#define NWS_SERVICE_INTERVAL_MS 30000UL  // at most one client's lookup per 30 s
+#define NWS_SERVICE_INTERVAL_MS 30000UL  // at most one api.weather.gov request per 30 s
 #endif
 
 #ifndef NWS_NET_RETRY_BASE_SEC
@@ -4527,6 +4529,7 @@ void setup() {
       "/fs/client_config_cache.txt",
       "/fs/history_settings.json",
       "/fs/history/hot_tier.json",
+      NWS_TEMP_FILE,
       "/fs/contacts_config.json",
       "/fs/email_format.json",
       "/fs/calibration_data.txt",
@@ -5058,6 +5061,7 @@ static void recoverOrphanedTmpFiles() {
     "/fs/history_settings.json",
     "/fs/server_heartbeat.json",
     "/fs/history/hot_tier.json",
+    NWS_TEMP_FILE,
     "/fs/archived_clients.json",
     nullptr
   };
@@ -6659,8 +6663,11 @@ static void nwsLog(const char *level, const char *fmt, ...) {
 
 enum : int {
   NWS_GET_NETWORK = -1,       // DNS, connect, TLS, send, or no answer at all
-  NWS_GET_BAD_RESPONSE = -2   // an answer that is not an HTTP response
+  NWS_GET_BAD_RESPONSE = -2,  // an answer that is not an HTTP response
+  NWS_GET_THROTTLED = -3      // not sent: the previous request started less than NWS_SERVICE_INTERVAL_MS ago
 };
+
+static unsigned long gNwsLastRequestMs = 0;  // when the last api.weather.gov request started (0 = none yet)
 
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
 // Tears the TLS+TCP pair down without waiting for the peer, the same steps the FTPS
@@ -6695,7 +6702,7 @@ struct NwsTlsRead {
 };
 
 // NwsHttpReader's byte source. Feeds the watchdog on every read; each recv waits at most
-// NWS_SOCKET_TIMEOUT_MS, and the whole response at most NWS_REQUEST_BUDGET_MS.
+// NWS_SOCKET_TIMEOUT_MS, and reading stops NWS_REQUEST_BUDGET_MS after the request began.
 static int nwsTlsRead(void *ctx, uint8_t *buf, size_t len) {
   NwsTlsRead *r = static_cast<NwsTlsRead *>(ctx);
   serviceTransferWatchdog();
@@ -6706,14 +6713,18 @@ static int nwsTlsRead(void *ctx, uint8_t *buf, size_t len) {
 }
 #endif
 
-// GET https://api.weather.gov<path>. Returns the HTTP status, NWS_GET_NETWORK or
-// NWS_GET_BAD_RESPONSE. On 200 the body is parsed into doc through filter, and jsonErr
-// is Ok only when the whole JSON value arrived.
+// GET https://api.weather.gov<path>. Returns the HTTP status, NWS_GET_NETWORK,
+// NWS_GET_BAD_RESPONSE or NWS_GET_THROTTLED. On 200 the body is parsed into doc through
+// filter, and jsonErr is Ok only when the whole JSON value arrived and the body ended as
+// its framing says. At most one request per NWS_SERVICE_INTERVAL_MS is sent, whoever asks.
 static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument &doc, DeserializationError &jsonErr) {
   jsonErr = DeserializationError::EmptyInput;
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  const unsigned long startMs = millis();
+  if (gNwsLastRequestMs != 0 && startMs - gNwsLastRequestMs < NWS_SERVICE_INTERVAL_MS) return NWS_GET_THROTTLED;
   NetworkInterface *network = Ethernet.getNetwork();
   if (!network || Ethernet.linkStatus() != LinkON) return NWS_GET_NETWORK;
+  gNwsLastRequestMs = startMs ? startMs : 1;
 
   char userAgent[40];
   snprintf(userAgent, sizeof(userAgent), "TankAlarm-Server/%s", FIRMWARE_VERSION);
@@ -6781,13 +6792,13 @@ static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument 
     sent += (size_t)n;
   }
 
-  NwsTlsRead readCtx = {tls, millis()};
+  NwsTlsRead readCtx = {tls, startMs};
   NwsHttpReader reader;
   reader.begin(nwsTlsRead, &readCtx, NWS_HTTP_BODY_MAX);
   int status;
   if (reader.readHead()) {
     status = reader.status;
-    if (status == 200) jsonErr = deserializeJson(doc, reader, DeserializationOption::Filter(filter));
+    if (status == 200) jsonErr = nwsParseBody(reader, filter, doc);
   } else {
     status = (reader.ioError || reader.eof) ? NWS_GET_NETWORK : NWS_GET_BAD_RESPONSE;
   }
@@ -6805,6 +6816,19 @@ static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument 
 static uint8_t gNwsCursor = 0;          // round-robin position in gClientMetadata
 static uint8_t gNwsNetFailStreak = 0;
 static double gNwsNetRetryAfter = 0.0;  // after a network failure nobody is asked before this
+
+// The second request of a two-request step, made on a later call so that a call makes
+// at most one request: the station list that /points pointed to, or the next station's
+// observations when the nearest one had none for the reading.
+enum NwsNextKind : uint8_t { NWS_NEXT_NONE = 0, NWS_NEXT_STATION_LIST, NWS_NEXT_STATION_OBS };
+static struct {
+  uint8_t kind;
+  char uid[NWS_UID_MAX];
+  char path[NWS_PATH_MAX];  // NWS_NEXT_STATION_LIST: the list path /points gave
+  float lat, lon;           // NWS_NEXT_STATION_LIST: the location /points was asked for
+  double target;            // NWS_NEXT_STATION_OBS: the reading time
+  uint8_t station;          // NWS_NEXT_STATION_OBS: the station to ask
+} gNwsNext;
 
 // api.weather.gov did not answer at all: wait for everyone, 5 min doubling to 6 h
 static void nwsNoteNetworkFailure(double now, const char *what) {
@@ -6844,8 +6868,9 @@ static double nwsOldestReadingNeedingTemp(const NwsClientTemp &wx, const char *c
   return oldest;
 }
 
-// /points for the client's location, then the two nearest observation stations
-static void nwsFindStations(const ClientMetadata &meta, NwsClientTemp &wx, double now) {
+// Finding the stations, request 1: /points for the client's location. Its station
+// list is asked for on the next call.
+static void nwsRequestPoints(const ClientMetadata &meta, NwsClientTemp &wx, double now) {
   char path[NWS_PATH_MAX];
   if (!nwsPointsPath(path, sizeof(path), meta.latitude, meta.longitude)) {
     nwsNoteClientFailure(wx, now, "Station lookup", 0);
@@ -6855,7 +6880,8 @@ static void nwsFindStations(const ClientMetadata &meta, NwsClientTemp &wx, doubl
   JsonDocument doc;
   DeserializationError err;
   nwsPointsFilter(filter);
-  int status = nwsHttpsGetJson(path, filter, doc, err);
+  const int status = nwsHttpsGetJson(path, filter, doc, err);
+  if (status == NWS_GET_THROTTLED) return;
   if (status == NWS_GET_NETWORK) {
     nwsNoteNetworkFailure(now, "Station lookup");
     return;
@@ -6874,14 +6900,26 @@ static void nwsFindStations(const ClientMetadata &meta, NwsClientTemp &wx, doubl
     nwsNoteClientFailure(wx, now, "Station lookup", status);
     return;
   }
+  gNwsNext.kind = NWS_NEXT_STATION_LIST;
+  snprintf(gNwsNext.uid, sizeof(gNwsNext.uid), "%s", wx.uid);
+  snprintf(gNwsNext.path, sizeof(gNwsNext.path), "%s", stationsPath);
+  gNwsNext.lat = meta.latitude;
+  gNwsNext.lon = meta.longitude;
+}
 
+// Finding the stations, request 2: the two nearest stations in the list /points gave
+static void nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat, float lon, double now) {
+  JsonDocument filter;
+  JsonDocument doc;
+  DeserializationError err;
   nwsStationsFilter(filter);
-  doc.clear();
-  status = nwsHttpsGetJson(stationsPath, filter, doc, err);
+  const int status = nwsHttpsGetJson(path, filter, doc, err);
+  if (status == NWS_GET_THROTTLED) return;
   if (status == NWS_GET_NETWORK) {
     nwsNoteNetworkFailure(now, "Station list");
     return;
   }
+  gNwsNetFailStreak = 0;
   char ids[NWS_STATIONS][NWS_STATION_ID_MAX];
   const uint8_t n = (status == 200 && err == DeserializationError::Ok)
                         ? nwsParseStations(doc.as<JsonVariantConst>(), ids, NWS_STATIONS)
@@ -6890,7 +6928,7 @@ static void nwsFindStations(const ClientMetadata &meta, NwsClientTemp &wx, doubl
     nwsNoteClientFailure(wx, now, "Station list", status);
     return;
   }
-  nwsSetStations(wx, ids, n, meta.latitude, meta.longitude, now);
+  nwsSetStations(wx, ids, n, lat, lon, now);
   wx.uncovered = false;
   nwsNoteSuccess(wx);
   gNwsTempDirty = true;
@@ -6898,67 +6936,90 @@ static void nwsFindStations(const ClientMetadata &meta, NwsClientTemp &wx, doubl
          n > 1 ? wx.stations[1] : "");
 }
 
-// The observation nearest reading time target, from the nearest station or, when it has
-// none in the window, the next one
-static void nwsFetchObservation(NwsClientTemp &wx, double target, double now) {
+// One station's observations around reading time target. When none matches and
+// another station is known, that one is asked on the next call.
+static void nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t station, double now) {
+  if (station >= nwsStationCount(wx)) return;  // the stations changed since: planned again
   const double start = target - NWS_OBS_MATCH_SEC;
   double end = target + NWS_OBS_MATCH_SEC;
   if (end > now) end = now;
-  JsonDocument filter;
-  nwsObservationsFilter(filter);
-  const uint8_t stations = nwsStationCount(wx);
-  for (uint8_t k = 0; k < stations; ++k) {
-    char path[NWS_PATH_MAX];
-    if (!nwsObservationsPath(path, sizeof(path), wx.stations[k], start, end)) break;
-    JsonDocument doc;
-    DeserializationError err;
-    const int status = nwsHttpsGetJson(path, filter, doc, err);
-    if (status == NWS_GET_NETWORK) {
-      nwsNoteNetworkFailure(now, "Observation request");
-      return;
-    }
-    gNwsNetFailStreak = 0;
-    if (status == 404) {  // the station is gone: find the stations again
-      nwsLog("warn", "NWS station %s for %.32s not found; looking up stations again", wx.stations[k], wx.uid);
-      nwsClearStations(wx);
-      nwsNoteFailure(wx, now);
-      gNwsTempDirty = true;
-      return;
-    }
-    if (status != 200 || err != DeserializationError::Ok) {
-      nwsNoteClientFailure(wx, now, "Observation request", status);
-      return;
-    }
-    float tempF = 0.0f;
-    double obsEpoch = 0.0;
-    if (nwsNearestObservation(doc.as<JsonVariantConst>(), target, NWS_OBS_MATCH_SEC, &tempF, &obsEpoch)) {
-      const bool first = wx.count == 0;
-      if (nwsNoteMatched(wx, target, (uint32_t)obsEpoch, tempF) || wx.settledThrough >= (uint32_t)target) {
-        gNwsTempDirty = true;
-      }
-      if (first && wx.count > 0) {
-        nwsLog("info", "%.32s: first outdoor temperature %.1f F from %s", wx.uid, (double)tempF, wx.stations[k]);
-      }
-      return;
-    }
+  char path[NWS_PATH_MAX];
+  if (!nwsObservationsPath(path, sizeof(path), wx.stations[station], start, end)) {
+    nwsNoteClientFailure(wx, now, "Observation request", 0);
+    return;
   }
-  nwsNoteNoMatch(wx, target, now);
-  if (wx.settledThrough >= (uint32_t)target) gNwsTempDirty = true;
+  JsonDocument filter;
+  JsonDocument doc;
+  DeserializationError err;
+  nwsObservationsFilter(filter);
+  const int status = nwsHttpsGetJson(path, filter, doc, err);
+  if (status == NWS_GET_THROTTLED) return;
+  if (status == NWS_GET_NETWORK) {
+    nwsNoteNetworkFailure(now, "Observation request");
+    return;
+  }
+  gNwsNetFailStreak = 0;
+  if (status == 404) {  // the station is gone: find the stations again
+    nwsLog("warn", "NWS station %s for %.32s not found; looking up stations again", wx.stations[station], wx.uid);
+    nwsClearStations(wx);
+    nwsNoteFailure(wx, now);
+    gNwsTempDirty = true;
+    return;
+  }
+  if (status != 200 || err != DeserializationError::Ok) {
+    nwsNoteClientFailure(wx, now, "Observation request", status);
+    return;
+  }
+  float tempF = 0.0f;
+  double obsEpoch = 0.0;
+  if (nwsNearestObservation(doc.as<JsonVariantConst>(), target, NWS_OBS_MATCH_SEC, &tempF, &obsEpoch)) {
+    const bool first = wx.count == 0;
+    if (nwsNoteMatched(wx, target, (uint32_t)obsEpoch, tempF, now)) gNwsTempDirty = true;
+    if (first && wx.count > 0) {
+      nwsLog("info", "%.32s: first outdoor temperature %.1f F from %s", wx.uid, (double)tempF, wx.stations[station]);
+    }
+    return;
+  }
+  if (station + 1 < nwsStationCount(wx)) {
+    gNwsNext.kind = NWS_NEXT_STATION_OBS;
+    snprintf(gNwsNext.uid, sizeof(gNwsNext.uid), "%s", wx.uid);
+    gNwsNext.target = target;
+    gNwsNext.station = (uint8_t)(station + 1);
+    return;
+  }
+  if (nwsNoteNoMatch(wx, target, now)) gNwsTempDirty = true;
 }
 
-// One step per call at most: ask a client for its location (a Notecard note), find a
-// client's weather stations, or fetch the observation for one reading.
+// At most one api.weather.gov request per call, and per NWS_SERVICE_INTERVAL_MS: the
+// pending second request of a step (gNwsNext), or the next client's step: ask it for
+// its location (a Notecard note), find its weather stations, or fetch the observation
+// for one of its readings.
 static void serviceOutdoorTemperature() {
 #if NWS_TEMP_ENABLED
   static unsigned long lastRunMs = 0;
   const unsigned long nowMs = millis();
   if (nowMs < 120000UL) return;  // let the network, the clock and the first notes settle after boot
   if (lastRunMs != 0 && nowMs - lastRunMs < NWS_SERVICE_INTERVAL_MS) return;
+  if (gNwsLastRequestMs != 0 && nowMs - gNwsLastRequestMs < NWS_SERVICE_INTERVAL_MS) return;
   lastRunMs = nowMs;
   if (gPaused || gDfuInProgress || gClientMetadataCount == 0) return;
   if (Ethernet.linkStatus() != LinkON) return;
   const double now = currentEpoch();
   if (!(now >= NWS_MIN_VALID_EPOCH) || now < gNwsNetRetryAfter) return;
+
+  if (gNwsNext.kind != NWS_NEXT_NONE) {
+    const uint8_t kind = gNwsNext.kind;
+    gNwsNext.kind = NWS_NEXT_NONE;  // asked once; a failure is handled as for any request
+    NwsClientTemp *wx = findClientMetadata(gNwsNext.uid) ? nwsFindClient(gNwsTemp, gNwsNext.uid) : nullptr;
+    if (wx) {
+      if (kind == NWS_NEXT_STATION_LIST) {
+        nwsRequestStationList(*wx, gNwsNext.path, gNwsNext.lat, gNwsNext.lon, now);
+      } else {
+        nwsRequestObservations(*wx, gNwsNext.target, gNwsNext.station, now);
+      }
+      return;
+    }
+  }
 
   for (uint8_t step = 0; step < gClientMetadataCount; ++step) {
     const uint8_t i = (uint8_t)((gNwsCursor + step) % gClientMetadataCount);
@@ -6976,9 +7037,9 @@ static void serviceOutdoorTemperature() {
         nwsLog("info", "Asked %.32s for its location (needed for outdoor temperature)", meta.clientUid);
       }
     } else if (action == NWS_ACT_FIND_STATIONS) {
-      nwsFindStations(meta, *wx, now);
+      nwsRequestPoints(meta, *wx, now);
     } else {
-      nwsFetchObservation(*wx, target, now);
+      nwsRequestObservations(*wx, target, 0, now);
     }
     return;
   }
