@@ -442,18 +442,45 @@ The server publishes **two body shapes** to `email.qo`:
 ```json
 {
   "to": "ops@example.com,owner@example.com",
-  "id": "dev:860000000000000-1783497600-3",
-  "subject": "Daily Sensor Summary - 2026-07-08",
+  "id": "dev:860000000000000-1794830400-3",
+  "subject": "Daily Sensor Summary - 2026-11-16 - NOT REPORTING: Silas",
   "serverName": "Tank Alarm Server",
+  "lateH": 30, "staleH": 49,
+  "staleCount": 1, "staleSites": "Silas",
   "sensors": [ { "client": "dev:...", "site": "Silas", "label": "Cox Wellhead",
-                 "sensorIndex": 1, "levelInches": 43.8, "sensorMa": 8.2,
-                 "alarm": false, "alarmType": "clear" } ],
+                 "sensorIndex": 1, "levelInches": 23, "sensorMa": 11.35,
+                 "alarm": false, "alarmType": "clear",
+                 "u": 1794613800, "stale": true, "ageH": 60.2, "asOf": "2026-11-13 17:50" },
+               { "client": "dev:...", "site": "North", "label": "Tank 2",
+                 "sensorIndex": 2, "levelInches": 41.2, "sensorMa": 9.1,
+                 "alarm": false, "alarmType": "clear", "u": 1794808800 } ],
   "fmt": { "groupBySite": true, "fieldLevelInches": true, "...": "..." }
 }
 ```
 
-The `subject` comes from the **/email-format** page (`{date}` token supported), and the
-page's field/summary toggles ride along in `fmt` so your route template can honor them.
+The `subject` comes from the **/email-format** page (`{date}` token supported, the server's
+local date), and the page's field/summary toggles ride along in `fmt` so your route template
+can honor them.
+
+**Old readings.** The server keeps each sensor's last value until a new one arrives, so a
+site that stops reporting still has a `levelInches`. Every sensor carries `u`, the time of its
+reading (Unix seconds), and an old one is flagged so the email does not show it as current:
+
+| Field | Meaning |
+|-------|---------|
+| `late: true` | The reading is at least `lateH` hours old (30): at least one daily report was missed. |
+| `stale: true` | The reading is at least `staleH` hours old (49), the same limit as the "Client stale" SMS. |
+| `ageH` | The reading's age in hours (one decimal). Sent with `late`/`stale`, and for every sensor when **Last Reading Time** is on. |
+| `asOf` | The reading's time as `YYYY-MM-DD HH:MM` in the time zone set with the daily report send time on the Contacts page (` UTC` is added when none is set). Sent with `ageH`. |
+| `staleCount`, `staleSites` | Sites whose newest reading is stale, and their names (`"Silas, North +2 more"`). |
+| `lateCount`, `lateSites` | The same for sites that are late but not yet stale. |
+
+The subject also gets ` - NOT REPORTING: <sites>` and ` - NO NEW DATA: <sites>`, so even a
+template that ignores the fields above shows which sites are behind. The site fields and the
+subject markers follow the **Stale Readings Warning** toggle on /email-format (on by
+default); the per-sensor fields are always sent. A very large daily report drops `fmt`, then
+`asOf`, `u` and `alarmType` of sensors not in alarm, before it would be too big to send.
+`levelInches` and `sensorIndex` are unchanged, so existing templates keep working.
 
 **Alarm / unload / test alert** (event-driven, v2.2.1+, sent to contacts with the
 **Email alerts** checkbox enabled on the /contacts page):
@@ -499,13 +526,25 @@ daily `sensors` array):
     "type": "text/plain",
     "value": body.type = "alarm"
       ? body.message
-      : $join($map(body.sensors, function($s) {
+      : ($exists(body.staleCount) ? "*** " & $string(body.staleCount) & " site(s) NOT REPORTING (no data for over " & $string(body.staleH) & " h): " & body.staleSites & " ***\n" : "") &
+        ($exists(body.lateCount) ? "*** " & $string(body.lateCount) & " site(s) with NO NEW DATA for over " & $string(body.lateH) & " h: " & body.lateSites & " ***\n" : "") &
+        ($exists(body.staleCount) or $exists(body.lateCount) ? "\n" : "") &
+        $join($map(body.sensors, function($s) {
           $s.site & " " & $s.label & " #" & $string($s.sensorIndex) & ": " &
-          $string($s.levelInches) & ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
+          ($s.stale or $s.late
+            ? "NO NEW READING for " & $string($s.ageH) & " h - last reading " & $string($s.levelInches) &
+              ($exists($s.asOf) ? " at " & $s.asOf : "")
+            : $string($s.levelInches)) &
+          ($s.alarm ? "  ** ALARM: " & $s.alarmType & " **" : "")
         }), "\n")
   }]
 }
 ```
+
+The old-reading lines (`staleCount`, `lateCount`, `late`/`stale`) are new in this version of
+the expression. A payload without those fields renders exactly as the previous version did.
+It was checked with the reference JavaScript JSONata (2.0.6); Notehub's engine may differ in
+small ways, so try it in Notehub's JSONata tester with a routed daily event before saving.
 
 > **Provider notes:** the `from` address must be a verified sender in SendGrid. For richer
 > formatting, point `content.type` at `text/html` and expand the template using the `fmt`
@@ -573,6 +612,11 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
   test email. Raising the route **Timeout** to 60 s avoids most retries.
 - The daily report's `fmt` object (from the server's `/email-format` page) is available to
   the script if you want to expand the sample renderer.
+- **Old readings:** the script lists sites that are not reporting at the top of the daily
+  email and prints `NO NEW READING for 2.5 days - last reading 23 (11.35 mA) at 2026-11-13
+  17:50` instead of the old value (see "Old readings" above). A script pasted before this
+  version prints the old value as before; only the subject shows `NOT REPORTING`. Paste the
+  current `doPost` from `/email-setup` to get the per-sensor lines.
 
 ### Recipient management (server side)
 
