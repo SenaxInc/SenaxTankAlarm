@@ -468,12 +468,12 @@ reading (Unix seconds), and an old one is flagged so the email does not show it 
 
 | Field | Meaning |
 |-------|---------|
-| `late: true` | The reading is not new, but under `staleH` hours old: its client missed the daily report due before this email (nothing newer has come since its last report, made 25 hours or more ago), or the reading is at least 30 hours old. |
+| `late: true` | The reading is not new, but under `staleH` hours old: its client missed the daily report due before this email (nothing newer has come since its last report, made 24 hours 20 minutes or more ago, so a report due with the email, at T-0:00, is not counted), or the reading is at least 30 hours old. |
 | `stale: true` | The reading is at least `staleH` hours old (49), the same limit as the "Client stale" SMS. A stale reading has `stale` and not `late`, so a template should test `stale or late`. |
 | `ageH` | The reading's age in hours (one decimal). Sent with `late`/`stale`, and for every sensor when **Last Reading Time** is on. |
 | `asOf` | The reading's time as `YYYY-MM-DD HH:MM` in the time zone set with the daily report send time on the Contacts page (` UTC` is added when none is set). Sent with `ageH`. |
-| `staleCount`, `staleSites` | Sites not reporting: nothing at all, no new reading, no daily report and no other note, for `staleH` hours, as for the "Client stale" SMS. After a server restart, until a site's next daily report, a site that sends only daily reports with old readings is listed here too, as the SMS also counts it. The count of distinct site names, and the names (`"Silas, North +2 more"`). |
-| `lateCount`, `lateSites` | The same for sites with no new readings: the newest reading is late, or stale while the site still sends its daily report or other notes (a failed sensor, or the first report after a battery outage). A site is in one list only. |
+| `staleCount`, `staleSites` | Sites not reporting: nothing at all, no new reading, no daily report and no other note (a battery, solar or power alarm, a config acknowledgement or a location answer counts too), for `staleH` hours, the "Client stale" SMS's limit. After a server restart, until a site's next daily report, a site that sends only daily reports with old readings is listed here too, as the SMS also counts it. The count of distinct site names, and the names (`"Silas, North +2 more"`). |
+| `lateCount`, `lateSites` | The same for sites with no new readings: the newest reading is late, or stale while the site still sends its daily report or other notes (a failed sensor, a sensor shut off for low power, or the first report after a battery outage). A site is in one list only. |
 
 The subject also gets ` - NOT REPORTING: <sites>` and ` - NO NEW READINGS: <sites>`, so even
 a template that ignores the fields above shows which sites are behind. The site fields and the
