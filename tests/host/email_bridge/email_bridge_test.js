@@ -435,16 +435,16 @@ try {
 {
   const br = makeBridge(source);
   checkEq('(s) daily with old readings ok', br.post(routed('ev-0510', {
-    to: 'ops@example.com', subject: 'Daily Sensor Summary - 2026-11-16 - NOT REPORTING: Silas - NO NEW DATA: North',
+    to: 'ops@example.com', subject: 'Daily Sensor Summary - 2026-11-16 - NOT REPORTING: Silas - NO NEW READINGS: North',
     id: 'dev:1-1794830400-7', serverName: 'Tank Alarm Server',
-    lateH: 30, staleH: 49, staleCount: 1, staleSites: 'Silas', lateCount: 1, lateSites: 'North',
+    staleH: 49, staleCount: 1, staleSites: 'Silas', lateCount: 1, lateSites: 'North',
     sensors: [
       { client: 'dev:2', site: 'Silas', label: 'Wellhead', sensorIndex: 1, levelInches: 23,
         sensorMa: 11.35, alarm: false, alarmType: 'clear', u: 1794613800, stale: true, ageH: 60.2,
         asOf: '2026-11-13 17:50' },
       { client: 'dev:3', site: 'North', label: 'Tank 2', sensorIndex: 2, levelInches: 41.2,
-        sensorMa: 9.1, alarm: true, alarmType: 'high', u: 1794720000, late: true, ageH: 31.4,
-        asOf: '2026-11-15 05:00' },
+        sensorMa: 9.1, alarm: true, alarmType: 'high', u: 1794735360, late: true, ageH: 26.4,
+        asOf: '2026-11-15 03:36' },
       { client: 'dev:4', site: 'East', label: 'Tank 1', sensorIndex: 1, levelInches: 10,
         alarm: false, alarmType: 'clear', u: 1794826800, ageH: 1, asOf: '2026-11-16 05:00' },
       { client: 'dev:5', site: 'West', label: 'Tank 3', sensorIndex: 1, levelInches: 5.5,
@@ -456,15 +456,15 @@ try {
   })), 'ok');
   const daily = br.sent[0] || {};
   checkEq('(s) subject passed through', daily.subject,
-          'Daily Sensor Summary - 2026-11-16 - NOT REPORTING: Silas - NO NEW DATA: North');
+          'Daily Sensor Summary - 2026-11-16 - NOT REPORTING: Silas - NO NEW READINGS: North');
   checkEq('(s) daily body', daily.body, [
     'Tank Alarm Server',
     '',
     '*** 1 site NOT REPORTING (no data for over 49 h): Silas ***',
-    '*** 1 site with NO NEW DATA for over 30 h: North ***',
+    '*** 1 site with NO NEW READINGS: North ***',
     '',
     'Silas Wellhead #1: NO NEW READING for 2.5 days - last reading 23 (11.35 mA) at 2026-11-13 17:50',
-    'North Tank 2 #2: NO NEW READING for 31 h - last reading 41.2 (9.1 mA) at 2026-11-15 05:00  ** ALARM: high **',
+    'North Tank 2 #2: NO NEW READING for 26 h - last reading 41.2 (9.1 mA) at 2026-11-15 03:36  ** ALARM: high **',
     'East Tank 1 #1: 10  (as of 2026-11-16 05:00)',
     'West Tank 3 #1: 5.5 (5.2 mA)',
     'South Tank 4 #1: NO NEW READING for 48 h - last reading 7',
@@ -484,14 +484,14 @@ try {
 
   checkEq('(s) two sites wording ok', br.post(routed('ev-0512', {
     to: 'ops@example.com', subject: 'Daily Sensor Summary', id: 'dev:1-1794830400-9',
-    staleH: 49, staleCount: 2, staleSites: 'Silas, North +1 more',
+    staleH: 49, staleCount: 3, staleSites: 'Silas, North +1 more',
     sensors: [
       { client: 'dev:2', site: 'Silas', label: 'Wellhead', sensorIndex: 1, levelInches: 23,
         alarm: false, alarmType: 'clear', stale: true, ageH: 120 },
     ],
   })), 'ok');
   checkEq('(s) two sites banner', (br.sent[2] || {}).body, [
-    '*** 2 sites NOT REPORTING (no data for over 49 h): Silas, North +1 more ***',
+    '*** 3 sites NOT REPORTING (no data for over 49 h): Silas, North +1 more ***',
     '',
     'Silas Wellhead #1: NO NEW READING for 5.0 days - last reading 23',
   ].join('\n'));

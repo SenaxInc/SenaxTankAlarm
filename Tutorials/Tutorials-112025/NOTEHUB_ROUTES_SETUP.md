@@ -445,7 +445,7 @@ The server publishes **two body shapes** to `email.qo`:
   "id": "dev:860000000000000-1794830400-3",
   "subject": "Daily Sensor Summary - 2026-11-16 - NOT REPORTING: Silas",
   "serverName": "Tank Alarm Server",
-  "lateH": 30, "staleH": 49,
+  "staleH": 49,
   "staleCount": 1, "staleSites": "Silas",
   "sensors": [ { "client": "dev:...", "site": "Silas", "label": "Cox Wellhead",
                  "sensorIndex": 1, "levelInches": 23, "sensorMa": 11.35,
@@ -468,19 +468,20 @@ reading (Unix seconds), and an old one is flagged so the email does not show it 
 
 | Field | Meaning |
 |-------|---------|
-| `late: true` | The reading is at least `lateH` hours old (30): at least one daily report was missed. |
-| `stale: true` | The reading is at least `staleH` hours old (49), the same limit as the "Client stale" SMS. |
+| `late: true` | The reading is not new, but under `staleH` hours old: its client missed the daily report due before this email (nothing newer has come since its last report, made 25 hours or more ago), or the reading is at least 30 hours old. |
+| `stale: true` | The reading is at least `staleH` hours old (49), the same limit as the "Client stale" SMS. A stale reading has `stale` and not `late`, so a template should test `stale or late`. |
 | `ageH` | The reading's age in hours (one decimal). Sent with `late`/`stale`, and for every sensor when **Last Reading Time** is on. |
 | `asOf` | The reading's time as `YYYY-MM-DD HH:MM` in the time zone set with the daily report send time on the Contacts page (` UTC` is added when none is set). Sent with `ageH`. |
-| `staleCount`, `staleSites` | Sites whose newest reading is stale, and their names (`"Silas, North +2 more"`). |
-| `lateCount`, `lateSites` | The same for sites that are late but not yet stale. |
+| `staleCount`, `staleSites` | Sites not reporting: nothing, not even a daily report, for `staleH` hours. The count of distinct site names, and the names (`"Silas, North +2 more"`). |
+| `lateCount`, `lateSites` | The same for sites with no new readings: the newest reading is late, or stale while the site still sends its daily report (a failed sensor, or the first report after a battery outage). A site is in one list only. |
 
-The subject also gets ` - NOT REPORTING: <sites>` and ` - NO NEW DATA: <sites>`, so even a
-template that ignores the fields above shows which sites are behind. The site fields and the
+The subject also gets ` - NOT REPORTING: <sites>` and ` - NO NEW READINGS: <sites>`, so even
+a template that ignores the fields above shows which sites are behind. The site fields and the
 subject markers follow the **Stale Readings Warning** toggle on /email-format (on by
-default); the per-sensor fields are always sent. A very large daily report drops `fmt`, then
-`asOf`, `u` and `alarmType` of sensors not in alarm, before it would be too big to send.
-`levelInches` and `sensorIndex` are unchanged, so existing templates keep working.
+default); the per-sensor fields are always sent. A daily report too large to send drops, in
+this order until it fits: `u` (and `ageH`/`asOf` of current readings), `fmt`, `id`, then
+`asOf` and `alarmType` of sensors not in alarm. `levelInches` and `sensorIndex` are unchanged,
+so existing templates keep working.
 
 **Alarm / unload / test alert** (event-driven, v2.2.1+, sent to contacts with the
 **Email alerts** checkbox enabled on the /contacts page):
@@ -519,7 +520,7 @@ daily `sensors` array):
 
 ```jsonata
 {
-  "personalizations": [{ "to": $map($split(body.to, ","), function($e) {{ "email": $trim($e) }}) }],
+  "personalizations": [{ "to": [$map($split(body.to, ","), function($e) {{ "email": $trim($e) }})] }],
   "from": { "email": "alerts@yourdomain.com", "name": "TankAlarm" },
   "subject": body.subject,
   "content": [{
@@ -527,7 +528,7 @@ daily `sensors` array):
     "value": body.type = "alarm"
       ? body.message
       : ($exists(body.staleCount) ? "*** " & $string(body.staleCount) & " site(s) NOT REPORTING (no data for over " & $string(body.staleH) & " h): " & body.staleSites & " ***\n" : "") &
-        ($exists(body.lateCount) ? "*** " & $string(body.lateCount) & " site(s) with NO NEW DATA for over " & $string(body.lateH) & " h: " & body.lateSites & " ***\n" : "") &
+        ($exists(body.lateCount) ? "*** " & $string(body.lateCount) & " site(s) with NO NEW READINGS: " & body.lateSites & " ***\n" : "") &
         ($exists(body.staleCount) or $exists(body.lateCount) ? "\n" : "") &
         $join($map(body.sensors, function($s) {
           $s.site & " " & $s.label & " #" & $string($s.sensorIndex) & ": " &
@@ -543,6 +544,8 @@ daily `sensors` array):
 
 The old-reading lines (`staleCount`, `lateCount`, `late`/`stale`) are new in this version of
 the expression. A payload without those fields renders exactly as the previous version did.
+The `to` list is now wrapped in `[...]`: the previous version sent a single recipient as an
+object, which SendGrid rejects, so a deployment with one email contact got no email.
 It was checked with the reference JavaScript JSONata (2.0.6); Notehub's engine may differ in
 small ways, so try it in Notehub's JSONata tester with a routed daily event before saving.
 
@@ -612,11 +615,11 @@ parses the note `body`, handles both body shapes above (alarm `message` vs daily
   test email. Raising the route **Timeout** to 60 s avoids most retries.
 - The daily report's `fmt` object (from the server's `/email-format` page) is available to
   the script if you want to expand the sample renderer.
-- **Old readings:** the script lists sites that are not reporting at the top of the daily
-  email and prints `NO NEW READING for 2.5 days - last reading 23 (11.35 mA) at 2026-11-13
-  17:50` instead of the old value (see "Old readings" above). A script pasted before this
-  version prints the old value as before; only the subject shows `NOT REPORTING`. Paste the
-  current `doPost` from `/email-setup` to get the per-sensor lines.
+- **Old readings:** the script lists sites that are not reporting, or have no new readings,
+  at the top of the daily email and prints `NO NEW READING for 2.5 days - last reading 23
+  (11.35 mA) at 2026-11-13 17:50` instead of the old value (see "Old readings" above). A
+  script pasted before this version prints the old value as before; only the subject lists
+  the sites. Paste the current `doPost` from `/email-setup` to get the per-sensor lines.
 
 ### Recipient management (server side)
 
