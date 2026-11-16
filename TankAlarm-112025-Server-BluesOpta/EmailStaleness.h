@@ -116,15 +116,38 @@ static inline double noteReadingEpoch(double noteT, double arrival, bool exactT,
   return arrival > 0.0 ? arrival : 0.0;
 }
 
+// The bounds of a believable reading time, as for the history (warmAcquisitionEpoch() in
+// WarmTierStore.h): from 2020 on (earlier, the client's clock was not set), before 2100, and at
+// most READING_MAX_AHEAD_SECONDS ahead of the server clock (both are network time).
+#ifndef READING_MIN_VALID_EPOCH
+#define READING_MIN_VALID_EPOCH 1577836800.0  // 2020-01-01Z
+#endif
+#ifndef READING_MAX_VALID_EPOCH
+#define READING_MAX_VALID_EPOCH 4102444800.0  // 2100-01-01Z
+#endif
+#ifndef READING_MAX_AHEAD_SECONDS
+#define READING_MAX_AHEAD_SECONDS 3600.0
+#endif
+
+// True when epoch can be a reading's time, seen at now (the server clock; 0 or less = not set,
+// when only the fixed bounds apply). A time far ahead of the clock would read as age 0 until
+// the clock caught up, so a site that then stopped would look current all that time.
+static inline bool readingEpochPlausible(double epoch, double now) {
+  if (!(epoch >= READING_MIN_VALID_EPOCH && epoch < READING_MAX_VALID_EPOCH)) return false;  // also NaN
+  return !(now > 0.0) || epoch <= now + READING_MAX_AHEAD_SECONDS;
+}
+
 // A sensor's reading time after a note: the time the note dates its reading by (readingT,
 // from noteReadingEpoch(), or 0 when the note's value was not taken), or else the time kept so
 // far. While no note has dated the value (a new record, or one saved before reading times
 // were kept) the note's own time (noteEpoch) stands in, fixed once: a stand-in that moved with
-// every note would keep a failed sensor's value fresh. 0 while no time at all is known.
-static inline double keptReadingEpoch(double kept, double readingT, double noteEpoch) {
-  if (readingT > 0.0) return readingT;
-  if (kept > 0.0) return kept;
-  return noteEpoch > 0.0 ? noteEpoch : 0.0;
+// every note would keep a failed sensor's value fresh. Each time is used only when it is
+// plausible at now (readingEpochPlausible()): a note with a bad time keeps the time there is,
+// and a kept time that is not plausible gives way to the stand-in. 0 while no time is known.
+static inline double keptReadingEpoch(double kept, double readingT, double noteEpoch, double now) {
+  if (readingEpochPlausible(readingT, now)) return readingT;
+  if (readingEpochPlausible(kept, now)) return kept;
+  return readingEpochPlausible(noteEpoch, now) ? noteEpoch : 0.0;
 }
 
 struct CivilTime {

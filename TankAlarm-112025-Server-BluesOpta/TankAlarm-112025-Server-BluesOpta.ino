@@ -188,6 +188,9 @@
 // The daily email's site lists keep every client's name, to count each site once.
 static_assert(SITE_LIST_MAX_NAMES >= MAX_SENSOR_RECORDS,
               "EmailStaleness.h: SITE_LIST_MAX_NAMES must cover MAX_SENSOR_RECORDS");
+// A reading's time may lead the server clock by as much for the email as for the history.
+static_assert(READING_MAX_AHEAD_SECONDS == WARM_MAX_FUTURE_SKEW_SEC,
+              "EmailStaleness.h: READING_MAX_AHEAD_SECONDS must match WARM_MAX_FUTURE_SKEW_SEC");
 
 // Orphaned sensor auto-prune threshold (72 hours / 3 days)
 // When a client has fresh AND stale sensors, sensors stale beyond this age
@@ -513,7 +516,9 @@ struct SensorRecord {
   // value with no valid mA) does not date the value kept either. The daily email and alarm
   // reminders judge a reading's age by it (sensorReadingEpoch()). Until a note dates the value,
   // the first note's time stands in, fixed so later notes do not move it (keptReadingEpoch();
-  // a registry entry saved before "re" takes its "u"). 0 only while no time at all is known:
+  // a registry entry saved before "re" takes its "u"). A time is taken only when it is
+  // plausible against the server clock (readingEpochPlausible(): not more than an hour ahead,
+  // not before the client's clock was set). 0 only while no time at all is known:
   // lastUpdateEpoch then stands in.
   double readingEpoch;
   double firstSeenEpoch;        // When this record was first created (for archive naming)
@@ -12801,6 +12806,14 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
 // note carries its "fv".
 static const char CLIENT_EXACT_T_SINCE[] = "2.2.16";
 
+// The clock a note's reading time is checked against (readingEpochPlausible()): the server's,
+// or, before it is set (notes read soon after a power loss), the note's own time, which is
+// also network time.
+static double readingCheckClock(double noteEpoch) {
+  const double now = currentEpoch();
+  return (now > 0.0) ? now : noteEpoch;
+}
+
 static void handleTelemetry(JsonDocument &doc, double epoch) {
   const char *clientUid = doc["c"] | "";
   // Fix #313-1a: reject notes that do not identify a sensor. Client sensor
@@ -13002,13 +13015,15 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // The reading's own time, which a reused or failed value does not advance
   // (noteReadingEpoch()). An on-demand answer from a client before CLIENT_EXACT_T_SINCE may be
   // its boot value stamped when sent (see the history gate below), so it gives no time.
-  // A note that gives no time keeps the one there is (keptReadingEpoch()).
+  // A note that gives no time, or one not plausible against the server clock, keeps the one
+  // there is (keptReadingEpoch()).
   {
     const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
     const bool flagged = ((doc["ru"] | 0) != 0) || ((doc["sf"] | 0) != 0) || !doc["fault"].isNull();
     double readingT = noteReadingEpoch(doc["t"] | 0.0, now, exactT, flagged, false);
     if (strcmp(doc["r"] | "", "ondemand") == 0 && !exactT) readingT = 0.0;
-    rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch);
+    rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch,
+                                         readingCheckClock(epoch));
   }
   gSensorRegistryDirty = true;
 
@@ -13323,7 +13338,8 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
     const bool flagged = ((doc["ru"] | 0) != 0) || ((doc["sf"] | 0) != 0) || !doc["fault"].isNull();
     readingT = noteReadingEpoch(doc["t"] | 0.0, rec->lastUpdateEpoch, exactT, flagged, !exactT);
   }
-  rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch);
+  rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch,
+                                       readingCheckClock(epoch));
   gSensorRegistryDirty = true;
 
   // Check rate limit before sending SMS
@@ -13705,6 +13721,13 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     double now = (sensorEpoch > 0.0)
                  ? sensorEpoch
                  : ((epoch > 0.0) ? epoch : currentEpoch());
+    // A "t" that is not plausible (a client clock far ahead, or not yet set) stands for no time
+    // here: the report's arrival is used instead, so the bad "t" can become neither
+    // lastUpdateEpoch nor the reading's stand-in time. It is still offered as the reading's
+    // time below, where keptReadingEpoch() turns it down.
+    if (sensorEpoch > 0.0 && !readingEpochPlausible(sensorEpoch, readingCheckClock(epoch))) {
+      now = (epoch > 0.0) ? epoch : currentEpoch();
+    }
     
     // Update 24-hour tracking: if current level is >22 hours old, roll it to previous
     // This ensures we always have a ~24hr baseline for change calculation
@@ -13739,7 +13762,7 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       const double readingT = noteReadingEpoch(sensorEpoch, now, exactT,
                                                dailyFaulted || !t["fault"].isNull(), false);
       rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, trustLevel ? readingT : 0.0,
-                                           rec->lastUpdateEpoch);
+                                           rec->lastUpdateEpoch, readingCheckClock(epoch));
     }
     gSensorRegistryDirty = true;
     
@@ -13912,7 +13935,12 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     strlcpy(rec->label, tankLabel, sizeof(rec->label));
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;
-    rec->readingEpoch = eventEpoch;
+    // A new value: its own time, or, when that is not plausible against the server clock
+    // (readingEpochPlausible()), the note's arrival, never the old value's time
+    rec->readingEpoch = keptReadingEpoch(0.0, eventEpoch, (epoch > 0.0) ? epoch : currentEpoch(),
+                                         readingCheckClock(epoch));
+    // upsertSensorRecord() marks only a new record: save the unload's value and time too
+    gSensorRegistryDirty = true;
   }
 }
 
