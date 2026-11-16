@@ -253,22 +253,63 @@ static void testReported() {
                                    nullptr) == READING_AGE_FRESH);
 
   // Client level. Silent for 60 h: not reporting.
-  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, kNow - 60 * kHour, kMissed, kLate, kStale) ==
-        READING_AGE_STALE);
-  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, 0.0, kMissed, kLate, kStale) ==
+  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, kNow - 60 * kHour, 0.0, kMissed, kLate,
+                          kStale) == READING_AGE_STALE);
+  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, 0.0, 0.0, kMissed, kLate, kStale) ==
         READING_AGE_STALE);
   // Still sending its daily report, but the newest reading is 60 h old (failed sensor, or
   // the first report after a battery outage): no new readings, not "not reporting"
-  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, report, kMissed, kLate, kStale) ==
+  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, report, 0.0, kMissed, kLate, kStale) ==
         READING_AGE_LATE);
-  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, kNow - (kStale - 1.0), kMissed, kLate,
+  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, kNow - (kStale - 1.0), 0.0, kMissed, kLate,
                           kStale) == READING_AGE_LATE);
-  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, kNow - kStale, kMissed, kLate, kStale) ==
+  CHECK(classifyClientAge(kNow, kNow - 60 * kHour, kNow - kStale, 0.0, kMissed, kLate, kStale) ==
         READING_AGE_STALE);
   // First missed report, healthy, unknown
-  CHECK(classifyClientAge(kNow, yReading, yReport, kMissed, kLate, kStale) == READING_AGE_LATE);
-  CHECK(classifyClientAge(kNow, reading, report, kMissed, kLate, kStale) == READING_AGE_FRESH);
-  CHECK(classifyClientAge(kNow, 0.0, report, kMissed, kLate, kStale) == READING_AGE_UNKNOWN);
+  CHECK(classifyClientAge(kNow, yReading, yReport, 0.0, kMissed, kLate, kStale) == READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, reading, report, 0.0, kMissed, kLate, kStale) == READING_AGE_FRESH);
+  CHECK(classifyClientAge(kNow, 0.0, report, 0.0, kMissed, kLate, kStale) == READING_AGE_UNKNOWN);
+
+  // Heard from by a note of any kind (lastNoteEpoch: telemetry or an alarm note with a reused or
+  // failed value) while no daily report is known (a server restart, or reports lost): the
+  // client still reports, so no new readings, not "not reporting", as for the stale-client SMS
+  const double old60 = kNow - 60 * kHour;
+  CHECK(classifyClientAge(kNow, old60, 0.0, kNow - 2 * kHour, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, old60, old60, kNow - 2 * kHour, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  // The note limit is the stale limit, inclusive
+  CHECK(classifyClientAge(kNow, old60, 0.0, kNow - (kStale - 1.0), kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, old60, 0.0, kNow - kStale, kMissed, kLate, kStale) ==
+        READING_AGE_STALE);
+  // Silent since its last reading (the Silas case): still not reporting
+  CHECK(classifyClientAge(kNow, old60, 0.0, old60, kMissed, kLate, kStale) == READING_AGE_STALE);
+  CHECK(classifyClientAge(kNow, old60, old60, old60, kMissed, kLate, kStale) == READING_AGE_STALE);
+  // A note never makes a reading newer, nor stands in for a missed report
+  CHECK(classifyClientAge(kNow, yReading, yReport, kNow - kHour, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, kNow - 35 * kHour, 0.0, kNow - kHour, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, reading, report, kNow - kHour, kMissed, kLate, kStale) ==
+        READING_AGE_FRESH);
+  CHECK(classifyClientAge(kNow, kNow - 26 * kHour, 0.0, kNow - 26 * kHour, kMissed, kLate,
+                          kStale) == READING_AGE_FRESH);
+  // A note stamped ahead of the server clock counts as just now (as in checkStaleClients())
+  CHECK(classifyClientAge(kNow, old60, 0.0, kNow + kHour, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  // No clock, no reading time, a bad note time, a bad report time
+  CHECK(classifyClientAge(0.0, old60, 0.0, kNow, kMissed, kLate, kStale) == READING_AGE_UNKNOWN);
+  CHECK(classifyClientAge(kNow, 0.0, 0.0, kNow, kMissed, kLate, kStale) == READING_AGE_UNKNOWN);
+  CHECK(classifyClientAge(kNow, old60, 0.0, -5.0, kMissed, kLate, kStale) == READING_AGE_STALE);
+  CHECK(classifyClientAge(kNow, old60, 0.0, NAN, kMissed, kLate, kStale) == READING_AGE_STALE);
+  CHECK(classifyClientAge(kNow, old60, NAN, kNow - kHour, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, old60, kNow - kHour, NAN, kMissed, kLate, kStale) ==
+        READING_AGE_LATE);
+  // Stale limit off: never "not reporting"
+  CHECK(classifyClientAge(kNow, old60, 0.0, kNow - kHour, kMissed, kLate, 0.0) == READING_AGE_LATE);
+  CHECK(classifyClientAge(kNow, old60, 0.0, 0.0, kMissed, kLate, 0.0) == READING_AGE_LATE);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -298,10 +339,104 @@ static void testNoteReadingEpoch() {
   // The reboot case end to end: the sensor's reading time stays at the last good reading, so
   // the email keeps marking it stale
   double readingEpoch = t;
-  const double fromReport = noteReadingEpoch(0.0, arrival, true, true, false);
-  if (fromReport > 0.0) readingEpoch = fromReport;
+  readingEpoch = keptReadingEpoch(readingEpoch, noteReadingEpoch(0.0, arrival, true, true, false),
+                                  arrival);
+  CHECK(readingEpoch == t);
   CHECK(classifyReportedReadingAge(kNow, readingEpoch, arrival, kMissed, kLate, kStale, nullptr) ==
         READING_AGE_STALE);
+}
+
+// ---------------------------------------------------------------------------------------------
+// keptReadingEpoch
+// ---------------------------------------------------------------------------------------------
+static void testKeptReadingEpoch() {
+  const double t = kNow - 74 * kHour;
+  const double note = kNow - 2 * kHour;
+  // A dated note wins, older or newer than the time kept (the value moves with it)
+  CHECK(keptReadingEpoch(t, note, note) == note);
+  CHECK(keptReadingEpoch(note, t, note) == t);
+  CHECK(keptReadingEpoch(0.0, t, note) == t);
+  // A note that dates nothing keeps the time there is
+  CHECK(keptReadingEpoch(t, 0.0, note) == t);
+  CHECK(keptReadingEpoch(t, NAN, note) == t);
+  CHECK(keptReadingEpoch(t, -5.0, note) == t);
+  CHECK(keptReadingEpoch(t, 0.0, 0.0) == t);
+  // ... and with no time yet, the note's own time stands in
+  CHECK(keptReadingEpoch(0.0, 0.0, note) == note);
+  CHECK(keptReadingEpoch(NAN, 0.0, note) == note);
+  CHECK(keptReadingEpoch(-5.0, 0.0, note) == note);
+  CHECK(keptReadingEpoch(0.0, 0.0, 0.0) == 0.0);
+  CHECK(keptReadingEpoch(0.0, 0.0, -5.0) == 0.0);
+  CHECK(keptReadingEpoch(0.0, 0.0, NAN) == 0.0);
+
+  // A registry entry saved before reading times were kept ("re"): its "u" is taken at load.
+  // The client (2.2.16+) rebooted with its sensor failed, so its daily reports carry no "t" for
+  // it. The time must stay put, so the sensor ages into late and stale and its site is listed
+  // under NO NEW READINGS (it still reports), instead of looking fresh after every report.
+  {
+    const double loadedU = kNow - 10 * kHour;  // the last note before the upgrade
+    double kept = loadedU;                     // obj["re"] | loadedEpoch
+    const ReadingAge want[4] = {READING_AGE_FRESH, READING_AGE_LATE, READING_AGE_STALE,
+                                READING_AGE_STALE};
+    for (int day = 0; day < 4; ++day) {
+      const double report = kNow + day * 24 * kHour;
+      const double email = report + 2 * kHour;
+      kept = keptReadingEpoch(kept, noteReadingEpoch(0.0, report, true, true, false), report);
+      CHECK(kept == loadedU);
+      CHECK(classifyReportedReadingAge(email, kept, report, kMissed, kLate, kStale, nullptr) ==
+            want[day]);
+      CHECK(classifyClientAge(email, kept, report, report, kMissed, kLate, kStale) ==
+            (day == 0 ? READING_AGE_FRESH : READING_AGE_LATE));
+      // The old way (re 0, so the report's lastUpdateEpoch stood in): 2 h old every day
+      CHECK(classifyReportedReadingAge(email, report, report, kMissed, kLate, kStale, nullptr) ==
+            READING_AGE_FRESH);
+    }
+  }
+
+  // A record created by a note that dates no reading (a 2.2.16+ client with no reading since
+  // boot): the first note's time stands in, and later notes like it do not move it
+  {
+    const double first = kNow - 72 * kHour;
+    double kept = 0.0;  // upsertSensorRecord(): memset
+    for (int n = 0; n < 6; ++n) {
+      const double arrival = first + n * 12 * kHour;
+      kept = keptReadingEpoch(kept, noteReadingEpoch(0.0, arrival, true, true, false), arrival);
+      CHECK(kept == first);
+    }
+    CHECK(classifyReportedReadingAge(kNow, kept, 0.0, kMissed, kLate, kStale, nullptr) ==
+          READING_AGE_STALE);
+    // A first dated reading replaces the stand-in, even an older one
+    kept = keptReadingEpoch(kept, noteReadingEpoch(first - kHour, kNow, true, false, false), kNow);
+    CHECK(kept == first - kHour);
+  }
+
+  // A queued daily report read after newer telemetry (pollNotecard() reads telemetry before
+  // daily reports). Its current-loop value is faulted (ru, no "ma"), so handleDaily() keeps the
+  // telemetry value (trustLevel false), and with it that value's time.
+  {
+    const double fresh = kNow - 3 * kHour;          // the telemetry the server shows
+    const double queuedT = kNow - 31 * kHour;       // the report's last good reading
+    const double queuedReport = kNow - 28 * kHour;  // when the report was made
+    double kept = keptReadingEpoch(0.0, noteReadingEpoch(fresh, fresh, true, false, false), fresh);
+    CHECK(kept == fresh);
+    const double fromQueued = noteReadingEpoch(queuedT, queuedT, true, true, false);
+    CHECK(fromQueued == queuedT);  // the report dates its own value, which is not taken ...
+    const bool trustLevel = false;
+    kept = keptReadingEpoch(kept, trustLevel ? fromQueued : 0.0, queuedT);
+    CHECK(kept == fresh);  // ... so the value kept keeps its time
+    CHECK(classifyReportedReadingAge(kNow, kept, queuedReport, kMissed, kLate, kStale, nullptr) ==
+          READING_AGE_FRESH);
+    // Taken, the fresh value would read "NO NEW READING for 31 h"
+    CHECK(classifyReportedReadingAge(kNow, fromQueued, queuedReport, kMissed, kLate, kStale,
+                                     nullptr) == READING_AGE_LATE);
+    // The other way: the telemetry with the good reading at queuedT never came, so the server
+    // still shows an older value. The report must not make it look newer.
+    double older = kNow - 80 * kHour;
+    older = keptReadingEpoch(older, trustLevel ? fromQueued : 0.0, queuedT);
+    CHECK(older == kNow - 80 * kHour);
+    CHECK(classifyReportedReadingAge(kNow, older, queuedReport, kMissed, kLate, kStale, nullptr) ==
+          READING_AGE_STALE);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -555,6 +690,22 @@ static bool contains(const std::string &text, const char *needle) {
   return text.find(needle) != std::string::npos;
 }
 
+// The text with each run of whitespace turned into one space, to match a call split over lines.
+static std::string squash(const std::string &text) {
+  std::string out;
+  bool space = false;
+  for (const char c : text) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      space = true;
+      continue;
+    }
+    if (space && !out.empty()) out += ' ';
+    space = false;
+    out += c;
+  }
+  return out;
+}
+
 // The text from `from` to the first `to` after it, or "" when either is missing.
 static std::string between(const std::string &text, const char *from, const char *to) {
   const size_t a = text.find(from);
@@ -584,31 +735,70 @@ static void testSketch() {
   CHECK(contains(sensorAge, "(double)STALE_CLIENT_THRESHOLD_SECONDS"));
   const std::string clientAge = functionBody(sketch, "static ReadingAge dailyEmailClientAge(");
   CHECK(contains(clientAge, "return READING_AGE_UNKNOWN;"));  // each client once
-  CHECK(contains(clientAge, "classifyClientAge(now, newest, lastDailyReportEpoch(uid),"));
+  CHECK(contains(clientAge, "classifyClientAge(now, newest, lastDailyReportEpoch(uid), lastNote,"));
   CHECK(contains(clientAge, "newest = sensorReadingEpoch(gSensorRecords[j]);"));
-  CHECK(!contains(clientAge, "lastUpdateEpoch"));
+  // The client's newest note of any kind, as the stale-client SMS measures it, read only to tell
+  // NOT REPORTING from NO NEW READINGS: never as a reading's time
+  {
+    const char *noteLine =
+        "if (gSensorRecords[j].lastUpdateEpoch > lastNote) lastNote = gSensorRecords[j].lastUpdateEpoch;";
+    CHECK(contains(clientAge, noteLine));
+    std::string rest = clientAge;
+    const size_t at = rest.find(noteLine);
+    if (at != std::string::npos) rest.erase(at, strlen(noteLine));
+    CHECK(!contains(rest, "lastUpdateEpoch"));
+    CHECK(!contains(sensorAge, "lastUpdateEpoch"));  // one sensor's age: its reading's time only
+    // Both come from this client's records only
+    const size_t loopAt = clientAge.find("for (uint8_t j = first;");
+    const size_t filterAt = clientAge.find("if (strcmp(gSensorRecords[j].clientUid, uid) != 0) continue;");
+    const size_t newestAt = clientAge.find("newest = sensorReadingEpoch(gSensorRecords[j]);");
+    const size_t noteAt = clientAge.find(noteLine);
+    CHECK(loopAt != std::string::npos && filterAt != std::string::npos);
+    CHECK(loopAt < filterAt && filterAt < newestAt && filterAt < noteAt);
+    const std::string staleSms = functionBody(sketch, "static void checkStaleClients() {");
+    CHECK(contains(staleSms, "latestUpdate = gSensorRecords[t].lastUpdateEpoch;"));
+  }
 
   // The reading's time: the client's acquisition "t", which a reused or failed value does not
-  // advance, kept across restarts; the last note's time only until the server knows it
+  // advance, kept across restarts. Until a note dates the value, the first note's time (or a
+  // registry entry's "u") stands in, fixed; the last note's time only while none is known.
   const std::string readingTime = functionBody(sketch, "static double sensorReadingEpoch(const SensorRecord &rec) {");
   CHECK(contains(readingTime, "return (rec.readingEpoch > 0.0) ? rec.readingEpoch : rec.lastUpdateEpoch;"));
   const std::string telemetry = functionBody(sketch, "static void handleTelemetry(JsonDocument &doc, double epoch) {");
   CHECK(contains(telemetry, "double readingT = noteReadingEpoch(doc[\"t\"] | 0.0, now, exactT, flagged, false);"));
   CHECK(contains(telemetry, "if (strcmp(doc[\"r\"] | \"\", \"ondemand\") == 0 && !exactT) readingT = 0.0;"));
-  CHECK(contains(telemetry, "if (readingT > 0.0) rec->readingEpoch = readingT;"));
+  CHECK(contains(telemetry, "rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch);"));
   const std::string alarm = functionBody(sketch, "static void handleAlarm(JsonDocument &doc, double epoch) {");
   CHECK(contains(alarm, "if (!doc[\"ot\"].isNull() || !doc[\"lvl\"].isNull() || !doc[\"ma\"].isNull()) {"));
   CHECK(contains(alarm, "noteReadingEpoch(doc[\"t\"] | 0.0, rec->lastUpdateEpoch, exactT, flagged, !exactT);"));
-  CHECK(contains(alarm, "if (readingT > 0.0) rec->readingEpoch = readingT;"));
+  // At function level (two-space indent): a diagnostic note, which carries no reading, still
+  // fixes the stand-in time of a value no note has dated
+  CHECK(contains(alarm, "\n  rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch);"));
   const std::string dailyIn = functionBody(sketch, "static void handleDaily(JsonDocument &doc, double epoch) {");
   CHECK(contains(dailyIn, "noteReadingEpoch(sensorEpoch, now, exactT,"));
   CHECK(contains(dailyIn, "dailyFaulted || !t[\"fault\"].isNull(), false);"));
   CHECK(!contains(dailyIn, "rec->readingEpoch = now;"));
-  // Every note that sets readingEpoch goes through noteReadingEpoch(), except the unload
+  // A value handleDaily() does not take (Fix 8: a faulted current-loop value with no valid mA)
+  // keeps its own time: the report's "t" goes only with the value. The report can be older
+  // than telemetry already read (pollNotecard() reads telemetry before daily reports).
+  CHECK(contains(dailyIn, "bool trustLevel = !(isCurrentLoopSensor && dailyFaulted && mA < 4.0f);"));
+  CHECK(contains(squash(dailyIn), "rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, trustLevel ? readingT : 0.0, rec->lastUpdateEpoch);"));
+  {
+    const size_t trustAt = dailyIn.find("bool trustLevel =");
+    const size_t writeAt = dailyIn.find("rec->readingEpoch =");
+    CHECK(trustAt != std::string::npos && writeAt != std::string::npos && trustAt < writeAt);
+    CHECK(writeAt == dailyIn.rfind("rec->readingEpoch ="));  // the only write
+  }
+  // Every note that sets readingEpoch goes through noteReadingEpoch() and keptReadingEpoch(),
+  // except the unload, which sets its value and that value's time together
+  CHECK(!contains(sketch, "if (readingT > 0.0) rec->readingEpoch = readingT;"));
+  CHECK(contains(sketch, "rec->currentValue = emptyInches;\n    rec->lastUpdateEpoch = eventEpoch;\n    rec->readingEpoch = eventEpoch;"));
   CHECK(contains(sketch, "const bool exactT = compareFirmwareVersions(doc[\"fv\"] | \"\", CLIENT_EXACT_T_SINCE) >= 0;"));
   CHECK(contains(sketch, "if (rec.readingEpoch > 0.0) obj[\"re\"] = (uint32_t)rec.readingEpoch;"));
-  CHECK(contains(sketch, "rec.readingEpoch = obj[\"re\"] | 0.0;"));
-  CHECK(contains(sketch, "existing->readingEpoch = obj[\"re\"] | 0.0;"));
+  // An entry saved before "re" takes its "u", once, so later notes do not move it
+  CHECK(contains(sketch, "rec.readingEpoch = obj[\"re\"] | loadedEpoch;"));
+  CHECK(contains(sketch, "existing->readingEpoch = obj[\"re\"] | loadedEpoch;"));
+  CHECK(!contains(sketch, "readingEpoch = obj[\"re\"] | 0.0;"));
   // Every client's name fits the site lists
   CHECK(contains(sketch, "static_assert(SITE_LIST_MAX_NAMES >= MAX_SENSOR_RECORDS,"));
   CHECK(contains(clientAge, "(double)MISSED_DAILY_REPORT_SECONDS"));
@@ -676,6 +866,7 @@ int main() {
   testStamp();
   testReported();
   testNoteReadingEpoch();
+  testKeptReadingEpoch();
   testSiteList();
   testSubjectMarker();
   testSketch();

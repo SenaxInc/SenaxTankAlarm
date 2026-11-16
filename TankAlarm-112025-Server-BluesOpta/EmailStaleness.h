@@ -4,8 +4,9 @@
 //
 // Why (2026-11-16): a solar site's battery went flat and the client stopped reporting. The
 // stale-client SMS fired at 49.9 h, but the daily email kept printing the site's last reading
-// (23 psi, 11.35 mA) for three days as if it were current. The server always knew each
-// reading's time (SensorRecord::lastUpdateEpoch); sendDailyEmail() just never sent it. These
+// (23 psi, 11.35 mA) for three days as if it were current. The server knew when each note
+// came (SensorRecord::lastUpdateEpoch), but sendDailyEmail() sent no time at all. It now sends
+// each reading's own time (SensorRecord::readingEpoch, the client's acquisition time). These
 // helpers decide when a reading counts as late or stale, format its time for the email, and
 // build the site lists ("not reporting", "no new readings") for the subject and the top of
 // the email.
@@ -73,17 +74,27 @@ static inline ReadingAge classifyReportedReadingAge(double now, double readingEp
 }
 
 // A client as a whole, from its newest reading, for the site lists. As above, except that a
-// client whose last daily report was made within the stale limit is still reporting: its old
-// readings (a failed sensor, or the first report after a battery outage) make it LATE ("no
-// new readings"), not STALE ("not reporting").
+// client heard from within the stale limit is still reporting: its old readings (a failed
+// sensor, or the first report after a battery outage) make it LATE ("no new readings"), not
+// STALE ("not reporting"). It is heard from by its last daily report, or by lastNoteEpoch, 0 if
+// none: the newest SensorRecord::lastUpdateEpoch of its sensors, which the stale-client SMS
+// goes by and which, unlike the report time, is kept across a restart. That is when its last
+// telemetry or alarm note came, but for a daily report the reading's own time, so after a
+// restart a client whose only notes are daily reports with old readings is STALE until its
+// next report, as for the SMS. A note can carry a reused or failed value, so it only tells
+// STALE from LATE: it never makes a reading newer or stands in for a missed report. A note
+// stamped ahead of the server clock counts as just now.
 static inline ReadingAge classifyClientAge(double now, double newestReadingEpoch,
-                                           double lastReportEpoch, double missedReportSeconds,
-                                           double lateSeconds, double staleSeconds) {
+                                           double lastReportEpoch, double lastNoteEpoch,
+                                           double missedReportSeconds, double lateSeconds,
+                                           double staleSeconds) {
   ReadingAge age = classifyReportedReadingAge(now, newestReadingEpoch, lastReportEpoch,
                                               missedReportSeconds, lateSeconds, staleSeconds,
                                               nullptr);
-  if (age == READING_AGE_STALE && lastReportEpoch > 0.0 && staleSeconds > 0.0 &&
-      now - lastReportEpoch < staleSeconds) {
+  // Two tests, not a max(): a NaN in one time cannot hide the other
+  if (age == READING_AGE_STALE && staleSeconds > 0.0 &&
+      ((lastReportEpoch > 0.0 && now - lastReportEpoch < staleSeconds) ||
+       (lastNoteEpoch > 0.0 && now - lastNoteEpoch < staleSeconds))) {
     age = READING_AGE_LATE;
   }
   return age;
@@ -103,6 +114,17 @@ static inline double noteReadingEpoch(double noteT, double arrival, bool exactT,
   if (noteT > 0.0) return (sendTimeT && flagged) ? 0.0 : noteT;
   if (exactT || flagged) return 0.0;
   return arrival > 0.0 ? arrival : 0.0;
+}
+
+// A sensor's reading time after a note: the time the note dates its reading by (readingT,
+// from noteReadingEpoch(), or 0 when the note's value was not taken), or else the time kept so
+// far. While no note has dated the value (a new record, or one saved before reading times
+// were kept) the note's own time (noteEpoch) stands in, fixed once: a stand-in that moved with
+// every note would keep a failed sensor's value fresh. 0 while no time at all is known.
+static inline double keptReadingEpoch(double kept, double readingT, double noteEpoch) {
+  if (readingT > 0.0) return readingT;
+  if (kept > 0.0) return kept;
+  return noteEpoch > 0.0 ? noteEpoch : 0.0;
 }
 
 struct CivilTime {

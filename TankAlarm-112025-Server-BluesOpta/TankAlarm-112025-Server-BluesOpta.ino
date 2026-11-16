@@ -176,7 +176,9 @@
 //    has seen a daily report from the client, since report times are not kept across a
 //    restart. A client that samples rarely (several hours) on a long offset can reach it.
 // At STALE_CLIENT_THRESHOLD_SECONDS a reading is stale, and a client with nothing newer, not
-// even a daily report, is listed as NOT REPORTING, matching the stale-client SMS.
+// even a daily report or a note with a reused or failed value, is listed as NOT REPORTING,
+// matching the stale-client SMS (which, after a restart and until the client's next daily
+// report, also counts a client whose only notes are daily reports with old readings).
 #ifndef MISSED_DAILY_REPORT_SECONDS
 #define MISSED_DAILY_REPORT_SECONDS 90000UL  // 25 hours
 #endif
@@ -507,8 +509,12 @@ struct SensorRecord {
   // When currentValue was measured: the client's acquisition time ("t") from telemetry, the
   // daily report, and alarm notes that carry the reading. A note sent on a reused or failed
   // value carries the last good reading's time, so this stays put while lastUpdateEpoch (when
-  // a note last came) moves on. The daily email and alarm reminders judge a reading's age by
-  // it (sensorReadingEpoch()). 0 = not known yet: lastUpdateEpoch stands in.
+  // a note last came) moves on. A daily value the server does not take (a faulted current-loop
+  // value with no valid mA) does not date the value kept either. The daily email and alarm
+  // reminders judge a reading's age by it (sensorReadingEpoch()). Until a note dates the value,
+  // the first note's time stands in, fixed so later notes do not move it (keptReadingEpoch();
+  // a registry entry saved before "re" takes its "u"). 0 only while no time at all is known:
+  // lastUpdateEpoch then stands in.
   double readingEpoch;
   double firstSeenEpoch;        // When this record was first created (for archive naming)
   // 24-hour change tracking (computed server-side)
@@ -12996,12 +13002,13 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   // The reading's own time, which a reused or failed value does not advance
   // (noteReadingEpoch()). An on-demand answer from a client before CLIENT_EXACT_T_SINCE may be
   // its boot value stamped when sent (see the history gate below), so it gives no time.
+  // A note that gives no time keeps the one there is (keptReadingEpoch()).
   {
     const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
     const bool flagged = ((doc["ru"] | 0) != 0) || ((doc["sf"] | 0) != 0) || !doc["fault"].isNull();
     double readingT = noteReadingEpoch(doc["t"] | 0.0, now, exactT, flagged, false);
     if (strcmp(doc["r"] | "", "ondemand") == 0 && !exactT) readingT = 0.0;
-    if (readingT > 0.0) rec->readingEpoch = readingT;
+    rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch);
   }
   gSensorRegistryDirty = true;
 
@@ -13307,15 +13314,16 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
   // Only a note that carries the reading dates it, with the reading's own "t". A diagnostic
   // or config-change note (sensor-fault, sensor-recovered, a clear) is stamped when sent and
-  // carries no reading, so it leaves readingEpoch alone.
+  // carries no reading, so it gives no time and keeps the one there is (keptReadingEpoch()).
   // A client before CLIENT_EXACT_T_SINCE stamps an alarm note with its send time, which then
   // dates only a value that is not reused or failed (noteReadingEpoch()).
+  double readingT = 0.0;
   if (!doc["ot"].isNull() || !doc["lvl"].isNull() || !doc["ma"].isNull()) {
     const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
     const bool flagged = ((doc["ru"] | 0) != 0) || ((doc["sf"] | 0) != 0) || !doc["fault"].isNull();
-    const double readingT = noteReadingEpoch(doc["t"] | 0.0, rec->lastUpdateEpoch, exactT, flagged, !exactT);
-    if (readingT > 0.0) rec->readingEpoch = readingT;
+    readingT = noteReadingEpoch(doc["t"] | 0.0, rec->lastUpdateEpoch, exactT, flagged, !exactT);
   }
+  rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, readingT, rec->lastUpdateEpoch);
   gSensorRegistryDirty = true;
 
   // Check rate limit before sending SMS
@@ -13722,11 +13730,16 @@ static void handleDaily(JsonDocument &doc, double epoch) {
     rec->lastUpdateEpoch = now;
     // The per-sensor "t" is the last good reading's time. Without it, a 2.2.16+ client has had
     // no reading since boot, and a flagged value is not a reading: keep the time we have.
+    // The time goes only with the value: a value not taken above (trustLevel) leaves the kept
+    // value's time alone. This report can be older than telemetry already read (pollNotecard
+    // reads telemetry before daily reports), or newer than the value kept, when the good
+    // reading at "t" never reached the server.
     {
       const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
       const double readingT = noteReadingEpoch(sensorEpoch, now, exactT,
                                                dailyFaulted || !t["fault"].isNull(), false);
-      if (readingT > 0.0) rec->readingEpoch = readingT;
+      rec->readingEpoch = keptReadingEpoch(rec->readingEpoch, trustLevel ? readingT : 0.0,
+                                           rec->lastUpdateEpoch);
     }
     gSensorRegistryDirty = true;
     
@@ -15059,8 +15072,8 @@ static double lastDailyReportEpoch(const char *clientUid) {
   return meta ? meta->dailyReportEpoch : 0.0;
 }
 
-// When a sensor's current value was measured (readingEpoch), or, before the server knows,
-// when its last note came.
+// When a sensor's current value was measured (readingEpoch), or the stand-in time fixed for it
+// (keptReadingEpoch()); when its last note came only while no time at all was known.
 static double sensorReadingEpoch(const SensorRecord &rec) {
   return (rec.readingEpoch > 0.0) ? rec.readingEpoch : rec.lastUpdateEpoch;
 }
@@ -15076,22 +15089,27 @@ static ReadingAge sensorReadingAge(const SensorRecord &rec, double now, double *
 
 // A client as a whole, for the daily email's site lists, judged at its first sensor record:
 // any later record of the same client gives READING_AGE_UNKNOWN, so each client counts once.
-// *nameOut is the site of its newest reading, or its uid when that has no site.
+// *nameOut is the site of its newest reading, or its uid when that has no site. Its newest
+// note (lastUpdateEpoch, as checkStaleClients() reads it) shows that it still reports, even
+// when every note since has carried a reused or failed value; it never dates a reading.
 static ReadingAge dailyEmailClientAge(uint8_t first, double now, const char **nameOut) {
   const char *uid = gSensorRecords[first].clientUid;
   for (uint8_t j = 0; j < first; ++j) {
     if (strcmp(gSensorRecords[j].clientUid, uid) == 0) return READING_AGE_UNKNOWN;
   }
   double newest = 0.0;
+  double lastNote = 0.0;
   const char *site = gSensorRecords[first].site;
   for (uint8_t j = first; j < gSensorRecordCount; ++j) {
-    if (strcmp(gSensorRecords[j].clientUid, uid) == 0 && sensorReadingEpoch(gSensorRecords[j]) > newest) {
+    if (strcmp(gSensorRecords[j].clientUid, uid) != 0) continue;
+    if (sensorReadingEpoch(gSensorRecords[j]) > newest) {
       newest = sensorReadingEpoch(gSensorRecords[j]);
       site = gSensorRecords[j].site;
     }
+    if (gSensorRecords[j].lastUpdateEpoch > lastNote) lastNote = gSensorRecords[j].lastUpdateEpoch;
   }
   *nameOut = (site && site[0] != '\0') ? site : uid;
-  return classifyClientAge(now, newest, lastDailyReportEpoch(uid),
+  return classifyClientAge(now, newest, lastDailyReportEpoch(uid), lastNote,
                            (double)MISSED_DAILY_REPORT_SECONDS,
                            (double)LATE_READING_THRESHOLD_SECONDS,
                            (double)STALE_CLIENT_THRESHOLD_SECONDS);
@@ -15295,11 +15313,12 @@ static void sendDailyEmail() {
   // reading, as if current. Each sensor now carries its reading time ("u"), and an old one
   // is flagged "late" or "stale" (sensorReadingAge(), see MISSED_DAILY_REPORT_SECONDS) with
   // its age and local time. Sites are listed at the top level and in the subject: NOT
-  // REPORTING when nothing, not even a daily report, has come for STALE_CLIENT_THRESHOLD_SECONDS
-  // (the stale-client SMS limit), and NO NEW READINGS when the newest reading is late, or
-  // stale but the client still reports. A site shows once, in the worse list. Computed from
-  // gSensorRecords so clients beyond MAX_CLIENT_METADATA are covered too. Never add a
-  // "message" or "type" key to this body: the email renderers take those as the alarm shape.
+  // REPORTING when nothing, not even a daily report or a note with a reused or failed value,
+  // has come for STALE_CLIENT_THRESHOLD_SECONDS (the stale-client SMS's limit and measure), and
+  // NO NEW READINGS when the newest reading is late, or stale but the client still reports. A
+  // site shows once, in the worse list. Computed from gSensorRecords so clients beyond
+  // MAX_CLIENT_METADATA are covered too. Never add a "message" or "type" key to this body: the
+  // email renderers take those as the alarm shape.
   const int32_t tzOffsetSec = localOffsetSeconds(gConfig.dailyTzOffsetMinutes, gConfig.dailyDstEnabled);
   const bool markUtc = (gConfig.dailyTzOffsetMinutes == 0 && !gConfig.dailyDstEnabled);
   static SiteList staleSites;  // static: 2 x 260 bytes off the stack; names point into gSensorRecords
@@ -16339,7 +16358,7 @@ static void loadSensorRegistry() {
           existing->alarmActive = obj["a"] | false;
           strlcpy(existing->alarmType, obj["at"] | "", sizeof(existing->alarmType));
           existing->lastUpdateEpoch = loadedEpoch;
-          existing->readingEpoch = obj["re"] | 0.0;
+          existing->readingEpoch = obj["re"] | loadedEpoch;  // no "re": as below
           existing->previousValue = obj["pl"] | 0.0f;
           existing->previousLevelEpoch = obj["pe"] | 0.0;
           existing->userNumber = obj["un"] | 0;
@@ -16370,7 +16389,10 @@ static void loadSensorRegistry() {
       rec.alarmActive = obj["a"] | false;
       strlcpy(rec.alarmType, obj["at"] | "", sizeof(rec.alarmType));
       rec.lastUpdateEpoch = loadedEpoch;
-      rec.readingEpoch = obj["re"] | 0.0;
+      // No "re": saved before reading times were kept. The last note's time stands in, fixed
+      // here (and saved as "re" with the next save), so later notes that date no reading (a
+      // failed sensor) do not make the value look new.
+      rec.readingEpoch = obj["re"] | loadedEpoch;
       rec.previousValue = obj["pl"] | 0.0f;
       rec.previousLevelEpoch = obj["pe"] | 0.0;
       rec.firstSeenEpoch = obj["fs"] | 0.0;
