@@ -12993,11 +12993,15 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   
   rec->currentValue = newLevel;
   rec->lastUpdateEpoch = now;
-  // The reading's own time, which a reused or failed value does not advance. No "t" (a client
-  // before v2.0.56, or no reading since boot): the note's time, as before.
+  // The reading's own time, which a reused or failed value does not advance
+  // (noteReadingEpoch()). An on-demand answer from a client before CLIENT_EXACT_T_SINCE may be
+  // its boot value stamped when sent (see the history gate below), so it gives no time.
   {
-    const double readingT = doc["t"] | 0.0;
-    rec->readingEpoch = (readingT > 0.0) ? readingT : now;
+    const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
+    const bool flagged = ((doc["ru"] | 0) != 0) || ((doc["sf"] | 0) != 0) || !doc["fault"].isNull();
+    double readingT = noteReadingEpoch(doc["t"] | 0.0, now, exactT, flagged, false);
+    if (strcmp(doc["r"] | "", "ondemand") == 0 && !exactT) readingT = 0.0;
+    if (readingT > 0.0) rec->readingEpoch = readingT;
   }
   gSensorRegistryDirty = true;
 
@@ -13304,9 +13308,13 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // Only a note that carries the reading dates it, with the reading's own "t". A diagnostic
   // or config-change note (sensor-fault, sensor-recovered, a clear) is stamped when sent and
   // carries no reading, so it leaves readingEpoch alone.
+  // A client before CLIENT_EXACT_T_SINCE stamps an alarm note with its send time, which then
+  // dates only a value that is not reused or failed (noteReadingEpoch()).
   if (!doc["ot"].isNull() || !doc["lvl"].isNull() || !doc["ma"].isNull()) {
-    const double readingT = doc["t"] | 0.0;
-    rec->readingEpoch = (readingT > 0.0) ? readingT : rec->lastUpdateEpoch;
+    const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
+    const bool flagged = ((doc["ru"] | 0) != 0) || ((doc["sf"] | 0) != 0) || !doc["fault"].isNull();
+    const double readingT = noteReadingEpoch(doc["t"] | 0.0, rec->lastUpdateEpoch, exactT, flagged, !exactT);
+    if (readingT > 0.0) rec->readingEpoch = readingT;
   }
   gSensorRegistryDirty = true;
 
@@ -13712,7 +13720,14 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       rec->currentValue = newLevel;
     }
     rec->lastUpdateEpoch = now;
-    rec->readingEpoch = now;  // the per-sensor "t" when sent: the last good reading's time
+    // The per-sensor "t" is the last good reading's time. Without it, a 2.2.16+ client has had
+    // no reading since boot, and a flagged value is not a reading: keep the time we have.
+    {
+      const bool exactT = compareFirmwareVersions(doc["fv"] | "", CLIENT_EXACT_T_SINCE) >= 0;
+      const double readingT = noteReadingEpoch(sensorEpoch, now, exactT,
+                                               dailyFaulted || !t["fault"].isNull(), false);
+      if (readingT > 0.0) rec->readingEpoch = readingT;
+    }
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data

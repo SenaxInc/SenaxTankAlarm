@@ -89,6 +89,22 @@ static inline ReadingAge classifyClientAge(double now, double newestReadingEpoch
   return age;
 }
 
+// The time a note dates its reading by, or 0 when the note does not date it and the sensor's
+// reading time should stay as it is.
+//  noteT     the note's "t" for this reading (a daily report's per-sensor "t"), 0 if absent
+//  arrival   when the note came: the reading time for a client that never sends "t"
+//  exactT    the client sends "t" with every reading it has (firmware 2.2.16 and later), so a
+//            missing "t" means it has had no reading since boot and the value is a placeholder
+//  flagged   the value is reused, failed or faulted (ru, sf, fault): not a new reading
+//  sendTimeT "t" is when the note was sent, not when the value was read (an alarm note from a
+//            client before 2.2.16): it dates only a value that is not flagged
+static inline double noteReadingEpoch(double noteT, double arrival, bool exactT, bool flagged,
+                                      bool sendTimeT) {
+  if (noteT > 0.0) return (sendTimeT && flagged) ? 0.0 : noteT;
+  if (exactT || flagged) return 0.0;
+  return arrival > 0.0 ? arrival : 0.0;
+}
+
 struct CivilTime {
   int32_t year;
   uint8_t month;   // 1-12

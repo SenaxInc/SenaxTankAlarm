@@ -272,6 +272,39 @@ static void testReported() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// noteReadingEpoch
+// ---------------------------------------------------------------------------------------------
+static void testNoteReadingEpoch() {
+  const double t = kNow - 74 * kHour;  // the last good reading
+  const double arrival = kNow - 2 * kHour;
+  // A note with "t" dates the reading by it, fresh or reused (a reused value carries the last
+  // good reading's time)
+  CHECK(noteReadingEpoch(t, arrival, true, false, false) == t);
+  CHECK(noteReadingEpoch(t, arrival, true, true, false) == t);
+  CHECK(noteReadingEpoch(t, arrival, false, true, false) == t);
+  // An older client's alarm note: "t" is the send time, so it dates only a fresh value
+  CHECK(noteReadingEpoch(arrival, arrival, false, false, true) == arrival);
+  CHECK(noteReadingEpoch(arrival, arrival, false, true, true) == 0.0);
+  // No "t": a 2.2.16+ client has had no reading since boot (a reboot while the sensor is
+  // failed must not make its old value look new), and a flagged value is no reading
+  CHECK(noteReadingEpoch(0.0, arrival, true, false, false) == 0.0);
+  CHECK(noteReadingEpoch(0.0, arrival, true, true, false) == 0.0);
+  CHECK(noteReadingEpoch(0.0, arrival, false, true, false) == 0.0);
+  // ... and a client that never sends "t" is dated on arrival, as before
+  CHECK(noteReadingEpoch(0.0, arrival, false, false, false) == arrival);
+  CHECK(noteReadingEpoch(0.0, 0.0, false, false, false) == 0.0);
+  CHECK(noteReadingEpoch(-5.0, arrival, false, false, false) == arrival);
+
+  // The reboot case end to end: the sensor's reading time stays at the last good reading, so
+  // the email keeps marking it stale
+  double readingEpoch = t;
+  const double fromReport = noteReadingEpoch(0.0, arrival, true, true, false);
+  if (fromReport > 0.0) readingEpoch = fromReport;
+  CHECK(classifyReportedReadingAge(kNow, readingEpoch, arrival, kMissed, kLate, kStale, nullptr) ==
+        READING_AGE_STALE);
+}
+
+// ---------------------------------------------------------------------------------------------
 // SiteList / appendSubjectMarker
 // ---------------------------------------------------------------------------------------------
 static std::string fmtList(const SiteList &l, size_t cap = SITE_LIST_TEXT_SIZE) {
@@ -560,13 +593,19 @@ static void testSketch() {
   const std::string readingTime = functionBody(sketch, "static double sensorReadingEpoch(const SensorRecord &rec) {");
   CHECK(contains(readingTime, "return (rec.readingEpoch > 0.0) ? rec.readingEpoch : rec.lastUpdateEpoch;"));
   const std::string telemetry = functionBody(sketch, "static void handleTelemetry(JsonDocument &doc, double epoch) {");
-  CHECK(contains(telemetry, "const double readingT = doc[\"t\"] | 0.0;"));
-  CHECK(contains(telemetry, "rec->readingEpoch = (readingT > 0.0) ? readingT : now;"));
+  CHECK(contains(telemetry, "double readingT = noteReadingEpoch(doc[\"t\"] | 0.0, now, exactT, flagged, false);"));
+  CHECK(contains(telemetry, "if (strcmp(doc[\"r\"] | \"\", \"ondemand\") == 0 && !exactT) readingT = 0.0;"));
+  CHECK(contains(telemetry, "if (readingT > 0.0) rec->readingEpoch = readingT;"));
   const std::string alarm = functionBody(sketch, "static void handleAlarm(JsonDocument &doc, double epoch) {");
   CHECK(contains(alarm, "if (!doc[\"ot\"].isNull() || !doc[\"lvl\"].isNull() || !doc[\"ma\"].isNull()) {"));
-  CHECK(contains(alarm, "rec->readingEpoch = (readingT > 0.0) ? readingT : rec->lastUpdateEpoch;"));
+  CHECK(contains(alarm, "noteReadingEpoch(doc[\"t\"] | 0.0, rec->lastUpdateEpoch, exactT, flagged, !exactT);"));
+  CHECK(contains(alarm, "if (readingT > 0.0) rec->readingEpoch = readingT;"));
   const std::string dailyIn = functionBody(sketch, "static void handleDaily(JsonDocument &doc, double epoch) {");
-  CHECK(contains(dailyIn, "rec->readingEpoch = now;"));
+  CHECK(contains(dailyIn, "noteReadingEpoch(sensorEpoch, now, exactT,"));
+  CHECK(contains(dailyIn, "dailyFaulted || !t[\"fault\"].isNull(), false);"));
+  CHECK(!contains(dailyIn, "rec->readingEpoch = now;"));
+  // Every note that sets readingEpoch goes through noteReadingEpoch(), except the unload
+  CHECK(contains(sketch, "const bool exactT = compareFirmwareVersions(doc[\"fv\"] | \"\", CLIENT_EXACT_T_SINCE) >= 0;"));
   CHECK(contains(sketch, "if (rec.readingEpoch > 0.0) obj[\"re\"] = (uint32_t)rec.readingEpoch;"));
   CHECK(contains(sketch, "rec.readingEpoch = obj[\"re\"] | 0.0;"));
   CHECK(contains(sketch, "existing->readingEpoch = obj[\"re\"] | 0.0;"));
@@ -636,6 +675,7 @@ int main() {
   testCivil();
   testStamp();
   testReported();
+  testNoteReadingEpoch();
   testSiteList();
   testSubjectMarker();
   testSketch();
