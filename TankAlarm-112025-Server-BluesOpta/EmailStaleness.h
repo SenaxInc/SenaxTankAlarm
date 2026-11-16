@@ -154,88 +154,52 @@ static inline int formatEpochDate(double epoch, int32_t offsetSeconds, char *buf
   return snprintf(buf, cap, "%04ld-%02u-%02u", (long)t.year, (unsigned)t.month, (unsigned)t.day);
 }
 
-// A short list of site names, for the email subject and the banner at the top of the email.
-// A name already in the list is not added again (two clients at one site show once). Names
-// are kept while they fit in SITE_LIST_TEXT_CAP characters joined by ", "; the rest are only
-// counted, and siteListFormat() ends the list with " +N more". A repeat of a name that did
-// not fit is recognised by a hash of the name, for the first SITE_LIST_MORE_HASHES such names.
-#ifndef SITE_LIST_TEXT_CAP
-#define SITE_LIST_TEXT_CAP 80
+// A list of site names, for the email subject and the banner at the top of the email. Each
+// name is kept once (two clients at one site show once), as a pointer to the caller's string,
+// which must outlive the list. SITE_LIST_MAX_NAMES must cover every client that can be listed
+// (the server checks it against MAX_SENSOR_RECORDS); a name past it is only counted, and a
+// repeat of it would be counted again. siteListFormat() writes as many names as fit, then
+// " +N more".
+#ifndef SITE_LIST_MAX_NAMES
+#define SITE_LIST_MAX_NAMES 64
 #endif
-#ifndef SITE_LIST_MORE_HASHES
-#define SITE_LIST_MORE_HASHES 16
-#endif
-// Room for a formatted list: the names, then " +NNN more"
-#define SITE_LIST_TEXT_SIZE (SITE_LIST_TEXT_CAP + 16)
+// Room for a list in the payload (staleSites, lateSites): names, then " +N more"
+#define SITE_LIST_TEXT_SIZE 96
 
 struct SiteList {
-  char names[SITE_LIST_TEXT_CAP + 2];        // the names that fit, each NUL-terminated
-  uint16_t used;                             // bytes used in names
-  uint16_t joined;                           // length of the names joined by ", "
-  uint8_t shown;                             // names kept
-  uint8_t more;                              // other names, that did not fit
-  uint8_t hashed;                            // entries used in moreHash
-  uint32_t moreHash[SITE_LIST_MORE_HASHES];  // hashes of the names counted in more
+  const char *names[SITE_LIST_MAX_NAMES];  // distinct names, in the order added
+  uint16_t count;                          // names kept
+  uint16_t extra;                          // names past SITE_LIST_MAX_NAMES, only counted
 };
 
 static inline void siteListInit(SiteList *l) {
-  l->names[0] = '\0';
-  l->used = 0;
-  l->joined = 0;
-  l->shown = 0;
-  l->more = 0;
-  l->hashed = 0;
+  l->count = 0;
+  l->extra = 0;
 }
 
-// FNV-1a, for recognising a name that did not fit
-static inline uint32_t siteNameHash(const char *name) {
-  uint32_t h = 2166136261u;
-  for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
-    h ^= *p;
-    h *= 16777619u;
-  }
-  return h;
-}
-
-// The number of distinct names added: kept and counted.
+// The number of distinct names added.
 static inline unsigned siteListCount(const SiteList *l) {
-  return (unsigned)l->shown + (unsigned)l->more;
+  return (unsigned)l->count + (unsigned)l->extra;
 }
 
-// True when the name was added before, kept or counted.
+// True when the name was added before.
 static inline bool siteListHas(const SiteList *l, const char *name) {
   if (!name || name[0] == '\0') return false;
-  const char *p = l->names;
-  for (uint8_t i = 0; i < l->shown; ++i) {
-    if (strcmp(p, name) == 0) return true;
-    p += strlen(p) + 1;
-  }
-  if (l->hashed > 0) {
-    const uint32_t h = siteNameHash(name);
-    for (uint8_t i = 0; i < l->hashed; ++i) {
-      if (l->moreHash[i] == h) return true;
-    }
+  for (uint16_t i = 0; i < l->count; ++i) {
+    if (strcmp(l->names[i], name) == 0) return true;
   }
   return false;
 }
 
-// Adds a name. Returns true when it is new to the list (kept or counted).
+// Adds a name. Returns true when it is new to the list.
 static inline bool siteListAdd(SiteList *l, const char *name) {
   if (!name || name[0] == '\0') return false;
   if (siteListHas(l, name)) return false;
-  const size_t len = strlen(name);
-  const size_t joined = (size_t)l->joined + (l->shown > 0 ? 2 : 0) + len;
-  if (joined > SITE_LIST_TEXT_CAP || l->shown == 255) {
-    if (l->hashed < SITE_LIST_MORE_HASHES) l->moreHash[l->hashed++] = siteNameHash(name);
-    if (l->more < 255) l->more++;
-    return true;
+  if (l->count < SITE_LIST_MAX_NAMES) {
+    l->names[l->count++] = name;
+  } else if (l->extra < UINT16_MAX) {
+    l->extra++;
   }
-  // joined <= CAP keeps used + len + 1 <= CAP + 1: each name is at least 1 byte, each
-  // separator 2, and each name takes len + 1 bytes here.
-  memcpy(l->names + l->used, name, len + 1);
-  l->used = (uint16_t)(l->used + len + 1);
-  l->joined = (uint16_t)joined;
-  l->shown++;
   return true;
 }
 
@@ -246,8 +210,9 @@ static inline size_t siteListTailLen(unsigned rest) {
   return n > 0 ? (size_t)n : 0;
 }
 
-// Writes the list into out (cap bytes, NUL-terminated): as many names as fit with ", "
-// between them, then " +N more" for the rest, never part of a name. "Silas, North +2 more".
+// Writes the list into out (cap bytes, NUL-terminated): as many names as fit, from the first,
+// with ", " between them, then " +N more" for the rest, never part of a name.
+// "Silas, North +2 more".
 // When not even one name fits it writes "N sites" ("1 site"), and when that does not fit
 // either, "". Returns the length written.
 static inline size_t siteListFormat(const SiteList *l, char *out, size_t cap) {
@@ -255,13 +220,12 @@ static inline size_t siteListFormat(const SiteList *l, char *out, size_t cap) {
   out[0] = '\0';
   const unsigned total = siteListCount(l);
   if (total == 0) return 0;
-  // The most names that fit together with the tail for the rest
+  // The most names, from the first, that fit together with the tail for the rest
   unsigned best = 0;
   size_t len = 0;
-  const char *p = l->names;
-  for (unsigned k = 1; k <= l->shown; ++k) {
-    len += (k > 1 ? 2 : 0) + strlen(p);
-    p += strlen(p) + 1;
+  for (unsigned k = 1; k <= l->count; ++k) {
+    len += (k > 1 ? 2 : 0) + strlen(l->names[k - 1]);
+    // No early stop: the tail can vanish at the last name, so more names can fit than fewer
     if (len + siteListTailLen(total - k) < cap) best = k;
   }
   if (best == 0) {
@@ -273,16 +237,14 @@ static inline size_t siteListFormat(const SiteList *l, char *out, size_t cap) {
     return (size_t)n;
   }
   size_t pos = 0;
-  p = l->names;
   for (unsigned k = 0; k < best; ++k) {
     if (k > 0) {
       out[pos++] = ',';
       out[pos++] = ' ';
     }
-    const size_t n = strlen(p);
-    memcpy(out + pos, p, n);
+    const size_t n = strlen(l->names[k]);
+    memcpy(out + pos, l->names[k], n);
     pos += n;
-    p += n + 1;
   }
   out[pos] = '\0';
   if (best < total) {

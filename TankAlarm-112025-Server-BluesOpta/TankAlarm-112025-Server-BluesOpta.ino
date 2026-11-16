@@ -183,6 +183,9 @@
 #ifndef LATE_READING_THRESHOLD_SECONDS
 #define LATE_READING_THRESHOLD_SECONDS 108000UL  // 30 hours
 #endif
+// The daily email's site lists keep every client's name, to count each site once.
+static_assert(SITE_LIST_MAX_NAMES >= MAX_SENSOR_RECORDS,
+              "EmailStaleness.h: SITE_LIST_MAX_NAMES must cover MAX_SENSOR_RECORDS");
 
 // Orphaned sensor auto-prune threshold (72 hours / 3 days)
 // When a client has fresh AND stale sensors, sensors stale beyond this age
@@ -501,6 +504,12 @@ struct SensorRecord {
   bool alarmActive;
   char alarmType[24];
   double lastUpdateEpoch;
+  // When currentValue was measured: the client's acquisition time ("t") from telemetry, the
+  // daily report, and alarm notes that carry the reading. A note sent on a reused or failed
+  // value carries the last good reading's time, so this stays put while lastUpdateEpoch (when
+  // a note last came) moves on. The daily email and alarm reminders judge a reading's age by
+  // it (sensorReadingEpoch()). 0 = not known yet: lastUpdateEpoch stands in.
+  double readingEpoch;
   double firstSeenEpoch;        // When this record was first created (for archive naming)
   // 24-hour change tracking (computed server-side)
   float previousValue;        // Reading from ~24h ago, in the sensor's own measurement unit
@@ -12984,6 +12993,12 @@ static void handleTelemetry(JsonDocument &doc, double epoch) {
   
   rec->currentValue = newLevel;
   rec->lastUpdateEpoch = now;
+  // The reading's own time, which a reused or failed value does not advance. No "t" (a client
+  // before v2.0.56, or no reading since boot): the note's time, as before.
+  {
+    const double readingT = doc["t"] | 0.0;
+    rec->readingEpoch = (readingT > 0.0) ? readingT : now;
+  }
   gSensorRegistryDirty = true;
 
   // Self-clear a stale latched "sensor-stuck" alarm. A sensor-stuck alarm is only set by
@@ -13286,6 +13301,13 @@ static void handleAlarm(JsonDocument &doc, double epoch) {
   // config-push clear), and the note does not say which. The reading enters history from
   // telemetry or the daily report at its own time.
   rec->lastUpdateEpoch = (epoch > 0.0) ? epoch : currentEpoch();
+  // Only a note that carries the reading dates it, with the reading's own "t". A diagnostic
+  // or config-change note (sensor-fault, sensor-recovered, a clear) is stamped when sent and
+  // carries no reading, so it leaves readingEpoch alone.
+  if (!doc["ot"].isNull() || !doc["lvl"].isNull() || !doc["ma"].isNull()) {
+    const double readingT = doc["t"] | 0.0;
+    rec->readingEpoch = (readingT > 0.0) ? readingT : rec->lastUpdateEpoch;
+  }
   gSensorRegistryDirty = true;
 
   // Check rate limit before sending SMS
@@ -13690,6 +13712,7 @@ static void handleDaily(JsonDocument &doc, double epoch) {
       rec->currentValue = newLevel;
     }
     rec->lastUpdateEpoch = now;
+    rec->readingEpoch = now;  // the per-sensor "t" when sent: the last good reading's time
     gSensorRegistryDirty = true;
     
     // Record historical snapshot from daily report so sparklines/charts have data
@@ -13861,6 +13884,7 @@ static void handleUnload(JsonDocument &doc, double epoch) {
     strlcpy(rec->label, tankLabel, sizeof(rec->label));
     rec->currentValue = emptyInches;
     rec->lastUpdateEpoch = eventEpoch;
+    rec->readingEpoch = eventEpoch;
   }
 }
 
@@ -15020,10 +15044,16 @@ static double lastDailyReportEpoch(const char *clientUid) {
   return meta ? meta->dailyReportEpoch : 0.0;
 }
 
+// When a sensor's current value was measured (readingEpoch), or, before the server knows,
+// when its last note came.
+static double sensorReadingEpoch(const SensorRecord &rec) {
+  return (rec.readingEpoch > 0.0) ? rec.readingEpoch : rec.lastUpdateEpoch;
+}
+
 // How old one sensor's reading is, for the daily email and alarm reminders (see
 // MISSED_DAILY_REPORT_SECONDS).
 static ReadingAge sensorReadingAge(const SensorRecord &rec, double now, double *ageSecondsOut) {
-  return classifyReportedReadingAge(now, rec.lastUpdateEpoch, lastDailyReportEpoch(rec.clientUid),
+  return classifyReportedReadingAge(now, sensorReadingEpoch(rec), lastDailyReportEpoch(rec.clientUid),
                                     (double)MISSED_DAILY_REPORT_SECONDS,
                                     (double)LATE_READING_THRESHOLD_SECONDS,
                                     (double)STALE_CLIENT_THRESHOLD_SECONDS, ageSecondsOut);
@@ -15040,8 +15070,8 @@ static ReadingAge dailyEmailClientAge(uint8_t first, double now, const char **na
   double newest = 0.0;
   const char *site = gSensorRecords[first].site;
   for (uint8_t j = first; j < gSensorRecordCount; ++j) {
-    if (strcmp(gSensorRecords[j].clientUid, uid) == 0 && gSensorRecords[j].lastUpdateEpoch > newest) {
-      newest = gSensorRecords[j].lastUpdateEpoch;
+    if (strcmp(gSensorRecords[j].clientUid, uid) == 0 && sensorReadingEpoch(gSensorRecords[j]) > newest) {
+      newest = sensorReadingEpoch(gSensorRecords[j]);
       site = gSensorRecords[j].site;
     }
   }
@@ -15257,8 +15287,8 @@ static void sendDailyEmail() {
   // "message" or "type" key to this body: the email renderers take those as the alarm shape.
   const int32_t tzOffsetSec = localOffsetSeconds(gConfig.dailyTzOffsetMinutes, gConfig.dailyDstEnabled);
   const bool markUtc = (gConfig.dailyTzOffsetMinutes == 0 && !gConfig.dailyDstEnabled);
-  SiteList staleSites;
-  SiteList lateSites;
+  static SiteList staleSites;  // static: 2 x 260 bytes off the stack; names point into gSensorRecords
+  static SiteList lateSites;
   siteListInit(&staleSites);
   siteListInit(&lateSites);
   for (uint8_t pass = 0; pass < 2; ++pass) {
@@ -15355,12 +15385,12 @@ static void sendDailyEmail() {
     obj["sensorMa"] = roundTo(gSensorRecords[i].sensorMa, 2);
     obj["alarm"] = gSensorRecords[i].alarmActive;
     obj["alarmType"] = gSensorRecords[i].alarmType;
-    // When this reading was taken (daily report) or received (telemetry/alarm), and how old
-    // it is. levelInches stays the last value either way, so existing templates keep working.
+    // When this reading was taken, and how old it is. levelInches stays the last value either
+    // way, so existing templates keep working.
     double ageSec = 0.0;
     ReadingAge age = sensorReadingAge(gSensorRecords[i], now, &ageSec);
     if (age != READING_AGE_UNKNOWN) {
-      obj["u"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;  // integer: a double that fits a float keeps only 7 digits
+      obj["u"] = (uint32_t)sensorReadingEpoch(gSensorRecords[i]);  // integer: a double that fits a float keeps only 7 digits
     }
     if (age == READING_AGE_STALE) {
       obj["stale"] = true;
@@ -15371,7 +15401,7 @@ static void sendDailyEmail() {
         (showLastReading && age == READING_AGE_FRESH)) {
       obj["ageH"] = roundTo(ageSec / 3600.0, 1);
       char asOf[32];  // "YYYY-MM-DD HH:MM UTC" is 20; room for the formatter's worst case
-      formatEpochStamp(gSensorRecords[i].lastUpdateEpoch, tzOffsetSec, markUtc, asOf, sizeof(asOf));
+      formatEpochStamp(sensorReadingEpoch(gSensorRecords[i]), tzOffsetSec, markUtc, asOf, sizeof(asOf));
       obj["asOf"] = asOf;  // char[] assignment copies into the document
     }
   }
@@ -16182,6 +16212,7 @@ static void saveSensorRegistry() {
       if (rec.alarmType[0] != '\0') obj["at"] = rec.alarmType;
       // Integer epochs: a double that fits a float would be written with only 7 digits.
       obj["u"] = (uint32_t)rec.lastUpdateEpoch;
+      if (rec.readingEpoch > 0.0) obj["re"] = (uint32_t)rec.readingEpoch;
       if (rec.firstSeenEpoch > 0.0) obj["fs"] = rec.firstSeenEpoch;
       if (rec.previousLevelEpoch > 0.0) {
         obj["pl"] = rec.previousValue;
@@ -16293,6 +16324,7 @@ static void loadSensorRegistry() {
           existing->alarmActive = obj["a"] | false;
           strlcpy(existing->alarmType, obj["at"] | "", sizeof(existing->alarmType));
           existing->lastUpdateEpoch = loadedEpoch;
+          existing->readingEpoch = obj["re"] | 0.0;
           existing->previousValue = obj["pl"] | 0.0f;
           existing->previousLevelEpoch = obj["pe"] | 0.0;
           existing->userNumber = obj["un"] | 0;
@@ -16323,6 +16355,7 @@ static void loadSensorRegistry() {
       rec.alarmActive = obj["a"] | false;
       strlcpy(rec.alarmType, obj["at"] | "", sizeof(rec.alarmType));
       rec.lastUpdateEpoch = loadedEpoch;
+      rec.readingEpoch = obj["re"] | 0.0;
       rec.previousValue = obj["pl"] | 0.0f;
       rec.previousLevelEpoch = obj["pe"] | 0.0;
       rec.firstSeenEpoch = obj["fs"] | 0.0;

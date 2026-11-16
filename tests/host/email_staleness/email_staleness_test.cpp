@@ -306,90 +306,95 @@ static void testSiteList() {
   CHECK(fmtList(l) == "Silas, North, Sil, Smith, North");
   CHECK(siteListCount(&l) == 4);
 
-  // Overflow: names that do not fit are counted once each, and the text says so
+  // Equal names at different addresses are one name (the server's names live in records)
+  char copy[8];
+  strcpy(copy, "Silas");
+  CHECK(!siteListAdd(&l, copy));
+
+  // Names that do not fit the text are still known, so a repeat is never counted twice
   siteListInit(&l);
-  char name[32];
+  char names[12][32];
   for (int i = 0; i < 12; ++i) {
-    snprintf(name, sizeof(name), "Site number %02d", i);  // 14 characters
-    CHECK(siteListAdd(&l, name));
+    snprintf(names[i], sizeof(names[i]), "Site number %02d", i);  // 14 characters
+    CHECK(siteListAdd(&l, names[i]));
   }
-  for (int i = 0; i < 12; ++i) {  // every name again: a second client at each site
-    snprintf(name, sizeof(name), "Site number %02d", i);
-    CHECK(!siteListAdd(&l, name));
-    CHECK(siteListHas(&l, name));
+  for (int i = 0; i < 12; ++i) {  // a second client at each site
+    char again[32];
+    snprintf(again, sizeof(again), "Site number %02d", i);
+    CHECK(!siteListAdd(&l, again));
+    CHECK(siteListHas(&l, again));
   }
-  // 5 names = 5 * 14 + 4 * 2 = 78 <= 80; the 6th would make 94
-  CHECK(l.shown == 5);
-  CHECK(l.more == 7);
   CHECK(siteListCount(&l) == 12);
+  // In the payload's 96 bytes: 5 names = 78, with " +7 more" 86; a 6th makes 94 + 8
   const char *five = "Site number 00, Site number 01, Site number 02, Site number 03, Site number 04";
   CHECK(fmtList(l) == std::string(five) + " +7 more");
   CHECK(fmtList(l) == std::string(five) + " +7 more");  // formatting does not change the list
 
-  // A sixth name, even one letter, does not fit (78 + 3 > 80)
-  CHECK(siteListAdd(&l, "A"));
-  CHECK(fmtList(l) == std::string(five) + " +8 more");
-
   // A smaller buffer cuts at a name, never inside one
-  CHECK(fmtList(l, 40) == "Site number 00, Site number 01 +11 more");
-  CHECK(fmtList(l, 39) == "Site number 00 +12 more");
-  CHECK(fmtList(l, 24) == "Site number 00 +12 more");
-  CHECK(fmtList(l, 23) == "13 sites");
-  CHECK(fmtList(l, 9) == "13 sites");
+  CHECK(fmtList(l, 40) == "Site number 00, Site number 01 +10 more");
+  CHECK(fmtList(l, 39) == "Site number 00 +11 more");
+  CHECK(fmtList(l, 24) == "Site number 00 +11 more");
+  CHECK(fmtList(l, 23) == "12 sites");
+  CHECK(fmtList(l, 9) == "12 sites");
   CHECK(fmtList(l, 8) == "");
   CHECK(fmtList(l, 1) == "");
   CHECK(siteListFormat(&l, nullptr, 10) == 0);
 
-  // A shorter name after an overflow still fits where there is room
+  // The tail can vanish at the last name: all names fit where all but one with " +1 more"
+  // would not
   siteListInit(&l);
-  CHECK(siteListAdd(&l, "Silas Ranch Wellhead"));                     // 20
-  CHECK(siteListAdd(&l, "North Pasture Tank Battery"));               // 48
-  CHECK(siteListAdd(&l, "A very long site name of thirty-nine ch"));  // 89: counted
-  CHECK(siteListAdd(&l, "Cox Lease"));                                // 59
-  CHECK(fmtList(l) == "Silas Ranch Wellhead, North Pasture Tank Battery, Cox Lease +1 more");
-  CHECK(siteListCount(&l) == 4);
+  CHECK(siteListAdd(&l, "Alpha"));
+  CHECK(siteListAdd(&l, "B"));
+  CHECK(fmtList(l, strlen("Alpha, B") + 1) == "Alpha, B");
+  CHECK(fmtList(l, strlen("Alpha, B")) == "2 sites");
 
-  // A first name longer than the cap: the text still names the count
+  // The reviewer's case: 19 distinct 31-character names, each at two clients. Every name is
+  // kept, so the count is 19 and the nineteenth is still found.
   siteListInit(&l);
-  std::string longName(SITE_LIST_TEXT_CAP + 5, 'x');
+  static char longNames[19][40];
+  for (int i = 0; i < 19; ++i) {
+    snprintf(longNames[i], sizeof(longNames[i]), "Thirty-one-char site name #%04u", (unsigned)i);
+    CHECK(strlen(longNames[i]) == 31);
+  }
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = 0; i < 19; ++i) CHECK(siteListAdd(&l, longNames[i]) == (pass == 0));
+  }
+  CHECK(siteListCount(&l) == 19);
+  CHECK(siteListHas(&l, longNames[18]));
+  CHECK(fmtList(l) == std::string(longNames[0]) + ", " + longNames[1] + " +17 more");
+
+  // A first name longer than the space: the text still names the count
+  siteListInit(&l);
+  std::string longName(SITE_LIST_TEXT_SIZE + 5, 'x');
   CHECK(siteListAdd(&l, longName.c_str()));
   CHECK(!siteListAdd(&l, longName.c_str()));
   CHECK(fmtList(l) == "1 site");
-  longName[0] = 'y';
-  CHECK(siteListAdd(&l, longName.c_str()));
+  std::string longName2(SITE_LIST_TEXT_SIZE + 5, 'y');
+  CHECK(siteListAdd(&l, longName2.c_str()));
   CHECK(fmtList(l) == "2 sites");
 
-  // Exactly at the cap fits
+  // Exactly filling the space fits
   siteListInit(&l);
-  std::string capName(SITE_LIST_TEXT_CAP, 'z');
+  std::string capName(SITE_LIST_TEXT_SIZE - 1, 'z');
   CHECK(siteListAdd(&l, capName.c_str()));
-  CHECK(l.shown == 1 && l.more == 0);
   CHECK(fmtList(l) == capName);
   CHECK(siteListAdd(&l, "B"));
-  CHECK(fmtList(l) == capName + " +1 more");
+  CHECK(fmtList(l) == "2 sites");
 
-  // Many one-letter names fill the cap exactly: 27 * 1 + 26 * 2 = 79, the 28th makes 82
+  // Every client of a full registry is kept; past SITE_LIST_MAX_NAMES names are only counted
   siteListInit(&l);
-  for (char c = 'a'; c <= 'z'; ++c) {
-    const char n1[2] = {c, '\0'};
-    CHECK(siteListAdd(&l, n1));
-  }
-  CHECK(siteListAdd(&l, "A"));
-  CHECK(siteListAdd(&l, "B"));
-  CHECK(l.shown == 27 && l.more == 1);
-  CHECK(fmtList(l).size() == 79 + strlen(" +1 more"));
-
-  // 255+ names saturate, not wrap; past the hash table a repeat may count again
-  siteListInit(&l);
-  CHECK(siteListAdd(&l, capName.c_str()));
+  static char many[300][16];
   for (int i = 0; i < 300; ++i) {
-    snprintf(name, sizeof(name), "S%d", i);
-    siteListAdd(&l, name);
+    snprintf(many[i], sizeof(many[i]), "S%u", (unsigned)i);
+    CHECK(siteListAdd(&l, many[i]));
   }
-  CHECK(l.more == 255);
-  CHECK(l.hashed == SITE_LIST_MORE_HASHES);
-  CHECK(fmtList(l) == capName + " +255 more");
+  CHECK(l.count == SITE_LIST_MAX_NAMES);
+  CHECK(l.extra == 300 - SITE_LIST_MAX_NAMES);
+  CHECK(siteListCount(&l) == 300);
+  CHECK(siteListHas(&l, many[SITE_LIST_MAX_NAMES - 1]));
+  CHECK(!siteListAdd(&l, many[SITE_LIST_MAX_NAMES - 1]));
   CHECK(fmtList(l).size() < SITE_LIST_TEXT_SIZE);
+  CHECK(fmtList(l).find(" more") != std::string::npos);
 }
 
 static SiteList listOf(std::initializer_list<const char *> names) {
@@ -430,7 +435,7 @@ static void testSubjectMarker() {
   appendSubjectMarkers(subject, sizeof(subject), "NOT REPORTING", &stale, "NO NEW READINGS", &late);
   CHECK_STR(subject,
             "Daily Tank Summary - 2026-11-16 - NOT REPORTING: Silas Ranch Wellhead, North Pasture "
-            "Tank Battery, Cox Lease, Bravo, Echo Ridge +1 more - NO NEW READINGS: Alpha Unit 4 "
+            "Tank Battery, Cox Lease, Bravo, Echo Ridge, Foxtrot - NO NEW READINGS: Alpha Unit 4 "
             "Battery +4 more");
   CHECK(strlen(subject) < sizeof(subject));
 
@@ -540,13 +545,33 @@ static void testSketch() {
   const std::string last = functionBody(sketch, "static double lastDailyReportEpoch(const char *clientUid) {");
   CHECK(contains(last, "return meta ? meta->dailyReportEpoch : 0.0;"));
   const std::string sensorAge = functionBody(sketch, "static ReadingAge sensorReadingAge(");
-  CHECK(contains(sensorAge, "classifyReportedReadingAge(now, rec.lastUpdateEpoch, lastDailyReportEpoch(rec.clientUid),"));
+  CHECK(contains(sensorAge, "classifyReportedReadingAge(now, sensorReadingEpoch(rec), lastDailyReportEpoch(rec.clientUid),"));
   CHECK(contains(sensorAge, "(double)MISSED_DAILY_REPORT_SECONDS"));
   CHECK(contains(sensorAge, "(double)LATE_READING_THRESHOLD_SECONDS"));
   CHECK(contains(sensorAge, "(double)STALE_CLIENT_THRESHOLD_SECONDS"));
   const std::string clientAge = functionBody(sketch, "static ReadingAge dailyEmailClientAge(");
   CHECK(contains(clientAge, "return READING_AGE_UNKNOWN;"));  // each client once
   CHECK(contains(clientAge, "classifyClientAge(now, newest, lastDailyReportEpoch(uid),"));
+  CHECK(contains(clientAge, "newest = sensorReadingEpoch(gSensorRecords[j]);"));
+  CHECK(!contains(clientAge, "lastUpdateEpoch"));
+
+  // The reading's time: the client's acquisition "t", which a reused or failed value does not
+  // advance, kept across restarts; the last note's time only until the server knows it
+  const std::string readingTime = functionBody(sketch, "static double sensorReadingEpoch(const SensorRecord &rec) {");
+  CHECK(contains(readingTime, "return (rec.readingEpoch > 0.0) ? rec.readingEpoch : rec.lastUpdateEpoch;"));
+  const std::string telemetry = functionBody(sketch, "static void handleTelemetry(JsonDocument &doc, double epoch) {");
+  CHECK(contains(telemetry, "const double readingT = doc[\"t\"] | 0.0;"));
+  CHECK(contains(telemetry, "rec->readingEpoch = (readingT > 0.0) ? readingT : now;"));
+  const std::string alarm = functionBody(sketch, "static void handleAlarm(JsonDocument &doc, double epoch) {");
+  CHECK(contains(alarm, "if (!doc[\"ot\"].isNull() || !doc[\"lvl\"].isNull() || !doc[\"ma\"].isNull()) {"));
+  CHECK(contains(alarm, "rec->readingEpoch = (readingT > 0.0) ? readingT : rec->lastUpdateEpoch;"));
+  const std::string dailyIn = functionBody(sketch, "static void handleDaily(JsonDocument &doc, double epoch) {");
+  CHECK(contains(dailyIn, "rec->readingEpoch = now;"));
+  CHECK(contains(sketch, "if (rec.readingEpoch > 0.0) obj[\"re\"] = (uint32_t)rec.readingEpoch;"));
+  CHECK(contains(sketch, "rec.readingEpoch = obj[\"re\"] | 0.0;"));
+  CHECK(contains(sketch, "existing->readingEpoch = obj[\"re\"] | 0.0;"));
+  // Every client's name fits the site lists
+  CHECK(contains(sketch, "static_assert(SITE_LIST_MAX_NAMES >= MAX_SENSOR_RECORDS,"));
   CHECK(contains(clientAge, "(double)MISSED_DAILY_REPORT_SECONDS"));
   CHECK(contains(clientAge, "(double)STALE_CLIENT_THRESHOLD_SECONDS"));
 
@@ -555,12 +580,15 @@ static void testSketch() {
   // Per sensor: the reading's time, its age class, and its age and local time when old
   CHECK(contains(daily, "ReadingAge age = sensorReadingAge(gSensorRecords[i], now, &ageSec);"));
   CHECK(!contains(daily, "classifyReadingAge("));  // never the age limits alone
-  CHECK(contains(daily, "obj[\"u\"] = (uint32_t)gSensorRecords[i].lastUpdateEpoch;"));
+  CHECK(contains(daily, "obj[\"u\"] = (uint32_t)sensorReadingEpoch(gSensorRecords[i]);"));
   CHECK(contains(daily, "obj[\"stale\"] = true;"));
   CHECK(contains(daily, "obj[\"late\"] = true;"));
   CHECK(contains(daily, "obj[\"ageH\"] = roundTo(ageSec / 3600.0, 1);"));
-  CHECK(contains(daily, "formatEpochStamp(gSensorRecords[i].lastUpdateEpoch, tzOffsetSec, markUtc,"));
+  CHECK(contains(daily, "formatEpochStamp(sensorReadingEpoch(gSensorRecords[i]), tzOffsetSec, markUtc,"));
+  CHECK(!contains(daily, "lastUpdateEpoch"));  // the reading's time, not the last note's
   // Site lists: each client once, a site in the worse list only, counts of distinct names
+  CHECK(contains(daily, "static SiteList staleSites;"));
+  CHECK(contains(daily, "siteListInit(&staleSites);"));
   CHECK(contains(daily, "if (dailyEmailClientAge(i, now, &name) != want) continue;"));
   CHECK(contains(daily, "} else if (!siteListHas(&staleSites, name)) {"));
   CHECK(contains(daily, "doc[\"staleCount\"] = siteListCount(&staleSites);"));
