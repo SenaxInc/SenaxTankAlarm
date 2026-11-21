@@ -9,6 +9,7 @@ on:
       - 'TankAlarm-112025-FTPS_Server_Test/**'
       - 'TankAlarm-112025-Viewer-BluesOpta/**'
       - 'TankAlarm-112025-Common/**'
+      - 'OptaView/**'
       - 'tests/host/**'
       - '.github/workflows/arduino-ci-112025.yml'
   pull_request:
@@ -18,6 +19,7 @@ on:
       - 'TankAlarm-112025-FTPS_Server_Test/**'
       - 'TankAlarm-112025-Viewer-BluesOpta/**'
       - 'TankAlarm-112025-Common/**'
+      - 'OptaView/**'
       - 'tests/host/**'
       - '.github/workflows/arduino-ci-112025.yml'
   workflow_dispatch:
@@ -266,6 +268,41 @@ jobs:
             make -C "$dir" test ARDUINOJSON_DIR="$RUNNER_TEMP/ArduinoJson/src"
             echo "::endgroup::"
           done
+
+  compile-optaview:
+    # OptaView is a bench tool, not part of the 112025 firmware. It has a job of its own so that
+    # a problem in it shows as its own failed check and never holds up build-firmware.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Arduino CLI
+        shell: bash
+        run: |
+          ARDUINO_CLI_VERSION="1.4.1"
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz" | tar -xz -C /tmp
+          install -m 0755 /tmp/arduino-cli "$HOME/bin/arduino-cli"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          arduino-cli version
+
+      - name: Install Arduino Mbed OS Opta Boards core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:mbed_opta
+
+      - name: Install the libraries OptaView uses
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "ArduinoRS485"
+
+      - name: Compile OptaView
+        run: arduino-cli compile --fqbn arduino:mbed_opta:opta --warnings all OptaView/OptaView.ino
 
   check-version:
     if: github.event_name == 'push'
