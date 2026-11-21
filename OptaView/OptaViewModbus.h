@@ -18,6 +18,13 @@
  * during the April 2026 bring-up) are skipped: the reply is located by slave address, function
  * and CRC, then checked as above. MbResult.noiseBytes says how many were skipped.
  *
+ * One thing those checks cannot catch is a reply that arrives after its request was given up:
+ * a read reply does not say which registers it holds, so it would pass for the answer to the
+ * next read of the same size. After an unanswered request, the next request to the same slave
+ * with the same function therefore waits one more timeout and drops what arrives (settleBus).
+ * A reply that is later than two timeouts is beyond help: the timeout has to be longer than the
+ * slowest reply.
+ *
  * Written for C++14 (the Opta core's compiler) and uses no heap, no printf and no exceptions.
  */
 
@@ -367,6 +374,8 @@ struct MbStats {
   uint32_t crcErrors;
   uint32_t exceptions;
   uint32_t otherErrors;
+  // Waits after an unanswered request during which something did arrive: late replies, most likely.
+  uint32_t lateArrivals;
 };
 
 struct MbDeviceIdObject {
@@ -405,13 +414,22 @@ class ModbusMaster {
         frameOffset_(0),
         frameLen_(0),
         lastActivityMs_(0),
-        haveActivity_(false) {
+        haveActivity_(false),
+        lateOpen_(false),
+        lateAny_(false),
+        lateSlave_(0),
+        lateFunction_(0),
+        lateSinceMs_(0),
+        lateWindowMs_(0) {
     memset(&stats, 0, sizeof(stats));
     memset(lastTx_, 0, sizeof(lastTx_));
     memset(rx_, 0, sizeof(rx_));
   }
 
-  uint16_t responseTimeoutMs;  // how long to wait for a reply to start and finish
+  // How long to wait for a reply to start and finish. A reply that comes later than that is
+  // dropped if it arrives within one more timeout (see settleBus). Later still, nothing can tell
+  // it from the answer to the next request, so this must be longer than the slowest reply.
+  uint16_t responseTimeoutMs;
   uint16_t quietMs;            // silence that ends a reply of unknown length
   uint16_t interFrameGapMs;    // minimum bus silence before a request (3.5 characters is 4 ms at 9600)
   MbStats stats;
@@ -582,6 +600,13 @@ class ModbusMaster {
   size_t frameLen_;
   uint32_t lastActivityMs_;
   bool haveActivity_;
+  // The last request that went unanswered, while its reply could still arrive (see settleBus).
+  bool lateOpen_;
+  bool lateAny_;          // more than one such request, to different slaves or functions
+  uint8_t lateSlave_;
+  uint8_t lateFunction_;
+  uint32_t lateSinceMs_;  // when the master gave up on it
+  uint32_t lateWindowMs_; // how long after that its reply is still expected
 
   static bool validSlave(uint8_t slave) { return slave >= 1 && slave <= 247; }
 
@@ -614,11 +639,52 @@ class ModbusMaster {
     return r;
   }
 
-  MbResult transact(const uint8_t *tx, size_t txLen, const MbExpect &e) {
-    MbResult r = {MB_TIMEOUT, 0, 0, 0};
+  // Gets the bus ready for a request to e.slave with e.function.
+  //
+  // A read reply carries no address, so a reply that arrives after its request was given up
+  // would pass for the answer to the next read of the same size, and spoil one of another size.
+  // After a request that went unanswered, the next request to the same slave with the same
+  // function therefore waits until one more timeout has passed since then, and everything that
+  // arrives in that time is dropped. Requests to other slaves or with other functions do not
+  // wait: a late reply cannot be mistaken for theirs.
+  void settleBus(const MbExpect &e) {
+    if (lateOpen_) {
+      const uint32_t began = transport_.nowMs();
+      const uint32_t since = (uint32_t)(began - lateSinceMs_);
+      if (since >= lateWindowMs_) {
+        lateOpen_ = false;
+      } else if (lateAny_ || (e.slave == lateSlave_ && e.function == lateFunction_)) {
+        const uint32_t guardMs = lateWindowMs_ - since;
+        uint32_t lastDrop = began;
+        bool dropped = false;
+        for (;;) {
+          bool got = false;
+          while (transport_.read() >= 0) {
+            got = true;
+          }
+          const uint32_t now = transport_.nowMs();
+          if (got) {
+            dropped = true;
+            lastDrop = now;
+          }
+          const uint32_t waited = (uint32_t)(now - began);
+          // Done when the window is over, unless a late frame is still coming in. Noise that
+          // never stops must not hold the master for ever.
+          const bool arriving = dropped && (uint32_t)(now - lastDrop) < quietMs;
+          if (waited >= guardMs && (!arriving || waited >= guardMs + MB_GRACE_MS)) {
+            break;
+          }
+          transport_.idle();
+        }
+        lateOpen_ = false;
+        if (dropped) {
+          ++stats.lateArrivals;
+        }
+      }
+    }
 
-    // Leave the bus quiet for a moment after the previous frame, then drop whatever arrived
-    // late: a stale reply must not be taken for the answer to this request.
+    // Leave the bus quiet for a moment after the previous frame, then drop whatever is waiting:
+    // a stale byte must not be taken for the start of the answer to this request.
     if (haveActivity_) {
       while ((uint32_t)(transport_.nowMs() - lastActivityMs_) < interFrameGapMs) {
         transport_.idle();
@@ -626,6 +692,35 @@ class ModbusMaster {
     }
     while (transport_.read() >= 0) {
     }
+  }
+
+  // A request got no proper reply. Its reply may still arrive, for one more timeout from now.
+  void noteUnanswered(const MbExpect &e, uint32_t now) {
+    uint32_t window = responseTimeoutMs;
+    bool any = false;
+    if (lateOpen_) {
+      const uint32_t since = (uint32_t)(now - lateSinceMs_);
+      if (since < lateWindowMs_) {
+        // The reply to an earlier request can still arrive as well. One record cannot name
+        // both, so until both windows are over every request waits.
+        any = lateAny_ || e.slave != lateSlave_ || e.function != lateFunction_;
+        if (lateWindowMs_ - since > window) {
+          window = lateWindowMs_ - since;
+        }
+      }
+    }
+    lateOpen_ = true;
+    lateAny_ = any;
+    lateSlave_ = e.slave;
+    lateFunction_ = e.function;
+    lateSinceMs_ = now;
+    lateWindowMs_ = window;
+  }
+
+  MbResult transact(const uint8_t *tx, size_t txLen, const MbExpect &e) {
+    MbResult r = {MB_TIMEOUT, 0, 0, 0};
+
+    settleBus(e);
 
     memcpy(lastTx_, tx, txLen);
     lastTxLen_ = txLen;
@@ -688,6 +783,10 @@ class ModbusMaster {
       r.status = mbCheckReply(e, rx_ + where.offset, where.length, &r.exception);
     } else {
       r.status = mbClassifyFailure(e, rx_, rxLen_);
+    }
+
+    if (mbIsLinkFailure(r.status)) {
+      noteUnanswered(e, end);
     }
 
     switch (r.status) {

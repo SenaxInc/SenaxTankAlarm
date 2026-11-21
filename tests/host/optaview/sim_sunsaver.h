@@ -17,6 +17,7 @@
 
 #include <deque>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -319,9 +320,18 @@ class SimSunSaver : public optaview::MbTransport {
   // The clock starts just below the 32-bit wrap, so every test crosses it.
   uint32_t nowMs() override { return (uint32_t)(0xFFFFFF00ULL + now_); }
 
-  void idle() override { now_ += 1; }
+  // Something that never returns keeps waiting on this clock. No test needs a simulated day, so
+  // the clock refuses to go further: the test fails with a message (Rig::run catches this)
+  // instead of holding CI until its own time limit.
+  void idle() override {
+    if (now_ >= kRunawayMs) {
+      throw std::runtime_error("a simulated day has passed and it has not returned");
+    }
+    now_ += 1;
+  }
 
  private:
+  static const uint64_t kRunawayMs = 24ULL * 3600ULL * 1000ULL;
   uint64_t now_ = 0;
   uint64_t downUntil_ = 0;
   uint32_t linkBaud_ = 0;
@@ -349,8 +359,11 @@ class SimSunSaver : public optaview::MbTransport {
   // Builds the reply to a request addressed to this controller. False = it stays silent.
   bool respond(const uint8_t *request, size_t len, std::vector<uint8_t> *reply) {
     const uint8_t function = request[1];
-    const uint16_t addr = (uint16_t)((request[2] << 8) | request[3]);
-    const uint16_t value = (uint16_t)((request[4] << 8) | request[5]);
+    // Only the 8-byte requests carry an address and a value. A shorter frame (function 0x2B,
+    // or a function with no data at all) must not be read past its end.
+    const bool hasFields = len == 8;
+    const uint16_t addr = hasFields ? (uint16_t)((request[2] << 8) | request[3]) : 0;
+    const uint16_t value = hasFields ? (uint16_t)((request[4] << 8) | request[5]) : 0;
 
     if (function == 0x03 || function == 0x04) {
       if (len != 8) return false;

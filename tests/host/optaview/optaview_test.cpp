@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -102,18 +103,22 @@ static std::string excerpt(const std::string &text) {
 
 static bool has(const std::string &text, const char *needle) { return text.find(needle) != std::string::npos; }
 
-#define CHECK_HAS(text, needle)                                                                      \
-  do {                                                                                               \
-    ++gChecks;                                                                                       \
-    if (!has((text), (needle)))                                                                      \
-      reportFailure(__FILE__, __LINE__, "output contains " #needle, "output was:\n" + excerpt(text)); \
+// These two take the text once. It is usually `rig.run("...")`, and a check that failed must not
+// run the command a second time to show what it printed.
+#define CHECK_HAS(text, needle)                                                                          \
+  do {                                                                                                   \
+    ++gChecks;                                                                                           \
+    const std::string checkText = (text);                                                                \
+    if (!has(checkText, (needle)))                                                                       \
+      reportFailure(__FILE__, __LINE__, "output contains " #needle, "output was:\n" + excerpt(checkText)); \
   } while (0)
 
-#define CHECK_HASNT(text, needle)                                                                          \
-  do {                                                                                                     \
-    ++gChecks;                                                                                             \
-    if (has((text), (needle)))                                                                             \
-      reportFailure(__FILE__, __LINE__, "output does not contain " #needle, "output was:\n" + excerpt(text)); \
+#define CHECK_HASNT(text, needle)                                                                                \
+  do {                                                                                                           \
+    ++gChecks;                                                                                                   \
+    const std::string checkText = (text);                                                                        \
+    if (has(checkText, (needle)))                                                                                \
+      reportFailure(__FILE__, __LINE__, "output does not contain " #needle, "output was:\n" + excerpt(checkText)); \
   } while (0)
 
 static bool near(double a, double b, double tolerance) { return a > b ? a - b <= tolerance : b - a <= tolerance; }
@@ -156,7 +161,13 @@ static std::string replaced(std::string text, const char *from, const char *to) 
 // ============================================================================
 struct StringOut : OvOut {
   std::string text;
-  void write(const char *data, size_t len) override { text.append(data, len); }
+  void write(const char *data, size_t len) override {
+    // A command that prints without end has to fail its test, not fill the memory.
+    if (text.size() > 16u * 1024u * 1024u) {
+      throw std::runtime_error("it has printed more than 16 MB and has not returned");
+    }
+    text.append(data, len);
+  }
 };
 
 struct FakeHost : OvConsoleHost {
@@ -208,7 +219,15 @@ struct Rig {
 
   std::string run(const std::string &line) {
     out.text.clear();
-    console.handleLine(line.c_str());
+    try {
+      console.handleLine(line.c_str());
+    } catch (const std::runtime_error &stuck) {
+      // The simulator's clock or the output gave up on a command that would not end. That is
+      // one failed check, and the tests carry on.
+      ++gChecks;
+      reportFailure(__FILE__, __LINE__, ("the command '" + line + "' returns").c_str(), stuck.what());
+      out.text.clear();
+    }
     gTranscript += out.text;
     return out.text;
   }
@@ -530,6 +549,192 @@ static void testTimeouts() {
   }
 }
 
+// A read reply does not say which registers it holds. One that arrives after its request was
+// given up would therefore pass for the answer to the next read of the same size. After an
+// unanswered request, the next one to the same slave with the same function waits one more
+// timeout, and what arrives in that time is dropped.
+static void testLateReplies() {
+  {  // The late reply arrives while the next request would have been waiting for its own.
+    Bare b;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0xAAAA;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    b.sim.responseDelayMs = 20;  // the controller is quick again
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x0009]);
+    CHECK(word != b.sim.regs[0x0008]);
+    CHECK_EQ(r.noiseBytes, 0);
+    // The second request went out one timeout after the first was given up, not before.
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1000 && b.sim.requestTimes[1] <= gaveUp + 1010, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
+    // That is all: the next read does not wait.
+    const uint64_t done = b.sim.elapsedMs();
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x000A, 1, &word).status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x000A]);
+    CHECK(b.sim.requestTimes[2] <= done + 10);
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
+  }
+  {  // A controller that always answers later than the timeout: every read fails, and none is
+     // answered with the value of the register before it.
+    Bare b;
+    b.sim.responseDelayMs = 1200;
+    for (uint16_t addr = 0x0008; addr <= 0x000C; ++addr) {
+      uint16_t word = 0xAAAA;
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, addr, 1, &word);
+      CHECK_MSG(r.status == MB_TIMEOUT, "0x%04X: %s", (unsigned)addr, mbStatusText(r.status));
+    }
+    CHECK_EQ(b.master.stats.ok, 0);
+    CHECK_EQ(b.master.stats.timeouts, 5);
+    CHECK_EQ(b.master.stats.lateArrivals, 4);  // the four late replies that a following read waited out
+  }
+  {  // A late block reply does not spoil a read of another size either.
+    Bare b;
+    b.sim.responseDelayMs = 1200;
+    uint16_t words[16];
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE000, 16, words).status, MB_TIMEOUT);
+    b.sim.responseDelayMs = 20;
+    uint16_t word = 0;
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word);
+    CHECK_MSG(r.status == MB_OK, "%s", mbStatusText(r.status));
+    CHECK_EQ(word, b.sim.regs[0x0008]);
+  }
+  {  // The wait is one timeout, whatever the timeout is, and the clock may wrap during it.
+    Bare b;
+    b.sim.powered = false;
+    b.master.responseTimeoutMs = 200;
+    uint16_t word = 0;
+    CHECK(b.sim.nowMs() > 0xFFFFFF00UL);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    CHECK(b.sim.nowMs() > 0xFFFFFF00UL);  // given up before the wrap
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word).status, MB_TIMEOUT);
+    CHECK(b.sim.nowMs() < 0x1000);        // and the wait crossed it
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 200 && b.sim.requestTimes[1] <= gaveUp + 210, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+    CHECK_EQ(b.master.stats.lateArrivals, 0);  // nothing arrived: this link is simply dead
+  }
+  {  // Another slave or another function does not wait: a late reply cannot be taken for theirs.
+    Bare b;
+    b.sim.powered = false;
+    uint16_t word = 0;
+    uint8_t bit = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    uint64_t gaveUp = b.sim.elapsedMs();
+    CHECK_EQ(b.master.readRegisters(2, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    CHECK(b.sim.requestTimes[1] <= gaveUp + 10);
+    gaveUp = b.sim.elapsedMs();
+    CHECK_EQ(b.master.readRegisters(2, MB_FC_READ_HOLDING, 0x0008, 1, &word).status, MB_TIMEOUT);
+    CHECK(b.sim.requestTimes[2] <= gaveUp + 10);
+    gaveUp = b.sim.elapsedMs();
+    CHECK_EQ(b.master.readBits(2, MB_FC_READ_COILS, 0x0000, 1, &bit).status, MB_TIMEOUT);
+    CHECK(b.sim.requestTimes[3] <= gaveUp + 10);
+    gaveUp = b.sim.elapsedMs();
+    CHECK_EQ(b.master.writeRegister(2, 0xE022, 1).status, MB_TIMEOUT);
+    CHECK(b.sim.requestTimes[4] <= gaveUp + 10);
+  }
+  {  // A late reply for another function arrives in front of the real reply and is skipped as
+     // noise, which is why such a request need not wait.
+    Bare b;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    b.sim.responseDelayMs = 20;
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
+    CHECK(b.sim.requestTimes[1] <= gaveUp + 10);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0xE022]);
+    CHECK_EQ(r.noiseBytes, 7);  // the late reply to the function 4 read
+  }
+  {  // Two unanswered requests of different kinds, the second given up while the reply to the
+     // first could still arrive (the probe does this when it shortens the timeout). One record
+     // cannot name both, so until both waits are over every request waits, whatever its kind.
+    Bare b;
+    uint16_t word = 0;
+    b.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t first = b.sim.elapsedMs();
+    b.master.responseTimeoutMs = 300;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word).status, MB_TIMEOUT);
+    CHECK(b.sim.requestTimes[1] <= first + 10);  // another function: sent at once
+    CHECK(b.sim.elapsedMs() < first + 400);      // and given up inside the first one's wait
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word).status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x0009]);
+    CHECK_MSG(b.sim.requestTimes[2] >= first + 1000 && b.sim.requestTimes[2] <= first + 1010, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[2] - first));
+    // A request to another slave waits as well while both are open.
+    Bare c;
+    c.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_EQ(c.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t failed = c.sim.elapsedMs();
+    c.master.responseTimeoutMs = 300;
+    CHECK_EQ(c.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word).status, MB_TIMEOUT);
+    CHECK_EQ(c.master.readRegisters(9, MB_FC_READ_INPUT, 0x0009, 1, &word).status, MB_TIMEOUT);
+    CHECK(c.sim.requestTimes[2] >= failed + 1000);
+    // Had the second been given up after the first one's wait was over, nothing would wait:
+    // that is the normal case, and it keeps a scan of many slave addresses quick.
+    Bare d;
+    d.sim.powered = false;
+    for (uint8_t slave = 1; slave <= 5; ++slave) {
+      d.master.readRegisters(slave, MB_FC_READ_INPUT, 0x0008, 1, &word);
+    }
+    CHECK_MSG(d.sim.elapsedMs() < 5 * 1000 + 200, "took %llu ms", (unsigned long long)d.sim.elapsedMs());
+  }
+  {  // An exception is an answer: nothing more is coming, so nothing waits.
+    Bare b;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0036, 1, &word).status, MB_EXCEPTION);
+    const uint64_t done = b.sim.elapsedMs();
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_OK);
+    CHECK(b.sim.requestTimes[1] <= done + 10);
+  }
+  {  // A late reply that is still coming in when the wait ends is allowed to finish first.
+    Bare b;
+    b.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    const std::vector<uint8_t> late = SimSunSaver::frame(bytes({0x01, 0x04, 0x02, 0x11, 0x83}));
+    b.sim.inject(997, late);  // its seven bytes arrive from 997 to 1003 ms: across the end of the wait
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x0009]);
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1003 + b.master.quietMs, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+  }
+  {  // Noise that never stops does not hold the master for ever.
+    Bare b;
+    b.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    b.sim.inject(900, std::vector<uint8_t>(5000, 0xFF));
+    b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1000 && b.sim.requestTimes[1] <= gaveUp + 1000 + MB_GRACE_MS + 10,
+              "sent %llu ms after", (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+  }
+  {  // Stray bytes between two answered requests are dropped as before, and are not counted as
+     // late: only what arrives while a late reply is waited for is.
+    Bare b;
+    uint16_t word = 0;
+    b.sim.inject(0, bytes({0x00, 0x55}));
+    b.sim.advance(5);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x0008]);
+    CHECK_EQ(b.master.stats.lateArrivals, 0);
+    b.sim.responseDelayMs = 1200;
+    b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word);
+    b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word);
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
+    b.master.resetStats();
+    CHECK_EQ(b.master.stats.lateArrivals, 0);
+  }
+}
+
 struct RecordingTrace : MbTraceSink {
   int calls;
   size_t txLen;
@@ -593,6 +798,25 @@ static void testBitsDeviceIdAndRaw() {
   r = b.master.rawRequest(unknown, sizeof(unknown));
   CHECK_EQ(r.status, MB_TIMEOUT);
   CHECK_EQ(trace.calls, 3);
+
+  {  // A request with no data is four bytes long. The simulator must not read an address and a
+     // value past its end (the sanitizer build watches this exactly sized buffer).
+    Bare c;
+    const std::vector<uint8_t> bare = SimSunSaver::frame(bytes({0x01, 0x11}));
+    CHECK_EQ(bare.size(), 4);
+    c.sim.send(bare.data(), bare.size());
+    c.sim.advance(100);
+    std::vector<uint8_t> reply;
+    for (int byte = c.sim.read(); byte >= 0; byte = c.sim.read()) {
+      reply.push_back((uint8_t)byte);
+    }
+    CHECK(reply == SimSunSaver::frame(bytes({0x01, 0x91, 0x01})));  // exception 1: illegal function
+    const uint8_t noData[] = {0x01, 0x11};
+    r = c.master.rawRequest(noData, sizeof(noData));
+    CHECK_EQ(r.status, MB_EXCEPTION);
+    CHECK_EQ(r.exception, 1);
+    CHECK_EQ(c.sim.requests.back().size(), 4);
+  }
 }
 
 // ============================================================================
@@ -1466,13 +1690,16 @@ static void testReadsAndFallback() {
     CHECK_EQ(rig.master.stats.timeouts, 1);
     CHECK_EQ(rig.master.stats.ok, 1);
   }
-  {  // A dead link ends the command after two failed requests instead of 20 timeouts.
+  {  // A dead link ends the command after three failed requests instead of 20 timeouts.
     Rig rig;
     rig.sim.powered = false;
     const uint64_t t0 = rig.sim.elapsedMs();
     const std::string out = rig.run("live");
-    CHECK_EQ(rig.sim.requests.size(), 4);  // the block and its retry, one register and its retry
-    CHECK(rig.sim.elapsedMs() - t0 < 4500);
+    CHECK_EQ(rig.sim.requests.size(), 3);  // the block, its repeat, and one register alone
+    // Three timeouts, and before each repeat one more for a reply that might only be late.
+    const uint64_t took = rig.sim.elapsedMs() - t0;
+    CHECK_MSG(took >= 5000 && took < 5200, "took %llu ms", (unsigned long long)took);
+    CHECK_HASNT(out, "something arrived");  // nothing did
     CHECK_HAS(lineWith(out, "adc_vb_f"), "-- no reply");
     CHECK_HAS(lineWith(out, "adc_va_f"), "-- not read");
     CHECK_HAS(out, "The controller is not answering");
@@ -1488,8 +1715,52 @@ static void testReadsAndFallback() {
     rig.sim.powered = false;
     rig.run("blocks off");
     const std::string out = rig.run("dump");
-    CHECK_EQ(rig.sim.requests.size(), 4);
+    CHECK_EQ(rig.sim.requests.size(), 3);
     CHECK_HAS(out, "The controller is not answering");
+  }
+  {  // A controller that answers later than the timeout allows. No register is shown with the
+     // value of the one before it, and the user is told that replies are arriving late.
+    Rig rig;
+    rig.run("blocks off");
+    rig.sim.responseDelayMs = 1200;
+    const std::string out = rig.run("dump live");
+    CHECK_HAS(lineWith(out, "adc_vb_f"), "-- no reply");
+    CHECK_HASNT(out, " V ");  // not one voltage was shown
+    CHECK_HASNT(out, " A ");
+    CHECK_EQ(rig.master.stats.ok, 0);
+    CHECK_HAS(out, "Note: something arrived after a request had been given up, and was dropped. If that was\r\n"
+                   "      its reply, replies are slower than the timeout: 'timeout <ms>' sets it (now 1000 ms).");
+    CHECK_EQ(countOf(out, "Note: something arrived"), 1);
+    CHECK(out.find("The controller is not answering") < out.find("Note: something arrived"));
+    CHECK_HAS(rig.run("status"),
+              "          Something arrived after a request had been given up, 2 times: late replies?");
+    // With enough time the same controller reads correctly.
+    rig.sim.advance(3000);
+    CHECK_HAS(rig.run("timeout 2000"), "Reply timeout: 2000 ms");
+    const std::string again = rig.run("dump live");
+    CHECK_HAS(lineWith(again, "adc_vb_f"), "13.68 V");
+    CHECK_HAS(lineWith(again, "adc_va_f"), "17.45 V");
+    CHECK_HAS(lineWith(again, "adc_ic_f"), "0.20 A");
+    CHECK_HASNT(again, "something arrived");
+  }
+  {  // Every command says so, not only the register reads, and each says it once. 'coils'
+     // repeats its requests too, and 'watch' reads until a key is pressed.
+    Rig rig;
+    rig.sim.responseDelayMs = 1200;
+    const std::string coils = rig.run("coils");
+    CHECK_HAS(coils, "-- no reply");
+    CHECK_EQ(countOf(coils, "Note: something arrived after a request had been given up"), 1);
+    CHECK_HAS(coils, "'timeout <ms>' sets it (now 1000 ms).");
+    rig.sim.advance(3000);
+    rig.host.pressKeyAfter(5500);  // in the pause after the first pass
+    const std::string watched = rig.run("watch 1");
+    CHECK_HAS(watched, "(no answer; trying again)");
+    CHECK_EQ(countOf(watched, "Note: something arrived after a request had been given up"), 1);
+    CHECK(watched.find("Stopped.") < watched.find("Note: something arrived"));
+    // A command that sends nothing has nothing to say about it.
+    rig.sim.advance(3000);
+    CHECK_HASNT(rig.run("status"), "Note: something arrived");
+    CHECK_HASNT(rig.run("help"), "something arrived");
   }
   {  // CRC errors are a link failure too, and are counted as such.
     Rig rig;
@@ -2251,11 +2522,45 @@ static void testConsoleRawAndExpert() {
   // The SunSaver has no function 16: its exception is shown as such.
   rig.run("raw 1 16 0xE022 1");
   CHECK_HAS(rig.run("yes"), "Not accepted: exception 1 (illegal function).");
-  // Any other function, as typed.
-  const std::string id = rig.run("raw 1 0x2B 0E 01 00");
+  // Any other function goes out as typed, and only after a yes: OptaView cannot tell whether
+  // it reads or writes (function 15 switches coils).
+  size_t sentSoFar = rig.sim.requests.size();
+  const std::string askId = rig.run("raw 1 0x2B 0E 01 00");
+  CHECK_HAS(askId, "Send function 43 to slave 1 with the bytes 0E 01 00?");
+  CHECK_HAS(askId, "it may change the controller, and nothing is checked.");
+  CHECK_HAS(askId, "Type yes to send it. Anything else cancels.");
+  CHECK(rig.console.awaitingConfirmation());
+  CHECK_EQ(rig.sim.requests.size(), sentSoFar);
+  const std::string id = rig.run("yes");
   CHECK_HAS(id, "> 01 2B 0E 01 00 70 77");
   CHECK_HAS(id, "4D 6F 72 6E 69 6E 67 73 74 61 72");  // "Morningstar"
+  CHECK_EQ(rig.sim.requests.size(), sentSoFar + 1);
+  CHECK(!rig.console.awaitingConfirmation());
+
+  rig.sim.coils[0x0001] = false;
+  sentSoFar = rig.sim.requests.size();
+  const std::string askCoils = rig.run("raw 1 15 00 01 00 01 01 01");  // write multiple coils
+  CHECK_HAS(askCoils, "Send function 15 to slave 1 with the bytes 00 01 00 01 01 01?");
+  CHECK_EQ(rig.sim.requests.size(), sentSoFar);
+  CHECK_HAS(rig.run("no"), "Cancelled. Nothing was sent.");
+  CHECK_EQ(rig.sim.requests.size(), sentSoFar);
+  rig.run("raw 1 15 00 01 00 01 01 01");
+  CHECK_HAS(rig.run("live"), "Cancelled. Nothing was sent.");  // another command is not a yes
+  CHECK_EQ(rig.sim.requests.size(), sentSoFar);
+  rig.run("raw 1 15 00 01 00 01 01 01");
+  const std::string coilsSent = rig.run("yes");
+  CHECK_HAS(coilsSent, "> 01 0F 00 01 00 01 01 01 D2 97");
+  CHECK_HAS(coilsSent, "(exception 1 (illegal function)");
+  CHECK_EQ(rig.sim.requests.size(), sentSoFar + 1);
+  CHECK(!rig.sim.coils[0x0001]);
+
+  // A function with no data at all.
+  const std::string askBare = rig.run("raw 1 17");
+  CHECK_HAS(askBare, "Send function 17 to slave 1 with no data?");
+  CHECK_HAS(rig.run("yes"), "> 01 11 C0 2C");
   CHECK_HAS(rig.run("raw 1 0x2B 0E 1G"), "'1G' is not a hex byte");
+  CHECK(!rig.console.awaitingConfirmation());
+  CHECK_HAS(rig.run("raw"), "Everything but functions 1 to 4 asks for 'yes' before it is sent.");
   CHECK_HAS(rig.run("expert off"), "Expert mode is off.");
   CHECK_HAS(rig.run("raw 1 6 0xE022 1"), "'expert on' unlocks the rest");
   CHECK_HAS(rig.run("expert sideways"), "Usage: expert");
@@ -2467,6 +2772,7 @@ static void testScaleCheck() {
     const std::string off = rig.run("scalecheck 12.00");
     CHECK_HAS(off, "     -> no candidate is within 1.2 % of the multimeter");
     CHECK_HAS(off, "  Live readings:   the multimeter fits none of the candidates, so this stays open.\r\n"
+                   "     That takes back what an earlier check found (x96.667).\r\n"
                    "     If the reading is right, the scale is x87.71: 'scale vlive 87.71' uses that.");
   }
   {  // A multimeter reading that fits nothing is not overruled by the regulation test.
@@ -2743,6 +3049,97 @@ static void testScaleCheck() {
     rig.run("no");
     CHECK_HASNT(rig.run("status"), "'scalecheck' tests");
   }
+  {  // A multimeter reading that fits no candidate contradicts an earlier verdict too: the live
+     // scale is open again, while the stored settings keep the verdict they got on their own.
+    Rig rig;
+    CHECK_HAS(rig.run("live"), "Note: voltages are shown");  // the reminder has been given once
+    rig.run("scalecheck 13.68");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
+    CHECK_HASNT(rig.run("live"), "Note: voltages are shown");
+    const std::string off = rig.run("scalecheck 12.00");
+    CHECK_HAS(off, "  Stored settings: x100, which is what OptaView uses now.\r\n"
+                   "  Live readings:   the multimeter fits none of the candidates, so this stays open.\r\n"
+                   "     That takes back what an earlier check found (x100).\r\n"
+                   "     If the reading is right, the scale is x87.71: 'scale vlive 87.71' uses that.");
+    const std::string status = rig.run("status");
+    CHECK_HAS(status, "stored settings: scale vset = x100/32768, confirmed by 'scalecheck'");
+    CHECK_HAS(status, "live readings:   scale vlive = x100/32768, not confirmed on this controller");
+    CHECK_HAS(rig.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");  // the reminder is back
+    CHECK_HASNT(rig.run("set EV_lvd 13.10"), "is not confirmed");
+    rig.run("no");
+    // Taking the reading at its word is then a matter for the next check.
+    rig.run("scale vlive 87.71");
+    CHECK_HAS(rig.run("scalecheck 12.00"), "  Live readings:   x87.71, which is what OptaView uses now.");
+    // With no earlier verdict there is nothing to take back.
+    Rig fresh;
+    CHECK_HASNT(fresh.run("scalecheck 12.00"), "takes back");
+    // A check that merely cannot tell leaves an earlier verdict alone.
+    Rig night;
+    night.run("scalecheck 13.68");
+    night.sim.regs[0x0011] = 3;
+    CHECK_HAS(night.run("scalecheck"), "  Live readings:   cannot tell yet.");
+    CHECK_EQ(countOf(night.run("status"), "confirmed by 'scalecheck'"), 2);
+  }
+  {  // What 'scalecheck' found belongs to the controller it talked to. Another slave address or
+     // other serial settings may reach another controller, so both scales are unconfirmed again.
+    Rig rig;
+    rig.run("scalecheck 13.68");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
+    CHECK_HAS(rig.run("slave 2"),
+              "Link: slave 2, 9600 8N2, read function 4\r\n"
+              "Note: with other link settings this may be another controller, so what 'scalecheck'\r\n"
+              "      found no longer counts. The voltage scales are unconfirmed again.");
+    const std::string status = rig.run("status");
+    CHECK_HAS(status, "stored settings: scale vset = x100/32768, not confirmed on this controller");
+    CHECK_HAS(status, "live readings:   scale vlive = x100/32768, not confirmed on this controller");
+    CHECK_HASNT(rig.run("slave 1"), "Note:");  // nothing had been found at slave 2
+    CHECK_HAS(rig.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");
+    CHECK_HAS(rig.run("set EV_lvd 13.10"), "is not confirmed");
+    rig.run("no");
+
+    // The same address again, the read function, the timeout and the block mode change nothing.
+    rig.run("scalecheck 13.68");
+    CHECK_HASNT(rig.run("slave 1"), "Note:");
+    rig.run("fc 3");
+    rig.run("timeout 800");
+    rig.run("blocks off");
+    CHECK_HASNT(rig.run("link 100"), "unconfirmed");  // refused: the link is unchanged
+    CHECK_HASNT(rig.run("link 9600 8N2"), "unconfirmed");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
+    CHECK_HASNT(rig.run("set EV_lvd 13.10"), "is not confirmed");
+    rig.run("no");
+
+    // Other serial settings.
+    CHECK_HAS(rig.run("link 9600 8N1"), "The voltage scales are unconfirmed again.");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 0);
+    CHECK_HASNT(rig.run("link 19200 8N1"), "Note:");  // said once; nothing is left to take back
+
+    // 'probe' that ends at other settings.
+    Rig probing;
+    probing.run("scalecheck 13.68");
+    probing.sim.deviceBaud = 19200;
+    const std::string found = probing.run("probe");
+    CHECK_HAS(found, "Found it: slave 1, 19200 8N2, read function 4.");
+    CHECK_HAS(found, "These settings are now in use. Try 'live'.\r\n"
+                     "Note: with other link settings this may be another controller");
+    CHECK_EQ(countOf(probing.run("status"), "confirmed by 'scalecheck'"), 0);
+    // 'probe' that finds the same settings, or nothing at all, leaves the verdicts alone.
+    Rig same;
+    same.run("scalecheck 13.68");
+    CHECK_HASNT(same.run("probe"), "unconfirmed");
+    same.sim.powered = false;
+    CHECK_HASNT(same.run("probe"), "unconfirmed");
+    same.sim.powered = true;
+    CHECK_EQ(countOf(same.run("status"), "confirmed by 'scalecheck'"), 2);
+
+    // The reminder after reads is given once for each controller.
+    Rig twice;
+    CHECK_HAS(twice.run("live"), "Note: voltages are shown");
+    CHECK_HASNT(twice.run("live"), "Note: voltages are shown");
+    CHECK_HASNT(twice.run("slave 2"), "Note:");
+    twice.run("slave 1");
+    CHECK_HAS(twice.run("live"), "Note: voltages are shown");
+  }
   {  // A profile without a scale check.
     Rig rig(100.0, kMiniProfile);
     CHECK_HAS(rig.run("scalecheck"), "This profile has no voltage scale check.");
@@ -2786,6 +3183,27 @@ static void testSnapshot() {
       }
       CHECK((item["text"] | "")[0] != '\0');
     }
+  }
+  {  // With the trace on, its lines stay out of the JSON, and it carries on afterwards.
+    Rig rig;
+    rig.run("trace on");
+    const std::string out = rig.run("snapshot");
+    const size_t begin = out.find("--- snapshot begins ---") + strlen("--- snapshot begins ---");
+    const size_t end = out.find("--- snapshot ends ---");
+    const std::string json = out.substr(begin, end - begin);
+    CHECK_HASNT(json, "> 01 04");
+    JsonDocument doc;
+    const DeserializationError error = deserializeJson(doc, json);
+    CHECK_MSG(!error, "with the trace on the snapshot is not valid JSON: %s", error.c_str());
+    CHECK_EQ(doc["registers"].as<JsonArrayConst>().size(), 94);
+    CHECK_EQ(doc["missing"] | -1, 0);
+    CHECK_HAS(out.substr(end), "(The trace was paused for the snapshot, so that it stays valid JSON.)");
+    CHECK_HAS(rig.run("get adc_vb_f"), "> 01 04 00 08 00 01 B0 08");
+    CHECK_HAS(rig.run("status"), "trace on");
+    // Without the trace there is nothing to say about it.
+    rig.run("trace off");
+    CHECK_HASNT(rig.run("snapshot"), "trace");
+    CHECK_HASNT(rig.run("get adc_vb_f"), "> 01 04");
   }
   {  // Registers that do not read are listed with the reason, and the JSON stays valid.
     Rig rig;
@@ -2936,6 +3354,7 @@ int main() {
   testCrcAndFrames();
   testReplyValidation();
   testTimeouts();
+  testLateReplies();
   testBitsDeviceIdAndRaw();
   testText();
   testExactDecimals();

@@ -131,7 +131,7 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 | `trace on\|off` | Show every request and reply in hex |
 | `sniff [ms]` | Listen on the bus without sending |
 | `raw <slave> <fc> <address> <count\|value>` | One request as typed |
-| `expert on\|off` | Allow `raw` to write |
+| `expert on\|off` | Allow `raw` to send more than reads (each still asks for `yes`) |
 
 Long commands stop when you press a key.
 
@@ -143,15 +143,24 @@ keeps these rules, and the host tests check each of them:
 - A reply counts only if its slave address, function, length and CRC all match the request,
   and a write only if the controller repeats the address and value. An exception reply is
   reported as an exception and never as data.
+- A read reply does not say which registers it holds, so a reply that arrives after its request
+  was given up could pass for the next answer. After a request that went unanswered, the next
+  one of its kind waits one more timeout and drops what arrives, and OptaView says so when
+  something did arrive. A reply that is later still cannot be caught: `timeout` has to be
+  longer than the controller's slowest reply.
 - `probe` reports a controller only after it has read a register. A controller that answers
   with an exception is reported as answering but refusing.
 - Settings are written by name, inside limits from the profile, after the old and the new value
   were shown and `yes` was typed. Every write is read back.
 - Pairs that must stay in order (reconnect above disconnect) are checked when you `set` one of
   them and again before `reset`.
-- Writing to an arbitrary address needs `expert on` first and still asks for `yes`.
+- `raw` sends functions 1 to 4, which only read, as they are typed. Every other request needs
+  `expert on` first and still asks for `yes`, because OptaView cannot tell what it would change.
 - Stored settings and live readings have a voltage scale each. `set` warns until the scale of
   the settings is confirmed, and a multimeter reading never changes how a setting is written.
+  What `scalecheck` found holds for the controller it talked to: another slave address or other
+  serial settings make both scales unconfirmed again. A different controller on the same cable
+  and settings looks the same to OptaView, so run `scalecheck` again after swapping one.
 - Currents are signed, so a small night-time back current reads as -0.04 A and not as 158 A.
 
 ## The voltage scales

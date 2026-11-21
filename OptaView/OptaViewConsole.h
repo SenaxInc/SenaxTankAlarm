@@ -144,7 +144,24 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     return was;
   }
 
+  // One line from the user. Two things are settled here because they hold for every command
+  // alike: the note about late replies, and what 'scalecheck' found once the link may reach
+  // another controller.
   void handleLine(const char *line) {
+    const OvLink before = device_.link;
+    const uint32_t lateBefore = device_.master().stats.lateArrivals;
+    runLine(line);
+    if (device_.master().stats.lateArrivals != lateBefore) {
+      lateNotice();
+    }
+    const OvLink &now = device_.link;
+    if (now.slave != before.slave || now.baud != before.baud || now.format != before.format) {
+      forgetController();
+    }
+  }
+
+ private:
+  void runLine(const char *line) {
     char buffer[OV_LINE_MAX];
     ovCopy(buffer, sizeof(buffer), line);
     char *argv[OV_MAX_ARGS];
@@ -234,6 +251,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
   }
 
+ public:
   // --- MbTraceSink ---
   void onTransaction(const uint8_t *tx, size_t txLen, const uint8_t *rx, size_t rxLen,
                      const MbResult &result) override {
@@ -260,7 +278,14 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   bool aborted() override { return stopRequested(); }
 
  private:
-  enum PendingKind : uint8_t { PENDING_NONE = 0, PENDING_SET, PENDING_COIL, PENDING_RESET, PENDING_RAW_WRITE };
+  enum PendingKind : uint8_t {
+    PENDING_NONE = 0,
+    PENDING_SET,
+    PENDING_COIL,
+    PENDING_RESET,
+    PENDING_RAW_WRITE,
+    PENDING_RAW_FRAME
+  };
 
   struct Pending {
     uint8_t kind;
@@ -271,6 +296,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     uint8_t function;
     uint16_t addr;
     uint16_t value;
+    uint8_t body[OV_MAX_ARGS];  // PENDING_RAW_FRAME: slave, function and the bytes as typed
+    uint8_t bodyLength;
   };
 
   OvOut &out_;
@@ -605,6 +632,16 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
   }
 
+  // The last thing a command says when, while it ran, something arrived for a request that had
+  // already been given up (see ModbusMaster::settleBus). Whatever the command was, the user
+  // should know: the usual cause is a reply timeout that is too short for this controller.
+  void lateNotice() {
+    out_.println("Note: something arrived after a request had been given up, and was dropped. If that was");
+    out_.print("      its reply, replies are slower than the timeout: 'timeout <ms>' sets it (now ");
+    out_.printU(device_.master().responseTimeoutMs);
+    out_.println(" ms).");
+  }
+
   // A scale is confirmed while it has the numerator that 'scalecheck' found on this controller.
   // Changing it by hand to anything else makes it unconfirmed again.
   static bool scaleConfirmed(const ScaleState &state, const OvScale &scale) {
@@ -619,6 +656,21 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   bool liveScaleOpen() const {
     const OvScale *scale = device_.profile().scaleCheck().liveScale;
     return scale != nullptr && !scaleConfirmed(liveScale_, *scale);
+  }
+
+  // 'scalecheck' judged the controller that was at the other end of the link at the time.
+  // Another slave address or other serial settings may reach another controller, so what was
+  // found there does not carry over, and neither do the reminders that were given.
+  void forgetController() {
+    const bool had = settingsScale_.found > 0.0 || liveScale_.found > 0.0;
+    settingsScale_.found = 0.0;
+    settingsScale_.noticed = false;
+    liveScale_.found = 0.0;
+    liveScale_.noticed = false;
+    if (had) {
+      out_.println("Note: with other link settings this may be another controller, so what 'scalecheck'");
+      out_.println("      found no longer counts. The voltage scales are unconfirmed again.");
+    }
   }
 
   // After a command that printed voltages on a scale that nothing has confirmed: says so, once
@@ -752,7 +804,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         "  trace on|off            show every request and reply in hex",
         "  sniff [ms]              listen without sending (5000 ms)",
         "  raw <slave> <fc> <address> <count|value>",
-        "                          one request; function 5, 6 and 16 write and need 'expert on'",
+        "                          one request; all but functions 1 to 4 need 'expert on' and a yes",
         "  expert on|off",
         "In the lists, W marks a setting that 'set' can change and ~ a register taken from the",
         "specification that has not been confirmed on our bench."};
@@ -804,6 +856,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(", other errors ");
     out_.printU(master.stats.otherErrors);
     out_.println();
+    if (master.stats.lateArrivals > 0) {
+      out_.print("          Something arrived after a request had been given up, ");
+      out_.printU(master.stats.lateArrivals);
+      out_.println(master.stats.lateArrivals == 1 ? " time: a late reply?" : " times: late replies?");
+    }
     const OvScaleCheck &check = profile.scaleCheck();
     if (check.settingsScale != nullptr) {
       out_.print("Voltage   stored settings: scale ");
@@ -1170,6 +1227,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
 
   void cmdSnapshot() {
     OvProfile &profile = device_.profile();
+    // What lies between the two markers has to be valid JSON, so the trace keeps quiet meanwhile.
+    ModbusMaster &master = device_.master();
+    MbTraceSink *const trace = master.trace;
+    master.trace = nullptr;
     out_.println("--- snapshot begins ---");
     out_.println("{");
     out_.print("  \"optaview\": ");
@@ -1246,6 +1307,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.println();
     out_.println("}");
     out_.println("--- snapshot ends ---");
+    master.trace = trace;
+    if (trace != nullptr) {
+      out_.println("(The trace was paused for the snapshot, so that it stays valid JSON.)");
+    }
     if (missing > 0) {
       out_.printU(missing);
       out_.println(missing == 1 ? " register could not be read; see its \"error\"."
@@ -1508,6 +1573,14 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       } else if (live.meterCompared && live.meterMatches == 0) {
         out_.print(kLabel);
         out_.println("the multimeter fits none of the candidates, so this stays open.");
+        if (liveScale_.found > 0.0) {
+          // The reading contradicts every candidate, the one an earlier check settled on included.
+          out_.print("     That takes back what an earlier check found (");
+          printCandidate(liveScale_.found);
+          out_.println(").");
+        }
+        liveScale_.found = 0.0;
+        liveScale_.noticed = false;
         out_.print("     If the reading is right, the scale is x");
         out_.printFixed(live.impliedNumerator, 2);
         out_.print(": 'scale ");
@@ -1941,6 +2014,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       case PENDING_RAW_WRITE:
         runRawWrite(action);
         break;
+      case PENDING_RAW_FRAME:
+        runRawFrame(action);
+        break;
       default:
         break;
     }
@@ -2161,7 +2237,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   void rawUsage() {
     out_.println("Usage: raw <slave> <function> <address> <count|value>");
     out_.println("       functions 1 to 4 read; 5, 6 and 16 write one value and need 'expert on'");
-    out_.println("       raw <slave> <function> <hex byte>...   sends any other function as typed (expert)");
+    out_.println("       raw <slave> <function> <hex byte>...   any other function as typed (expert)");
+    out_.println("       Everything but functions 1 to 4 asks for 'yes' before it is sent.");
   }
 
   void printLastExchange(const MbResult &result) {
@@ -2189,8 +2266,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       return;
     }
     if (!reads && !writes) {
-      // Any other function: the bytes after the function code, as typed.
-      uint8_t body[OV_MAX_ARGS];
+      // Any other function: the bytes after the function code, as typed. OptaView cannot tell
+      // what such a request does (function 15 switches coils, 22 and 23 change registers), so
+      // it is sent only after a yes, like every other write.
+      uint8_t *body = pending_.body;
       size_t length = 0;
       body[length++] = (uint8_t)slave;
       body[length++] = (uint8_t)function;
@@ -2202,8 +2281,22 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         }
         ++length;
       }
-      const MbResult result = master.rawRequest(body, length);
-      printLastExchange(result);
+      out_.print("Send function ");
+      out_.printU(function);
+      out_.print(" to slave ");
+      out_.printU(slave);
+      if (length > 2) {
+        out_.print(" with the bytes ");
+        out_.printHexBytes(body + 2, length - 2);
+      } else {
+        out_.print(" with no data");
+      }
+      out_.println("?");
+      out_.println(
+          "OptaView cannot tell what this request does: it may change the controller, and nothing is checked.");
+      out_.println("Type yes to send it. Anything else cancels.");
+      pending_.kind = PENDING_RAW_FRAME;
+      pending_.bodyLength = (uint8_t)length;
       return;
     }
     uint32_t addr = 0;
@@ -2268,6 +2361,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         out_.println(bits[i] != 0 ? "  on" : "  off");
       }
     }
+  }
+
+  void runRawFrame(const Pending &action) {
+    const MbResult result = device_.master().rawRequest(action.body, action.bodyLength);
+    printLastExchange(result);
   }
 
   void runRawWrite(const Pending &action) {

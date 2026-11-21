@@ -84,7 +84,7 @@ inline void ovDescribeResult(const MbResult &r, char *out, size_t cap) {
 }
 
 static const uint16_t OV_MAX_SPAN_WORDS = MB_MAX_READ_REGISTERS;
-static const uint8_t OV_LINK_DOWN_AFTER = 2;      // failed requests in a row that end a batch
+static const uint8_t OV_LINK_DOWN_AFTER = 3;      // failed requests in a row that end a batch
 static const uint16_t OV_PROBE_TIMEOUT_MS = 400;  // reply wait during the probe sweep and scans
 static const uint32_t OV_RESET_GIVE_UP_MS = 20000;
 
@@ -401,11 +401,15 @@ class OvDevice {
   }
   bool linkDown() const { return linkDown_; }
 
-  // One read request for `count` words, repeated after a link failure.
+  // One read request for `count` words, repeated after a link failure. The master lets one more
+  // timeout pass before the repeat, so that a reply that is merely late is not taken for its
+  // answer; every attempt therefore counts towards giving up on the link.
   MbResult readWords(uint16_t addr, uint16_t count, uint16_t *out) {
     MbResult r = master_.readRegisters(link.slave, link.readFunction, addr, count, out);
-    for (uint8_t attempt = 0; attempt < retries && mbIsLinkFailure(r.status); ++attempt) {
+    note(r);
+    for (uint8_t attempt = 0; attempt < retries && mbIsLinkFailure(r.status) && !linkDown_; ++attempt) {
       r = master_.readRegisters(link.slave, link.readFunction, addr, count, out);
+      note(r);
     }
     return r;
   }
@@ -436,7 +440,6 @@ class OvDevice {
         continue;
       }
       const MbResult r = readWords(at, n, words + done);
-      note(r);
       if (r.status == MB_OK) {
         for (uint16_t i = 0; i < n; ++i) {
           status[done + i].status = MB_OK;
@@ -895,7 +898,6 @@ class OvDevice {
       return false;
     }
     const MbResult r = readWords(addr, 1, word);
-    note(r);
     status->status = r.status;
     status->exception = r.exception;
     if (r.status != MB_OK) {
