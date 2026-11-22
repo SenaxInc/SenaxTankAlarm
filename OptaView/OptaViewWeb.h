@@ -67,7 +67,9 @@ static const char OV_WEB_MARKER[] = "x-optaview";  // lower case: header names a
 static const uint8_t OV_WEB_SLOTS = 2;             // connections that may wait for their first byte
 static const uint32_t OV_WEB_FIRST_BYTE_MS = 3000;
 static const uint32_t OV_WEB_SESSION_IDLE_MS = 30UL * 60UL * 1000UL;
-static const uint32_t OV_WEB_COMMAND_MS = 60000;   // the longest a request may keep the Opta busy
+// The longest a command may work. Reading the request and sending the answer have limits of
+// their own, in OptaViewHttp.h.
+static const uint32_t OV_WEB_COMMAND_MS = 60000;
 static const uint32_t OV_WEB_HEARTBEAT_MS = 1000;
 static const size_t OV_WEB_PIN_MIN = 4;
 static const size_t OV_WEB_PIN_MAX = 8;
@@ -490,7 +492,7 @@ class OvWeb : public OvConsoleExtra {
   void serve(OvConn &conn, int first) {
     cut_ = false;
     const OvHttpParse parse = readRequest(conn, first);
-    response_.attach(&conn);
+    response_.attach(conn, clock_);
     if (parse == OV_HTTP_OK) {
       ++served_;
       route();

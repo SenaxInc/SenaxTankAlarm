@@ -242,23 +242,25 @@ class EthernetConn : public optaview::OvConn {
 
   void open(const EthernetClient &client) {
     client_ = client;
+    // With its usual timeout of 1.5 s the library's write() waits for the browser, and starts
+    // that wait again after every byte the browser takes, so a browser that reads slowly on
+    // purpose could keep one call from returning. With 0 it hands over what fits into the
+    // network stack's send buffer and returns. The waiting is OvHttpResponse's, with its limits.
+    client_.setSocketTimeout(0);
     open_ = true;
   }
 
   int read() override { return open_ ? client_.read() : -1; }
 
-  bool write(const uint8_t *data, size_t len) override {
-    while (open_ && len > 0) {
-      // The library gives a write 1.5 s. It returns what it could send in that time, and 0
-      // when that was nothing or the browser is gone.
-      const size_t sent = client_.write(data, len);
-      if (sent == 0 || sent > len) {
-        return false;
-      }
-      data += sent;
-      len -= sent;
+  // The library answers 0 both when nothing fits right now and when the connection has
+  // failed, so this cannot tell a browser that is gone from one that is slow. It does not have
+  // to: OvHttpResponse gives up on a connection that takes nothing for a few seconds.
+  int write(const uint8_t *data, size_t len) override {
+    if (!open_) {
+      return -1;
     }
-    return len == 0;
+    const size_t sent = client_.write(data, len);
+    return sent <= len ? (int)sent : -1;
   }
 
   void close() override {

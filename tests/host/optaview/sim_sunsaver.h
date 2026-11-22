@@ -296,8 +296,12 @@ class SimSunSaver : public optaview::MbTransport {
         break;
       }
       case FAULT_WRONG_ECHO:
-        reply[5] ^= 0x01;
-        reply = frame(std::vector<uint8_t>(reply.begin(), reply.end() - 2));
+        // Only the eight-byte acknowledgement of a write (function 5 or 6) echoes a value. A
+        // refusal is five bytes long and goes out as it is.
+        if (reply.size() == 8 && (reply[1] == 0x05 || reply[1] == 0x06)) {
+          reply[5] ^= 0x01;
+          reply = frame(std::vector<uint8_t>(reply.begin(), reply.end() - 2));
+        }
         break;
       case FAULT_GARBAGE:
         reply.assign(6, 0x5A);

@@ -51,9 +51,21 @@ struct FakeConn : OvConn {
   std::deque<Piece> arriving;
   size_t offset = 0;
   std::string sent;
-  std::vector<uint64_t> sentAt;      // when each successful write was made
-  uint64_t goneAt = kNever;          // from then on the other end is gone and writes fail
+  std::vector<uint64_t> sentAt;      // when each write that took something was made
+  std::vector<size_t> sentSizes;     // ...and how many bytes it took
+  uint64_t goneAt = kNever;          // from then on the other end is gone, and a write says so
   size_t failAfterBytes = std::numeric_limits<size_t>::max();
+  // How the other end takes what is sent to it. As it stands: all of it, at once.
+  size_t takeAtMost = std::numeric_limits<size_t>::max();  // bytes a write takes
+  uint64_t takeEveryMs = 0;          // after taking something it takes nothing for this long: a slow reader
+  uint64_t deafFrom = kNever;        // from then on it takes nothing, without being gone
+  uint64_t deafUntil = 0;            // ...and neither does it before this
+  // A sender that never pauses: once everything that was fed has been read, read() returns this
+  // byte for ever (-1: it does not). `tick` is called after every thousand of them, which is how
+  // time passes in a test where nobody waits.
+  int endless = -1;
+  uint64_t endlessReads = 0;
+  std::function<void()> tick;
   bool failed = false;
   unsigned writes = 0;
   unsigned writesAfterFailure = 0;
@@ -85,26 +97,38 @@ struct FakeConn : OvConn {
       arriving.pop_front();
       offset = 0;
     }
+    if (endless >= 0) {
+      if (++endlessReads % 1000 == 0 && tick) {
+        tick();
+      }
+      return endless;
+    }
     return -1;
   }
 
-  bool write(const uint8_t *data, size_t len) override {
+  int write(const uint8_t *data, size_t len) override {
     ++writes;
     if (closes > 0) {
       ++writesAfterClose;
-      return false;
+      return -1;
     }
     if (failed) {
       ++writesAfterFailure;
-      return false;
+      return -1;
     }
-    if (clock() >= goneAt || sent.size() + len > failAfterBytes) {
+    const uint64_t now = clock();
+    if (now >= goneAt || sent.size() + len > failAfterBytes) {
       failed = true;
-      return false;
+      return -1;
     }
-    sent.append((const char *)data, len);
-    sentAt.push_back(clock());
-    return true;
+    if (now >= deafFrom || now < deafUntil || (!sentAt.empty() && now - sentAt.back() < takeEveryMs)) {
+      return 0;
+    }
+    const size_t taken = len < takeAtMost ? len : takeAtMost;
+    sent.append((const char *)data, taken);
+    sentAt.push_back(now);
+    sentSizes.push_back(taken);
+    return (int)taken;
   }
 
   void close() override { ++closes; }
@@ -533,7 +557,7 @@ static void testHttpReader() {
         }
         return reads % 900 == 0 ? '\n' : 'a';
       }
-      bool write(const uint8_t *, size_t) override { return true; }
+      int write(const uint8_t *, size_t len) override { return (int)len; }
       void close() override {}
     };
     ManualClock clock;
@@ -559,7 +583,7 @@ static void testHttpReader() {
         const uint64_t at = reads % 6;
         return at == 0 ? 'a' : at == 1 ? ':' : at == 2 ? 'b' : at == 3 ? '\r' : at == 4 ? '\n' : 'x';
       }
-      bool write(const uint8_t *, size_t) override { return true; }
+      int write(const uint8_t *, size_t len) override { return (int)len; }
       void close() override {}
     };
     ManualClock clock2;
@@ -599,6 +623,47 @@ static void testHttpReader() {
     const uint64_t start = clock.now;
     ovHttpDrain(busy, clock, 50, 500);
     CHECK_EQ(clock.now - start, 500);
+    // Also when it comes without a single pause, so that there is never a moment at which
+    // nothing is waiting to be read. Nobody waits then, and the test clock only moves because
+    // the connection moves it. A drain that looked at the time only between bursts would read
+    // this one for ever; the connection gives up after a minute of it and says so.
+    struct Stream : OvConn {
+      ManualClock *clock;
+      uint64_t reads = 0;
+      int read() override {
+        if (++reads % 1000 == 0 && ++clock->now > 60000) {  // a thousand bytes a millisecond
+          throw std::runtime_error("the drain went on reading for a minute");
+        }
+        return 'x';
+      }
+      int write(const uint8_t *, size_t len) override { return (int)len; }
+      void close() override {}
+    };
+    ManualClock streamClock;
+    Stream stream;
+    stream.clock = &streamClock;
+    try {
+      ovHttpDrain(stream, streamClock, 50, 500);
+    } catch (const std::runtime_error &stuck) {
+      ++gChecks;
+      reportFailure(__FILE__, __LINE__, "a stream without pauses is let go after the longest time", stuck.what());
+    }
+    CHECK_EQ(streamClock.now, 500);
+    CHECK(stream.reads >= 500000 && stream.reads < 501000);
+    // The same across the wrap of the 32-bit clock, which this test clock reaches after 4.096 s.
+    streamClock.now = 3800;
+    stream.reads = 0;
+    try {
+      ovHttpDrain(stream, streamClock, 50, 500);
+    } catch (const std::runtime_error &stuck) {
+      ++gChecks;
+      reportFailure(__FILE__, __LINE__, "a stream without pauses is let go across the clock's wrap", stuck.what());
+    }
+    CHECK_EQ(streamClock.now, 4300);
+    // A longest time of nothing reads nothing.
+    stream.reads = 0;
+    ovHttpDrain(stream, streamClock, 50, 0);
+    CHECK_EQ(stream.reads, 0);
   }
 }
 
@@ -661,6 +726,9 @@ static void testHttpHelpers() {
 // ============================================================================
 // The answer writer and the JSON writer
 // ============================================================================
+// The two limits on sending, as the README and the header of OptaViewHttp.h state them.
+static_assert(OV_HTTP_SEND_STALL_MS == 5000 && OV_HTTP_SEND_MS == 30000, "the limits on sending an answer");
+
 static void testHttpResponse() {
   ManualClock clock;
   {
@@ -670,7 +738,7 @@ static void testHttpResponse() {
     CHECK(!response.attached());
     response.print("into nothing");  // not attached: dropped
     CHECK(!response.pending());
-    response.attach(&conn);
+    response.attach(conn, clock);
     CHECK(response.attached());
     CHECK(!response.begun());
     response.begin(200, "application/json", "X-Extra: 1\r\n", 2);
@@ -700,7 +768,7 @@ static void testHttpResponse() {
     // Without a type, a length or extra headers.
     FakeConn bare;
     bare.clock = conn.clock;
-    response.attach(&bare);
+    response.attach(bare, clock);
     CHECK(!response.begun());
     CHECK_EQ(response.sent(), 0);
     response.begin(404, nullptr);
@@ -724,7 +792,7 @@ static void testHttpResponse() {
     FakeConn conn;
     conn.clock = [&clock] { return clock.now; };
     OvHttpResponse response;
-    response.attach(&conn);
+    response.attach(conn, clock);
     std::string big;
     for (int i = 0; i < 5000; ++i) {
       big += (char)('a' + i % 26);
@@ -740,7 +808,7 @@ static void testHttpResponse() {
     // Exactly one buffer: sent when it is full, with nothing left over.
     FakeConn exact;
     exact.clock = conn.clock;
-    response.attach(&exact);
+    response.attach(exact, clock);
     response.write(big.data(), 1024);
     CHECK_EQ(exact.writes, 1);
     CHECK(!response.pending());
@@ -751,7 +819,7 @@ static void testHttpResponse() {
     conn.clock = [&clock] { return clock.now; };
     conn.failAfterBytes = 1500;
     OvHttpResponse response;
-    response.attach(&conn);
+    response.attach(conn, clock);
     const std::string big(5000, 'x');
     response.write(big.data(), big.size());
     CHECK(response.failed());
@@ -766,11 +834,163 @@ static void testHttpResponse() {
     // A new answer on a new connection starts clean.
     FakeConn next;
     next.clock = conn.clock;
-    response.attach(&next);
+    response.attach(next, clock);
     CHECK(!response.failed());
     response.print("ok");
     CHECK(response.flush());
     CHECK(next.sent == "ok");
+  }
+
+  // --- The other end does not take everything at once ---
+  std::string big;
+  for (int i = 0; i < 5000; ++i) {
+    big += (char)('A' + i % 26);
+  }
+  {
+    // It takes a few bytes at a time: everything arrives, once and in order, and no time passes.
+    FakeConn conn;
+    conn.clock = [&clock] { return clock.now; };
+    conn.takeAtMost = 100;
+    OvHttpResponse response;
+    response.attach(conn, clock);
+    const uint64_t start = clock.now;
+    response.write(big.data(), big.size());
+    CHECK(response.flush());
+    CHECK(conn.sent == big);
+    CHECK_EQ(response.sent(), 5000);
+    CHECK_EQ(conn.writes, 54);  // four full buffers in eleven pieces each, and the rest in ten
+    CHECK_EQ(clock.now - start, 0);
+  }
+  {
+    // It takes nothing for a while and then carries on: the answer waits for it, and is whole.
+    FakeConn conn;
+    conn.clock = [&clock] { return clock.now; };
+    conn.deafUntil = clock.now + OV_HTTP_SEND_STALL_MS - 1;
+    OvHttpResponse response;
+    response.attach(conn, clock);
+    const uint64_t start = clock.now;
+    response.write(big.data(), big.size());
+    CHECK(response.flush());
+    CHECK(conn.sent == big);
+    CHECK_EQ(clock.now - start, OV_HTTP_SEND_STALL_MS - 1);
+  }
+  {
+    // It takes nothing for five seconds: it is gone. The time counts from the last byte it took,
+    // nothing is tried after that, and what was left is dropped.
+    FakeConn conn;
+    conn.clock = [&clock] { return clock.now; };
+    conn.takeAtMost = 300;
+    conn.takeEveryMs = 1000;
+    conn.deafFrom = clock.now + 2500;  // it takes 300 bytes at 0, 1 and 2 s, and then no more
+    OvHttpResponse response;
+    response.attach(conn, clock);
+    const uint64_t start = clock.now;
+    response.write(big.data(), big.size());
+    CHECK(response.failed());
+    CHECK_EQ(clock.now - start, 2000 + OV_HTTP_SEND_STALL_MS);
+    CHECK(conn.sent == big.substr(0, 900));
+    CHECK_EQ(response.sent(), 900);
+    const unsigned writes = conn.writes;
+    CHECK(!response.flush());
+    response.print("more");
+    CHECK(!response.pending());
+    CHECK(!response.flush());
+    CHECK_EQ(conn.writes, writes);
+    CHECK_EQ(clock.now - start, 2000 + OV_HTTP_SEND_STALL_MS);
+  }
+  {
+    // It never stalls, but it takes a byte a second. Thirty seconds is all an answer gets.
+    FakeConn conn;
+    conn.clock = [&clock] { return clock.now; };
+    conn.takeAtMost = 1;
+    conn.takeEveryMs = 1000;
+    OvHttpResponse response;
+    response.attach(conn, clock);
+    const uint64_t start = clock.now;
+    response.write(big.data(), big.size());
+    CHECK(response.failed());
+    CHECK_EQ(clock.now - start, OV_HTTP_SEND_MS);
+    CHECK(conn.sent == big.substr(0, 30));  // at 0 s, 1 s ... 29 s
+    CHECK_EQ(response.sent(), 30);
+    const unsigned writes = conn.writes;
+    CHECK(!response.flush());
+    response.print("more");
+    CHECK(!response.flush());
+    CHECK_EQ(conn.writes, writes);
+    CHECK_EQ(clock.now - start, OV_HTTP_SEND_MS);
+  }
+  {
+    // The thirty seconds are those spent sending, added up over the pieces of one answer. Time
+    // in which nothing is waiting to go out, as while a command works, is not part of them.
+    FakeConn conn;
+    conn.clock = [&clock] { return clock.now; };
+    conn.takeAtMost = 100;
+    conn.takeEveryMs = 1000;
+    OvHttpResponse response;
+    response.attach(conn, clock);
+    const uint64_t start = clock.now;
+    response.write(big.data(), 1000);
+    CHECK(response.flush());                  // 100 bytes at 0 s, 1 s ... 9 s
+    CHECK_EQ(clock.now - start, 9000);
+    clock.now += 100000;                      // a long command works, and nothing is sent
+    response.write(big.data() + 1000, 1000);
+    CHECK(response.flush());                  // nine seconds more
+    CHECK_EQ(clock.now - start, 118000);
+    clock.now += 100000;
+    response.write(big.data() + 2000, 1000);
+    CHECK(response.flush());                  // and nine more, which makes 27 s of sending
+    CHECK_EQ(clock.now - start, 227000);
+    CHECK(conn.sent == big.substr(0, 3000));
+    clock.now += 100000;
+    response.write(big.data() + 3000, 1000);  // three seconds are left: 100 bytes at 0 s, 1 s and 2 s
+    CHECK(!response.flush());
+    CHECK(response.failed());
+    CHECK_EQ(clock.now - start, 330000);
+    CHECK(conn.sent == big.substr(0, 3300));
+    CHECK_EQ(response.sent(), 3300);
+    // The next answer has thirty seconds of its own.
+    FakeConn next;
+    next.clock = conn.clock;
+    next.takeAtMost = 100;
+    next.takeEveryMs = 1000;
+    response.attach(next, clock);
+    const uint64_t again = clock.now;
+    response.write(big.data(), 1000);
+    CHECK(response.flush());
+    CHECK(!response.failed());
+    CHECK_EQ(clock.now - again, 9000);
+    CHECK(next.sent == big.substr(0, 1000));
+  }
+  {
+    // When the other end is known to be gone, nothing waits for it.
+    FakeConn conn;
+    conn.clock = [&clock] { return clock.now; };
+    conn.takeAtMost = 10;
+    conn.goneAt = clock.now;
+    OvHttpResponse response;
+    response.attach(conn, clock);
+    const uint64_t start = clock.now;
+    response.print("hello");
+    CHECK(!response.flush());
+    CHECK_EQ(clock.now - start, 0);
+    CHECK(conn.sent.empty());
+    // Neither is one that claims to have taken more than it was given.
+    struct Liar : OvConn {
+      unsigned writes = 0;
+      int read() override { return -1; }
+      int write(const uint8_t *, size_t len) override {
+        ++writes;
+        return (int)len + 1;
+      }
+      void close() override {}
+    };
+    Liar liar;
+    response.attach(liar, clock);
+    response.print("hello");
+    CHECK(!response.flush());
+    CHECK(response.failed());
+    CHECK_EQ(response.sent(), 0);
+    CHECK_EQ(liar.writes, 1);
   }
 }
 
@@ -1619,10 +1839,12 @@ struct WebRig {
   std::vector<std::unique_ptr<FakeConn> > conns;
   FakeConn *last = nullptr;
 
-  // With a short page of the test's own, or with the page that is built into the firmware.
+  // With a short page of the test's own, or with the page that is built into the firmware. And
+  // with the built-in register map, or with one of the test's own (its text has to outlive this).
   enum Page { TEST_PAGE, EMBEDDED_PAGE };
-  explicit WebRig(Page which = TEST_PAGE)
-      : clock(rig.sim),
+  explicit WebRig(Page which = TEST_PAGE, const char *profileJson = OV_BUILTIN_PROFILE)
+      : rig(100.0, profileJson),
+        clock(rig.sim),
         pageText(which == EMBEDDED_PAGE ? std::string(OV_WEB_PAGE, OV_WEB_PAGE_LENGTH) : makePage()),
         pageHeaders(which == EMBEDDED_PAGE ? OV_WEB_PAGE_HEADERS : kPageHeaders),
         web(rig.device, host, clock, page()) {}
@@ -1745,6 +1967,25 @@ struct WebRig {
     CHECK_EQ(cookie.size(), 32);
   }
 };
+
+// A register map of sixteen registers that are read as one block, with `pad` more characters
+// spread over their names: the text of the block in an answer grows by a byte with each.
+static std::string wideProfile(size_t pad) {
+  std::string json = "{\"schema\":1,\"profile\":\"wide\",\"title\":\"Wide\",\"version\":\"1\","
+                     "\"groups\":[{\"name\":\"g\",\"title\":\"G\"}],\"registers\":[";
+  std::string first;
+  for (size_t i = 0; i < 16; ++i) {
+    const std::string name = fmtStr("r%02u", (unsigned)i) + std::string(pad / 16 + (i < pad % 16 ? 1 : 0), 'x');
+    if (i == 0) {
+      first = name;
+    }
+    json += fmtStr("%s{\"addr\":%u,\"name\":\"%s\",\"group\":\"g\"}", i == 0 ? "" : ",", (unsigned)(0xE000 + i),
+                   name.c_str());
+  }
+  return json + "],\"coils\":[{\"addr\":\"0xFF\",\"name\":\"reset\",\"trigger\":true}],"
+                "\"modbus\":{\"slaveId\":1,\"baud\":9600,\"format\":\"8N2\",\"readFunction\":4,\"maxBlock\":16,"
+                "\"probeRegister\":\"" + first + "\",\"resetCoil\":\"reset\"},\"liveGroups\":[\"g\"]}";
+}
 
 // A JSON value as text when it is a string, and something that matches nothing when it is not.
 static std::string str(JsonVariantConst value) {
@@ -1993,6 +2234,25 @@ static void testWebRouting() {
     CHECK_EQ(parseReply(flood->sent).status, 414);
     CHECK(w.now() - start <= 510);
     CHECK_EQ(flood->closes, 1);
+    // So is one that sends without a single pause, so that there is never a moment in which
+    // nothing is waiting to be read: it gets its answer, and the half second holds.
+    FakeConn *stream = w.connect();
+    stream->feed("GET /" + std::string(2000, 'a'));
+    stream->endless = 'a';
+    unsigned ticks = 0;
+    stream->tick = [&w, &ticks] {
+      w.rig.sim.advance(1);  // a thousand bytes a millisecond
+      if (++ticks > 60000) {
+        throw std::runtime_error("the stream was read for a minute");
+      }
+    };
+    const uint64_t began = w.now();
+    w.serve(stream);
+    CHECK_EQ(parseReply(stream->sent).status, 414);
+    CHECK(w.now() - began >= 500 && w.now() - began <= 510);
+    CHECK_EQ(stream->closes, 1);
+    CHECK_EQ(stream->readsAfterClose, 0);
+    CHECK_EQ(w.get("/api/session").status, 200);
     // None of this reached anything.
     CHECK(!w.web.pinSet());
     CHECK_EQ(w.rig.sim.requests.size(), 0);
@@ -2098,6 +2358,95 @@ static void testWebConnections() {
     CHECK_EQ(gone->writesAfterClose, 0);
     CHECK(gone->sent.size() <= 1500);
     CHECK(w.get("/").body == w.pageText);
+  }
+  {
+    // A browser that reads slowly gets the page all the same, as long as it gets through it in
+    // thirty seconds. Meanwhile another browser waits its turn.
+    WebRig w;
+    FakeConn *slow = w.connect();
+    slow->feed(w.build(Ask()));
+    slow->takeAtMost = 200;
+    slow->takeEveryMs = 1000;
+    FakeConn *waiting = w.connect();
+    Ask session;
+    session.target = "/api/session";
+    waiting->feed(w.build(session), 500);
+    const uint64_t start = w.now();
+    w.serve(slow);
+    const Reply page = parseReply(slow->sent);
+    CHECK_EQ(page.status, 200);
+    CHECK(page.body == w.pageText);
+    CHECK(w.now() - start > 20000 && w.now() - start < OV_HTTP_SEND_MS);
+    CHECK(waiting->sent.empty());
+    w.serve(waiting);
+    CHECK_EQ(parseReply(waiting->sent).status, 200);
+  }
+  {
+    // One that takes a few bytes a second never stalls, and would hold the Opta for as long as
+    // it liked. Thirty seconds of sending is all an answer gets: then the connection is closed,
+    // whatever is left, and the next browser is served.
+    WebRig w;
+    FakeConn *crawl = w.connect();
+    crawl->feed(w.build(Ask()));
+    crawl->takeAtMost = 10;
+    crawl->takeEveryMs = 1000;
+    const uint64_t start = w.now();
+    w.serve(crawl);
+    CHECK_EQ(crawl->closes, 1);
+    CHECK(w.now() - start >= OV_HTTP_SEND_MS && w.now() - start <= OV_HTTP_SEND_MS + 10);
+    CHECK_EQ(crawl->sent.size(), 300);  // ten bytes at 0 s, 1 s ... 29 s
+    CHECK(w.pageText.size() > 3000);
+    CHECK_EQ(crawl->writesAfterClose, 0);
+    CHECK_EQ(w.web.served(), 1);
+    CHECK(w.get("/").body == w.pageText);
+    // The same for an answer of the API, before anybody has logged in.
+    FakeConn *api = w.connect();
+    Ask profile;
+    profile.target = "/api/session";
+    api->feed(w.build(profile));
+    api->takeAtMost = 1;
+    api->takeEveryMs = 1000;
+    const uint64_t again = w.now();
+    w.serve(api);
+    CHECK_EQ(api->closes, 1);
+    CHECK(w.now() - again >= OV_HTTP_SEND_MS && w.now() - again <= OV_HTTP_SEND_MS + 10);
+    CHECK_EQ(api->sent.size(), 30);
+  }
+  {
+    // One that stops taking the answer altogether, without closing the connection: after five
+    // seconds without a byte taken it counts as gone.
+    WebRig w;
+    FakeConn *stuck = w.connect();
+    stuck->feed(w.build(Ask()));
+    stuck->takeAtMost = 500;
+    stuck->takeEveryMs = 1000;
+    stuck->deafFrom = w.now() + 500;  // it takes the first 500 bytes and then nothing
+    const uint64_t start = w.now();
+    w.serve(stuck);
+    CHECK_EQ(stuck->closes, 1);
+    CHECK_EQ(stuck->sent.size(), 500);
+    CHECK(w.now() - start >= OV_HTTP_SEND_STALL_MS && w.now() - start <= OV_HTTP_SEND_STALL_MS + 10);
+    CHECK_EQ(stuck->writesAfterClose, 0);
+    CHECK_EQ(w.get("/api/session").status, 200);
+    // A refusal that is not taken either, from a sender that goes on sending: five seconds for
+    // the answer, half a second for what keeps arriving, and the connection is closed.
+    FakeConn *both = w.connect();
+    both->feed("GET /" + std::string(2000, 'a'));
+    both->deafFrom = 0;
+    both->endless = 'a';
+    unsigned ticks = 0;
+    both->tick = [&w, &ticks] {
+      w.rig.sim.advance(1);
+      if (++ticks > 60000) {
+        throw std::runtime_error("the stream was read for a minute");
+      }
+    };
+    const uint64_t began = w.now();
+    w.serve(both);
+    CHECK_EQ(both->closes, 1);
+    CHECK(both->sent.empty());
+    CHECK(w.now() - began >= OV_HTTP_SEND_STALL_MS + 500 && w.now() - began <= OV_HTTP_SEND_STALL_MS + 520);
+    CHECK_EQ(w.get("/api/session").status, 200);
   }
 }
 
@@ -3140,6 +3489,52 @@ static void testWebLongCommands() {
     CHECK_MSG(longest <= 2100, "%llu ms without a byte", (unsigned long long)longest);
   }
   {
+    // An answer in JSON takes no such byte: one inside it would break it. While the server
+    // reads for a JSON answer there is always text waiting to go out, and a byte that means
+    // nothing is only ever added when there is none. The one exception is the moment at which
+    // the text of a block has just filled the buffer to its last byte and gone out by itself.
+    // The test makes that moment happen: sixteen registers in one block, their names made
+    // longer until the block's text is exactly one buffer, on a controller that takes two
+    // seconds to reply.
+    size_t pad = 0;
+    for (int round = 0; round < 2; ++round) {
+      const std::string profile = wideProfile(pad);
+      WebRig w(WebRig::TEST_PAGE, profile.c_str());
+      w.login();
+      CHECK_EQ(w.console("timeout 3000").status, 200);
+      w.rig.sim.responseDelayMs = 2000;
+      const uint64_t start = w.now();
+      const Reply read = w.get("/api/read?groups=g");
+      CHECK(w.now() - start >= 2000);
+      std::string clean;
+      for (size_t i = 0; i < w.last->sent.size(); ++i) {
+        if (w.last->sent[i] != OV_WEB_HEARTBEAT) {
+          clean += w.last->sent[i];
+        }
+      }
+      const std::string opens = "\"registers\":[";
+      const size_t from = clean.find(opens);
+      const size_t to = clean.find("]}],\"linkDown\"");
+      CHECK(from != std::string::npos && to != std::string::npos && to > from);
+      if (from == std::string::npos || to == std::string::npos || to <= from) {
+        break;
+      }
+      const size_t block = to - (from + opens.size());
+      if (round == 0) {
+        CHECK(block < 1024);
+        pad = block < 1024 ? 1024 - block : 0;
+        continue;
+      }
+      CHECK_EQ(block, 1024);
+      CHECK_EQ(w.last->sentSizes.size(), 3);  // the head, the block in one full buffer, the rest
+      CHECK_EQ(w.last->sentSizes.size() > 1 ? w.last->sentSizes[1] : 0, 1024);
+      CHECK(w.last->sent.find(OV_WEB_HEARTBEAT) == std::string::npos);
+      CHECK(read.isJson);
+      CHECK_EQ(read.json["groups"][0]["registers"].size(), 16);
+      CHECK(read.json["stopped"] == false);
+    }
+  }
+  {
     // The browser goes away during the wait: the command is stopped within about a second,
     // and the Opta is free for the next request. The restart itself had been sent before.
     WebRig w;
@@ -3170,7 +3565,34 @@ static void testWebLongCommands() {
     CHECK_EQ(read.json["groups"][1]["registers"].size(), 10);
   }
   {
-    // One minute is the most a request may keep the Opta busy.
+    // The browser stops taking the answer during the wait, without closing the connection (a
+    // cable was pulled). Nothing tells the Opta that it is gone, so the command is stopped when
+    // a byte for it has waited five seconds.
+    WebRig w;
+    w.login();
+    w.rig.sim.resetDownMs = 40000;
+    const Reply ask = w.console("reset");
+    FakeConn *deaf = w.connect();
+    Ask yes;
+    yes.method = "POST";
+    yes.target = "/api/console";
+    yes.body = "{\"line\":\"yes\",\"answer\":\"" + str(ask.json["question"]) + "\"}";
+    deaf->feed(w.build(yes));
+    deaf->deafFrom = w.now() + 3000;
+    const uint64_t start = w.now();
+    w.serve(deaf);
+    CHECK(w.now() - start >= 3000 + OV_HTTP_SEND_STALL_MS && w.now() - start < 4600 + OV_HTTP_SEND_STALL_MS);
+    CHECK_EQ(deaf->closes, 1);
+    CHECK_EQ(deaf->writesAfterClose, 0);
+    CHECK_EQ(w.rig.sim.resets, 1);
+    CHECK(deaf->sent.find(OV_WEB_TRAILER) == std::string::npos);  // the page sees an answer that broke off
+    w.idle(40000);
+    const Reply after = w.console("live");
+    CHECK(after.json["cut"] == false);
+    CHECK_HAS(after.text, "led_state");
+  }
+  {
+    // One minute is the most a command may work.
     WebRig w;
     w.login();
     const uint64_t start = w.now();

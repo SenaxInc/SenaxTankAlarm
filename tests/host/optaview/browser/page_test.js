@@ -706,6 +706,39 @@ async function toolsView(win, profile) {
   checkHas(log, '> no\n', 'and the answers');
   checkHas(log, '> <img id="planted" src="x"><b>get</b>\n', 'as text');
   await shot(win, 'tools');
+
+  // An answer that does not arrive whole, or does not arrive at all. The page cannot tell then
+  // whether the command was carried out. It has to say so and keep the dialog open, not close it
+  // as if all were well. (The Opta ends an answer early when the browser stops taking it. A
+  // browser cannot be made to do that, so the test stands in the way of the answer instead.)
+  await page.route('**/api/console', (route) => route.fulfill({
+    status: 200,
+    contentType: 'text/plain; charset=utf-8',
+    body: 'adc_vb_f                13.68 V\r\nadc_va',
+  }));
+  await page.fill('#consoleLine', 'live');
+  await page.press('#consoleLine', 'Enter');
+  checkHas(await result(win), 'adc_vb_f                13.68 V\nadc_va', 'what arrived of a cut-off answer is shown');
+  checkHas(await win.text('#dialogHint'), 'The answer broke off before its end.', 'and the page says that it broke off');
+  await close(win);
+  await page.unroute('**/api/console');
+  win.allow = /net::ERR_FAILED/;
+  await page.route('**/api/console', (route) => route.abort());
+  await page.fill('#consoleLine', 'live');
+  await page.press('#consoleLine', 'Enter');
+  await result(win);
+  checkHas(await win.text('#dialogHint'), 'No answer from OptaView. Whether the command was carried out is not known',
+           'a command that gets no answer says so');
+  checkEq(await dialogText(win), '', 'and shows nothing as its result');
+  await close(win);
+  await page.unroute('**/api/console');
+  // The next command is answered as usual.
+  await page.fill('#consoleLine', 'live');
+  await page.press('#consoleLine', 'Enter');
+  checkHas(await result(win), 'led_state', 'the command after it is answered in full');
+  checkEq(await win.text('#dialogHint'), '', 'with nothing to add');
+  await close(win);
+  win.allow = null;
   await win.settle();
 }
 

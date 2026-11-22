@@ -125,26 +125,17 @@ class PcConn : public OvConn {
     return -1;  // nothing now, or the browser has closed: the reader's time limits deal with both
   }
 
-  bool write(const uint8_t *data, size_t len) override {
-    while (len > 0) {
-      if (fd_ < 0) {
-        return false;
-      }
-      const ssize_t sent = ::send(fd_, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
-      if (sent > 0) {
-        data += sent;
-        len -= (size_t)sent;
-      } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // Like the Opta's Ethernet client, which gives a write a second and a half.
-        struct pollfd ready = {fd_, POLLOUT, 0};
-        if (::poll(&ready, 1, 1500) <= 0) {
-          return false;
-        }
-      } else if (!(sent < 0 && errno == EINTR)) {
-        return false;
-      }
+  // Like the Opta's Ethernet client with its socket timeout at 0: what fits goes, and nothing
+  // waits. Unlike it, this one can tell a browser that is gone.
+  int write(const uint8_t *data, size_t len) override {
+    if (fd_ < 0) {
+      return -1;
     }
-    return true;
+    const ssize_t sent = ::send(fd_, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent >= 0) {
+      return (int)sent;
+    }
+    return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
   }
 
   void close() override {

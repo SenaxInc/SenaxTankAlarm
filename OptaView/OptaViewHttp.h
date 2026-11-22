@@ -15,6 +15,13 @@
  *   headers                             64
  *   body                              1024 bytes, and only with Content-Length
  *   silence inside a request             2 s        whole request   6 s
+ *
+ * And on the way out (an answer that breaks one is given up and the connection closed):
+ *   the other end takes nothing          5 s        sending one answer, in all   30 s
+ *
+ * Nothing here waits without a limit. One connection can therefore keep the Opta's single loop
+ * for a bounded time only, whatever the other end does: send without end, or read a byte now
+ * and then.
  */
 
 #ifndef OPTAVIEW_HTTP_H
@@ -29,15 +36,17 @@
 
 namespace optaview {
 
-// One TCP connection, as the web server sees it.
+// One TCP connection, as the web server sees it. Neither read() nor write() may wait: all the
+// waiting is done in this file, on OvClock and against a limit.
 class OvConn {
  public:
   virtual ~OvConn() {}
   // Next received byte, or -1 when none is waiting right now.
   virtual int read() = 0;
-  // Sends all of data. Returns false when the other end is gone; nothing is sent after that.
-  virtual bool write(const uint8_t *data, size_t len) = 0;
-  // Ends the connection. What was written before is still delivered.
+  // Hands over as much of data as the connection takes right now and returns how many bytes
+  // that was: 0 when it takes none at the moment, -1 when the other end is known to be gone.
+  virtual int write(const uint8_t *data, size_t len) = 0;
+  // Ends the connection. What was handed over before is still delivered.
   virtual void close() = 0;
 };
 
@@ -59,6 +68,8 @@ static const size_t OV_HTTP_COOKIE_MAX = 48;
 static const uint8_t OV_HTTP_MAX_HEADERS = 64;
 static const uint32_t OV_HTTP_GAP_MS = 2000;
 static const uint32_t OV_HTTP_REQUEST_MS = 6000;
+static const uint32_t OV_HTTP_SEND_STALL_MS = 5000;  // the other end takes nothing for this long: it is gone
+static const uint32_t OV_HTTP_SEND_MS = 30000;       // all the time one answer may spend being sent
 
 enum OvHttpParse : uint8_t {
   OV_HTTP_OK = 0,
@@ -440,15 +451,15 @@ inline void ovHttpDrain(OvConn &conn, OvClock &clock, uint32_t quietMs, uint32_t
   const uint32_t start = clock.nowMs();
   uint32_t last = start;
   for (;;) {
-    bool got = false;
-    while (conn.read() >= 0) {
-      got = true;
-    }
     const uint32_t now = clock.nowMs();
-    if (got) {
-      last = now;
+    if ((uint32_t)(now - start) >= mostMs) {
+      return;  // looked at before every byte: bytes that never stop coming do not get past it
     }
-    if ((uint32_t)(now - last) >= quietMs || (uint32_t)(now - start) >= mostMs) {
+    if (conn.read() >= 0) {
+      last = now;
+      continue;
+    }
+    if ((uint32_t)(now - last) >= quietMs) {
       return;
     }
     clock.idle();
@@ -462,19 +473,31 @@ inline void ovHttpDrain(OvConn &conn, OvClock &clock, uint32_t quietMs, uint32_t
 // The answer to one request. It is an OvOut, so the console and the JSON writer print straight
 // into it. The body is not framed: it ends when the connection closes, which every answer here
 // is followed by. A body whose length is known in advance says so in Content-Length.
+//
+// Sending waits for the other end, and that is limited twice. An end that takes nothing for
+// OV_HTTP_SEND_STALL_MS is gone. And an answer may spend OV_HTTP_SEND_MS being sent, added up
+// over all its pieces: a reader that takes a byte now and then never stalls, and without this it
+// could hold the Opta for as long as it liked. Time in which nothing is being sent, as when a
+// command is working, does not count.
 class OvHttpResponse : public OvOut {
  public:
-  OvHttpResponse() : conn_(nullptr), used_(0), failed_(false), begun_(false), sent_(0) {}
+  OvHttpResponse()
+      : conn_(nullptr), clock_(nullptr), used_(0), failed_(false), begun_(false), sent_(0), sendingMs_(0) {}
 
-  // Starts a new answer on `conn`.
-  void attach(OvConn *conn) {
-    conn_ = conn;
+  // Starts a new answer on `conn`. `clock` times the sending.
+  void attach(OvConn &conn, OvClock &clock) {
+    conn_ = &conn;
+    clock_ = &clock;
     used_ = 0;
     failed_ = false;
     begun_ = false;
     sent_ = 0;
+    sendingMs_ = 0;
   }
-  void detach() { conn_ = nullptr; }
+  void detach() {
+    conn_ = nullptr;
+    clock_ = nullptr;
+  }
   bool attached() const { return conn_ != nullptr; }
 
   // The status line and the headers. `extra` is zero or more complete header lines, each ending
@@ -522,14 +545,38 @@ class OvHttpResponse : public OvOut {
     }
   }
 
-  // Sends what has been collected. Returns false once the other end is gone.
+  // Sends what has been collected, waiting for the other end to take it. Returns false once the
+  // answer has been given up: the other end is gone or takes nothing, or the answer has had all
+  // the time it gets. What had not been sent by then is dropped, and nothing is sent after it.
   bool flush() {
     if (used_ > 0 && !failed_ && conn_ != nullptr) {
-      if (conn_->write(buffer_, used_)) {
-        sent_ += used_;
-      } else {
-        failed_ = true;
+      const uint32_t start = clock_->nowMs();
+      uint32_t last = start;  // when the other end last took something
+      size_t done = 0;
+      while (done < used_) {
+        const uint32_t now = clock_->nowMs();
+        if (sendingMs_ + (uint32_t)(now - start) >= OV_HTTP_SEND_MS) {
+          failed_ = true;  // looked at before every piece, so a slow but steady reader ends here
+          break;
+        }
+        const int took = conn_->write(buffer_ + done, used_ - done);
+        if (took < 0 || (size_t)took > used_ - done) {
+          failed_ = true;
+          break;
+        }
+        if (took > 0) {
+          done += (size_t)took;
+          sent_ += (uint32_t)took;
+          last = now;
+          continue;
+        }
+        if ((uint32_t)(now - last) >= OV_HTTP_SEND_STALL_MS) {
+          failed_ = true;
+          break;
+        }
+        clock_->idle();
       }
+      sendingMs_ += (uint32_t)(clock_->nowMs() - start);
     }
     used_ = 0;
     return !failed_;
@@ -541,11 +588,13 @@ class OvHttpResponse : public OvOut {
 
  private:
   OvConn *conn_;
+  OvClock *clock_;
   uint8_t buffer_[1024];
   size_t used_;
   bool failed_;
   bool begun_;
   uint32_t sent_;
+  uint32_t sendingMs_;  // what this answer has spent in flush() so far
 };
 
 // ---------------------------------------------------------------------------------------------

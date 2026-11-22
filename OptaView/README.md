@@ -111,6 +111,11 @@ What to know before you rely on it:
 - **One thing at a time.** The Opta answers one request and then the next. While a command
   runs on the USB console the page waits, and the other way round. A command from the page
   that takes longer than a minute is stopped, and so is one whose browser has gone.
+- **No connection can hold the Opta up.** A request has 6 seconds to arrive. A browser that
+  takes nothing of an answer for 5 seconds is taken to be gone, and an answer that is still
+  not delivered after 30 seconds of sending is given up. The page is 49 KB and the Opta's
+  network stack sends about 1 KB per round trip, so the page needs a link whose round trip is
+  well under half a second.
 - **Open it by its address.** A request that names the Opta in any other way than by its IP
   address is refused, which keeps a page from another web site from reaching the Opta through
   your browser.
@@ -402,7 +407,8 @@ make -C tests/host/optaview test ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 Two suites run the same headers the sketch compiles. `optaview_test` drives the console against
 a simulated SunSaver that can drop, cut, corrupt and delay replies, refuse blocks, answer at
 another address or speed, and restart. `optaview_web_test` writes HTTP requests as text and has
-the web server answer them on top of that simulation, and it walks the address policy through
+the web server answer them on top of that simulation. It plays browsers that never stop
+sending or that take an answer a byte at a time, and it walks the address policy through
 cables that go in late and DHCP servers that never answer. Run
 `tests/host/optaview/build/optaview_test_o2` with `OPTAVIEW_TRANSCRIPT=session.txt` set to keep
 everything the console printed, which shows what a session looks like without a controller on

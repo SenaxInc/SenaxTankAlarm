@@ -803,12 +803,17 @@ class OvDevice {
       out.effect = OV_WRITE_NOT_TAKEN;  // it reads as before, or the controller said no
     } else {
       out.effect = OV_WRITE_UNKNOWN;
-      if (unknownOpen_ && unknownAddr_ != reg.addr) {
-        writeUnsettled_ = true;  // one register is remembered; the earlier one stays open for good
+      if (!unknownOpen_ || unknownAddr_ != reg.addr) {
+        if (unknownOpen_) {
+          writeUnsettled_ = true;  // one register is remembered; the earlier one stays open for good
+        }
+        unknownOpen_ = true;
+        unknownAddr_ = reg.addr;
+        unknownBefore_ = before;
       }
-      unknownOpen_ = true;
-      unknownAddr_ = reg.addr;
-      unknownBefore_ = before;
+      // Otherwise this is a second write in doubt to the same register. What the register held
+      // before the first of them stays the value to compare with: if the first was taken, the
+      // register differs from it, whatever the caller took it to hold before the second.
     }
     return out;
   }

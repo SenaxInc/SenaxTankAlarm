@@ -140,6 +140,39 @@ static void testReplyValidation() {
     Bare b;
     b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
     CHECK_EQ(b.master.writeRegister(1, 0xE022, 0x10C5).status, MB_ECHO_MISMATCH);
+    CHECK_EQ(b.sim.regs[0xE022], 0x10C5);  // the controller stored it all the same
+    b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
+    CHECK_EQ(b.master.writeCoil(1, 0x0001, true).status, MB_ECHO_MISMATCH);
+  }
+  {  // That fault has nothing to alter in a refusal, which is five bytes long and echoes no
+     // value: the refusal goes out as it is, and the simulator does not reach past its end
+     // (the sanitizer build watches for that). Each one still uses the fault up.
+    Bare b;
+    b.sim.refuseWrites = true;
+    b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
+    MbResult r = b.master.writeRegister(1, 0xE022, 0x10C5);
+    CHECK_EQ(r.status, MB_EXCEPTION);
+    CHECK_EQ(r.exception, 4);
+    b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
+    r = b.master.writeRegister(1, 0x0008, 1);  // not a setting
+    CHECK_EQ(r.status, MB_EXCEPTION);
+    CHECK_EQ(r.exception, 2);
+    b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
+    r = b.master.writeCoil(1, 0x0005, true);  // no such coil
+    CHECK_EQ(r.status, MB_EXCEPTION);
+    CHECK_EQ(r.exception, 2);
+    b.sim.refuseWrites = false;
+    CHECK_EQ(b.master.writeRegister(1, 0xE022, 0x10C5).status, MB_OK);
+    // Nor in the reply to a read, which echoes nothing either: its data arrives as it is.
+    uint16_t words[2] = {0, 0};
+    b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 2, words).status, MB_OK);
+    CHECK_EQ(words[0], 0x1183);
+    CHECK_EQ(words[1], b.sim.regs[0x0009]);
+    uint8_t bits[1] = {9};
+    b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
+    CHECK_EQ(b.master.readBits(1, MB_FC_READ_COILS, 0x0000, 1, bits).status, MB_OK);
+    CHECK_EQ(bits[0], 0);
   }
   {  // The Opta's DE-flip artifact: zero bytes in front of the reply are skipped and counted.
     for (uint8_t noise = 1; noise <= 3; ++noise) {
@@ -1464,6 +1497,31 @@ static void testReadsAndFallback() {
     CHECK(!rig.device.blocksFailed());
     CHECK_EQ(countOf(out, "-- no reply"), 9);
   }
+  {  // 'blocks on' repeats a block like any other read: one lost reply goes unnoticed, and it is
+     // the block that is asked for again.
+    Rig rig;
+    rig.run("blocks on");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    const std::string out = rig.run("dump live");
+    CHECK_EQ(countOf(out, "--"), 0);
+    CHECK_HAS(lineWith(out, "adc_vb_f"), "13.68 V");
+    CHECK_EQ(rig.sim.requests.size(), 2);
+    CHECK_EQ(rig.sim.requests[0][5], 9);
+    CHECK(rig.sim.requests[1] == rig.sim.requests[0]);
+    // As often as 'retries' says, and no more often.
+    Rig twice;
+    twice.run("blocks on");
+    twice.device.retries = 2;
+    twice.sim.blocksAnswered = false;
+    CHECK_EQ(countOf(twice.run("dump live"), "-- no reply"), 9);
+    CHECK_EQ(twice.sim.requests.size(), 3);
+    Rig once;
+    once.run("blocks on");
+    once.device.retries = 0;
+    once.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    CHECK_EQ(countOf(once.run("dump live"), "-- no reply"), 9);
+    CHECK_EQ(once.sim.requests.size(), 1);
+  }
   {  // An older controller without registers 0x0038-0x003A: the block is refused, each register
      // is asked alone, and only the missing ones are reported. Blocks stay in use.
     Rig rig;
@@ -1527,6 +1585,52 @@ static void testReadsAndFallback() {
     CHECK(!other.device.blocksFailed());
     CHECK_EQ(countOf(second, "--"), 0);
     CHECK_EQ(other.sim.requests.size(), 4u + 2u);
+  }
+  {  // The register that is asked alone after a silent block may answer with a refusal, as on the
+     // older controller, whose block 0x0038-0x003A starts with a register it does not have. A
+     // refusal is an answer: the controller is there, so the block gets its second try. That one
+     // is refused as well, and the registers are asked one by one.
+    Rig rig;
+    rig.sim.makeOldFirmware();
+    rig.sim.failNext(SimSunSaver::FAULT_NONE);      // the block 0x0027-0x002A
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);  // the block 0x0038-0x003A
+    const std::string out = rig.run("dump mppt");
+    CHECK_HAS(lineWith(out, "Sweep_Voc"), "21.30 V");
+    CHECK_EQ(countOf(out, "-- exception 2"), 3);
+    CHECK_HASNT(out, "no reply");
+    CHECK(!rig.device.blocksFailed());
+    CHECK(!rig.device.linkDown());
+    CHECK_EQ(rig.sim.requests.size(), 7);
+    CHECK_EQ(rig.sim.requests[1][5], 3);  // the block: no reply
+    CHECK_EQ(rig.sim.requests[2][5], 1);  // its first register alone: refused
+    CHECK_EQ(rig.sim.requests[2][3], 0x38);
+    CHECK(rig.sim.requests[3] == rig.sim.requests[1]);  // the block once more: refused
+    for (size_t i = 4; i < 7; ++i) {
+      CHECK_EQ(rig.sim.requests[i][5], 1);
+      CHECK_EQ(rig.sim.requests[i][3], 0x38 + (i - 4));
+    }
+    // On a link that is silent on every block, that second try is what shows it: the controller
+    // has answered in between, so it is blocks that do not work, and none is asked for again.
+    Rig silent;
+    silent.sim.makeOldFirmware();
+    silent.sim.blocksAnswered = false;
+    uint16_t words[3] = {0xAAAA, 0xAAAA, 0xAAAA};
+    OvWordStatus status[3];
+    silent.device.beginBatch();
+    silent.device.readSpan(0x0038, 3, words, status);
+    CHECK(silent.device.blocksFailed());
+    CHECK(!silent.device.linkDown());
+    CHECK_EQ(silent.sim.requests.size(), 5);
+    CHECK_EQ(silent.sim.requests[0][5], 3);
+    CHECK_EQ(silent.sim.requests[1][5], 1);
+    CHECK(silent.sim.requests[2] == silent.sim.requests[0]);
+    CHECK_EQ(silent.sim.requests[3][5], 1);
+    CHECK_EQ(silent.sim.requests[4][5], 1);
+    for (int i = 0; i < 3; ++i) {
+      CHECK_EQ(status[i].status, MB_EXCEPTION);
+      CHECK_EQ(status[i].exception, 2);
+      CHECK_EQ(words[i], 0);
+    }
   }
   {  // Without repeats (retries 0) one silent block and one register that answers settle it, as
      // they always did.
@@ -2472,6 +2576,85 @@ static void testConsoleSet() {
     CHECK_HAS(rig.run("get EV_lvd"), "11.50 V");
     CHECK(rig.device.resetMaybeNeeded());
     CHECK_HAS(rig.run("status"), kMaybe);
+  }
+  {  // The same holds below the console, for a caller that reads before it has called
+     // settleLink(): what the register reads on another slave address, at another baud rate or
+     // in another format says nothing about the write. Back on the settings the write went out
+     // on, a read settles it.
+    for (int which = 0; which < 3; ++which) {
+      Rig rig;
+      rig.run("set EV_lvd 13.10");
+      rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+      rig.run("yes");
+      CHECK(rig.device.resetMaybeNeeded());
+      const OvLink written = rig.device.link;
+      if (which == 0) {
+        rig.device.link.slave = 2;
+        rig.sim.slaveId = 2;
+      } else if (which == 1) {
+        rig.device.link.baud = 19200;
+        rig.sim.deviceBaud = 19200;
+      } else {
+        rig.device.link.format = MB_8N1;
+        rig.sim.deviceFormat = MB_8N1;
+      }
+      CHECK(rig.device.applyLink());
+      uint16_t word = 0;
+      OvWordStatus status;
+      rig.device.beginBatch();
+      rig.device.readSpan(0xE022, 1, &word, &status);
+      CHECK_EQ(status.status, MB_OK);
+      CHECK_MSG(rig.device.resetMaybeNeeded(), "a read on other link settings (case %d) settled the write", which);
+      rig.device.link = written;
+      rig.sim.slaveId = 1;
+      rig.sim.deviceBaud = 9600;
+      rig.sim.deviceFormat = MB_8N2;
+      CHECK(rig.device.applyLink());
+      rig.device.readSpan(0xE022, 1, &word, &status);
+      CHECK_EQ(status.status, MB_OK);
+      CHECK(!rig.device.resetMaybeNeeded());
+      CHECK(!rig.device.resetNeeded());
+    }
+  }
+  {  // Two writes in doubt to the same register are one register to read, and a read settles
+     // them. The console cannot get there, because 'set' reads the register before it asks; a
+     // caller of the device can.
+    Rig rig;
+    const OvRegister *lvd = rig.profile.findRegister("EV_lvd");
+    CHECK(lvd != nullptr);
+    const uint16_t held = rig.sim.regs[0xE022];
+    uint16_t word = 0;
+    OvWordStatus status;
+    for (int i = 0; i < 2; ++i) {
+      rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);  // the write, the read-back and its repeat
+      CHECK_EQ(rig.device.writeRegister(*lvd, 0x10C5, held).effect, OV_WRITE_UNKNOWN);
+      CHECK(rig.device.resetMaybeNeeded());
+    }
+    CHECK_EQ(rig.sim.regs[0xE022], held);
+    rig.device.beginBatch();
+    rig.device.readSpan(0xE022, 1, &word, &status);
+    CHECK_EQ(word, held);
+    CHECK(!rig.device.resetMaybeNeeded());  // neither was taken: nothing is due
+    CHECK(!rig.device.resetNeeded());
+    // What counts is what the register held before the first of the two. Here the first was
+    // taken and only its acknowledgement was lost; the caller found that out by other means and
+    // gives the new value as what the register holds before its second write. The register
+    // then reads as before the second write, and a restart is due all the same.
+    Rig taken;
+    lvd = taken.profile.findRegister("EV_lvd");
+    taken.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    taken.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_EQ(taken.device.writeRegister(*lvd, 0x10C5, held).effect, OV_WRITE_UNKNOWN);
+    CHECK_EQ(taken.sim.regs[0xE022], 0x10C5);
+    taken.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    CHECK_EQ(taken.device.writeRegister(*lvd, 0x10D0, 0x10C5).effect, OV_WRITE_UNKNOWN);
+    CHECK(taken.device.resetMaybeNeeded());
+    CHECK(!taken.device.resetNeeded());
+    taken.device.beginBatch();
+    taken.device.readSpan(0xE022, 1, &word, &status);
+    CHECK_EQ(word, 0x10C5);
+    CHECK(taken.device.resetNeeded());
+    CHECK(!taken.device.resetMaybeNeeded());
   }
   {  // Two writes in doubt, to two registers. Reading the second settles the second; the first
      // stays in doubt until a restart, because only one register is remembered.
