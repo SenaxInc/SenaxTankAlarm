@@ -269,6 +269,58 @@ static void testTimeouts() {
     const uint64_t replyEnd = b.sim.elapsedMs();
     b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
     CHECK(b.sim.requestTimes[1] >= replyEnd + b.master.interFrameGapMs);
+    CHECK_EQ(b.master.interFrameGapMs, 5);
+    CHECK(b.sim.requestTimes[1] < replyEnd + 10);  // and not for longer than that
+  }
+  {  // How long, follows from the baud rate: 3.5 characters of 11 bits, one millisecond more for
+     // the millisecond clock, and never less than the 5 ms of 9600 baud.
+    CHECK_EQ(mbInterFrameGapMs(300), 129);
+    CHECK_EQ(mbInterFrameGapMs(600), 65);
+    CHECK_EQ(mbInterFrameGapMs(1200), 33);
+    CHECK_EQ(mbInterFrameGapMs(2400), 17);
+    CHECK_EQ(mbInterFrameGapMs(4800), 9);
+    CHECK_EQ(mbInterFrameGapMs(9600), 5);
+    CHECK_EQ(mbInterFrameGapMs(19200), 5);
+    CHECK_EQ(mbInterFrameGapMs(115200), 5);
+    CHECK_EQ(mbInterFrameGapMs(1000000), 5);
+    CHECK_EQ(mbInterFrameGapMs(1), 38501);
+    CHECK_EQ(mbInterFrameGapMs(0), 38501);  // no division by zero
+    // The silence that ends a frame of unknown length is 50 ms until 3.5 characters are longer.
+    CHECK_EQ(mbQuietMs(115200), 50);
+    CHECK_EQ(mbQuietMs(9600), 50);
+    CHECK_EQ(mbQuietMs(1200), 50);
+    CHECK_EQ(mbQuietMs(600), 65);
+    CHECK_EQ(mbQuietMs(300), 129);
+  }
+  {  // The master takes both times when the link is opened through it, and keeps what it had
+     // when the port refuses the settings.
+    Bare b;
+    CHECK_EQ(b.master.quietMs, 50);
+    CHECK(b.master.configure(300, MB_8N2));
+    CHECK_EQ(b.master.interFrameGapMs, 129);
+    CHECK_EQ(b.master.quietMs, 129);
+    const unsigned configures = b.sim.configures;
+    CHECK(!b.master.configure(299, MB_8N2));
+    CHECK_EQ(b.sim.configures, configures + 1);  // the port was asked, and said no
+    CHECK_EQ(b.master.interFrameGapMs, 129);
+    CHECK_EQ(b.master.quietMs, 129);
+    CHECK(b.master.configure(1200, MB_8E1));
+    CHECK_EQ(b.master.interFrameGapMs, 33);
+    CHECK_EQ(b.master.quietMs, 50);
+    CHECK(b.master.configure(9600, MB_8N2));
+    CHECK_EQ(b.master.interFrameGapMs, 5);
+    CHECK_EQ(b.master.quietMs, 50);
+  }
+  {  // At 300 baud the next request waits out 129 ms, not 5.
+    Bare b;
+    b.sim.deviceBaud = 300;
+    CHECK(b.master.configure(300, MB_8N2));
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_OK);
+    const uint64_t replyEnd = b.sim.elapsedMs();
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word).status, MB_OK);
+    CHECK(b.sim.requestTimes[1] >= replyEnd + 129);
+    CHECK(b.sim.requestTimes[1] < replyEnd + 135);
   }
   {  // Counters.
     Bare b;
@@ -1358,10 +1410,15 @@ static void testReadsAndFallback() {
     rig.sim.blocksAnswered = false;
     const std::string out = rig.run("live");
     CHECK(rig.device.blocksFailed());
-    CHECK_EQ(rig.sim.requests.size(), 2u + 9u + 11u);  // the block and its retry, then word by word
-    for (size_t i = 2; i < rig.sim.requests.size(); ++i) {
+    // The block, its first register alone, the block once more, then word by word.
+    CHECK_EQ(rig.sim.requests.size(), 3u + 8u + 11u);
+    CHECK_EQ(rig.sim.requests[0][5], 9);
+    CHECK_EQ(rig.sim.requests[1][5], 1);
+    CHECK_EQ(rig.sim.requests[2][5], 9);
+    for (size_t i = 3; i < rig.sim.requests.size(); ++i) {
       CHECK_EQ(rig.sim.requests[i][5], 1);
     }
+    CHECK(!rig.device.linkDown());
     CHECK_HAS(lineWith(out, "adc_vb_f"), "13.68 V");
     CHECK_HAS(lineWith(out, "led_state"), "FLOAT (slow green blink) (4)");
     CHECK_EQ(countOf(out, "--"), 0);
@@ -1427,12 +1484,80 @@ static void testReadsAndFallback() {
     CHECK_EQ(rig.master.stats.timeouts, 1);
     CHECK_EQ(rig.master.stats.ok, 1);
   }
+  {  // The same controller, and the reply to the first register that is asked alone is lost as
+     // well. That is the third request in a row without an answer only if the block was repeated
+     // first: the single read comes second, is repeated, and the batch goes on.
+    Rig rig;
+    rig.sim.blocksAnswered = false;
+    rig.sim.failNext(SimSunSaver::FAULT_NONE);      // the block: silence anyway
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);  // its first register alone
+    const std::string out = rig.run("live");
+    CHECK(!rig.device.linkDown());
+    CHECK(rig.device.blocksFailed());
+    CHECK_HASNT(out, "The controller is not answering");
+    CHECK_EQ(countOf(out, "--"), 0);
+    CHECK_HAS(lineWith(out, "adc_vb_f"), "13.68 V");
+    CHECK_HAS(lineWith(out, "led_state"), "FLOAT (slow green blink) (4)");
+    CHECK_EQ(rig.sim.requests.size(), 4u + 8u + 11u);  // block, single, single again, block, the rest
+    CHECK_EQ(rig.sim.requests[0][5], 9);
+    CHECK_EQ(rig.sim.requests[1][5], 1);
+    CHECK_EQ(rig.sim.requests[2][5], 1);
+    CHECK_EQ(rig.sim.requests[3][5], 9);
+    CHECK_HAS(out, "block reads do not work on this link");
+  }
+  {  // One lost reply to a block does not end block reads: the register alone answers, the block
+     // is asked again and answers too.
+    Rig rig;
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    const std::string out = rig.run("live");
+    CHECK(!rig.device.blocksFailed());
+    CHECK(!rig.device.linkDown());
+    CHECK_EQ(countOf(out, "--"), 0);
+    CHECK_HAS(lineWith(out, "adc_vb_f"), "13.68 V");
+    CHECK_EQ(rig.sim.requests.size(), 4u + 2u);
+    CHECK_EQ(rig.sim.requests[0][5], 9);
+    CHECK_EQ(rig.sim.requests[1][5], 1);
+    CHECK_EQ(rig.sim.requests[2][5], 9);
+    CHECK_HASNT(out, "block reads do not work");
+    // The same for a reply that arrives damaged, and for the second block of the command.
+    Rig other;
+    other.sim.failNext(SimSunSaver::FAULT_NONE);
+    other.sim.failNext(SimSunSaver::FAULT_BAD_CRC);
+    const std::string second = other.run("live");
+    CHECK(!other.device.blocksFailed());
+    CHECK_EQ(countOf(second, "--"), 0);
+    CHECK_EQ(other.sim.requests.size(), 4u + 2u);
+  }
+  {  // Without repeats (retries 0) one silent block and one register that answers settle it, as
+     // they always did.
+    Rig rig;
+    rig.device.retries = 0;
+    rig.sim.blocksAnswered = false;
+    const std::string out = rig.run("live");
+    CHECK(rig.device.blocksFailed());
+    CHECK_EQ(rig.sim.requests.size(), 2u + 8u + 11u);
+    CHECK_EQ(countOf(out, "--"), 0);
+  }
+  {  // More repeats do not hide the controller either: three silent blocks in a row used to end
+     // the batch before a single register was asked.
+    Rig rig;
+    rig.device.retries = 3;
+    rig.sim.blocksAnswered = false;
+    const std::string out = rig.run("live");
+    CHECK(!rig.device.linkDown());
+    CHECK(rig.device.blocksFailed());
+    CHECK_EQ(countOf(out, "--"), 0);
+    CHECK_EQ(rig.sim.requests.size(), 3u + 8u + 11u);
+  }
   {  // A dead link ends the command after three failed requests instead of 20 timeouts.
     Rig rig;
     rig.sim.powered = false;
     const uint64_t t0 = rig.sim.elapsedMs();
     const std::string out = rig.run("live");
-    CHECK_EQ(rig.sim.requests.size(), 3);  // the block, its repeat, and one register alone
+    CHECK_EQ(rig.sim.requests.size(), 3);  // the block, one register alone, and its repeat
+    CHECK_EQ(rig.sim.requests[0][5], 9);
+    CHECK_EQ(rig.sim.requests[1][5], 1);
+    CHECK_EQ(rig.sim.requests[2][5], 1);
     // Three timeouts, and before each repeat one more for a reply that might only be late.
     const uint64_t took = rig.sim.elapsedMs() - t0;
     CHECK_MSG(took >= 5000 && took < 5200, "took %llu ms", (unsigned long long)took);
@@ -1512,6 +1637,19 @@ struct CountingListener : OvProbeListener {
   int attempts;
   CountingListener() : attempts(0) {}
   void onProbeAttempt(const OvLink &, const MbResult &) override { ++attempts; }
+};
+
+// Notes, for every attempt of a probe, the baud rate it was made at and the pause between
+// frames that the master kept at that moment.
+struct GapListener : OvProbeListener {
+  ModbusMaster &master;
+  std::vector<std::pair<uint32_t, uint16_t> > seen;
+  std::vector<uint16_t> quiet;
+  explicit GapListener(ModbusMaster &m) : master(m) {}
+  void onProbeAttempt(const OvLink &tried, const MbResult &) override {
+    seen.push_back(std::make_pair(tried.baud, master.interFrameGapMs));
+    quiet.push_back(master.quietMs);
+  }
 };
 
 static void testProbe() {
@@ -1613,6 +1751,70 @@ static void testProbe() {
     CHECK_EQ(rig.master.responseTimeoutMs, 1000);
     CHECK_HAS(rig.run("slave 9"), "slave 9, 9600 8N2");
     CHECK_HAS(rig.run("get adc_vb_f"), "13.68 V");
+  }
+  {  // The pause between frames belongs to the baud rate, also while a probe tries one rate
+     // after the other, and afterwards it is that of the link that stays in use.
+    Rig rig;
+    rig.sim.deviceBaud = 19200;
+    rig.sim.deviceFormat = MB_8N1;
+    rig.sim.portMaxBaud = 115200;
+    CHECK_HAS(rig.run("link 300 8N2"), "300 8N2");
+    CHECK_EQ(rig.master.interFrameGapMs, 129);
+    CHECK_EQ(rig.master.quietMs, 129);
+    GapListener listener(rig.master);
+    rig.device.beginBatch();
+    const OvProbeOutcome found = rig.device.probe(&listener);
+    CHECK(found.found);
+    CHECK_EQ(found.link.baud, 19200);
+    CHECK(listener.seen.size() > 12);  // 300 baud, then 9600, then 19200
+    bool at300 = false;
+    bool at9600 = false;
+    for (size_t i = 0; i < listener.seen.size(); ++i) {
+      CHECK_EQ(listener.seen[i].second, mbInterFrameGapMs(listener.seen[i].first));
+      CHECK_EQ(listener.quiet[i], mbQuietMs(listener.seen[i].first));
+      at300 = at300 || listener.seen[i].first == 300;
+      at9600 = at9600 || listener.seen[i].first == 9600;
+    }
+    CHECK(at300);
+    CHECK(at9600);
+    CHECK_EQ(rig.master.interFrameGapMs, 5);
+    CHECK_EQ(rig.master.quietMs, 50);
+
+    // Nothing found: the link goes back to what it was, and so do the pauses.
+    Rig lost;
+    lost.sim.powered = false;
+    lost.run("link 600 8N2");
+    CHECK_EQ(lost.master.interFrameGapMs, 65);
+    lost.device.beginBatch();
+    CHECK(!lost.device.probe(nullptr).found);
+    CHECK_EQ(lost.device.link.baud, 600);
+    CHECK_EQ(lost.master.interFrameGapMs, 65);
+    CHECK_EQ(lost.master.quietMs, 65);
+  }
+  {  // 'link' sets them with the baud rate. A rate that the serial port refuses leaves the link
+     // and the pauses as they were.
+    Rig rig;
+    rig.sim.portMaxBaud = 115200;
+    rig.sim.deviceBaud = 300;
+    CHECK_EQ(rig.master.interFrameGapMs, 5);
+    CHECK_HAS(rig.run("link 300"), "300 8N2");
+    CHECK_EQ(rig.master.interFrameGapMs, 129);
+    CHECK_HAS(rig.run("get adc_vb_f"), "13.68 V");
+    const uint64_t replyEnd = rig.sim.elapsedMs();
+    const size_t sent = rig.sim.requests.size();
+    CHECK_HAS(rig.run("get adc_va_f"), "17.45 V");
+    CHECK(rig.sim.requestTimes[sent] >= replyEnd + 129);
+    const std::string refused = rig.run("link 230400");
+    CHECK_HAS(refused, "The serial port cannot do that. The link is unchanged.");
+    CHECK_HAS(refused, "300 8N2");
+    CHECK_EQ(rig.device.link.baud, 300);
+    CHECK_EQ(rig.master.interFrameGapMs, 129);
+    CHECK_EQ(rig.master.quietMs, 129);
+    CHECK_HAS(rig.run("get adc_vb_f"), "13.68 V");  // the port is open again with the old settings
+    rig.sim.deviceBaud = 9600;
+    CHECK_HAS(rig.run("link 9600"), "9600 8N2");
+    CHECK_EQ(rig.master.interFrameGapMs, 5);
+    CHECK_EQ(rig.master.quietMs, 50);
   }
   {
     Rig rig;
@@ -2047,14 +2249,32 @@ static void testConsoleSet() {
     CHECK(!rig.console.awaitingConfirmation());
     CHECK_EQ(rig.sent(0x06), 0);
   }
+  // What is said after a write that could not be confirmed, and what it leaves standing. A
+  // missing acknowledgement is not a refusal, and "failed" is only said of what is known to have
+  // failed.
+  static const char kChanged[] = "Settings were changed in this session. 'reset' makes the controller use them.";
+  static const char kMaybe[] =
+      "A write got no answer in this session, so a setting may have been changed. If one was,\r\n"
+      "'reset' makes the controller use it.";
+  static const char kUsesIt[] = "The controller uses it after a restart: 'reset' when all your changes are in.";
+  static const char kUsesWhatItHolds[] =
+      "The controller uses what it holds after a restart: 'reset' when all your changes are in.";
+  static const char kIfWritten[] =
+      "If it was written, the controller uses it after a restart: 'reset' when all your changes are in.";
   {  // The write is lost on the way: the read-back shows the old value.
     Rig rig;
     rig.run("set EV_lvd 13.10");
     rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
     const std::string out = rig.run("yes");
-    CHECK_HAS(out, "The write failed (no reply), and EV_lvd reads 11.50 V [0x0EB8].");
+    CHECK_HAS(out, "The controller did not acknowledge the write (no reply), and EV_lvd still reads 11.50 V [0x0EB8]: "
+                   "it was not written.\r\n");
+    CHECK_HASNT(out, "restart");
+    CHECK_HASNT(out, "failed");
     CHECK_EQ(rig.sent(0x06), 1);  // a write is never repeated on its own
     CHECK_HASNT(rig.run("status"), "Settings were changed");
+    CHECK_HASNT(rig.run("status"), "may have been changed");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
   }
   {  // The acknowledgement is lost, but the write went through: the read-back shows that.
     Rig rig;
@@ -2062,21 +2282,73 @@ static void testConsoleSet() {
     rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
     const std::string out = rig.run("yes");
     CHECK_HAS(out, "The controller did not acknowledge the write (no reply), but it took effect: EV_lvd = 13.10 V");
+    CHECK_HAS(out, kUsesIt);
     CHECK_EQ(rig.sent(0x06), 1);
+    CHECK_HAS(rig.run("status"), kChanged);
   }
-  {  // The controller acknowledges, then holds something else.
+  {  // The controller acknowledges, then holds something else. It holds a changed setting, so the
+     // restart is due all the same.
     Rig rig;
     rig.sim.storeMask = 0xFFF0;
     rig.run("set EV_lvd 13.10");
     const std::string out = rig.run("yes");
     CHECK_HAS(out, "The controller acknowledged the write, but EV_lvd reads 13.09 V [0x10C0], not what was written.");
+    CHECK_HAS(out, kUsesWhatItHolds);
+    CHECK_HASNT(out, kUsesIt);
+    CHECK(rig.device.resetNeeded());
+    CHECK_HAS(rig.run("status"), kChanged);
+  }
+  {  // The controller acknowledges and still reads what it held: said as such, and an acknowledged
+     // write counts.
+    Rig rig;
+    rig.sim.storeMask = 0x0000;
+    rig.sim.regs[0xE022] = 0;  // what a mask of 0 stores, so that it "still reads" this
+    rig.run("set EV_lvd 13.10");
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "The controller acknowledged the write, but EV_lvd still reads 0.00 V [0x0000], not what was written.");
+    CHECK_HAS(out, kUsesWhatItHolds);
+    CHECK(rig.device.resetNeeded());
+  }
+  {  // The controller acknowledges, and then the read-back fails: nothing confirms the value, but
+     // the controller said that it wrote.
+    Rig rig;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_NONE);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "The controller acknowledged the write.\r\n"
+                   "Reading it back failed (no reply).\r\n"
+                   "'get EV_lvd' shows what it holds now.\r\n");
+    CHECK_HAS(out, kUsesWhatItHolds);
+    CHECK_HASNT(out, "failed too");
+    CHECK_HASNT(out, "not known");
+    CHECK(rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("status"), kChanged);
+    CHECK_HAS(rig.run("get EV_lvd"), "13.10 V");
   }
   {  // The controller refuses the write.
     Rig rig;
     rig.sim.refuseWrites = true;
     rig.run("set EV_lvd 13.10");
     const std::string out = rig.run("yes");
-    CHECK_HAS(out, "The write failed (exception 4 (device failure)), and EV_lvd reads 11.50 V [0x0EB8].");
+    CHECK_HAS(out, "The controller refused the write (exception 4 (device failure)), and EV_lvd still reads 11.50 V "
+                   "[0x0EB8].\r\n");
+    CHECK_HASNT(out, "restart");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    // Refused, and the register cannot be read afterwards either: a refusal is still a refusal.
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_NONE);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    const std::string blind = rig.run("yes");
+    CHECK_HAS(blind, "The controller refused the write (exception 4 (device failure)).\r\n"
+                     "Reading it back failed too (no reply).\r\n"
+                     "'get EV_lvd' shows what it holds now.\r\n");
+    CHECK_HASNT(blind, "not known");
+    CHECK_HASNT(blind, "restart");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
   }
   {  // Write acknowledged with other data.
     Rig rig;
@@ -2086,13 +2358,154 @@ static void testConsoleSet() {
     // The simulator did store the value; only its acknowledgement was wrong.
     CHECK_HAS(out, "did not acknowledge the write (write acknowledged with different data), but it took effect");
   }
-  {  // The link dies after the question: say what is and is not known.
+  {  // No acknowledgement, and the register reads something that is neither the old value nor
+     // the new one: the controller took the write its own way, and its reply was lost.
+    Rig rig;
+    rig.sim.storeMask = 0xFFF0;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "The controller did not acknowledge the write (no reply), and EV_lvd reads 13.09 V [0x10C0], "
+                   "which is neither what it held nor what was sent.\r\n");
+    CHECK_HAS(out, kUsesWhatItHolds);
+    CHECK(rig.device.resetNeeded());
+  }
+  {  // The link dies after the question: say what is and is not known. Nothing came back, so
+     // nothing says that the write failed.
     Rig rig;
     rig.run("set EV_lvd 13.10");
     rig.sim.powered = false;
     const std::string out = rig.run("yes");
-    CHECK_HAS(out, "The write failed (no reply), and reading it back failed too (no reply).\r\n"
-                   "'get EV_lvd' shows what it holds now.");
+    CHECK_HAS(out, "The controller did not acknowledge the write (no reply).\r\n"
+                   "Reading it back failed too (no reply): whether it was written is not known.\r\n"
+                   "'get EV_lvd' shows what it holds now.\r\n");
+    CHECK_HAS(out, kIfWritten);
+    CHECK_HASNT(out, "The write failed");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(rig.device.resetMaybeNeeded());
+    const std::string status = rig.run("status");
+    CHECK_HAS(status, kMaybe);
+    CHECK_HASNT(status, kChanged);
+    // The link comes back and the register is read: it holds what it held, so nothing is due.
+    rig.sim.powered = true;
+    CHECK_HAS(rig.run("get EV_lvd"), "11.50 V");
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK(!rig.device.resetNeeded());
+    CHECK_HASNT(rig.run("status"), "may have been changed");
+    CHECK_HASNT(rig.run("status"), kChanged);
+  }
+  {  // The same silence, but the controller did store the value: only its acknowledgement and
+     // the answers to the read-back were lost. The next read of the register shows it, and then
+     // the restart is known to be due.
+    Rig rig;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "whether it was written is not known.");
+    CHECK_EQ(rig.sim.regs[0xE022], 0x10C5);
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK(!rig.device.resetNeeded());
+    CHECK_HAS(rig.run("status"), kMaybe);
+    // A read of other registers settles nothing.
+    rig.run("get EV_lvr");
+    CHECK(rig.device.resetMaybeNeeded());
+    // A block that holds the register does.
+    rig.run("dump load");
+    CHECK(rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    const std::string status = rig.run("status");
+    CHECK_HAS(status, kChanged);
+    CHECK_HASNT(status, "may have been changed");
+    // The restart ends it.
+    rig.run("reset anyway");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+  }
+  {  // Setting it again is the other way to find out: 'set' reads the register first.
+    Rig rig;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    rig.run("yes");
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("set EV_lvd 13.10"), "It already holds that value. Nothing to write.");
+    CHECK(rig.device.resetNeeded());
+    CHECK_HAS(rig.run("status"), kChanged);
+  }
+  {  // Asking to change the other register of a pair reads this one for the comparison, and that
+     // settles it just the same.
+    Rig rig;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    rig.run("yes");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.run("set EV_lvr 13.25");
+    CHECK(!rig.device.resetMaybeNeeded());
+    rig.run("no");
+  }
+  {  // A restart makes the controller use whatever it holds, so it ends the doubt as well.
+    Rig rig;
+    rig.run("set EV_lvr 13.25");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    rig.run("yes");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK_HASNT(rig.run("status"), "may have been changed");
+  }
+  {  // With other link settings the register of another controller may be read: that settles
+     // nothing, and the doubt stays until a restart.
+    Rig rig;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    rig.run("yes");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.run("slave 2");
+    rig.sim.slaveId = 2;
+    CHECK_HAS(rig.run("get EV_lvd"), "11.50 V");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.run("slave 1");
+    rig.sim.slaveId = 1;
+    CHECK_HAS(rig.run("get EV_lvd"), "11.50 V");
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("status"), kMaybe);
+  }
+  {  // Two writes in doubt, to two registers. Reading the second settles the second; the first
+     // stays in doubt until a restart, because only one register is remembered.
+    Rig rig;
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    rig.run("yes");
+    rig.run("set Et_float 900");  // asks for no other register, so EV_lvd is not read on the way
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    CHECK_HAS(rig.run("yes"), "whether it was written is not known.");
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("get Et_float"), "9000 s");
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("get EV_lvd"), "11.50 V");
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK(!rig.device.resetNeeded());
+    // A write that is known to have been taken says more than the doubt.
+    rig.run("set EV_lvr 13.25");
+    CHECK_HAS(rig.run("yes"), "Written and read back");
+    CHECK(rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    const std::string status = rig.run("status");
+    CHECK_HAS(status, kChanged);
+    CHECK_HASNT(status, "may have been changed");
+  }
+  {  // A profile without a reset command has nothing to say about restarts.
+    const std::string noReset = replaced(kMiniProfile, ",\"resetCoil\":\"reset\"", "");
+    Rig rig(100.0, noReset.c_str());
+    rig.sim.regs[0xE010] = rig.sim.setVolts(12.00);
+    rig.run("set a 13.00");
+    rig.sim.powered = false;
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "whether it was written is not known.");
+    CHECK_HASNT(out, "restart");
   }
 }
 
@@ -2123,7 +2536,68 @@ static void testConsoleCoilsAndReset() {
     CHECK(!rig.sim.coils[0x0000]);
     rig.sim.coils.erase(0x0002);
     rig.run("coil charge_disconnect on");
-    CHECK_HAS(rig.run("yes"), "The controller did not accept it: exception 2 (illegal data address).");
+    CHECK_HAS(rig.run("yes"), "The controller refused it: exception 2 (illegal data address).");
+  }
+  {  // The acknowledgement is lost, but the controller has switched. That is not a refusal: the
+     // coil is read back, and what it reads is what is said.
+    Rig rig;
+    rig.run("coil load_disconnect on");
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    const std::string out = rig.run("yes");
+    CHECK(rig.sim.coils[0x0001]);
+    CHECK_HAS(out, "Sent, but the controller did not acknowledge it (no reply).\r\n"
+                   "load_disconnect now reads on: it was switched.\r\n");
+    CHECK_HASNT(out, "refused");
+    CHECK_HASNT(out, "not known");
+    CHECK_EQ(rig.sent(0x05), 1);  // a command is never repeated on its own
+    // Switching it off again, with an acknowledgement that arrives damaged.
+    rig.run("coil load_disconnect off");
+    rig.sim.failNext(SimSunSaver::FAULT_BAD_CRC);
+    const std::string off = rig.run("yes");
+    CHECK(!rig.sim.coils[0x0001]);
+    CHECK_HAS(off, "Sent, but the controller did not acknowledge it (CRC error).\r\n"
+                   "load_disconnect now reads off: it was switched.\r\n");
+  }
+  {  // The command itself is lost: the coil reads as before.
+    Rig rig;
+    rig.run("coil load_disconnect on");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    const std::string out = rig.run("yes");
+    CHECK(!rig.sim.coils[0x0001]);
+    CHECK_HAS(out, "Sent, but the controller did not acknowledge it (no reply).\r\n"
+                   "load_disconnect now reads off: it was not switched.\r\n");
+    CHECK_HASNT(out, "refused");
+  }
+  {  // Nothing answers any more: say that it is not known.
+    Rig rig;
+    rig.run("coil load_disconnect on");
+    rig.sim.powered = false;
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "Sent, but the controller did not acknowledge it (no reply).\r\n"
+                   "It is not known whether it was switched: 'coils' shows the coil states.\r\n");
+    CHECK_HASNT(out, "refused");
+    CHECK_HASNT(out, "now reads");
+  }
+  {  // An action coil reads off whatever it did, so there is nothing to read back.
+    Rig rig;
+    rig.run("coil clear_kwh on");
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    const std::string out = rig.run("yes");
+    CHECK_EQ(rig.sim.triggered.size(), 1);  // it was carried out
+    CHECK_HAS(out, "Sent, but the controller did not acknowledge it (no reply).\r\n"
+                   "It is not known whether the controller carried it out.\r\n");
+    CHECK_EQ(rig.sent(0x01), 0);
+    CHECK_EQ(rig.sent(0x05), 1);
+  }
+  {  // An acknowledged switch whose read-back fails is still acknowledged.
+    Rig rig;
+    rig.run("coil load_disconnect on");
+    rig.sim.failNext(SimSunSaver::FAULT_NONE);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "Sent and acknowledged.\r\n");
+    CHECK_HASNT(out, "now reads");
+    CHECK_HASNT(out, "not known");
   }
   {  // set, then reset: the fault clears and the new LVD is in effect.
     Rig rig;
@@ -2272,7 +2746,48 @@ static void testConsoleRawAndExpert() {
   CHECK(rig.sim.coils[0x0001]);
   // The SunSaver has no function 16: its exception is shown as such.
   rig.run("raw 1 16 0xE022 1");
-  CHECK_HAS(rig.run("yes"), "Not accepted: exception 1 (illegal function).");
+  CHECK_HAS(rig.run("yes"), "Refused: exception 1 (illegal function).");
+  CHECK_HASNT(rig.run("status"), "may have been changed");
+  {  // A raw write whose acknowledgement does not arrive is not called refused: the controller
+     // may have carried it out. For a register that leaves a restart that may be due.
+    Rig lost;
+    lost.run("expert on");
+    lost.run("raw 1 6 0xE022 0x10C5");
+    lost.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    const std::string out = lost.run("yes");
+    CHECK_EQ(lost.sim.regs[0xE022], 0x10C5);
+    CHECK_HAS(out, "Not acknowledged: no reply.\r\n"
+                   "It is not known whether the controller carried it out.\r\n");
+    CHECK_HASNT(out, "Refused");
+    CHECK_HASNT(out, "Not accepted");
+    CHECK(lost.device.resetMaybeNeeded());
+    CHECK(!lost.device.resetNeeded());
+    CHECK_HAS(lost.run("status"), "A write got no answer in this session, so a setting may have been changed.");
+    // OptaView does not know which register a raw request was for, so no read settles it.
+    lost.run("get EV_lvd");
+    CHECK(lost.device.resetMaybeNeeded());
+    lost.run("reset anyway");
+    CHECK_HAS(lost.run("yes"), "The controller answers again");
+    CHECK(!lost.device.resetMaybeNeeded());
+  }
+  {  // A coil switches at once: no restart is due for it, acknowledged or not.
+    Rig coil;
+    coil.run("expert on");
+    coil.run("raw 1 5 1 0xFF00");
+    CHECK_HAS(coil.run("yes"), "Acknowledged.");
+    CHECK(!coil.device.resetNeeded());
+    coil.run("raw 1 5 1 0x0000");
+    coil.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    const std::string out = coil.run("yes");
+    CHECK_HAS(out, "Not acknowledged: no reply.");
+    CHECK(!coil.sim.coils[0x0001]);
+    CHECK(!coil.device.resetMaybeNeeded());
+    CHECK(!coil.device.resetNeeded());
+    // A register does call for one.
+    coil.run("raw 1 6 0xE022 0x10C5");
+    CHECK_HAS(coil.run("yes"), "Acknowledged.");
+    CHECK(coil.device.resetNeeded());
+  }
   // Any other function goes out as typed, and only after a yes: OptaView cannot tell whether
   // it reads or writes (function 15 switches coils).
   size_t sentSoFar = rig.sim.requests.size();
@@ -3241,9 +3756,26 @@ static void testTwoConsoles() {
     // A write that did not take is nothing to restart for.
     rig.sim.refuseWrites = true;
     web.run("set EV_lvr 13.20");
-    CHECK_HAS(web.run("yes"), "The write failed");
+    CHECK_HAS(web.run("yes"), "The controller refused the write");
     CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
     rig.sim.refuseWrites = false;
+    // A write that got no answer at all is in doubt on both, until either side reads the
+    // register again.
+    static const char kMaybe[] = "A write got no answer in this session, so a setting may have been changed.";
+    web.run("set EV_lvr 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_HAS(web.run("yes"), "whether it was written is not known.");
+    CHECK_HAS(rig.run("status"), kMaybe);
+    CHECK_HAS(web.run("status"), kMaybe);
+    CHECK_HASNT(rig.run("status"), kWaiting);
+    CHECK_HAS(rig.run("get EV_lvr"), "13.10 V");
+    CHECK_HAS(web.run("status"), kWaiting);
+    CHECK_HASNT(web.run("status"), kMaybe);
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(!rig.device.resetNeeded());
     // A restart that the controller did not come back from leaves the note standing.
     web.run("set EV_lvr 13.20");
     web.run("yes");

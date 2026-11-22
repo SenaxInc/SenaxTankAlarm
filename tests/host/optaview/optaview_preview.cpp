@@ -18,6 +18,7 @@
 //   sim battery <volts>    what it measures at the battery terminals
 //   sim refuse on|off      it refuses every write (Modbus exception 4)
 //   sim delay <ms>         how long it takes to answer
+//   sim drop <n>           its next n replies are lost on the way (it does what was asked)
 //   sim skip <seconds>     this much time passes at once (a session ends after 30 minutes)
 //   sim writes             how many requests that change something it has received
 //   sim quit
@@ -309,6 +310,9 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
   } else if (what == "delay" && numeric && number >= 0.0 && number <= 10000.0) {
     sim.responseDelayMs = (uint32_t)number;
     printf("sim: replies take %u ms\n", (unsigned)sim.responseDelayMs);
+  } else if (what == "drop" && numeric && number >= 1.0 && number <= 20.0) {
+    sim.failNext(SimSunSaver::FAULT_LOST_REPLY, (unsigned)number);
+    printf("sim: the next %u replies are lost\n", (unsigned)number);
   } else if (what == "skip" && numeric && number >= 0.0 && number <= 86400.0) {
     sim.skip((uint32_t)(number * 1000.0));
     printf("sim: %u s have passed\n", (unsigned)number);
@@ -319,7 +323,8 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
     fflush(stdout);
     exit(0);
   } else {
-    printf("sim: power off|on, battery <volts>, refuse on|off, delay <ms>, skip <seconds>, writes, quit\n");
+    printf("sim: power off|on, battery <volts>, refuse on|off, delay <ms>, drop <replies>, skip <seconds>, writes, "
+           "quit\n");
   }
 }
 

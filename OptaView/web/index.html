@@ -451,6 +451,10 @@ function applyState(next) {
   if (state.resetNeeded) {
     setNotice('reset', 'warn', 'Settings were changed. The controller uses them after a restart.',
               'Restart the controller', restart);
+  } else if (state.resetMaybe) {
+    setNotice('reset', 'warn', 'A change got no answer from the controller, so a setting may or may not have ' +
+              'been changed. Check the values under Settings. A changed setting is used after a restart.',
+              'Restart the controller', restart);
   } else {
     clearNotice('reset');
   }

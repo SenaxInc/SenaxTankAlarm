@@ -127,11 +127,21 @@ struct OvProbeOutcome {
   uint16_t attempts;
 };
 
+// What a write did to the register, as far as the acknowledgement and the read-back show. The
+// acknowledgement alone cannot tell: it can be lost on the way back from a controller that has
+// stored the value.
+enum OvWriteEffect : uint8_t {
+  OV_WRITE_NOT_TAKEN = 0,  // refused, or the register still reads what it held before
+  OV_WRITE_TAKEN,          // acknowledged, or the register no longer reads what it held before
+  OV_WRITE_UNKNOWN         // no acknowledgement, and the register could not be read afterwards
+};
+
 struct OvWriteOutcome {
   MbResult write;         // the write request; never repeated, a lost reply is not a lost write
   OvWordStatus readBack;  // reading the register again afterwards
   uint16_t readBackRaw;
   bool verified;          // the register now holds what was written
+  uint8_t effect;         // OvWriteEffect
 };
 
 struct OvResetOutcome {
@@ -363,7 +373,11 @@ class OvDevice {
         settingsEpoch_(0),
         liveEpoch_(0),
         generation_(0),
-        resetNeeded_(false) {
+        resetNeeded_(false),
+        writeUnsettled_(false),
+        unknownOpen_(false),
+        unknownAddr_(0),
+        unknownBefore_(0) {
     link.slave = 1;
     link.baud = 9600;
     link.format = MB_8N2;
@@ -391,8 +405,9 @@ class OvDevice {
     settleLink();
   }
 
-  // (Re)opens the serial port with link.baud and link.format.
-  bool applyLink() { return master_.transport().configure(link.baud, link.format); }
+  // (Re)opens the serial port with link.baud and link.format, and gives the master the pauses
+  // that go with that baud rate.
+  bool applyLink() { return master_.configure(link.baud, link.format); }
 
   uint16_t maxBlock() const {
     const uint8_t n = profile_.modbus().maxBlock;
@@ -468,6 +483,14 @@ class OvDevice {
   bool resetNeeded() const { return resetNeeded_; }
   void noteSettingsWritten() { resetNeeded_ = true; }
 
+  // A write went out and nothing has shown whether the controller took it: its acknowledgement
+  // did not come, and the register could not be read afterwards. If it was taken, a restart is
+  // due as well. The next read of that register settles it: it either still holds what it held
+  // before the write, or settings were written.
+  bool resetMaybeNeeded() const { return !resetNeeded_ && (unknownOpen_ || writeUnsettled_); }
+  // For a write of unknown outcome that did not pass through writeRegister(). No read settles it.
+  void noteWriteUnknown() { writeUnsettled_ = true; }
+
   // Counts everything that can make a question that is waiting for "yes" out of date: a write,
   // a restart, other link settings, another scale. A front end notes the count when it asks and
   // sends nothing if the count has moved by the time the answer comes, because the other front
@@ -486,6 +509,11 @@ class OvDevice {
       return false;
     }
     settled_ = link;
+    if (unknownOpen_) {
+      // What that register reads on another controller says nothing about the write.
+      unknownOpen_ = false;
+      writeUnsettled_ = true;
+    }
     const bool had = settingsFound_ > 0.0 || liveFound_ > 0.0;
     settingsFound_ = 0.0;
     liveFound_ = 0.0;
@@ -499,11 +527,9 @@ class OvDevice {
   // timeout pass before the repeat, so that a reply that is merely late is not taken for its
   // answer; every attempt therefore counts towards giving up on the link.
   MbResult readWords(uint16_t addr, uint16_t count, uint16_t *out) {
-    MbResult r = master_.readRegisters(link.slave, link.readFunction, addr, count, out);
-    note(r);
+    MbResult r = readOnce(addr, count, out);
     for (uint8_t attempt = 0; attempt < retries && mbIsLinkFailure(r.status) && !linkDown_; ++attempt) {
-      r = master_.readRegisters(link.slave, link.readFunction, addr, count, out);
-      note(r);
+      r = readOnce(addr, count, out);
     }
     return r;
   }
@@ -533,7 +559,33 @@ class OvDevice {
         ++done;
         continue;
       }
-      const MbResult r = readWords(at, n, words + done);
+      MbResult r;
+      if (blockMode != OV_BLOCKS_AUTO) {
+        r = readWords(at, n, words + done);  // forced on: repeated like any other read
+      } else {
+        // In automatic mode a block that gets no usable reply is not simply asked for again.
+        // First its first register is asked alone, to see whether the controller answers at
+        // all. Only if it does is the block tried once more, and a block that is lost a second
+        // time means that blocks are the problem. Repeating the block first would use up two of
+        // the OV_LINK_DOWN_AFTER failures: one lost reply to the single read after them would
+        // then end the batch on a controller that is there.
+        r = readOnce(at, n, words + done);
+        if (mbIsLinkFailure(r.status)) {
+          readOne(at, words + done, status + done);
+          const bool answered = status[done].status == MB_OK || status[done].status == MB_EXCEPTION;
+          if (answered && retries > 0) {
+            r = readOnce(at, n, words + done);  // a failed read leaves the word read alone as it is
+          }
+          if (!answered || mbIsLinkFailure(r.status)) {
+            if (answered) {
+              blocksFailed_ = true;
+            }
+            ++done;  // this word has its status from being read alone
+            continue;
+          }
+          // The second try of the block was answered, with data or with an exception: carry on.
+        }
+      }
       if (r.status == MB_OK) {
         for (uint16_t i = 0; i < n; ++i) {
           status[done + i].status = MB_OK;
@@ -556,16 +608,7 @@ class OvDevice {
         done = (uint16_t)(done + n);
         continue;
       }
-      if (blockMode == OV_BLOCKS_AUTO) {
-        // No usable reply to a block. If one register still answers, blocks are the problem.
-        readOne(at, words + done, status + done);
-        if (status[done].status == MB_OK || status[done].status == MB_EXCEPTION) {
-          blocksFailed_ = true;
-        }
-        ++done;
-        continue;
-      }
-      // Blocks are forced on: the whole block is lost.
+      // No usable reply, and blocks are forced on: the whole block is lost.
       for (uint16_t i = 0; i < n; ++i) {
         words[done + i] = 0;
         status[done + i].status = r.status;
@@ -675,7 +718,7 @@ class OvDevice {
     bool done = false;
     for (size_t b = 0; b < baudCount && !done; ++b) {
       for (size_t f = 0; f < formatCount && !done; ++f) {
-        if (!master_.transport().configure(bauds[b], formats[f])) {
+        if (!master_.configure(bauds[b], formats[f])) {
           continue;
         }
         for (size_t s = 0; s < slaveCount && !done; ++s) {
@@ -739,8 +782,10 @@ class OvDevice {
     return out;
   }
 
-  // Writes one register with function 06 and reads it back.
-  OvWriteOutcome writeRegister(const OvRegister &reg, uint16_t raw) {
+  // Writes one register with function 06 and reads it back. `before` is what the register held
+  // when it was last read: it tells a write that was not taken from one that was taken with
+  // another value, when the acknowledgement does not arrive.
+  OvWriteOutcome writeRegister(const OvRegister &reg, uint16_t raw, uint16_t before) {
     OvWriteOutcome out;
     memset(&out, 0, sizeof(out));
     out.write = master_.writeRegister(link.slave, reg.addr, raw);
@@ -749,9 +794,21 @@ class OvDevice {
     uint16_t stored = 0;
     readOne(reg.addr, &stored, &out.readBack);
     out.readBackRaw = stored;
-    out.verified = out.readBack.status == MB_OK && stored == raw;
-    if (out.verified) {
+    const bool read = out.readBack.status == MB_OK;
+    out.verified = read && stored == raw;
+    if (out.verified || out.write.status == MB_OK || (read && stored != before)) {
+      out.effect = OV_WRITE_TAKEN;
       resetNeeded_ = true;
+    } else if (read || !mbIsLinkFailure(out.write.status)) {
+      out.effect = OV_WRITE_NOT_TAKEN;  // it reads as before, or the controller said no
+    } else {
+      out.effect = OV_WRITE_UNKNOWN;
+      if (unknownOpen_ && unknownAddr_ != reg.addr) {
+        writeUnsettled_ = true;  // one register is remembered; the earlier one stays open for good
+      }
+      unknownOpen_ = true;
+      unknownAddr_ = reg.addr;
+      unknownBefore_ = before;
     }
     return out;
   }
@@ -799,7 +856,9 @@ class OvDevice {
       const MbResult r = master_.readRegisters(link.slave, link.readFunction, defaults.probeRegister->addr, 1, &raw);
       if (r.status == MB_OK || r.status == MB_EXCEPTION) {
         out.cameBack = true;
-        resetNeeded_ = false;
+        resetNeeded_ = false;  // whatever was written, the controller uses it now
+        writeUnsettled_ = false;
+        unknownOpen_ = false;
         break;
       }
       if ((uint32_t)(transport.nowMs() - start) >= OV_RESET_GIVE_UP_MS) {
@@ -874,6 +933,10 @@ class OvDevice {
   uint32_t liveEpoch_;
   uint32_t generation_;
   bool resetNeeded_;
+  bool writeUnsettled_;     // a write of unknown outcome that no read can settle any more
+  bool unknownOpen_;        // a write of unknown outcome that the next read of its register settles
+  uint16_t unknownAddr_;    // that register
+  uint16_t unknownBefore_;  // what it held before the write
 
   static bool confirmed(const OvScale *scale, double found) {
     if (scale == nullptr || !(found > 0.0)) {
@@ -1005,6 +1068,21 @@ class OvDevice {
     } else {
       consecutiveFailures_ = 0;
     }
+  }
+
+  // One read request, sent once.
+  MbResult readOnce(uint16_t addr, uint16_t count, uint16_t *out) {
+    const MbResult r = master_.readRegisters(link.slave, link.readFunction, addr, count, out);
+    note(r);
+    if (r.status == MB_OK && unknownOpen_ && unknownAddr_ >= addr && (uint32_t)unknownAddr_ < (uint32_t)addr + count &&
+        link.slave == settled_.slave && link.baud == settled_.baud && link.format == settled_.format) {
+      // The register of a write whose outcome was unknown has been read, on the same controller.
+      unknownOpen_ = false;
+      if (out[unknownAddr_ - addr] != unknownBefore_) {
+        resetNeeded_ = true;
+      }
+    }
+    return r;
   }
 
   // Reads one word. True when it was read.

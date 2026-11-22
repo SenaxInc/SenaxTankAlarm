@@ -453,6 +453,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     uint8_t function;
     uint16_t addr;
     uint16_t value;
+    uint16_t before;            // PENDING_SET: what the register held when the question was asked
     uint8_t body[OV_MAX_ARGS];  // PENDING_RAW_FRAME: slave, function and the bytes as typed
     uint8_t bodyLength;
     uint32_t generation;        // OvDevice::generation() when the question was asked
@@ -1052,6 +1053,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     if (device_.resetNeeded()) {
       out_.println("Settings were changed in this session. 'reset' makes the controller use them.");
+    } else if (device_.resetMaybeNeeded()) {
+      out_.println("A write got no answer in this session, so a setting may have been changed. If one was,");
+      out_.println("'reset' makes the controller use it.");
     }
   }
 
@@ -1881,16 +1885,19 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     ask(PENDING_SET);
     pending_.reg = reg;
     pending_.value = raw;
+    pending_.before = now[0];
   }
 
   void runSet(const Pending &action) {
     const OvRegister &reg = *action.reg;
-    const OvWriteOutcome outcome = device_.writeRegister(reg, action.value);
+    const OvWriteOutcome outcome = device_.writeRegister(reg, action.value, action.before);
     char text[OV_VALUE_TEXT];
     const uint16_t readBack[2] = {outcome.readBackRaw, 0};
     ovFormatValue(reg, readBack, text, sizeof(text));
+    const bool acknowledged = outcome.write.status == MB_OK;
+    const bool hasReset = device_.profile().modbus().resetCoil != nullptr;
     if (outcome.verified) {
-      if (outcome.write.status == MB_OK) {
+      if (acknowledged) {
         out_.print("Written and read back: ");
       } else {
         out_.print("The controller did not acknowledge the write (");
@@ -1903,33 +1910,50 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(" ");
       printRawWords(readBack, 1);
       out_.println();
-      if (device_.profile().modbus().resetCoil != nullptr) {
+      if (hasReset) {
         out_.println("The controller uses it after a restart: 'reset' when all your changes are in.");
       }
       return;
     }
-    if (outcome.write.status == MB_OK) {
-      out_.print("The controller acknowledged the write, ");
+    // Not confirmed. A missing acknowledgement is not a refusal: the controller may have stored
+    // the value and its reply was lost. So this says what came back for the write, what the
+    // register reads now, and what that leaves open.
+    const bool refused = !acknowledged && !mbIsLinkFailure(outcome.write.status);
+    if (acknowledged) {
+      out_.print("The controller acknowledged the write");
     } else {
-      out_.print("The write failed (");
+      out_.print(refused ? "The controller refused the write (" : "The controller did not acknowledge the write (");
       describe(outcome.write);
-      out_.print("), ");
+      out_.print(")");
     }
     if (outcome.readBack.status == MB_OK) {
-      out_.print(outcome.write.status == MB_OK ? "but " : "and ");
+      const bool asBefore = outcome.readBackRaw == action.before;
+      out_.print(acknowledged ? ", but " : ", and ");
       out_.print(reg.name);
-      out_.print(" reads ");
+      out_.print(asBefore ? " still reads " : " reads ");
       out_.print(text);
       out_.print(" ");
       printRawWords(readBack, 1);
-      out_.println(outcome.write.status == MB_OK ? ", not what was written." : ".");
+      if (acknowledged) {
+        out_.println(", not what was written.");
+      } else if (!asBefore) {
+        out_.println(", which is neither what it held nor what was sent.");
+      } else {
+        out_.println(refused ? "." : ": it was not written.");
+      }
     } else {
-      out_.print("and reading it back failed too (");
+      out_.println(".");
+      out_.print(acknowledged ? "Reading it back failed (" : "Reading it back failed too (");
       describe(outcome.readBack);
-      out_.println(").");
+      out_.println(outcome.effect == OV_WRITE_UNKNOWN ? "): whether it was written is not known." : ").");
       out_.print("'get ");
       out_.print(reg.name);
       out_.println("' shows what it holds now.");
+    }
+    if (hasReset && outcome.effect == OV_WRITE_TAKEN) {
+      out_.println("The controller uses what it holds after a restart: 'reset' when all your changes are in.");
+    } else if (hasReset && outcome.effect == OV_WRITE_UNKNOWN) {
+      out_.println("If it was written, the controller uses it after a restart: 'reset' when all your changes are in.");
     }
   }
 
@@ -1968,25 +1992,47 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   void runCoil(const Pending &action) {
     const OvCoil &coil = *action.coil;
     const MbResult result = device_.writeCoil(coil, action.on);
-    if (result.status != MB_OK) {
-      out_.print("The controller did not accept it: ");
+    const bool acknowledged = result.status == MB_OK;
+    if (!acknowledged && !mbIsLinkFailure(result.status)) {
+      out_.print("The controller refused it: ");
       describe(result);
       out_.println(".");
       return;
     }
-    out_.print("Sent and acknowledged.");
+    // A missing acknowledgement is not a refusal: the controller may have switched and its reply
+    // was lost. A coil that keeps its state is read back to find out.
+    if (acknowledged) {
+      out_.print("Sent and acknowledged.");
+    } else {
+      out_.print("Sent, but the controller did not acknowledge it (");
+      describe(result);
+      out_.println(").");
+    }
+    bool known = acknowledged;
     if (!coil.trigger) {
       bool now = false;
       const MbResult readBack = device_.readCoil(coil, &now);
       if (readBack.status == MB_OK) {
-        out_.print(" ");
+        known = true;
+        if (acknowledged) {
+          out_.print(" ");
+        }
         out_.print(coil.name);
         out_.print(" now reads ");
         out_.print(now ? "on" : "off");
-        out_.print(".");
+        if (acknowledged) {
+          out_.print(".");
+        } else {
+          out_.println(now == action.on ? ": it was switched." : ": it was not switched.");
+        }
       }
     }
-    out_.println();
+    if (acknowledged) {
+      out_.println();
+    } else if (!known) {
+      out_.println(coil.trigger ? "It is not known whether the controller carried it out."
+                                : "It is not known whether it was switched: 'coils' shows the coil states.");
+    }
   }
 
   void cmdReset(int argc, char **argv) {
@@ -2472,13 +2518,26 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     device_.noteControllerChanged();
     printLastExchange(result);
+    // Registers are what a restart is for. A coil switches at once.
+    const bool setting = action.function != MB_FC_WRITE_COIL;
     if (result.status == MB_OK) {
       out_.println("Acknowledged.");
-      device_.noteSettingsWritten();
-    } else {
-      out_.print("Not accepted: ");
+      if (setting) {
+        device_.noteSettingsWritten();
+      }
+    } else if (!mbIsLinkFailure(result.status)) {
+      out_.print("Refused: ");
       describe(result);
       out_.println(".");
+    } else {
+      // No proper answer is not a refusal: the request may have been carried out.
+      out_.print("Not acknowledged: ");
+      describe(result);
+      out_.println(".");
+      out_.println("It is not known whether the controller carried it out.");
+      if (setting) {
+        device_.noteWriteUnknown();
+      }
     }
   }
 };

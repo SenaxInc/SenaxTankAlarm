@@ -782,6 +782,7 @@ class OvWeb : public OvConsoleExtra {
     writeScale(json, "live", check.liveScale, device_.liveScaleConfirmed(), device_.liveScaleFound());
     json.endObject();
     json.flag("resetNeeded", device_.resetNeeded());
+    json.flag("resetMaybe", device_.resetMaybeNeeded());
     json.beginObject("counters");
     json.u("sent", master.stats.sent);
     json.u("ok", master.stats.ok);

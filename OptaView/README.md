@@ -261,6 +261,11 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   with an exception is reported as answering but refusing.
 - Settings are written by name, inside limits from the profile, after the old and the new value
   were shown and `yes` was typed. Every write is read back.
+- A write or a switch that gets no acknowledgement is never sent again by itself, and it is not
+  called failed: the controller may have carried it out before its reply was lost. What the
+  register or the coil reads afterwards decides. When that cannot be read either, OptaView says
+  that it does not know, and it keeps saying that a restart may be due until the register has
+  been read again.
 - Pairs that must stay in order (reconnect above disconnect) are checked when you `set` one of
   them and again before `reset`.
 - `raw` sends functions 1 to 4, which only read, as they are typed. Every other request needs
@@ -412,7 +417,8 @@ make -C tests/host/optaview preview ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 This builds the firmware's web server and console as a program for your PC, with the simulated
 SunSaver behind them, and serves the page at <http://127.0.0.1:8080/>. Its terminal is the USB
 console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
-`sim power off`, `sim refuse on` (every write is refused), `sim delay 300`. Add
+`sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
+next three replies are lost on the way). Add
 `PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
 simulated controller answers as the specification says, so the preview shows the page and not
 how a real SunSaver behaves.

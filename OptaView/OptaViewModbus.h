@@ -121,6 +121,23 @@ static const uint16_t MB_MAX_READ_BITS = 2000;
 static const uint16_t MB_MAX_WRITE_REGISTERS = 123;
 static const uint32_t MB_GRACE_MS = 400;    // extra time for a reply still arriving at the timeout
 
+// The silence that separates two frames: 3.5 characters of 11 bits (Modbus over Serial Line,
+// section 2.5.1.1). That is 4 ms at 9600 baud and 129 ms at 300. One millisecond is added, since
+// the master measures it on a millisecond clock, and the result is never below the 5 ms that this
+// master leaves at 9600 baud and above.
+inline uint16_t mbInterFrameGapMs(uint32_t baud) {
+  const uint32_t ms = 38500UL / (baud == 0 ? 1UL : baud) + 1UL;  // 38501 at most
+  return ms < 5UL ? (uint16_t)5 : (uint16_t)ms;
+}
+
+// The silence that ends a frame whose length is not known in advance. 50 ms is far more than the
+// standard's 3.5 characters at 9600 baud, for a controller that pauses inside a reply. Below 800
+// baud 3.5 characters take longer than that, and then they decide.
+inline uint16_t mbQuietMs(uint32_t baud) {
+  const uint16_t gap = mbInterFrameGapMs(baud);
+  return gap < 50 ? (uint16_t)50 : gap;
+}
+
 // ---------------------------------------------------------------------------------------------
 // CRC-16 (Modbus): polynomial 0xA001, initial value 0xFFFF, low byte first on the wire
 // ---------------------------------------------------------------------------------------------
@@ -430,12 +447,24 @@ class ModbusMaster {
   // dropped if it arrives within one more timeout (see settleBus). Later still, nothing can tell
   // it from the answer to the next request, so this must be longer than the slowest reply.
   uint16_t responseTimeoutMs;
-  uint16_t quietMs;            // silence that ends a reply of unknown length
-  uint16_t interFrameGapMs;    // minimum bus silence before a request (3.5 characters is 4 ms at 9600)
+  uint16_t quietMs;            // silence that ends a reply of unknown length (see mbQuietMs)
+  uint16_t interFrameGapMs;    // minimum bus silence before a request (see mbInterFrameGapMs)
   MbStats stats;
   MbTraceSink *trace;
 
   MbTransport &transport() { return transport_; }
+
+  // (Re)opens the link and sets the two times above, which depend on the baud rate. Whatever
+  // changes the serial settings comes through here: the transport's own configure() would leave
+  // the master with the pauses of the old baud rate.
+  bool configure(uint32_t baud, uint8_t format) {
+    if (!transport_.configure(baud, format)) {
+      return false;
+    }
+    interFrameGapMs = mbInterFrameGapMs(baud);
+    quietMs = mbQuietMs(baud);
+    return true;
+  }
 
   // FC03 / FC04. out receives `quantity` registers.
   MbResult readRegisters(uint8_t slave, uint8_t function, uint16_t address, uint16_t quantity,

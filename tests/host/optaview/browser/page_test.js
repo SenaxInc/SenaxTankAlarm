@@ -522,6 +522,64 @@ async function settingsView(win, profile) {
   await close(win);
   await page.waitForSelector(notice('reset'), { state: 'detached' });
   checkEq(await win.preview.writes(), before + 3, 'two writes and the restart reached the controller');
+
+  // A change that gets no answer at all: the controller loses its power between the question
+  // and Yes. Nothing says that the write failed, because nothing is known. The page says that a
+  // setting may have changed, until the setting has been read again.
+  await page.fill(newValue('EV_lvr'), '13.40');
+  await page.click(changeButton('EV_lvr'));
+  await question(win);
+  await win.preview.line('sim power off', /sim: the controller has no power/);
+  await yes(win);
+  done = await result(win);
+  checkHas(done, 'The controller did not acknowledge the write (no reply).', 'silence is not called a refusal');
+  checkHas(done, 'Reading it back failed too (no reply): whether it was written is not known.', 'what is not known is said');
+  checkHasnt(done, 'The write failed', 'nothing is called failed that may have worked');
+  await close(win);
+  await page.waitForSelector(notice('reset'), { timeout: 20000 });
+  checkHas(await win.text(notice('reset')), 'a setting may or may not have been changed', 'a restart may be due');
+  checkHasnt(await win.text(notice('reset')), 'Settings were changed.', 'and it is not said to be due');
+  await page.waitForSelector(notice('link'), { timeout: 20000 });
+  // The controller is back and the settings are read again. It holds what it held, so nothing
+  // is due and the notice goes.
+  await win.preview.line('sim power on', /sim: the controller has power/);
+  await page.click(`${notice('link')} button`);
+  await page.waitForSelector(notice('reset'), { state: 'detached', timeout: 30000 });
+  await waitNow(win, 'EV_lvr', '13.25 V');
+  checkEq(await page.inputValue(newValue('EV_lvr')), '', 'the field was emptied when Yes was pressed');
+
+  // The same silence from a controller that did store the value: only its answers were lost.
+  // Reading the settings again shows the new value, and now the restart is known to be due.
+  await page.fill(newValue('EV_lvr'), '13.40');
+  await page.click(changeButton('EV_lvr'));
+  await question(win);
+  await win.preview.line('sim drop 3', /sim: the next 3 replies are lost/);
+  await yes(win);
+  done = await result(win);
+  checkHas(done, 'whether it was written is not known.', 'the controller answered nothing');
+  await close(win);
+  await waitNow(win, 'EV_lvr', '13.40 V');
+  await page.waitForFunction((selector) => {
+    const node = document.querySelector(selector);
+    return node && node.textContent.includes('Settings were changed.');
+  }, notice('reset'), { timeout: 20000 });
+  checkHasnt(await win.text(notice('reset')), 'may or may not', 'the doubt is gone');
+  // Back to the value it had, and the restart.
+  await page.fill(newValue('EV_lvr'), '13.25');
+  await page.click(changeButton('EV_lvr'));
+  await question(win);
+  await yes(win);
+  checkHas(await result(win), 'Written and read back: EV_lvr = 13.25 V [0x10F6]', 'the value is put back');
+  await close(win);
+  await waitNow(win, 'EV_lvr', '13.25 V');
+  await page.click(`${notice('reset')} button`);
+  await question(win);
+  await yes(win);
+  checkHas(await result(win), 'The controller answers again after', 'the restart');
+  await close(win);
+  await page.waitForSelector(notice('reset'), { state: 'detached' });
+  checkEq(await win.preview.writes(), before + 7,
+          'the lost write, the write whose answer was lost, the write that put it back, and the restart');
   await win.settle();
 }
 

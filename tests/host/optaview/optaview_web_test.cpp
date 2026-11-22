@@ -2413,6 +2413,7 @@ static void testWebReading() {
     CHECK(str(state.json["scales"]["live"]["name"]) == "vlive");
     CHECK(state.json["scales"]["live"]["confirmed"] == false);
     CHECK(state.json["resetNeeded"] == false);
+    CHECK(state.json["resetMaybe"] == false);
     CHECK_EQ(state.json["counters"]["sent"].as<long>(), 0);
     CHECK_EQ(w.rig.sim.requests.size(), 0);
 
@@ -2917,6 +2918,52 @@ static void testWebConsole() {
     CHECK_HAS(w.console("help").text, "  set <name> <value>");
     CHECK_HASNT(w.console("help").text, "web pin");
     CHECK(w.web.sessionOpen());
+  }
+  {
+    // A write that gets no answer, and a read-back that gets none either: the page is told that
+    // a restart may be due, not that the write failed. The controller did store the value here.
+    WebRig lost;
+    lost.login();
+    const Reply ask = lost.console("set EV_lvr 13.25");
+    lost.rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    lost.rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    const Reply yes = lost.console("yes", str(ask.json["question"]));
+    CHECK_HAS(yes.text, "The controller did not acknowledge the write (no reply).\r\n"
+                        "Reading it back failed too (no reply): whether it was written is not known.\r\n");
+    CHECK_HASNT(yes.text, "The write failed");
+    CHECK(yes.json["state"]["resetMaybe"] == true);
+    CHECK(yes.json["state"]["resetNeeded"] == false);
+    CHECK(lost.get("/api/state").json["resetMaybe"] == true);
+    // Reading other registers settles nothing. Reading the settings, as the page does when the
+    // dialog closes, shows the new value: now the restart is known to be due.
+    const Reply live = lost.get("/api/read?groups=live");
+    CHECK(live.json["state"]["resetMaybe"] == true);
+    const Reply load = lost.get("/api/read?groups=load");
+    CHECK(load.json["state"]["resetNeeded"] == true);
+    CHECK(load.json["state"]["resetMaybe"] == false);
+    const Reply reset = lost.console("reset");
+    const Reply done = lost.console("yes", str(reset.json["question"]));
+    CHECK(done.json["state"]["resetNeeded"] == false);
+    CHECK(done.json["state"]["resetMaybe"] == false);
+
+    // The other way round: the write never reached the controller. The same read shows the old
+    // value, and nothing is due.
+    WebRig silent;
+    silent.login();
+    const Reply again = silent.console("set EV_lvr 13.25");
+    silent.rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    const Reply unknown = silent.console("yes", str(again.json["question"]));
+    CHECK(unknown.json["state"]["resetMaybe"] == true);
+    const Reply settled = silent.get("/api/read?groups=load");
+    CHECK(settled.json["state"]["resetMaybe"] == false);
+    CHECK(settled.json["state"]["resetNeeded"] == false);
+    // A switch whose acknowledgement is lost is read back, and the page is told what it reads.
+    const Reply coil = silent.console("coil load_disconnect on");
+    silent.rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    const Reply switched = silent.console("yes", str(coil.json["question"]));
+    CHECK_HAS(switched.text, "Sent, but the controller did not acknowledge it (no reply).\r\n"
+                             "load_disconnect now reads on: it was switched.\r\n");
+    CHECK(switched.json["state"]["resetMaybe"] == false);
   }
   {
     // A coil, and the restart.

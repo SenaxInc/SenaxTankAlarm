@@ -12,7 +12,7 @@
 
 namespace optaview {
 
-// The page: 48677 bytes, its lines ending in LF.
+// The page: 48980 bytes, its lines ending in LF.
 static const char OV_WEB_PAGE[] =
     R"OVWEB(<!DOCTYPE html>)OVWEB" "\n"
     R"OVWEB(<html lang="en">)OVWEB" "\n"
@@ -498,6 +498,11 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(  show($('linkPill'), view !== '');)OVWEB" "\n"
     R"OVWEB(  if (state.resetNeeded) {)OVWEB" "\n"
     R"OVWEB(    setNotice('reset', 'warn', 'Settings were changed. The controller uses them after a restart.',)OVWEB" "\n"
+    R"OVWEB(              'Restart the controller', restart);)OVWEB" "\n"
+    R"OVWEB(  } else if (state.resetMaybe) {)OVWEB" "\n"
+    R"OVWEB(    setNotice('reset', 'warn', 'A change got no answer from the controller, so a setting may or may not have ')OVWEB"
+    R"OVWEB( +)OVWEB" "\n"
+    R"OVWEB(              'been changed. Check the values under Settings. A changed setting is used after a restart.',)OVWEB" "\n"
     R"OVWEB(              'Restart the controller', restart);)OVWEB" "\n"
     R"OVWEB(  } else {)OVWEB" "\n"
     R"OVWEB(    clearNotice('reset');)OVWEB" "\n"
@@ -1258,7 +1263,7 @@ static const size_t OV_WEB_PAGE_LENGTH = sizeof(OV_WEB_PAGE) - 1;
 static const char OV_WEB_PAGE_HEADERS[] =
     "Content-Security-Policy: "
     "default-src 'none'; "
-    "script-src 'sha256-VJ9s0uKHP0vB/8iKJFP5Q9qppXeKvJLGY/J49v6KC54='; "
+    "script-src 'sha256-+1rmcWwQ50tv1EshvYE7osqzMu5NFVf8I6P3HCW82w0='; "
     "style-src 'sha256-Ww9KXXDgOmF/WhmUHbakfApV1Aazm40Ei8oarUHhAcw='; "
     "connect-src 'self'; "
     "img-src data:; "

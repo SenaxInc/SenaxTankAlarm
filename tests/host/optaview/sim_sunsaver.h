@@ -56,6 +56,7 @@ class SimSunSaver : public optaview::MbTransport {
   uint32_t resetDownMs = 1500;       // silent for this long after a reset
   uint8_t leadingNoiseBytes = 0;     // 0x00 bytes in front of every reply (the DE-flip artifact)
   bool powered = true;               // false: nothing answers
+  uint32_t portMaxBaud = 0;          // the serial port refuses a higher baud rate (0 = no limit)
   // How the controller encodes voltages: n = V * 32768 / numerator. Three figures, because the
   // specification gives 100 for everything but the regulation target (96.667), and a real
   // controller may differ from it in any of the three.
@@ -232,6 +233,7 @@ class SimSunSaver : public optaview::MbTransport {
   bool configure(uint32_t baud, uint8_t format) override {
     ++configures;
     if (format > optaview::MB_8O1 || baud < 300) return false;
+    if (portMaxBaud != 0 && baud > portMaxBaud) return false;
     linkBaud_ = baud;
     linkFormat_ = format;
     incoming_.clear();
