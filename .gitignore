@@ -13,6 +13,7 @@
 **/ServerConfig.h
 **/ClientConfig.h
 **/ViewerConfig.h
+**/OptaViewConfig.h
 
 # Build directories
 build/

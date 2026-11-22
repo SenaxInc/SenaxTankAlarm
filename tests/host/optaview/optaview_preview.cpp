@@ -1,0 +1,394 @@
+// OptaView on a PC: the web page and the USB console of the firmware, with the simulated
+// SunSaver (sim_sunsaver.h) in place of the RS-485 port and a TCP socket of this PC in place of
+// the Opta's Ethernet port.
+//
+//   make preview ARDUINOJSON_DIR=/path/to/ArduinoJson/src
+//   then open http://127.0.0.1:8080/ in a browser
+//
+// Everything above the hardware is the firmware's own code: the HTTP reader, the login, the
+// API, the console and the page as it is built into the sketch, with its Content-Security-Policy.
+// So this is where a change to web/index.html is tried out, and what the browser test
+// (browser/page_test.js) drives. What it cannot show is the Opta's network stack; the address
+// policy of OptaViewNet.h is not part of it either.
+//
+// The terminal is the USB console: type 'help', 'status', 'web pin 2468'. A line that starts
+// with "sim" goes to the simulated controller instead:
+//
+//   sim power off|on       the controller loses or gets back its power
+//   sim battery <volts>    what it measures at the battery terminals
+//   sim refuse on|off      it refuses every write (Modbus exception 4)
+//   sim delay <ms>         how long it takes to answer
+//   sim skip <seconds>     this much time passes at once (a session ends after 30 minutes)
+//   sim writes             how many requests that change something it has received
+//   sim quit
+//
+// Options: --port <n> (default 8080; 0 takes any free port and prints it), --pin <digits>
+// (start with this PIN, as OptaViewConfig.h does on the Opta).
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <string>
+
+#include "OptaViewBuiltinProfile.h"
+#include "OptaViewConsole.h"
+#include "OptaViewDevice.h"
+#include "OptaViewHttp.h"
+#include "OptaViewModbus.h"
+#include "OptaViewProfile.h"
+#include "OptaViewText.h"
+#include "OptaViewWeb.h"
+#include "OptaViewWebPage.h"
+#include "sim_sunsaver.h"
+
+using namespace optaview;
+
+static uint64_t realMs() {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)(now.tv_nsec / 1000000L);
+}
+
+// The simulated controller on a clock that keeps step with the PC's: a millisecond of waiting
+// takes a millisecond. (The tests run it on a clock that only counts.)
+class LiveSunSaver : public SimSunSaver {
+ public:
+  unsigned writes;  // requests that change something: a coil (function 5) or a register (6)
+
+  LiveSunSaver() : writes(0), startMs_(realMs()), skippedMs_(0) {}
+
+  void send(const uint8_t *data, size_t len) override {
+    if (len > 1 && (data[1] == 0x05 || data[1] == 0x06)) {
+      ++writes;
+    }
+    SimSunSaver::send(data, len);
+    // The log of every frame is for the tests. A preview may run for days.
+    requests.clear();
+    requestTimes.clear();
+  }
+
+  void idle() override {
+    advance(1);
+    const uint64_t due = startMs_ + (elapsedMs() - skippedMs_);
+    const uint64_t now = realMs();
+    if (due > now) {
+      struct timespec wait;
+      wait.tv_sec = (time_t)((due - now) / 1000ULL);
+      wait.tv_nsec = (long)((due - now) % 1000ULL) * 1000000L;
+      nanosleep(&wait, nullptr);
+    }
+  }
+
+  // Time that passes without anybody waiting for it.
+  void skip(uint32_t ms) {
+    advance(ms);
+    skippedMs_ += ms;
+  }
+
+ private:
+  uint64_t startMs_;
+  uint64_t skippedMs_;
+};
+
+struct LiveClock : OvClock {
+  LiveSunSaver &sim;
+  explicit LiveClock(LiveSunSaver &s) : sim(s) {}
+  uint32_t nowMs() override { return sim.nowMs(); }
+  void idle() override { sim.idle(); }
+};
+
+// One browser connection.
+class PcConn : public OvConn {
+ public:
+  PcConn() : fd_(-1) {}
+  bool isFree() const { return fd_ < 0; }
+  void open(int fd) { fd_ = fd; }
+
+  int read() override {
+    uint8_t byte;
+    if (fd_ >= 0 && ::recv(fd_, &byte, 1, MSG_DONTWAIT) == 1) {
+      return byte;
+    }
+    return -1;  // nothing now, or the browser has closed: the reader's time limits deal with both
+  }
+
+  bool write(const uint8_t *data, size_t len) override {
+    while (len > 0) {
+      if (fd_ < 0) {
+        return false;
+      }
+      const ssize_t sent = ::send(fd_, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (sent > 0) {
+        data += sent;
+        len -= (size_t)sent;
+      } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // Like the Opta's Ethernet client, which gives a write a second and a half.
+        struct pollfd ready = {fd_, POLLOUT, 0};
+        if (::poll(&ready, 1, 1500) <= 0) {
+          return false;
+        }
+      } else if (!(sent < 0 && errno == EINTR)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void close() override {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+ private:
+  int fd_;
+};
+
+class PcWebHost : public OvWebHost {
+ public:
+  PcWebHost() : listener_(-1), port_(0) {}
+
+  // Listens on this PC only: 127.0.0.1.
+  bool listen(uint16_t port) {
+    listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_ < 0) {
+      return false;
+    }
+    const int on = 1;
+    ::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    socklen_t size = sizeof(address);
+    if (::bind(listener_, (struct sockaddr *)&address, sizeof(address)) != 0 || ::listen(listener_, 8) != 0 ||
+        ::getsockname(listener_, (struct sockaddr *)&address, &size) != 0 ||
+        ::fcntl(listener_, F_SETFL, O_NONBLOCK) != 0) {
+      ::close(listener_);
+      listener_ = -1;
+      return false;
+    }
+    port_ = ntohs(address.sin_port);
+    return true;
+  }
+
+  uint16_t port() const { return port_; }
+
+  OvConn *accept() override {
+    for (size_t i = 0; i < sizeof(conns_) / sizeof(conns_[0]); ++i) {
+      if (conns_[i].isFree()) {
+        const int fd = ::accept(listener_, nullptr, nullptr);
+        if (fd < 0) {
+          return nullptr;
+        }
+        conns_[i].open(fd);
+        return &conns_[i];
+      }
+    }
+    return nullptr;
+  }
+
+  void random(uint8_t *out, size_t len) override {
+    FILE *source = fopen("/dev/urandom", "rb");
+    if (source == nullptr || fread(out, 1, len, source) != len) {
+      fprintf(stderr, "optaview_preview: /dev/urandom cannot be read\n");
+      exit(1);
+    }
+    fclose(source);
+  }
+
+  bool address(char *out, size_t cap) override {
+    snprintf(out, cap, "127.0.0.1:%u", (unsigned)port_);
+    return true;
+  }
+
+ private:
+  int listener_;
+  uint16_t port_;
+  PcConn conns_[OV_WEB_SLOTS];  // the server holds no more than this many at a time
+};
+
+// The terminal as the USB console's output and its "has a key been pressed".
+class TerminalOut : public OvOut {
+ public:
+  void write(const char *text, size_t len) override { fwrite(text, 1, len, stdout); }
+};
+
+class Terminal : public OvConsoleHost {
+ public:
+  Terminal() : open_(true) {}
+
+  // A line that has been typed, without its line ending. False when there is none yet.
+  bool takeLine(std::string *line) {
+    fill();
+    const size_t end = buffer_.find('\n');
+    if (end == std::string::npos) {
+      return false;
+    }
+    *line = buffer_.substr(0, end);
+    buffer_.erase(0, end + 1);
+    if (!line->empty() && (*line)[line->size() - 1] == '\r') {
+      line->erase(line->size() - 1);
+    }
+    return true;
+  }
+
+  // On a terminal a "key press" is a line: the terminal hands over what was typed at Enter.
+  bool inputPending() override {
+    fill();
+    return !buffer_.empty();
+  }
+  void discardInput() override {
+    fill();
+    buffer_.clear();
+  }
+
+ private:
+  std::string buffer_;
+  bool open_;
+
+  void fill() {
+    while (open_) {
+      struct pollfd ready = {STDIN_FILENO, POLLIN, 0};
+      if (::poll(&ready, 1, 0) <= 0) {
+        return;
+      }
+      char chunk[256];
+      const ssize_t got = ::read(STDIN_FILENO, chunk, sizeof(chunk));
+      if (got > 0) {
+        buffer_.append(chunk, (size_t)got);
+      } else if (!(got < 0 && errno == EINTR)) {
+        open_ = false;  // no terminal (any more): the page is still served
+      }
+    }
+  }
+};
+
+static bool isOnOff(const std::string &word, bool *on) {
+  if (word == "on" || word == "off") {
+    *on = word == "on";
+    return true;
+  }
+  return false;
+}
+
+// A "sim ..." line. Every change is confirmed with one line that starts with "sim:", which the
+// browser test waits for.
+static void simCommand(LiveSunSaver &sim, const std::string &line) {
+  char verb[16] = "";
+  char value[32] = "";
+  sscanf(line.c_str(), "sim %15s %31s", verb, value);
+  const std::string what(verb);
+  bool on = false;
+  char *end = nullptr;
+  const double number = strtod(value, &end);
+  const bool numeric = value[0] != '\0' && *end == '\0';
+  if (what == "power" && isOnOff(value, &on)) {
+    sim.powered = on;
+    printf("sim: the controller has %s\n", on ? "power" : "no power");
+  } else if (what == "battery" && numeric && number >= 0.0 && number <= 40.0) {
+    sim.regs[0x0008] = sim.volts(number);
+    printf("sim: the battery is at %.2f V\n", number);
+  } else if (what == "refuse" && isOnOff(value, &on)) {
+    sim.refuseWrites = on;
+    printf("sim: writes are %s\n", on ? "refused" : "accepted");
+  } else if (what == "delay" && numeric && number >= 0.0 && number <= 10000.0) {
+    sim.responseDelayMs = (uint32_t)number;
+    printf("sim: replies take %u ms\n", (unsigned)sim.responseDelayMs);
+  } else if (what == "skip" && numeric && number >= 0.0 && number <= 86400.0) {
+    sim.skip((uint32_t)(number * 1000.0));
+    printf("sim: %u s have passed\n", (unsigned)number);
+  } else if (what == "writes") {
+    printf("sim: %u writes so far\n", sim.writes);
+  } else if (what == "quit") {
+    printf("sim: bye\n");
+    fflush(stdout);
+    exit(0);
+  } else {
+    printf("sim: power off|on, battery <volts>, refuse on|off, delay <ms>, skip <seconds>, writes, quit\n");
+  }
+}
+
+int main(int argc, char **argv) {
+  long port = 8080;
+  const char *pin = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+      port = strtol(argv[++i], nullptr, 10);
+    } else if (strcmp(argv[i], "--pin") == 0 && i + 1 < argc) {
+      pin = argv[++i];
+    } else {
+      fprintf(stderr, "usage: optaview_preview [--port <n>] [--pin <4 to 8 digits>]\n");
+      return 2;
+    }
+  }
+  if (port < 0 || port > 65535) {
+    fprintf(stderr, "optaview_preview: a port is 0 to 65535\n");
+    return 2;
+  }
+  signal(SIGPIPE, SIG_IGN);
+
+  static LiveSunSaver sim;
+  static ModbusMaster master(sim);
+  static OvProfile profile;
+  static OvDevice device(master, profile);
+  static LiveClock clock(sim);
+  static PcWebHost host;
+  static TerminalOut out;
+  static Terminal terminal;
+  static OvConsole console(out, terminal, device);
+  static const OvWebPage page = {OV_WEB_PAGE, OV_WEB_PAGE_LENGTH, OV_WEB_PAGE_HEADERS};
+  static OvWeb web(device, host, clock, page);
+
+  char problem[160];
+  if (!profile.load(OV_BUILTIN_PROFILE, sizeof(OV_BUILTIN_PROFILE) - 1, problem, sizeof(problem))) {
+    fprintf(stderr, "optaview_preview: the built-in profile did not load (%s)\n", problem);
+    return 1;
+  }
+  device.useProfileDefaults();
+  device.applyLink();
+  if (pin != nullptr && !web.setPin(pin)) {
+    fprintf(stderr, "optaview_preview: a PIN is 4 to 8 digits\n");
+    return 2;
+  }
+  if (!host.listen((uint16_t)port)) {
+    fprintf(stderr, "optaview_preview: cannot listen on 127.0.0.1:%ld (%s)\n", port, strerror(errno));
+    return 1;
+  }
+  console.addExtra(&web);
+
+  printf("OptaView preview with a simulated SunSaver: http://127.0.0.1:%u/\n", (unsigned)host.port());
+  printf("This terminal is its USB console. 'sim' lists what changes the simulated controller.\n");
+  console.begin();
+  console.prompt();
+  fflush(stdout);
+
+  for (;;) {
+    std::string line;
+    while (terminal.takeLine(&line)) {
+      if (line.compare(0, 3, "sim") == 0 && (line.size() == 3 || line[3] == ' ')) {
+        simCommand(sim, line);
+      } else {
+        console.handleLine(line.c_str());
+      }
+      console.prompt();
+      fflush(stdout);
+    }
+    web.poll();
+    sim.idle();
+  }
+}

@@ -5,9 +5,16 @@
  * fall back from block requests to single registers, the probe sweep, verified writes, the
  * reset sequence, the pair checks and the voltage scale check.
  *
- * Nothing here prints. The USB console (OptaViewConsole.h) decides what to show, and a web UI
- * can later sit on the same calls. No Arduino dependency, so the host tests run this code
- * against a simulated SunSaver.
+ * Nothing here prints. The USB console (OptaViewConsole.h) decides what to show, and the web
+ * page (OptaViewWeb.h) sits on the same calls. No Arduino dependency, so the host tests run this
+ * code against a simulated SunSaver.
+ *
+ * More than one front end
+ * -----------------------
+ * The USB console and the web page work on the same controller at the same time. What one of
+ * them learns or changes has to hold for the other, so it is kept here and in neither of them:
+ * what 'scalecheck' found, whether settings are waiting for a restart, and a count of everything
+ * that makes a question that is waiting for "yes" out of date (see generation()).
  *
  * Reads and the MRC-1
  * -------------------
@@ -350,11 +357,18 @@ class OvDevice {
         profile_(profile),
         blocksFailed_(false),
         linkDown_(false),
-        consecutiveFailures_(0) {
+        consecutiveFailures_(0),
+        settingsFound_(0.0),
+        liveFound_(0.0),
+        settingsEpoch_(0),
+        liveEpoch_(0),
+        generation_(0),
+        resetNeeded_(false) {
     link.slave = 1;
     link.baud = 9600;
     link.format = MB_8N2;
     link.readFunction = MB_FC_READ_INPUT;
+    settled_ = link;
   }
 
   OvLink link;
@@ -374,6 +388,7 @@ class OvDevice {
     master_.responseTimeoutMs = d.responseTimeoutMs;
     blockMode = OV_BLOCKS_AUTO;
     blocksFailed_ = false;
+    settleLink();
   }
 
   // (Re)opens the serial port with link.baud and link.format.
@@ -400,6 +415,85 @@ class OvDevice {
     consecutiveFailures_ = 0;
   }
   bool linkDown() const { return linkDown_; }
+
+  // -------------------------------------------------------------------------------------------
+  // What the front ends share
+  // -------------------------------------------------------------------------------------------
+
+  // The numerator that 'scalecheck' found for a voltage scale on the controller at the other end
+  // of the link, or 0 when nothing has been found (set 0 to take a finding back).
+  double settingsScaleFound() const { return settingsFound_; }
+  double liveScaleFound() const { return liveFound_; }
+  void setSettingsScaleFound(double numerator) {
+    settingsFound_ = numerator;
+    ++settingsEpoch_;
+  }
+  void setLiveScaleFound(double numerator) {
+    liveFound_ = numerator;
+    ++liveEpoch_;
+  }
+
+  // A scale is confirmed while it has the numerator that was found on this controller. Changing
+  // it by hand to anything else makes it unconfirmed again. "Open": the profile wants the scale
+  // tested, and it is not confirmed.
+  bool settingsScaleConfirmed() const {
+    return confirmed(profile_.scaleCheck().settingsScale, settingsFound_);
+  }
+  bool liveScaleConfirmed() const { return confirmed(profile_.scaleCheck().liveScale, liveFound_); }
+  bool settingsScaleOpen() const {
+    return profile_.scaleCheck().settingsScale != nullptr && !settingsScaleConfirmed();
+  }
+  bool liveScaleOpen() const { return profile_.scaleCheck().liveScale != nullptr && !liveScaleConfirmed(); }
+
+  // These count up whenever somebody who has been told "this scale is not confirmed" has to be
+  // told again: the link may lead to another controller, a check found something, or the scale
+  // was changed by hand. A front end remembers the count at which it gave its reminder.
+  uint32_t settingsScaleEpoch() const { return settingsEpoch_; }
+  uint32_t liveScaleEpoch() const { return liveEpoch_; }
+
+  // A scale's numerator was changed by hand ('scale <name> <x>'). A value that was shown with
+  // the old figure no longer means the same raw word.
+  void scaleChanged(const OvScale *scale) {
+    const OvScaleCheck &check = profile_.scaleCheck();
+    if (scale == check.settingsScale) {
+      ++settingsEpoch_;
+    }
+    if (scale == check.liveScale) {
+      ++liveEpoch_;
+    }
+    ++generation_;
+  }
+
+  // Settings were written and the controller has not restarted since: it does not use them yet.
+  bool resetNeeded() const { return resetNeeded_; }
+  void noteSettingsWritten() { resetNeeded_ = true; }
+
+  // Counts everything that can make a question that is waiting for "yes" out of date: a write,
+  // a restart, other link settings, another scale. A front end notes the count when it asks and
+  // sends nothing if the count has moved by the time the answer comes, because the other front
+  // end has changed what the question was about.
+  uint32_t generation() const { return generation_; }
+  // For a request that went to the controller without passing through this class.
+  void noteControllerChanged() { ++generation_; }
+
+  // Call after every command. 'scalecheck' judged the controller that was at the other end of
+  // the link at the time; another slave address or other serial settings may reach another
+  // controller, so what was found there does not carry over. Returns true when something that
+  // had been found was dropped.
+  bool settleLink() {
+    if (link.slave == settled_.slave && link.baud == settled_.baud && link.format == settled_.format) {
+      settled_ = link;
+      return false;
+    }
+    settled_ = link;
+    const bool had = settingsFound_ > 0.0 || liveFound_ > 0.0;
+    settingsFound_ = 0.0;
+    liveFound_ = 0.0;
+    ++settingsEpoch_;
+    ++liveEpoch_;
+    ++generation_;
+    return had;
+  }
 
   // One read request for `count` words, repeated after a link failure. The master lets one more
   // timeout pass before the repeat, so that a reply that is merely late is not taken for its
@@ -650,11 +744,15 @@ class OvDevice {
     OvWriteOutcome out;
     memset(&out, 0, sizeof(out));
     out.write = master_.writeRegister(link.slave, reg.addr, raw);
+    ++generation_;
     beginBatch();
     uint16_t stored = 0;
     readOne(reg.addr, &stored, &out.readBack);
     out.readBackRaw = stored;
     out.verified = out.readBack.status == MB_OK && stored == raw;
+    if (out.verified) {
+      resetNeeded_ = true;
+    }
     return out;
   }
 
@@ -668,7 +766,10 @@ class OvDevice {
     return r;
   }
 
-  MbResult writeCoil(const OvCoil &coil, bool on) { return master_.writeCoil(link.slave, coil.addr, on); }
+  MbResult writeCoil(const OvCoil &coil, bool on) {
+    ++generation_;
+    return master_.writeCoil(link.slave, coil.addr, on);
+  }
 
   // Restarts the controller through the profile's reset coil, waits, then asks until it answers.
   OvResetOutcome resetController(OvAbortCheck *abort) {
@@ -680,6 +781,7 @@ class OvDevice {
     }
     MbTransport &transport = master_.transport();
     out.command = master_.writeCoil(link.slave, defaults.resetCoil->addr, true);
+    ++generation_;
     out.sent = out.command.status != MB_BAD_REQUEST;
     if (out.command.status == MB_EXCEPTION || out.command.status == MB_BAD_REQUEST) {
       return out;  // refused: it did not restart
@@ -697,6 +799,7 @@ class OvDevice {
       const MbResult r = master_.readRegisters(link.slave, link.readFunction, defaults.probeRegister->addr, 1, &raw);
       if (r.status == MB_OK || r.status == MB_EXCEPTION) {
         out.cameBack = true;
+        resetNeeded_ = false;
         break;
       }
       if ((uint32_t)(transport.nowMs() - start) >= OV_RESET_GIVE_UP_MS) {
@@ -764,6 +867,21 @@ class OvDevice {
   bool blocksFailed_;
   bool linkDown_;
   uint8_t consecutiveFailures_;
+  OvLink settled_;          // the link settings that the findings below belong to
+  double settingsFound_;
+  double liveFound_;
+  uint32_t settingsEpoch_;
+  uint32_t liveEpoch_;
+  uint32_t generation_;
+  bool resetNeeded_;
+
+  static bool confirmed(const OvScale *scale, double found) {
+    if (scale == nullptr || !(found > 0.0)) {
+      return false;
+    }
+    const double gap = scale->num - found;
+    return gap < 0.001 && gap > -0.001;
+  }
 
   // What a scale may really be: the numerator in use now ('scale' may have changed it), the one
   // in the profile file, and the profile's alternates.

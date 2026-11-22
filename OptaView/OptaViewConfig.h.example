@@ -1,0 +1,38 @@
+/**
+ * OptaViewConfig.h  -  what one installation sets for itself (optional)
+ *
+ * Copy this file to "OptaViewConfig.h" in the same folder, take the "//" off the lines you want
+ * and change their values. The sketch picks the file up when it is compiled. Without the file,
+ * and for every line that stays commented out, OptaView does what is described below.
+ *
+ * A value that cannot be used stops the build with a message that names the setting.
+ *
+ * OptaViewConfig.h is listed in .gitignore, so a PIN written here stays out of the repository.
+ * Anybody who has the compiled firmware can still read it there.
+ */
+
+#ifndef OPTAVIEW_CONFIG_H
+#define OPTAVIEW_CONFIG_H
+
+// The PIN of the web page: 4 to 8 digits, in quotes.
+// Without this line there is no PIN at power-on, and the first browser that opens the page
+// chooses one, which lasts until power-off. With it, nobody who gets to the page first can do
+// that. 'web pin' on the USB console changes the PIN until power-off either way.
+// #define OPTAVIEW_WEB_PIN "2468"
+
+// How the Opta gets its address:
+//   "auto"    DHCP first; when nothing answers within 20 s, the fixed address below
+//   "dhcp"    DHCP only, for as long as it takes
+//   "static"  the fixed address below, at once
+// #define OPTAVIEW_NET_MODE "auto"
+
+// The fixed address and its subnet mask.
+// #define OPTAVIEW_NET_ADDRESS "192.168.1.16"
+// #define OPTAVIEW_NET_MASK "255.255.255.0"
+
+// The gateway (the router). Without this line it is the first address of the network, which is
+// where a router usually is: 192.168.1.1 for the address above. "" says that there is none; the
+// Opta then answers only devices on its own network.
+// #define OPTAVIEW_NET_GATEWAY "192.168.1.1"
+
+#endif  // OPTAVIEW_CONFIG_H

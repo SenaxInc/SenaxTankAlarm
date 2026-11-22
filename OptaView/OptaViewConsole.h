@@ -1,8 +1,11 @@
 /**
  * OptaViewConsole.h
  *
- * The OptaView console: one line of text in, text out. OptaView.ino feeds it from USB Serial;
- * the host tests feed it strings and read what it prints.
+ * The OptaView console: one line of text in, text out. OptaView.ino feeds one from USB Serial,
+ * the web page (OptaViewWeb.h) feeds another one of its own, and the host tests feed it strings
+ * and read what it prints. Every console on a device shares what the device knows about the
+ * controller (OptaViewDevice.h), and nothing else: a question that waits for "yes" belongs to
+ * the console that asked it.
  *
  * Rules the console keeps (review findings F-26 / X-R03 on the v0.1 demo):
  *   - It only calls a controller "found" when a register read came back with data.
@@ -26,7 +29,7 @@
 
 namespace optaview {
 
-static const char OV_VERSION[] = "0.2.0";
+static const char OV_VERSION[] = "0.3.0";
 static const size_t OV_LINE_MAX = 160;
 static const int OV_MAX_ARGS = 24;
 static const size_t OV_VALUE_TEXT = 200;
@@ -40,7 +43,25 @@ class OvConsoleHost {
   virtual bool inputPending() = 0;
   // Throws away what was typed to stop a command.
   virtual void discardInput() = 0;
+  // False where nobody can press a key (the web page's console): the console then leaves out
+  // "Press a key to stop", and refuses the one command that only a key press ends.
+  virtual bool hasKeys() { return true; }
 };
+
+// Commands that belong to something outside the console: the network, the web page. The sketch
+// adds them to the USB console; 'help' and 'status' then show them as well.
+class OvConsoleExtra {
+ public:
+  virtual ~OvConsoleExtra() {}
+  // Runs the command if it is one of its own. Returns false when it is not.
+  virtual bool command(int argc, char **argv, OvOut &out) = 0;
+  // Its lines for 'help', the heading included.
+  virtual void help(OvOut &out) = 0;
+  // Its lines for 'status'.
+  virtual void status(OvOut &out) = 0;
+};
+
+static const uint8_t OV_MAX_EXTRAS = 4;
 
 // Collects typed characters into a line, with echo and backspace, for a terminal that sends
 // each key as it is pressed. Lines may end with CR, LF or CR LF.
@@ -81,6 +102,9 @@ class OvLineEditor {
 
   const char *line() const { return line_; }
 
+  // True while nothing is typed on the line that is being collected.
+  bool empty() const { return length_ == 0; }
+
   // Forgets a half-typed line (the terminal was closed and opened again).
   void clear() {
     length_ = 0;
@@ -100,6 +124,107 @@ class OvLineEditor {
   bool skipLineFeed_;
 };
 
+// A JSON string.
+inline void ovPrintJsonString(OvOut &out, const char *text) {
+  out.printChar('"');
+  for (const char *p = text; *p != '\0'; ++p) {
+    const unsigned char c = (unsigned char)*p;
+    if (c == '"' || c == '\\') {
+      out.printChar('\\');
+      out.printChar((char)c);
+    } else if (c < 0x20) {
+      out.print("\\u00");
+      out.printHex(c, 2);
+    } else {
+      out.printChar((char)c);
+    }
+  }
+  out.printChar('"');
+}
+
+// The snapshot: the raw words of every register in the profile, as one JSON object to keep. The
+// console prints it between two markers and the web page offers it as a download. `abort` may
+// stop it early; what was not read by then counts as missing. Returns how many registers are
+// missing.
+inline uint32_t ovPrintSnapshot(OvDevice &device, OvOut &out, OvAbortCheck *abort) {
+  OvProfile &profile = device.profile();
+  out.println("{");
+  out.print("  \"optaview\": ");
+  ovPrintJsonString(out, OV_VERSION);
+  out.println(",");
+  out.print("  \"profile\": ");
+  ovPrintJsonString(out, profile.id());
+  out.println(",");
+  out.print("  \"profileVersion\": ");
+  ovPrintJsonString(out, profile.version());
+  out.println(",");
+  out.print("  \"link\": {\"slave\": ");
+  out.printU(device.link.slave);
+  out.print(", \"baud\": ");
+  out.printU(device.link.baud);
+  out.print(", \"format\": \"");
+  out.print(mbFormatName(device.link.format));
+  out.print("\", \"readFunction\": ");
+  out.printU(device.link.readFunction);
+  out.println("},");
+  out.println("  \"registers\": [");
+  size_t cursor = 0;
+  OvSpan span;
+  uint16_t words[OV_MAX_SPAN_WORDS];
+  OvWordStatus status[OV_MAX_SPAN_WORDS];
+  bool first = true;
+  uint32_t missing = 0;
+  while (device.nextSpan(nullptr, &cursor, &span)) {
+    if (abort != nullptr && abort->aborted()) {
+      // Count what is left as missing.
+      missing += (uint32_t)(profile.registerCount() - span.first);
+      break;
+    }
+    device.readSpan(span.addr, span.words, words, status);
+    uint16_t offset = 0;
+    for (size_t k = 0; k < span.count; ++k) {
+      const OvRegister &reg = profile.reg(span.first + k);
+      const OvWordStatus regStatus = OvDevice::combine(status + offset, reg.words);
+      if (!first) {
+        out.println(",");
+      }
+      first = false;
+      out.print("    {\"addr\": \"0x");
+      out.printHex(reg.addr, 4);
+      out.print("\", \"name\": ");
+      ovPrintJsonString(out, reg.name);
+      if (regStatus.status == MB_OK) {
+        char text[OV_VALUE_TEXT];
+        ovFormatValue(reg, words + offset, text, sizeof(text));
+        out.print(", \"raw\": [");
+        for (uint8_t w = 0; w < reg.words; ++w) {
+          if (w > 0) {
+            out.print(", ");
+          }
+          out.printU(words[offset + w]);
+        }
+        out.print("], \"text\": ");
+        ovPrintJsonString(out, text);
+      } else {
+        char text[64];
+        ovDescribeStatus(regStatus, text, sizeof(text));
+        out.print(", \"error\": ");
+        ovPrintJsonString(out, text);
+        ++missing;
+      }
+      out.print("}");
+      offset = (uint16_t)(offset + reg.words);
+    }
+  }
+  out.println();
+  out.println("  ],");
+  out.print("  \"missing\": ");
+  out.printU(missing);
+  out.println();
+  out.println("}");
+  return missing;
+}
+
 class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortCheck {
  public:
   OvConsole(OvOut &out, OvConsoleHost &host, OvDevice &device)
@@ -111,10 +236,20 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         stopped_(false),
         blocksNoticeShown_(false),
         writeNotesShown_(false),
-        resetPending_(false) {
+        extraCount_(0) {
     memset(&pending_, 0, sizeof(pending_));
     memset(&settingsScale_, 0, sizeof(settingsScale_));
     memset(&liveScale_, 0, sizeof(liveScale_));
+    memset(extras_, 0, sizeof(extras_));
+  }
+
+  // Adds commands from outside the console. Returns false when there is no room for more.
+  bool addExtra(OvConsoleExtra *extra) {
+    if (extra == nullptr || extraCount_ >= OV_MAX_EXTRAS) {
+      return false;
+    }
+    extras_[extraCount_++] = extra;
+    return true;
   }
 
   void begin() {
@@ -144,18 +279,35 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     return was;
   }
 
+  // Somebody else is at this console now: an open question, expert mode and the trace were the
+  // last visitor's, and so is everything this console says only once.
+  void newVisitor() {
+    pending_.kind = PENDING_NONE;
+    expert_ = false;
+    if (trace_) {
+      trace_ = false;
+      if (device_.master().trace == this) {
+        device_.master().trace = nullptr;
+      }
+    }
+    writeNotesShown_ = false;
+    blocksNoticeShown_ = false;
+    settingsScale_.noticed = false;
+    liveScale_.noticed = false;
+  }
+
+  bool traceOn() const { return trace_; }
+
   // One line from the user. Two things are settled here because they hold for every command
   // alike: the note about late replies, and what 'scalecheck' found once the link may reach
   // another controller.
   void handleLine(const char *line) {
-    const OvLink before = device_.link;
     const uint32_t lateBefore = device_.master().stats.lateArrivals;
     runLine(line);
     if (device_.master().stats.lateArrivals != lateBefore) {
       lateNotice();
     }
-    const OvLink &now = device_.link;
-    if (now.slave != before.slave || now.baud != before.baud || now.format != before.format) {
+    if (device_.settleLink()) {
       forgetController();
     }
   }
@@ -245,6 +397,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     } else if (is(cmd, "yes") || is(cmd, "no")) {
       out_.println("Nothing is waiting for a yes or a no.");
     } else {
+      for (uint8_t i = 0; i < extraCount_; ++i) {
+        if (extras_[i]->command(argc, argv, out_)) {
+          return;
+        }
+      }
       out_.print("Unknown command ");
       printQuoted(cmd);
       out_.println(". 'help' lists the commands.");
@@ -298,6 +455,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     uint16_t value;
     uint8_t body[OV_MAX_ARGS];  // PENDING_RAW_FRAME: slave, function and the bytes as typed
     uint8_t bodyLength;
+    uint32_t generation;        // OvDevice::generation() when the question was asked
   };
 
   OvOut &out_;
@@ -307,19 +465,21 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   bool expert_;
   bool trace_;
   bool stopped_;
-  // What this session knows about one of the two voltage scales that 'scalecheck' tests. The
+  // What this console has said about one of the two voltage scales that 'scalecheck' tests. The
   // stored settings and the live readings have a scale each, and each is settled on its own
-  // evidence.
+  // evidence. What a check found is the device's to keep (every console shares it); here is only
+  // whether this console's user has been reminded.
   struct ScaleState {
-    double found;  // the numerator 'scalecheck' found on this controller; 0 = nothing yet
-    bool shown;    // the command that is running printed a value that uses it
-    bool noticed;  // the user has been told that it is not confirmed
+    bool shown;        // the command that is running printed a value that uses it
+    bool noticed;      // the user has been told that it is not confirmed...
+    uint32_t atEpoch;  // ...and nothing has happened since that calls for telling it again
   };
   ScaleState settingsScale_;
   ScaleState liveScale_;
   bool blocksNoticeShown_;
   bool writeNotesShown_;
-  bool resetPending_;
+  OvConsoleExtra *extras_[OV_MAX_EXTRAS];
+  uint8_t extraCount_;
 
   // -------------------------------------------------------------------------------------------
   // Small helpers
@@ -395,6 +555,14 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     *out = (uint8_t)value;
     return true;
+  }
+
+  // Ends a line that announces a long command, with how to stop it where there is a way.
+  void stopHint(const char *hint) {
+    if (host_.hasKeys()) {
+      out_.print(hint);
+    }
+    out_.println();
   }
 
   bool stopRequested() {
@@ -495,16 +663,16 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     printNumber(den);
   }
 
-  // "vset = x100/32768, not confirmed on this controller"
-  void printScaleState(const OvScale &scale, const ScaleState &state) {
+  // "vset = x100/32768, not confirmed on this controller". `found` is what 'scalecheck' found.
+  void printScaleState(const OvScale &scale, bool confirmed, double found) {
     out_.print(scale.name);
     out_.print(" = ");
     printScale(scale.num, scale.den);
-    if (scaleConfirmed(state, scale)) {
+    if (confirmed) {
       out_.println(", confirmed by 'scalecheck'");
-    } else if (state.found > 0.0) {
+    } else if (found > 0.0) {
       out_.print(", but 'scalecheck' found x");
-      printNumber(state.found);
+      printNumber(found);
       out_.println(" on this controller");
     } else {
       out_.println(", not confirmed on this controller");
@@ -642,48 +810,42 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.println(" ms).");
   }
 
-  // A scale is confirmed while it has the numerator that 'scalecheck' found on this controller.
-  // Changing it by hand to anything else makes it unconfirmed again.
-  static bool scaleConfirmed(const ScaleState &state, const OvScale &scale) {
-    const double gap = scale.num - state.found;
-    return state.found > 0.0 && gap < 0.001 && gap > -0.001;
-  }
-  // "Open": the profile wants this scale tested, and it is not confirmed.
-  bool settingsScaleOpen() const {
-    const OvScale *scale = device_.profile().scaleCheck().settingsScale;
-    return scale != nullptr && !scaleConfirmed(settingsScale_, *scale);
-  }
-  bool liveScaleOpen() const {
-    const OvScale *scale = device_.profile().scaleCheck().liveScale;
-    return scale != nullptr && !scaleConfirmed(liveScale_, *scale);
+  bool settingsScaleOpen() const { return device_.settingsScaleOpen(); }
+  bool liveScaleOpen() const { return device_.liveScaleOpen(); }
+
+  // The link settings changed, so another controller may be answering now. The device has
+  // already dropped what 'scalecheck' found (OvDevice::settleLink); this tells the user.
+  void forgetController() {
+    out_.println("Note: with other link settings this may be another controller, so what 'scalecheck'");
+    out_.println("      found no longer counts. The voltage scales are unconfirmed again.");
   }
 
-  // 'scalecheck' judged the controller that was at the other end of the link at the time.
-  // Another slave address or other serial settings may reach another controller, so what was
-  // found there does not carry over, and neither do the reminders that were given.
-  void forgetController() {
-    const bool had = settingsScale_.found > 0.0 || liveScale_.found > 0.0;
-    settingsScale_.found = 0.0;
-    settingsScale_.noticed = false;
-    liveScale_.found = 0.0;
-    liveScale_.noticed = false;
-    if (had) {
-      out_.println("Note: with other link settings this may be another controller, so what 'scalecheck'");
-      out_.println("      found no longer counts. The voltage scales are unconfirmed again.");
-    }
+  // True while this console's reminder about a scale still stands: it was given, and the device
+  // has not counted anything since that calls for giving it again (another controller, a new
+  // finding, a scale changed by hand, here or on another console).
+  static bool reminded(const ScaleState &state, uint32_t epoch) { return state.noticed && state.atEpoch == epoch; }
+  static void remind(ScaleState *state, uint32_t epoch) {
+    state->noticed = true;
+    state->atEpoch = epoch;
   }
 
   // After a command that printed voltages on a scale that nothing has confirmed: says so, once
   // for each scale. 'scalecheck' brings the reminder back when it finds a scale in use wrong.
   void scaleNotice() {
     const OvScaleCheck &check = device_.profile().scaleCheck();
-    const bool live = liveScaleOpen() && liveScale_.shown && !liveScale_.noticed;
-    const bool settings = settingsScaleOpen() && settingsScale_.shown && !settingsScale_.noticed;
+    const bool live =
+        liveScaleOpen() && liveScale_.shown && !reminded(liveScale_, device_.liveScaleEpoch());
+    const bool settings = settingsScaleOpen() && settingsScale_.shown &&
+                          !reminded(settingsScale_, device_.settingsScaleEpoch());
     if ((!live && !settings) || device_.linkDown()) {
       return;
     }
-    liveScale_.noticed = liveScale_.noticed || live;
-    settingsScale_.noticed = settingsScale_.noticed || settings;
+    if (live) {
+      remind(&liveScale_, device_.liveScaleEpoch());
+    }
+    if (settings) {
+      remind(&settingsScale_, device_.settingsScaleEpoch());
+    }
     const bool both = live && settings;
     out_.println(both ? "Note: voltages are shown with scales that are not confirmed on this controller"
                       : "Note: voltages are shown with a scale that is not confirmed on this controller");
@@ -805,12 +967,19 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         "  sniff [ms]              listen without sending (5000 ms)",
         "  raw <slave> <fc> <address> <count|value>",
         "                          one request; all but functions 1 to 4 need 'expert on' and a yes",
-        "  expert on|off",
-        "In the lists, W marks a setting that 'set' can change and ~ a register taken from the",
-        "specification that has not been confirmed on our bench."};
+        "  expert on|off"};
     for (size_t i = 0; i < sizeof(kLines) / sizeof(kLines[0]); ++i) {
+      // Only a key press ends 'watch', so it is not offered where there are no keys.
+      if (!host_.hasKeys() && strncmp(kLines[i], "  watch ", 8) == 0) {
+        continue;
+      }
       out_.println(kLines[i]);
     }
+    for (uint8_t i = 0; i < extraCount_; ++i) {
+      extras_[i]->help(out_);
+    }
+    out_.println("In the lists, W marks a setting that 'set' can change and ~ a register taken from the");
+    out_.println("specification that has not been confirmed on our bench.");
   }
 
   void cmdStatus() {
@@ -864,12 +1033,12 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     const OvScaleCheck &check = profile.scaleCheck();
     if (check.settingsScale != nullptr) {
       out_.print("Voltage   stored settings: scale ");
-      printScaleState(*check.settingsScale, settingsScale_);
+      printScaleState(*check.settingsScale, device_.settingsScaleConfirmed(), device_.settingsScaleFound());
     }
     if (check.liveScale != nullptr) {
       out_.print(check.settingsScale != nullptr ? "          live readings:   scale "
                                                 : "Voltage   live readings: scale ");
-      printScaleState(*check.liveScale, liveScale_);
+      printScaleState(*check.liveScale, device_.liveScaleConfirmed(), device_.liveScaleFound());
     }
     if (settingsScaleOpen() || liveScaleOpen()) {
       out_.println("          'scalecheck' tests what is not confirmed.");
@@ -878,7 +1047,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(expert_ ? "on" : "off");
     out_.print(", trace ");
     out_.println(trace_ ? "on" : "off");
-    if (resetPending_) {
+    for (uint8_t i = 0; i < extraCount_; ++i) {
+      extras_[i]->status(out_);
+    }
+    if (device_.resetNeeded()) {
       out_.println("Settings were changed in this session. 'reset' makes the controller use them.");
     }
   }
@@ -893,7 +1065,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(reg->name);
     out_.print(" (0x");
     out_.printHex(reg->addr, 4);
-    out_.println("). Press a key to stop.");
+    out_.print(").");
+    stopHint(" Press a key to stop.");
     const OvProbeOutcome outcome = device_.probe(this);
     blocksNoticeShown_ = false;
     if (outcome.found) {
@@ -964,7 +1137,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.printU(device_.link.baud);
     out_.printChar(' ');
     out_.print(mbFormatName(device_.link.format));
-    out_.println(". Press a key to stop.");
+    out_.print(".");
+    stopHint(" Press a key to stop.");
     const uint16_t savedTimeout = master.responseTimeoutMs;
     if (master.responseTimeoutMs > OV_PROBE_TIMEOUT_MS) {
       master.responseTimeoutMs = OV_PROBE_TIMEOUT_MS;
@@ -1037,6 +1211,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     if (device_.profile().liveGroupCount() == 0) {
       out_.println("This profile names no live groups. Use 'dump'.");
+      return;
+    }
+    if (!host_.hasKeys()) {
+      out_.println("'watch' runs until a key is pressed, and there are no keys here. 'live' reads once.");
       return;
     }
     MbTransport &transport = device_.master().transport();
@@ -1208,104 +1386,13 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.println("Coils come from the specification and have not been tried on our bench.");
   }
 
-  void printJsonString(const char *text) {
-    out_.printChar('"');
-    for (const char *p = text; *p != '\0'; ++p) {
-      const unsigned char c = (unsigned char)*p;
-      if (c == '"' || c == '\\') {
-        out_.printChar('\\');
-        out_.printChar((char)c);
-      } else if (c < 0x20) {
-        out_.print("\\u00");
-        out_.printHex(c, 2);
-      } else {
-        out_.printChar((char)c);
-      }
-    }
-    out_.printChar('"');
-  }
-
   void cmdSnapshot() {
-    OvProfile &profile = device_.profile();
     // What lies between the two markers has to be valid JSON, so the trace keeps quiet meanwhile.
     ModbusMaster &master = device_.master();
     MbTraceSink *const trace = master.trace;
     master.trace = nullptr;
     out_.println("--- snapshot begins ---");
-    out_.println("{");
-    out_.print("  \"optaview\": ");
-    printJsonString(OV_VERSION);
-    out_.println(",");
-    out_.print("  \"profile\": ");
-    printJsonString(profile.id());
-    out_.println(",");
-    out_.print("  \"profileVersion\": ");
-    printJsonString(profile.version());
-    out_.println(",");
-    out_.print("  \"link\": {\"slave\": ");
-    out_.printU(device_.link.slave);
-    out_.print(", \"baud\": ");
-    out_.printU(device_.link.baud);
-    out_.print(", \"format\": \"");
-    out_.print(mbFormatName(device_.link.format));
-    out_.print("\", \"readFunction\": ");
-    out_.printU(device_.link.readFunction);
-    out_.println("},");
-    out_.println("  \"registers\": [");
-    size_t cursor = 0;
-    OvSpan span;
-    uint16_t words[OV_MAX_SPAN_WORDS];
-    OvWordStatus status[OV_MAX_SPAN_WORDS];
-    bool first = true;
-    uint32_t missing = 0;
-    while (device_.nextSpan(nullptr, &cursor, &span)) {
-      if (stopRequested()) {
-        // Count what is left as missing.
-        missing += (uint32_t)(profile.registerCount() - span.first);
-        break;
-      }
-      device_.readSpan(span.addr, span.words, words, status);
-      uint16_t offset = 0;
-      for (size_t k = 0; k < span.count; ++k) {
-        const OvRegister &reg = profile.reg(span.first + k);
-        const OvWordStatus regStatus = OvDevice::combine(status + offset, reg.words);
-        if (!first) {
-          out_.println(",");
-        }
-        first = false;
-        out_.print("    {\"addr\": \"0x");
-        out_.printHex(reg.addr, 4);
-        out_.print("\", \"name\": ");
-        printJsonString(reg.name);
-        if (regStatus.status == MB_OK) {
-          char text[OV_VALUE_TEXT];
-          ovFormatValue(reg, words + offset, text, sizeof(text));
-          out_.print(", \"raw\": [");
-          for (uint8_t w = 0; w < reg.words; ++w) {
-            if (w > 0) {
-              out_.print(", ");
-            }
-            out_.printU(words[offset + w]);
-          }
-          out_.print("], \"text\": ");
-          printJsonString(text);
-        } else {
-          char text[64];
-          ovDescribeStatus(regStatus, text, sizeof(text));
-          out_.print(", \"error\": ");
-          printJsonString(text);
-          ++missing;
-        }
-        out_.print("}");
-        offset = (uint16_t)(offset + reg.words);
-      }
-    }
-    out_.println();
-    out_.println("  ],");
-    out_.print("  \"missing\": ");
-    out_.printU(missing);
-    out_.println();
-    out_.println("}");
+    const uint32_t missing = ovPrintSnapshot(device_, out_, this);
     out_.println("--- snapshot ends ---");
     master.trace = trace;
     if (trace != nullptr) {
@@ -1508,14 +1595,6 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.println(" at the battery voltage.");
   }
 
-  // Keeps what a test found. That either confirms the scale in use or shows it to be the wrong
-  // one; then the reminder after reads comes back until the user switches the scale.
-  void takeVerdict(ScaleState *state, const OvScaleCandidates &candidates, int8_t verdict) {
-    state->found = candidates.num[verdict];
-    if (verdict > 0) {
-      state->noticed = false;
-    }
-  }
 
   void cmdScaleCheck(int argc, char **argv) {
     OvProfile &profile = device_.profile();
@@ -1554,7 +1633,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       static const char kLabel[] = "  Stored settings: ";
       if (settings.verdict >= 0) {
         printFoundScale(kLabel, *check.settingsScale, check.settingsFileNum, settings.candidates, settings.verdict);
-        takeVerdict(&settingsScale_, settings.candidates, settings.verdict);
+        // The device keeps what a test found. That either confirms the scale in use or shows it
+        // to be the wrong one; then the reminder after reads comes back until the scale is
+        // switched.
+        device_.setSettingsScaleFound(settings.candidates.num[settings.verdict]);
       } else {
         out_.print(kLabel);
         out_.println("cannot tell from these setpoints.");
@@ -1566,21 +1648,20 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       static const char kLabel[] = "  Live readings:   ";
       if (live.verdict >= 0) {
         printFoundScale(kLabel, *check.liveScale, check.liveFileNum, live.candidates, live.verdict);
-        takeVerdict(&liveScale_, live.candidates, live.verdict);
+        device_.setLiveScaleFound(live.candidates.num[live.verdict]);
         if (live.conflict) {
           printTargetScaleHint(check, live);
         }
       } else if (live.meterCompared && live.meterMatches == 0) {
         out_.print(kLabel);
         out_.println("the multimeter fits none of the candidates, so this stays open.");
-        if (liveScale_.found > 0.0) {
+        if (device_.liveScaleFound() > 0.0) {
           // The reading contradicts every candidate, the one an earlier check settled on included.
           out_.print("     That takes back what an earlier check found (");
-          printCandidate(liveScale_.found);
+          printCandidate(device_.liveScaleFound());
           out_.println(").");
         }
-        liveScale_.found = 0.0;
-        liveScale_.noticed = false;
+        device_.setLiveScaleFound(0.0);
         out_.print("     If the reading is right, the scale is x");
         out_.printFixed(live.impliedNumerator, 2);
         out_.print(": 'scale ");
@@ -1638,13 +1719,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(" is now ");
     printScale(scale->num, scale->den);
     out_.println(" until OptaView restarts. The profile file is unchanged.");
-    // One of the two tested scales, set to something that 'scalecheck' has not found on this
-    // controller: the reminders about it start again.
-    ScaleState *state = scale == profile.scaleCheck().settingsScale ? &settingsScale_
-                        : scale == profile.scaleCheck().liveScale   ? &liveScale_
-                                                                    : nullptr;
-    if (state != nullptr && !scaleConfirmed(*state, *scale)) {
-      state->noticed = false;
+    // The device counts the change: the reminders about a tested scale start again, and a
+    // question that is waiting for "yes" somewhere showed its value with the old figure.
+    device_.scaleChanged(scale);
+    const OvScaleCheck &check = profile.scaleCheck();
+    if ((scale == check.settingsScale && settingsScaleOpen()) || (scale == check.liveScale && liveScaleOpen())) {
       out_.println("'scalecheck' has not confirmed that figure on this controller.");
     }
   }
@@ -1799,7 +1878,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     previewChecks(*reg, raw);
     printWriteNotes();
     out_.println("Type yes to write it. Anything else cancels.");
-    pending_.kind = PENDING_SET;
+    ask(PENDING_SET);
     pending_.reg = reg;
     pending_.value = raw;
   }
@@ -1824,7 +1903,6 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(" ");
       printRawWords(readBack, 1);
       out_.println();
-      resetPending_ = true;
       if (device_.profile().modbus().resetCoil != nullptr) {
         out_.println("The controller uses it after a restart: 'reset' when all your changes are in.");
       }
@@ -1882,7 +1960,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.printHex(coil->addr, 4);
     out_.println(")? Coils have not been tried on our bench.");
     out_.println("Type yes to send it. Anything else cancels.");
-    pending_.kind = PENDING_COIL;
+    ask(PENDING_COIL);
     pending_.coil = coil;
     pending_.on = on;
   }
@@ -1957,11 +2035,12 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.printHex(profile.modbus().resetCoil->addr, 4);
     out_.println("). Charging and the load output may drop out for a moment.");
     out_.println("Type yes to restart it. Anything else cancels.");
-    pending_.kind = PENDING_RESET;
+    ask(PENDING_RESET);
   }
 
   void runReset() {
-    out_.println("Restarting the controller. Press a key to stop waiting.");
+    out_.print("Restarting the controller.");
+    stopHint(" Press a key to stop waiting.");
     const OvResetOutcome outcome = device_.resetController(this);
     if (!outcome.sent) {
       out_.println("The reset command could not be sent.");
@@ -1993,14 +2072,27 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print("The controller answers again after ");
     out_.printFixed((double)outcome.backAfterMs / 1000.0, 1);
     out_.println(" s.");
-    resetPending_ = false;
     printLiveGroups();
     out_.println("If a fault above still asks for a reset, the controller did not restart: try again or");
     out_.println("power-cycle it.");
     afterReads();
   }
 
+  // Opens a question. The caller fills in what it is about.
+  void ask(uint8_t kind) {
+    pending_.kind = kind;
+    pending_.generation = device_.generation();
+  }
+
   void runPending(const Pending &action) {
+    if (action.generation != device_.generation()) {
+      // Between the question and the yes, another console (the web page, or this USB port seen
+      // from there) wrote to the controller or changed the link or a scale. What was shown with
+      // the question may no longer be true, so nothing is sent on the strength of it.
+      out_.println("Not sent: the controller or the link was changed from elsewhere after this was asked.");
+      out_.println("Give the command again to see how things are now.");
+      return;
+    }
     switch (action.kind) {
       case PENDING_SET:
         runSet(action);
@@ -2176,7 +2268,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     MbTransport &transport = device_.master().transport();
     out_.print("Listening for ");
     out_.printU(ms);
-    out_.println(" ms without sending. Press a key to stop.");
+    out_.print(" ms without sending.");
+    stopHint(" Press a key to stop.");
     const uint32_t start = transport.nowMs();
     uint8_t burst[64];
     size_t count = 0;
@@ -2295,7 +2388,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.println(
           "OptaView cannot tell what this request does: it may change the controller, and nothing is checked.");
       out_.println("Type yes to send it. Anything else cancels.");
-      pending_.kind = PENDING_RAW_FRAME;
+      ask(PENDING_RAW_FRAME);
       pending_.bodyLength = (uint8_t)length;
       return;
     }
@@ -2317,7 +2410,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.printU(function);
       out_.println("? No limits apply and nothing is checked first.");
       out_.println("Type yes to send it. Anything else cancels.");
-      pending_.kind = PENDING_RAW_WRITE;
+      ask(PENDING_RAW_WRITE);
       pending_.slave = (uint8_t)slave;
       pending_.function = (uint8_t)function;
       pending_.addr = (uint16_t)addr;
@@ -2365,6 +2458,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
 
   void runRawFrame(const Pending &action) {
     const MbResult result = device_.master().rawRequest(action.body, action.bodyLength);
+    device_.noteControllerChanged();
     printLastExchange(result);
   }
 
@@ -2376,10 +2470,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     } else {
       result = master.writeSingle(action.slave, action.function, action.addr, action.value);
     }
+    device_.noteControllerChanged();
     printLastExchange(result);
     if (result.status == MB_OK) {
       out_.println("Acknowledged.");
-      resetPending_ = true;
+      device_.noteSettingsWritten();
     } else {
       out_.print("Not accepted: ");
       describe(result);

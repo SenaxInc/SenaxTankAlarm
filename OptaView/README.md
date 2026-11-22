@@ -2,15 +2,21 @@
 
 OptaView turns an Arduino Opta into a field tool for Morningstar charge controllers: an open
 replacement for the Windows-only MSView. It talks Modbus RTU over the Opta's RS-485 port to a
-SunSaver MPPT through an MRC-1 adapter, and you drive it from any serial terminal over USB.
+SunSaver MPPT through an MRC-1 adapter. You drive it from a web page that the Opta serves on
+its Ethernet port, or from any serial terminal over USB.
 
-**Version 0.2** can find the controller, show its meters and status, list every documented
+**Version 0.3** can find the controller, show its meters and status, list every documented
 register, save a snapshot of all of them, and change stored settings such as the low voltage
-disconnect, with a check before and a read-back after each write.
+disconnect, with a check before and a read-back after each write. New in 0.3 is
+[the web page](#the-web-page), which does all of that from a browser.
 
-> **Status.** Version 0.2 is a rewrite of the June 2026 demo. Its logic is tested on a PC
-> against a simulated SunSaver (`tests/host/optaview`), and the sketch is built in CI.
-> **It has not been run against a real controller yet.** The section
+![The Live view of the web page](screenshots/live.png)
+
+> **Status.** Version 0.2 rewrote the June 2026 demo and 0.3 adds the web page. The logic is
+> tested on a PC against a simulated SunSaver, the page is driven in a real browser against
+> that simulation, and the sketch is built in CI (see [Tests](#tests)).
+> **OptaView has not been run on an Opta yet: not against a real controller, and its network
+> side not on a real Ethernet port.** The section
 > [What is confirmed on hardware](#what-is-confirmed-on-hardware) lists what that leaves open,
 > and [First session](#first-session) starts with steps that only read.
 
@@ -18,7 +24,9 @@ disconnect, with a check before and a read-back after each write.
 
 - An Arduino Opta with RS-485 (Opta RS485 or Opta WiFi).
 - A Morningstar MRC-1 MeterBus adapter between the Opta and the SunSaver MPPT.
-- Libraries: **ArduinoRS485** and **ArduinoJson** (version 7).
+- For the web page: an Ethernet cable from the Opta to your network, or straight to a laptop.
+- Libraries: **ArduinoRS485** and **ArduinoJson** (version 7). The Ethernet library comes with
+  the Opta's board package.
 
 ### Wiring
 
@@ -48,9 +56,108 @@ Open the serial monitor at **115200 baud** and set the line ending to **New Line
 greets each time a terminal opens the port. It echoes what you type, so switch local echo off in
 terminal programs such as PuTTY.
 
+A PIN for the web page and a fixed network address can be built in before you compile: see
+[Network and PIN](#network-and-pin).
+
+## The web page
+
+Plug the Opta into the network and open `http://<its address>/` in a browser. The USB console
+shows the address when a terminal opens the port, when the network changes, and with `net`:
+
+```text
+Network   address 192.168.1.57 from DHCP
+Web page  http://192.168.1.57/, no PIN yet: the first visitor chooses it
+```
+
+Where no DHCP server answers, as on a cable straight to a laptop, the Opta takes
+**192.168.1.16** after 20 seconds. Give the laptop an address on the same network, such as
+192.168.1.20 with the mask 255.255.255.0.
+
+The first browser that opens the page chooses a PIN of 4 to 8 digits, unless one is built in.
+After that the page has four views:
+
+| View | |
+|---|---|
+| **Live** | The meters and the status registers, read again every 5 seconds |
+| **Settings** | Every stored setting with the value the controller holds now, the range OptaView allows and a field for a new value, under the notes to read before writing |
+| **Controller** | Restart, the switches (coils), any group of registers as a table, and where the register map comes from |
+| **Tools** | Find the controller, link status, the voltage scale check, a snapshot to download, the wiring checklist, and the console itself |
+
+![Changing the low voltage disconnect](screenshots/settings-confirm.png)
+
+The page decides nothing about a change by itself. Change, Switch on and Restart send the
+console's own commands (`set EV_lvd 13.10`, `coil ... on`, `reset`) and show the console's own
+text in a dialog. The limits, the pair checks, the question before a write and the read-back
+after it are therefore the ones under [What keeps a session safe](#what-keeps-a-session-safe).
+Yes and Cancel answer the question that is on the screen and no other. Everything the page
+sent is in the log of the Tools view, where the console also takes commands as you type them.
+
+It is laid out for a phone as well:
+
+<img src="screenshots/phone-settings.png" width="300" alt="The Settings view on a phone">
+
+What to know before you rely on it:
+
+- **It is not encrypted.** The Opta has no TLS here, so the PIN and the session cross the
+  network in the clear. Use the page on a network you trust and never put it on the internet.
+  The PIN keeps somebody who is on that network from changing settings in passing. It is not
+  more than that.
+- **One browser is logged in at a time.** Logging in from a second one ends the first one's
+  session. A session also ends after 30 minutes in which nobody did anything (the readings the
+  page takes by itself do not count), and with `web logout` on the USB console.
+- **Wrong PINs are answered more and more slowly:** the next try has to wait 1 second, then 2,
+  4, 8 and 30 seconds, and up to 15 minutes. `web pin <digits>` on the USB console sets a new
+  PIN and ends the wait.
+- **One thing at a time.** The Opta answers one request and then the next. While a command
+  runs on the USB console the page waits, and the other way round. A command from the page
+  that takes longer than a minute is stopped, and so is one whose browser has gone.
+- **Open it by its address.** A request that names the Opta in any other way than by its IP
+  address is refused, which keeps a page from another web site from reaching the Opta through
+  your browser.
+- **Nothing is kept at power-off:** not a PIN chosen in the browser, not a network mode typed
+  at the console. What is built in with `OptaViewConfig.h` is what the Opta starts with.
+- `watch` belongs to the USB console. On the page the Live view does that job.
+
+## Network and PIN
+
+| Mode | |
+|---|---|
+| `auto` (the default) | DHCP first. When no address has arrived after 20 s, the fixed address. If the cable only goes in after that, DHCP gets one more try |
+| `dhcp` | DHCP only, for as long as it takes |
+| `static` | The fixed address at once |
+
+The fixed address is 192.168.1.16 with the mask 255.255.255.0, unless you set another. These
+commands of the USB console change things until power-off:
+
+| Command | |
+|---|---|
+| `net` | The address, where it came from, the mode and the Opta's hardware (MAC) address |
+| `net auto`, `net dhcp` | Change the mode |
+| `net static <address> [mask] [gateway]` | A fixed address, for example `net static 10.20.30.40 255.255.0.0` |
+| `web` | Where the page is, whether a PIN is set and whether a browser is logged in |
+| `web pin <digits>`, `web pin clear` | Set the PIN, or let the next visitor choose it |
+| `web logout` | End the browser's session |
+
+To build settings in, copy `OptaViewConfig.h.example` to `OptaViewConfig.h` next to the sketch,
+take the `//` off the lines you need and upload again:
+
+```cpp
+#define OPTAVIEW_WEB_PIN "2468"
+#define OPTAVIEW_NET_MODE "static"
+#define OPTAVIEW_NET_ADDRESS "192.168.5.20"
+```
+
+`OptaViewConfig.h` is in `.gitignore`, so a PIN in it stays out of the repository. A value that
+cannot be used (a PIN with a letter in it, an address like 192.168.1.300, a gateway on another
+network) stops the build with a message that names the setting.
+
 ## First session
 
-The first four steps only read. Nothing is written to the controller until step 6.
+The first four steps only read. Nothing is written to the controller until step 6. The steps
+are given as console commands. On the web page they are Find the controller under Tools (1),
+the Live view (2), the register tables of the Controller view (3), Download a snapshot (4) and
+the voltage scale check (5) under Tools, Change in the Settings view (6) and Restart in the
+Controller view (7).
 
 1. `probe` looks for the controller: it tries the link settings in use, then the usual
    alternatives, and reports a find only when a register was actually read.
@@ -132,13 +239,15 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 | `sniff [ms]` | Listen on the bus without sending |
 | `raw <slave> <fc> <address> <count\|value>` | One request as typed |
 | `expert on\|off` | Allow `raw` to send more than reads (each still asks for `yes`) |
+| `net ...`, `web ...` | The network address and the web page's PIN: see [Network and PIN](#network-and-pin). USB console only |
 
-Long commands stop when you press a key.
+Long commands stop when you press a key. The console of the web page takes the same commands,
+except `watch`, `net` and `web`.
 
 ## What keeps a session safe
 
-The June demo treated any reply with a valid CRC as success (review finding F-26). Version 0.2
-keeps these rules, and the host tests check each of them:
+The June demo treated any reply with a valid CRC as success (review finding F-26). Since
+version 0.2 OptaView keeps these rules, and the host tests check each of them:
 
 - A reply counts only if its slave address, function, length and CRC all match the request,
   and a write only if the controller repeats the address and value. An exception reply is
@@ -162,6 +271,13 @@ keeps these rules, and the host tests check each of them:
   serial settings make both scales unconfirmed again. A different controller on the same cable
   and settings looks the same to OptaView, so run `scalecheck` again after swapping one.
 - Currents are signed, so a small night-time back current reads as -0.04 A and not as 158 A.
+- The web page changes the controller only by sending these same commands, and it shows what
+  the console answered. An answer names the question it belongs to, so a Yes that arrives late,
+  twice or from another tab changes nothing, and `yes` typed as a command agrees to nothing.
+- A request that changes something is accepted only from OptaView's own page in the browser
+  that is logged in: it needs the session cookie, which scripts cannot read, and a header that
+  a page from another site cannot send. The page itself is served with a policy that lets the
+  browser run its one script and nothing else.
 
 ## The voltage scales
 
@@ -228,8 +344,13 @@ registers 0x0008 to 0x000C one at a time with function 4 at 9600 baud, 8N2, slav
 
 Not confirmed yet, and so the first things to try:
 
-- OptaView 0.2 itself. Only the transmit sequence and the port settings are carried over
+- OptaView itself. Only the transmit sequence and the port settings are carried over
   unchanged from sketches that ran on the bench.
+- The network side of 0.3. It was written from the source of the Opta's Ethernet library and
+  tested with stand-ins for it, so all of this waits for an Opta: getting an address by DHCP,
+  falling back to the fixed address, the listener on port 80, how quickly pages load (the
+  library starts a thread for each connection), and the processor's random number generator
+  behind the session tokens.
 - Every register marked `~`, including all the EEPROM settings.
 - Reading several registers in one request. OptaView tries it, and if the adapter does not
   answer blocks it falls back to single registers and says so.
@@ -273,36 +394,84 @@ git clone --depth 1 --branch v7.4.3 https://github.com/bblanchon/ArduinoJson.git
 make -C tests/host/optaview test ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 ```
 
-The suite runs the same headers the sketch compiles against a simulated SunSaver that can drop,
-cut, corrupt and delay replies, refuse blocks, answer at another address or speed, and restart.
-Run `tests/host/optaview/build/optaview_test_o2` with `OPTAVIEW_TRANSCRIPT=session.txt` set to
-keep everything the console printed, which shows what a session looks like without a controller
-on the bench.
+Two suites run the same headers the sketch compiles. `optaview_test` drives the console against
+a simulated SunSaver that can drop, cut, corrupt and delay replies, refuse blocks, answer at
+another address or speed, and restart. `optaview_web_test` writes HTTP requests as text and has
+the web server answer them on top of that simulation, and it walks the address policy through
+cables that go in late and DHCP servers that never answer. Run
+`tests/host/optaview/build/optaview_test_o2` with `OPTAVIEW_TRANSCRIPT=session.txt` set to keep
+everything the console printed, which shows what a session looks like without a controller on
+the bench.
+
+### The page without an Opta
+
+```bash
+make -C tests/host/optaview preview ARDUINOJSON_DIR=/tmp/ArduinoJson/src
+```
+
+This builds the firmware's web server and console as a program for your PC, with the simulated
+SunSaver behind them, and serves the page at <http://127.0.0.1:8080/>. Its terminal is the USB
+console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
+`sim power off`, `sim refuse on` (every write is refused), `sim delay 300`. Add
+`PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
+simulated controller answers as the specification says, so the preview shows the page and not
+how a real SunSaver behaves.
+
+```bash
+npm install playwright@1.63.0 && npx playwright install chromium    # once, in a folder of your choice
+NODE_PATH=<that folder>/node_modules make -C tests/host/optaview browser-test ARDUINOJSON_DIR=/tmp/ArduinoJson/src
+```
+
+This drives the page of the preview in Chromium: choosing a PIN, the readings, a change with
+Cancel and with Yes, a value outside its limits, the restart, the switches, the snapshot,
+wrong PINs, sessions that end, a window the size of a phone, and an Opta that goes away. It
+also fails if the browser blocks anything under the page's policy or if the page asks anything
+of another server. `BROWSER_TEST_ARGS="--shots <folder>"` saves the screenshots this README
+uses. CI runs it as the `optaview-page` check.
+
+The page is one file, `web/index.html`. After editing it:
+
+```bash
+python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
+```
+
+The script also works out the hashes that the page's policy names for its style sheet and its
+script, and refuses a page that needs more than that policy allows (an inline event handler, a
+file from another server). The host tests fail when the header is out of date.
 
 ## Files
 
 | File | |
 |---|---|
-| `OptaView.ino` | The glue: RS-485 port, USB serial, startup |
+| `OptaView.ino` | The glue: RS-485 port, USB serial, Ethernet port, startup |
 | `OptaViewModbus.h` | Modbus RTU master that checks every reply |
 | `OptaViewProfile.h` | Profile loader, and raw values to units and back |
 | `OptaViewDevice.h` | Block reads with fallback, probe, verified writes, reset, scale check |
 | `OptaViewConsole.h` | The commands and the line editor |
+| `OptaViewHttp.h` | The HTTP that the page needs: reading a request, writing an answer |
+| `OptaViewNet.h` | How the Opta gets its address, and the `net` commands |
+| `OptaViewWeb.h` | The web server: PIN and session, the API, the console over HTTP, the `web` commands |
 | `OptaViewText.h` | Number formatting and parsing without `printf` |
 | `OptaViewBuiltinProfile.h` | The profile as embedded text (generated) |
+| `OptaViewWebPage.h` | The page as embedded text, with its policy (generated) |
+| `OptaViewConfig.h.example` | Template for a built-in PIN and network address |
 | `profiles/sunsaver-mppt.json` | The SunSaver MPPT register map |
-| `tools/` | Profile lint and embedding |
+| `web/index.html` | The page |
+| `tools/` | Profile lint, and embedding of the profile and of the page |
 
 Only `OptaView.ino` needs an Arduino. The headers have no Arduino dependency, which is what
-lets the tests run them.
+lets the tests run them, and what lets the preview serve the page from a PC.
 
 ## What comes next
 
 The plan is [`CODE REVIEW/OPTAVIEW_NEW_REPO_DESIGN_04222026.md`](../CODE%20REVIEW/OPTAVIEW_NEW_REPO_DESIGN_04222026.md).
-Version 0.2 is its foundation under a serial console. Still to come from it:
+Version 0.2 was its foundation under a serial console, and 0.3 is its web interface over
+Ethernet. Still to come:
 
-1. A first run on the bench, and the corrections to the profile that it brings.
-2. The web interface over WiFi or Ethernet: live monitor, settings editor, probe wizard.
+1. A first run on the bench, and the corrections to the profile and to the network side that
+   it brings.
+2. The web page over WiFi on the Opta WiFi, and settings that survive power-off (the PIN, the
+   network mode).
 3. Profiles and snapshots stored on the Opta, and restore from a snapshot with a diff to
    approve.
 4. The logged data (the specification's record layout needs checking on hardware first).

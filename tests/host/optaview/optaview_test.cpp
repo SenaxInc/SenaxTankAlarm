@@ -5,270 +5,7 @@
 //
 // The code under test is compiled as C++14, the dialect of the Opta's compiler.
 
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
-// The profile loader allocates through OV_ALLOC and OV_FREE (see OptaViewProfile.h). Here they
-// count what is live and can make any one allocation fail.
-static long gAllocCalls = 0;
-static long gAllocFailAt = -1;
-static long gAllocLive = 0;
-
-static void *testAlloc(size_t count, size_t size) {
-  if (gAllocCalls++ == gAllocFailAt) {
-    return nullptr;
-  }
-  ++gAllocLive;
-  return calloc(count, size);
-}
-
-static void testFree(const void *pointer) {
-  if (pointer != nullptr) {
-    --gAllocLive;
-    free(const_cast<void *>(pointer));
-  }
-}
-
-#define OV_ALLOC(count, size) testAlloc((count), (size))
-#define OV_FREE(pointer) testFree(pointer)
-
-#include "OptaViewBuiltinProfile.h"
-#include "OptaViewConsole.h"
-#include "OptaViewDevice.h"
-#include "OptaViewModbus.h"
-#include "OptaViewProfile.h"
-#include "OptaViewText.h"
-#include "sim_sunsaver.h"
-
-using namespace optaview;
-
-// ============================================================================
-// Minimal test framework
-// ============================================================================
-static long gChecks = 0;
-static long gFailures = 0;
-static std::string gTranscript;  // everything the console printed, checked for plain ASCII at the end
-
-static std::string fmtStr(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static std::string fmtStr(const char *fmt, ...) {
-  char buf[1024];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  return std::string(buf);
-}
-
-static void reportFailure(const char *file, int line, const char *expr, const std::string &detail) {
-  ++gFailures;
-  if (gFailures <= 100) {
-    fprintf(stderr, "%s:%d: CHECK failed: %s%s%s\n", file, line, expr, detail.empty() ? "" : "  -- ", detail.c_str());
-  }
-}
-
-#define CHECK(cond)                                                            \
-  do {                                                                         \
-    ++gChecks;                                                                 \
-    if (!(cond)) reportFailure(__FILE__, __LINE__, #cond, std::string());      \
-  } while (0)
-
-#define CHECK_MSG(cond, ...)                                                    \
-  do {                                                                          \
-    ++gChecks;                                                                  \
-    if (!(cond)) reportFailure(__FILE__, __LINE__, #cond, fmtStr(__VA_ARGS__)); \
-  } while (0)
-
-#define CHECK_EQ(actual, expected)                                                                  \
-  do {                                                                                              \
-    ++gChecks;                                                                                      \
-    const long long checkActual = (long long)(actual);                                              \
-    const long long checkExpected = (long long)(expected);                                          \
-    if (checkActual != checkExpected)                                                               \
-      reportFailure(__FILE__, __LINE__, #actual " == " #expected,                                   \
-                    fmtStr("got %lld (0x%llX), expected %lld (0x%llX)", checkActual,               \
-                           (unsigned long long)checkActual, checkExpected, (unsigned long long)checkExpected)); \
-  } while (0)
-
-static std::string excerpt(const std::string &text) {
-  return text.size() > 700 ? text.substr(0, 700) + "..." : text;
-}
-
-static bool has(const std::string &text, const char *needle) { return text.find(needle) != std::string::npos; }
-
-// These two take the text once. It is usually `rig.run("...")`, and a check that failed must not
-// run the command a second time to show what it printed.
-#define CHECK_HAS(text, needle)                                                                          \
-  do {                                                                                                   \
-    ++gChecks;                                                                                           \
-    const std::string checkText = (text);                                                                \
-    if (!has(checkText, (needle)))                                                                       \
-      reportFailure(__FILE__, __LINE__, "output contains " #needle, "output was:\n" + excerpt(checkText)); \
-  } while (0)
-
-#define CHECK_HASNT(text, needle)                                                                                \
-  do {                                                                                                           \
-    ++gChecks;                                                                                                   \
-    const std::string checkText = (text);                                                                        \
-    if (has(checkText, (needle)))                                                                                \
-      reportFailure(__FILE__, __LINE__, "output does not contain " #needle, "output was:\n" + excerpt(checkText)); \
-  } while (0)
-
-static bool near(double a, double b, double tolerance) { return a > b ? a - b <= tolerance : b - a <= tolerance; }
-
-// The line of `text` that contains `needle`, or "" when there is none.
-static std::string lineWith(const std::string &text, const char *needle) {
-  const size_t at = text.find(needle);
-  if (at == std::string::npos) {
-    return std::string();
-  }
-  size_t start = text.rfind('\n', at);
-  start = start == std::string::npos ? 0 : start + 1;
-  size_t end = text.find('\r', at);
-  if (end == std::string::npos) {
-    end = text.size();
-  }
-  return text.substr(start, end - start);
-}
-
-static size_t countOf(const std::string &text, const char *needle) {
-  size_t count = 0;
-  for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
-    ++count;
-  }
-  return count;
-}
-
-static std::string replaced(std::string text, const char *from, const char *to) {
-  const size_t at = text.find(from);
-  if (at == std::string::npos) {
-    fprintf(stderr, "test bug: '%s' is not in the profile text\n", from);
-    exit(2);
-  }
-  text.replace(at, strlen(from), to);
-  return text;
-}
-
-// ============================================================================
-// Rigs
-// ============================================================================
-struct StringOut : OvOut {
-  std::string text;
-  void write(const char *data, size_t len) override {
-    // A command that prints without end has to fail its test, not fill the memory.
-    if (text.size() > 16u * 1024u * 1024u) {
-      throw std::runtime_error("it has printed more than 16 MB and has not returned");
-    }
-    text.append(data, len);
-  }
-};
-
-struct FakeHost : OvConsoleHost {
-  SimSunSaver *sim;
-  uint64_t keyAt;
-  unsigned discards;
-  FakeHost() : sim(nullptr), keyAt(std::numeric_limits<uint64_t>::max()), discards(0) {}
-  bool inputPending() override { return sim->elapsedMs() >= keyAt; }
-  void discardInput() override {
-    keyAt = std::numeric_limits<uint64_t>::max();
-    ++discards;
-  }
-  // The user presses a key `ms` from now.
-  void pressKeyAfter(uint32_t ms) { keyAt = sim->elapsedMs() + ms; }
-};
-
-// The Modbus master alone on a simulated controller.
-struct Bare {
-  SimSunSaver sim;
-  ModbusMaster master;
-  Bare() : master(sim) { sim.configure(9600, MB_8N2); }
-};
-
-// The whole stack: simulator, master, built-in profile, device and console.
-struct Rig {
-  SimSunSaver sim;
-  ModbusMaster master;
-  OvProfile profile;
-  OvDevice device;
-  StringOut out;
-  FakeHost host;
-  OvConsole console;
-
-  // The numerators say how the simulated controller encodes the voltages it measures, its
-  // stored settings (0 = like the measured ones) and its regulation target.
-  explicit Rig(double voltsNumerator = 100.0, const char *profileJson = OV_BUILTIN_PROFILE,
-               double settingsNumerator = 0.0, double referenceNumerator = 96.667)
-      : sim(voltsNumerator, settingsNumerator, referenceNumerator),
-        master(sim),
-        device(master, profile),
-        console(out, host, device) {
-    char error[200];
-    const bool ok = profile.load(profileJson, strlen(profileJson), error, sizeof(error));
-    CHECK_MSG(ok, "profile did not load: %s", error);
-    device.useProfileDefaults();
-    device.applyLink();
-    host.sim = &sim;
-  }
-
-  std::string run(const std::string &line) {
-    out.text.clear();
-    try {
-      console.handleLine(line.c_str());
-    } catch (const std::runtime_error &stuck) {
-      // The simulator's clock or the output gave up on a command that would not end. That is
-      // one failed check, and the tests carry on.
-      ++gChecks;
-      reportFailure(__FILE__, __LINE__, ("the command '" + line + "' returns").c_str(), stuck.what());
-      out.text.clear();
-    }
-    gTranscript += out.text;
-    return out.text;
-  }
-
-  // Requests the master has sent with this function code.
-  size_t sent(uint8_t function) const {
-    size_t count = 0;
-    for (size_t i = 0; i < sim.requests.size(); ++i) {
-      if (sim.requests[i].size() > 1 && sim.requests[i][1] == function) {
-        ++count;
-      }
-    }
-    return count;
-  }
-};
-
-// A small profile for the tests that need their own register map.
-static const char kMiniProfile[] =
-    "{\"schema\":1,\"profile\":\"mini\",\"title\":\"Mini\",\"version\":\"1\","
-    "\"scales\":{\"v\":{\"num\":100,\"den\":32768,\"units\":\"V\",\"decimals\":2}},"
-    "\"labels\":{\"st\":[\"A\",\"B\"]},"
-    "\"groups\":[{\"name\":\"g\",\"title\":\"G\"}],"
-    "\"registers\":["
-    "{\"addr\":\"0xE010\",\"name\":\"a\",\"scale\":\"v\",\"group\":\"g\",\"writable\":true,\"min\":1,\"max\":20},"
-    "{\"addr\":57361,\"name\":\"b\",\"type\":\"enum\",\"labels\":\"st\",\"group\":\"g\"},"
-    "{\"addr\":\"0xE012\",\"name\":\"c\",\"type\":\"u32\",\"group\":\"g\"},"
-    "{\"addr\":\"0xE014\",\"name\":\"d\",\"group\":\"h\"},"
-    "{\"addr\":\"0xE015\",\"name\":\"e\",\"type\":\"u32\",\"order\":\"lo-hi\",\"group\":\"h\"}],"
-    "\"coils\":[{\"addr\":\"0xFF\",\"name\":\"reset\",\"trigger\":true}],"
-    "\"modbus\":{\"slaveId\":1,\"baud\":9600,\"format\":\"8N2\",\"readFunction\":4,\"maxBlock\":3,"
-    "\"probeRegister\":\"a\",\"resetCoil\":\"reset\"},"
-    "\"liveGroups\":[\"g\"],"
-    "\"checks\":[{\"below\":\"a\",\"above\":\"d\",\"message\":\"m\"}]}";
-
-static std::vector<uint8_t> bytes(std::initializer_list<int> list) {
-  std::vector<uint8_t> out;
-  for (int value : list) {
-    out.push_back((uint8_t)value);
-  }
-  return out;
-}
+#include "test_support.h"
 
 // ============================================================================
 // Modbus master
@@ -1905,6 +1642,20 @@ static std::string typeInto(OvLineEditor &editor, StringOut &echo, const std::st
 }
 
 static void testLineEditor() {
+  {  // Nothing is typed until a character that counts arrives, and again after each Enter.
+    OvLineEditor editor;
+    StringOut echo;
+    CHECK(editor.empty());
+    CHECK(typeInto(editor, echo, "\x01\x1B\b") == "" && editor.empty());
+    CHECK(typeInto(editor, echo, "l") == "" && !editor.empty());
+    CHECK(typeInto(editor, echo, "\b") == "" && editor.empty());
+    CHECK(typeInto(editor, echo, "li") == "" && !editor.empty());
+    CHECK(typeInto(editor, echo, "ve\r") == "live|" && editor.empty());
+    CHECK(typeInto(editor, echo, "\n") == "" && editor.empty());
+    CHECK(typeInto(editor, echo, "x") == "" && !editor.empty());
+    editor.clear();
+    CHECK(editor.empty());
+  }
   {  // Lines end with LF, CR or CR LF, and each Enter is one line.
     OvLineEditor editor;
     StringOut echo;
@@ -1977,7 +1728,7 @@ static void testConsoleBasics() {
   Rig rig;
   rig.out.text.clear();
   rig.console.begin();
-  CHECK_HAS(rig.out.text, "OptaView 0.2.0");
+  CHECK_HAS(rig.out.text, "OptaView 0.3.0");
   CHECK_HAS(rig.out.text, "Morningstar SunSaver MPPT");
   CHECK_HAS(rig.out.text, "slave 1, 9600 8N2, read function 4");
   rig.out.text.clear();
@@ -3308,6 +3059,282 @@ static void testWatchSniffTrace() {
   }
 }
 
+// ============================================================================
+// Two front ends on one controller (the USB console and the web page's console)
+// ============================================================================
+
+// A second console on a rig's device, the way the web page has one.
+struct OtherConsole {
+  StringOut out;
+  FakeHost host;
+  OvConsole console;
+  explicit OtherConsole(Rig &rig) : console(out, host, rig.device) { host.sim = &rig.sim; }
+  std::string run(const std::string &line) {
+    out.text.clear();
+    console.handleLine(line.c_str());
+    gTranscript += out.text;
+    return out.text;
+  }
+};
+
+struct PingExtra : OvConsoleExtra {
+  unsigned calls = 0;
+  bool command(int argc, char **argv, OvOut &out) override {
+    if (!ovEqualsIgnoreCase(argv[0], "ping")) {
+      return false;
+    }
+    ++calls;
+    out.print("pong ");
+    out.printU((uint32_t)argc);
+    out.println();
+    return true;
+  }
+  void help(OvOut &out) override {
+    out.println("Extras");
+    out.println("  ping                    answers pong");
+  }
+  void status(OvOut &out) override { out.println("Ping      ready"); }
+};
+
+static void testTwoConsoles() {
+  static const char kStale[] = "Not sent: the controller or the link was changed from elsewhere after this was asked.";
+  {
+    // A "yes" is only good for what the question showed. Once the other front end has written,
+    // restarted the controller, changed the link or changed a scale, nothing is sent on it.
+    Rig rig;
+    OtherConsole web(rig);
+    rig.run("set EV_lvd 12.00");
+    CHECK(rig.console.awaitingConfirmation());
+    web.run("set EV_lvr 13.00");
+    CHECK_HAS(web.run("yes"), "Written and read back: EV_lvr = 13.00 V");
+    const size_t writes = rig.sent(0x06);
+    const std::string late = rig.run("yes");
+    CHECK_HAS(late, kStale);
+    CHECK_HAS(late, "Give the command again to see how things are now.");
+    CHECK_EQ(rig.sent(0x06), writes);
+    CHECK_EQ(rig.sim.regs[0xE022], 0x0EB8);
+    CHECK(!rig.console.awaitingConfirmation());
+    // Asked again, it goes through.
+    rig.run("set EV_lvd 12.00");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_lvd = 12.00 V");
+
+    // The link: even when it is put back, the question was about what was there before.
+    rig.run("set EV_lvd 11.50");
+    web.run("slave 2");
+    web.run("slave 1");
+    CHECK_HAS(rig.run("yes"), kStale);
+    CHECK_EQ(rig.sim.regs[0xE022], rig.sim.setVolts(12.00));
+
+    // A scale: the value in the question was worked out with the old figure.
+    rig.run("set EV_lvd 11.50");
+    web.run("scale vset 96.667");
+    CHECK_HAS(rig.run("yes"), kStale);
+    web.run("scale vset 100");
+
+    // A restart from the other side.
+    rig.run("set EV_lvd 11.50");
+    web.run("reset");
+    CHECK_HAS(web.run("yes"), "The controller answers again");
+    CHECK_HAS(rig.run("yes"), kStale);
+
+    // A coil switched from the other side.
+    rig.run("set EV_lvd 11.50");
+    web.run("coil load_disconnect on");
+    CHECK_HAS(web.run("yes"), "Sent and acknowledged.");
+    CHECK_HAS(rig.run("yes"), kStale);
+
+    // It works both ways round.
+    web.run("coil load_disconnect off");
+    rig.run("set EV_lvd 11.50");
+    CHECK_HAS(rig.run("yes"), "Written and read back");
+    CHECK_HAS(web.run("yes"), kStale);
+    CHECK(rig.sim.coils[0x0001]);
+
+    // Reading changes nothing, so it voids nothing. Neither do the settings that only say how
+    // to ask: the timeout, the read function, block reads.
+    rig.run("set EV_lvd 12.10");
+    web.run("live");
+    web.run("dump load");
+    web.run("status");
+    web.run("timeout 800");
+    web.run("fc 3");
+    web.run("fc 4");
+    web.run("blocks off");
+    web.run("scalecheck");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_lvd = 12.10 V");
+
+    // A question that the other side cancelled, or never answered, voids nothing either.
+    rig.run("set EV_lvd 12.20");
+    web.run("set EV_lvr 13.10");
+    web.run("no");
+    web.run("reset");
+    CHECK(web.console.cancelPending());
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_lvd = 12.20 V");
+  }
+  {
+    // What 'scalecheck' finds belongs to the controller, so both consoles know it.
+    Rig rig;
+    OtherConsole web(rig);
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Careful: the scale of stored settings");
+    web.run("no");
+    CHECK_HAS(rig.run("scalecheck 13.68"), "Verdict");
+    CHECK(rig.device.settingsScaleConfirmed());
+    CHECK(rig.device.liveScaleConfirmed());
+    const std::string status = web.run("status");
+    CHECK_HAS(lineWith(status, "stored settings"), "confirmed by 'scalecheck'");
+    CHECK_HAS(lineWith(status, "live readings"), "confirmed by 'scalecheck'");
+    CHECK_HASNT(web.run("set EV_lvd 12.00"), "Careful: the scale of stored settings");
+    web.run("no");
+    CHECK_HASNT(web.run("live"), "not confirmed on this controller");
+
+    // Another slave address may be another controller: the findings go, for both.
+    const std::string moved = web.run("slave 2");
+    CHECK_HAS(moved, "what 'scalecheck'");
+    CHECK_HAS(moved, "The voltage scales are unconfirmed again.");
+    CHECK(!rig.device.settingsScaleConfirmed());
+    CHECK(!rig.device.liveScaleConfirmed());
+    CHECK_HAS(lineWith(rig.run("status"), "stored settings"), "not confirmed on this controller");
+    // The console that did not change the link has nothing to announce: it is told when it asks.
+    CHECK_HASNT(rig.run("slave 1"), "scalecheck");
+  }
+  {
+    // The reminder about an unconfirmed scale is given once on each console, and again on both
+    // when something has happened that calls for it.
+    static const char kNote[] = "Note: voltages are shown with a scale that is not confirmed on this controller";
+    Rig rig;
+    OtherConsole web(rig);
+    CHECK_HAS(rig.run("live"), kNote);
+    CHECK_HASNT(rig.run("live"), kNote);
+    CHECK_HAS(web.run("live"), kNote);
+    CHECK_HASNT(web.run("live"), kNote);
+    web.run("scale vlive 96.667");
+    CHECK_HAS(rig.run("live"), kNote);
+    CHECK_HAS(web.run("live"), kNote);
+    CHECK_HASNT(rig.run("live"), kNote);
+    // A check that finds the scale in use wrong brings it back as well.
+    CHECK_HAS(rig.run("scalecheck 13.68"), "not the x96.667 that OptaView uses now");
+    CHECK_HAS(web.run("live"), kNote);
+    CHECK_HAS(rig.run("live"), kNote);
+    // Switched to what was found, it is confirmed: nothing more to say on either.
+    web.run("scale vlive 100");
+    CHECK_HASNT(rig.run("live"), kNote);
+    CHECK_HASNT(web.run("live"), kNote);
+  }
+  {
+    // Settings written from one side wait for a restart on both, until either side restarts.
+    Rig rig;
+    OtherConsole web(rig);
+    static const char kWaiting[] = "Settings were changed in this session. 'reset' makes the controller use them.";
+    CHECK_HASNT(rig.run("status"), kWaiting);
+    CHECK(!rig.device.resetNeeded());
+    web.run("set EV_lvr 13.00");
+    web.run("yes");
+    CHECK(rig.device.resetNeeded());
+    CHECK_HAS(rig.run("status"), kWaiting);
+    CHECK_HAS(web.run("status"), kWaiting);
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(!rig.device.resetNeeded());
+    CHECK_HASNT(web.run("status"), kWaiting);
+    CHECK_HASNT(rig.run("status"), kWaiting);
+
+    // A write that did not take is nothing to restart for.
+    rig.sim.refuseWrites = true;
+    web.run("set EV_lvr 13.20");
+    CHECK_HAS(web.run("yes"), "The write failed");
+    CHECK(!rig.device.resetNeeded());
+    rig.sim.refuseWrites = false;
+    // A restart that the controller did not come back from leaves the note standing.
+    web.run("set EV_lvr 13.20");
+    web.run("yes");
+    CHECK(rig.device.resetNeeded());
+    rig.sim.powered = false;
+    rig.run("reset anyway");
+    CHECK(!rig.console.awaitingConfirmation());  // the checks cannot be read, and that ends it
+    rig.sim.powered = true;
+    CHECK(rig.device.resetNeeded());
+  }
+  {
+    // Every console counts for itself: an open question, expert mode and the trace of one are
+    // not the other's.
+    Rig rig;
+    OtherConsole web(rig);
+    rig.run("set EV_lvd 12.00");
+    CHECK_HAS(web.run("yes"), "Nothing is waiting for a yes or a no.");
+    CHECK(rig.console.awaitingConfirmation());
+    rig.run("no");
+    rig.run("expert on");
+    CHECK_HAS(web.run("raw 1 6 0xE022 0x1000"), "Only functions 1 to 4 are open here.");
+    CHECK_HAS(lineWith(web.run("status"), "Modes"), "expert off, trace off");
+    CHECK_HAS(lineWith(rig.run("status"), "Modes"), "expert on, trace off");
+  }
+  {
+    // newVisitor(): what the last visitor left behind is gone.
+    Rig rig;
+    OtherConsole web(rig);
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");
+    web.run("no");
+    web.run("expert on");
+    web.run("trace on");
+    CHECK(rig.master.trace == &web.console);
+    CHECK(web.console.traceOn());
+    CHECK_HAS(lineWith(web.run("status"), "Modes"), "expert on, trace on");
+    CHECK_HASNT(web.run("set EV_lvd 12.00"), "Before you write:");
+    CHECK(web.console.awaitingConfirmation());
+    web.console.newVisitor();
+    CHECK(!web.console.awaitingConfirmation());
+    CHECK(!web.console.traceOn());
+    CHECK(rig.master.trace == nullptr);
+    CHECK_HAS(web.run("yes"), "Nothing is waiting for a yes or a no.");
+    CHECK_HAS(web.run("raw 1 6 0xE022 0x1000"), "Only functions 1 to 4 are open here.");
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");  // the notes on writing, once more
+    web.run("no");
+    CHECK_HAS(web.run("live"), "not confirmed on this controller");
+    web.console.newVisitor();
+    CHECK_HAS(web.run("live"), "not confirmed on this controller");  // and the reminder
+    CHECK_EQ(rig.sent(0x06), 0);
+
+    // The trace of the other console is not this one's to switch off.
+    rig.run("trace on");
+    CHECK(rig.master.trace == &rig.console);
+    web.console.newVisitor();
+    CHECK(rig.master.trace == &rig.console);
+    rig.run("trace off");
+  }
+  {
+    // Commands from outside the console.
+    Rig rig;
+    PingExtra ping;
+    CHECK_HAS(rig.run("ping"), "Unknown command 'ping'");
+    CHECK(!rig.console.addExtra(nullptr));
+    CHECK(rig.console.addExtra(&ping));
+    CHECK(rig.run("ping a b") == "pong 3\r\n");
+    CHECK(rig.run("PING") == "pong 1\r\n");
+    CHECK_EQ(ping.calls, 2);
+    CHECK_HAS(rig.run("pong"), "Unknown command 'pong'");
+    const std::string help = rig.run("help");
+    CHECK_HAS(help, "  ping                    answers pong");
+    CHECK(help.find("  expert on|off") < help.find("Extras"));
+    CHECK(help.find("Extras") < help.find("In the lists, W marks"));
+    const std::string status = rig.run("status");
+    CHECK_HAS(status, "Ping      ready");
+    CHECK(status.find("Modes ") < status.find("Ping "));
+    // A command of the console itself is never handed on.
+    CHECK_HAS(rig.run("live"), "adc_vb_f");
+    CHECK_EQ(ping.calls, 2);
+    // While a question is open, an extra's command cancels like any other line.
+    rig.run("set EV_lvd 12.00");
+    CHECK_HAS(rig.run("ping"), "Cancelled. Nothing was sent.");
+    CHECK_EQ(ping.calls, 2);
+    // There is room for four.
+    PingExtra more[OV_MAX_EXTRAS];
+    for (uint8_t i = 0; i + 1 < OV_MAX_EXTRAS; ++i) {
+      CHECK(rig.console.addExtra(&more[i]));
+    }
+    CHECK(!rig.console.addExtra(&more[OV_MAX_EXTRAS - 1]));
+  }
+}
+
 static void testTranscript() {
   // The console only ever prints plain ASCII, and ends every line with CR LF.
   CHECK(gTranscript.size() > 50000);
@@ -3374,6 +3401,7 @@ int main() {
   testScaleCheck();
   testSnapshot();
   testWatchSniffTrace();
+  testTwoConsoles();
   testTranscript();
   CHECK_EQ(gAllocLive, 0);
 

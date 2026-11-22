@@ -6,7 +6,7 @@ Each suite lives in its own folder, `tests/host/<suite>/`, with a `Makefile` tha
 
 Suites that need ArduinoJson receive its `src` folder as `ARDUINOJSON_DIR`. The host tests pin ArduinoJson v7.4.3, which CI clones; the firmware jobs install the latest release.
 
-A suite may use another tool the Ubuntu runner provides. `email_bridge` runs the Google Apps Script email bridge from the server's `/email-setup` page under node (18 or later), with stubs for the Apps Script services; run it with `node tests/host/email_bridge/email_bridge_test.js`. `optaview` runs the OptaView headers against a simulated SunSaver MPPT, and first uses python3 to lint the register profile and to check that the copy embedded in the sketch is current.
+A suite may use another tool the Ubuntu runner provides. `email_bridge` runs the Google Apps Script email bridge from the server's `/email-setup` page under node (18 or later), with stubs for the Apps Script services; run it with `node tests/host/email_bridge/email_bridge_test.js`. `optaview` runs the OptaView headers against a simulated SunSaver MPPT in two test programs, one for the Modbus core and the console and one for the web server, and first uses python3 to lint the register profile and to check that the copies of the profile and of the web page that are embedded in the sketch are current. Its `browser-test` target drives OptaView's web page in Chromium and needs Node.js and Playwright, so it is not part of `test`: the `optaview-page` job of the same workflow runs it (see `OptaView/README.md`).
 
 To run a suite locally (Linux, macOS or WSL, with g++ or clang++):
 
