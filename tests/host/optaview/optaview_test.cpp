@@ -19,6 +19,11 @@ static void testCrcAndFrames() {
   CHECK(!mbCrcOk(reply, 3));
   reply[3] ^= 0x01;
   CHECK(!mbCrcOk(reply, sizeof(reply)));
+  // Either byte of the CRC alone makes a frame bad.
+  const uint8_t lowWrong[] = {0x01, 0x04, 0x02, 0x11, 0x83, 0xF5, 0xC1};
+  const uint8_t highWrong[] = {0x01, 0x04, 0x02, 0x11, 0x83, 0xF4, 0xC0};
+  CHECK(!mbCrcOk(lowWrong, sizeof(lowWrong)));
+  CHECK(!mbCrcOk(highWrong, sizeof(highWrong)));
   uint8_t buffer[8] = {0x01, 0x04, 0x00, 0x08, 0x00, 0x01, 0, 0};
   CHECK_EQ(mbAppendCrc(buffer, 6), 8);
   CHECK_EQ(buffer[6], 0xB0);
@@ -143,6 +148,54 @@ static void testReplyValidation() {
     CHECK_EQ(b.sim.regs[0xE022], 0x10C5);  // the controller stored it all the same
     b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
     CHECK_EQ(b.master.writeCoil(1, 0x0001, true).status, MB_ECHO_MISMATCH);
+  }
+  {  // The acknowledgement has to repeat all four bytes, the address as well as the value: an
+     // acknowledgement for another register is not this write's.
+    MbExpect e;
+    e.slave = 1;
+    e.function = MB_FC_WRITE_REGISTER;
+    e.kind = MB_REPLY_ECHO;
+    e.quantity = 0;
+    const uint8_t sent[4] = {0xE0, 0x22, 0x10, 0xC5};
+    memcpy(e.echo, sent, sizeof(sent));
+    uint8_t code = 0;
+    uint8_t ack[8] = {0x01, 0x06, 0xE0, 0x22, 0x10, 0xC5, 0, 0};
+    CHECK_EQ(mbCheckReply(e, ack, sizeof(ack), &code), MB_OK);
+    for (size_t i = 2; i < 6; ++i) {
+      ack[i] ^= 0x01;
+      CHECK_MSG(mbCheckReply(e, ack, sizeof(ack), &code) == MB_ECHO_MISMATCH,
+                "byte %u of the acknowledgement is not compared", (unsigned)i);
+      ack[i] ^= 0x01;
+    }
+    // On the wire: the write is lost, and what arrives acknowledges the register next to it.
+    Bare b;
+    b.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    b.sim.inject(20, SimSunSaver::frame(bytes({0x01, 0x06, 0xE0, 0x23, 0x10, 0xC5})));
+    CHECK_EQ(b.master.writeRegister(1, 0xE022, 0x10C5).status, MB_ECHO_MISMATCH);
+  }
+  {  // A reply to a read of bits holds as many bytes as the bits that were asked for need: one
+     // byte too many or too few is not taken, valid CRC or not.
+    Bare more;
+    uint8_t bits[9] = {9, 9, 9, 9, 9, 9, 9, 9, 9};
+    more.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    more.sim.inject(20, SimSunSaver::frame(bytes({0x01, 0x01, 0x02, 0xFF, 0xFF})));
+    CHECK_EQ(more.master.readBits(1, MB_FC_READ_COILS, 0x0000, 8, bits).status, MB_BAD_LENGTH);
+    Bare fewer;
+    fewer.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    fewer.sim.inject(20, SimSunSaver::frame(bytes({0x01, 0x01, 0x01, 0xFF})));
+    CHECK_EQ(fewer.master.readBits(1, MB_FC_READ_COILS, 0x0000, 9, bits).status, MB_BAD_LENGTH);
+    for (size_t i = 0; i < sizeof(bits); ++i) {
+      CHECK_EQ(bits[i], 9);
+    }
+  }
+  {  // The identification that comes back has to be the kind that was asked for (read code 1).
+    Bare b;
+    MbDeviceId id;
+    b.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    b.sim.inject(20, SimSunSaver::frame(bytes(
+                         {0x01, 0x2B, 0x0E, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00, 0x03, 0x61, 0x62, 0x63})));
+    CHECK_EQ(b.master.readDeviceId(1, id).status, MB_ECHO_MISMATCH);
+    CHECK_EQ(id.count, 0);
   }
   {  // That fault has nothing to alter in a refusal, which is five bytes long and echoes no
      // value: the refusal goes out as it is, and the simulator does not reach past its end
@@ -752,6 +805,30 @@ static void testText() {
   CHECK_EQ(ovCopy(copy, sizeof(copy), nullptr), 0);
   CHECK(copy[0] == '\0');
 
+  // Text that does not fit is cut and ended inside the room it was given: with room for four
+  // characters, the fifth and what follows it stay as they were.
+  char room[8];
+  memset(room, 'z', sizeof(room));
+  CHECK_EQ(ovCopy(room, 4, "abcdef"), 3);
+  CHECK(memcmp(room, "abc\0zzzz", 8) == 0);
+  memset(room, 'z', sizeof(room));
+  CHECK_EQ(ovFormatU64(123456, room, 4), 3);
+  CHECK(memcmp(room, "123\0zzzz", 8) == 0);
+  memset(room, 'z', sizeof(room));
+  CHECK_EQ(ovFormatHex(0x12345678UL, 8, room, 4), 3);
+  CHECK(memcmp(room, "123\0zzzz", 8) == 0);
+  memset(room, 'z', sizeof(room));
+  CHECK_EQ(ovFormatFixed(123.456, 2, room, 6), 5);  // the point fits, the second decimal does not
+  CHECK(memcmp(room, "123.4\0zz", 8) == 0);
+  memset(room, 'z', sizeof(room));
+  CHECK_EQ(ovFormatFixed(-123.456, 2, room, 4), 3);
+  CHECK(memcmp(room, "-12\0zzzz", 8) == 0);
+  CHECK_EQ(ovFormatU64(7, room, 0), 0);
+  CHECK_EQ(ovFormatHex(7, 2, room, 0), 0);
+  CHECK_EQ(ovFormatFixed(7.0, 2, room, 0), 0);
+  CHECK_EQ(ovCopy(room, 0, "abc"), 0);
+  CHECK(memcmp(room, "-12\0zzzz", 8) == 0);  // no room at all: nothing is touched
+
   StringOut out;
   out.printI(-5);
   out.printChar(' ');
@@ -949,6 +1026,8 @@ static void testBuiltinProfile() {
     CHECK(profile.findRegister("ev_LVD") == profile.findRegister("EV_lvd"));  // names ignore case
     CHECK(profile.findRegister("nope") == nullptr);
     CHECK(profile.findRegisterAt(0x0036) == nullptr);
+    CHECK(profile.findRegisterAt(0x0015) == profile.findRegister("Ahc_r"));
+    CHECK(profile.findRegisterAt(0x0016) == nullptr);  // its second word is not a register of its own
     CHECK(profile.findCoil("RESET") != nullptr);
     CHECK(profile.findGroup("load") != nullptr);
 
@@ -1042,6 +1121,10 @@ static void testProfileCodec() {
   CHECK(formatted(*profile.findRegister("T_amb"), 0xFFEC) == "-20 C");
   CHECK(formatted(*profile.findRegister("T_rts"), 0x0080) == "not connected");
   CHECK(formatted(*profile.findRegister("T_rts"), 0x0019) == "25 C");
+  // An unsigned byte is the low byte as well. (This profile has none.)
+  OvRegister unsignedByte = *profile.findRegister("T_hs");
+  unsignedByte.type = OV_U8;
+  CHECK(formatted(unsignedByte, 0xFFEC) == "236 C");
   // Two-word counters: high word first in RAM, low word first in EEPROM.
   CHECK(formatted(*profile.findRegister("Ahc_t"), 0x0001, 0x1170) == "7000.0 Ah");
   CHECK(formatted(*profile.findRegister("EAhc_t"), 0x1170, 0x0001) == "7000.0 Ah");
@@ -1088,6 +1171,22 @@ static void testProfileCodec() {
   CHECK_EQ(ovEncode(absorbTime, -1, &raw), OV_ENCODE_OUT_OF_RANGE);
   CHECK_EQ(ovEncode(*profile.findRegister("Emodbus_id"), 2, &raw), OV_ENCODE_NOT_WRITABLE);
   CHECK_EQ(ovEncode(*profile.findRegister("adc_vb_f"), 12.0, &raw), OV_ENCODE_NOT_WRITABLE);
+  // This profile has no signed setting, but another may: a signed register takes negative
+  // values and stops at its own two ends.
+  OvRegister offset = absorbTime;
+  offset.type = OV_I16;
+  CHECK_EQ(ovEncode(offset, -5, &raw), OV_ENCODE_OK);
+  CHECK_EQ(raw, 0xFFFB);
+  CHECK_EQ(ovEncode(offset, -32768, &raw), OV_ENCODE_OK);
+  CHECK_EQ(raw, 0x8000);
+  CHECK_EQ(ovEncode(offset, 32767, &raw), OV_ENCODE_OK);
+  CHECK_EQ(raw, 0x7FFF);
+  CHECK_EQ(ovEncode(offset, 32768, &raw), OV_ENCODE_OUT_OF_RANGE);
+  CHECK_EQ(ovEncode(offset, -32769, &raw), OV_ENCODE_OUT_OF_RANGE);
+  // Only one word can be written, whatever the register says about itself.
+  OvRegister wide = absorbTime;
+  wide.words = 2;
+  CHECK_EQ(ovEncode(wide, 900, &raw), OV_ENCODE_NOT_WRITABLE);
 
   // With the other candidate scale the same voltages give the raw values worked out by hand
   // in the lithium review (13.10 V = 4441, 11.00 V = 3729).
@@ -1252,6 +1351,102 @@ static void testProfileRejects() {
     CHECK(!profile.findRegister("a")->bench);
     CHECK(!profile.scaleCheck().present);
     CHECK_EQ(profile.modbus().maxBlock, 3);
+    CHECK_EQ(profile.findRegister("a")->type, OV_U16);
+    CHECK_EQ(profile.findRegister("b")->type, OV_ENUM);
+    CHECK_EQ(profile.findRegister("c")->type, OV_U32);
+  }
+  {  // Each type name gives its own type, and of the one-word types only the two plain 16-bit
+     // numbers may be writable.
+    const struct {
+      const char *json;
+      uint8_t type;
+      bool mayBeWritable;
+    } kinds[] = {{"\"type\":\"u16\"", OV_U16, true},
+                 {"\"type\":\"i16\"", OV_I16, true},
+                 {"\"type\":\"u8\"", OV_U8, false},
+                 {"\"type\":\"i8\"", OV_I8, false},
+                 {"\"type\":\"enum\",\"labels\":\"st\"", OV_ENUM, false},
+                 {"\"type\":\"bits\",\"labels\":\"st\"", OV_BITS, false}};
+    const char *const last =
+        "{\"addr\":\"0xE015\",\"name\":\"e\",\"type\":\"u32\",\"order\":\"lo-hi\",\"group\":\"h\"}";
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
+      const std::string entry = std::string(last) + ",{\"addr\":\"0xE020\",\"name\":\"t\"," + kinds[i].json;
+      const std::string typed = replaced(mini, last, (entry + "}").c_str());
+      const std::string writable = replaced(mini, last, (entry + ",\"writable\":true}").c_str());
+      {
+        OvProfile profile;
+        char error[200];
+        CHECK_MSG(profile.load(typed.c_str(), typed.size(), error, sizeof(error)), "%s: %s", kinds[i].json, error);
+        CHECK_MSG(profile.findRegister("t")->type == kinds[i].type, "%s", kinds[i].json);
+        CHECK_EQ(profile.findRegister("t")->words, 1);
+        CHECK(!profile.findRegister("t")->writable);  // unless the profile says so
+        if (kinds[i].mayBeWritable) {
+          CHECK_MSG(profile.load(writable.c_str(), writable.size(), error, sizeof(error)), "%s: %s", kinds[i].json,
+                    error);
+          CHECK(profile.findRegister("t")->writable);
+        }
+      }
+      if (!kinds[i].mayBeWritable) {
+        expectRejected(writable, "only one-word u16 and i16 registers can be writable");
+      }
+    }
+  }
+  {  // The registers may stand in any order in the file. They are kept by address, which the
+     // block reads rely on, and everything that names one still finds the right one.
+    const char *const first = "{\"addr\":\"0xE010\",\"name\":\"a\",\"scale\":\"v\",\"group\":\"g\",\"writable\":true,"
+                              "\"min\":1,\"max\":20},";
+    const char *const last =
+        "{\"addr\":\"0xE015\",\"name\":\"e\",\"type\":\"u32\",\"order\":\"lo-hi\",\"group\":\"h\"}";
+    std::string moved(first);
+    moved.erase(moved.size() - 1);  // without its comma
+    const std::string shuffled = replaced(replaced(mini, first, ""), last, (std::string(last) + "," + moved).c_str());
+    {
+      OvProfile profile;
+      char error[200];
+      CHECK_MSG(profile.load(shuffled.c_str(), shuffled.size(), error, sizeof(error)), "%s", error);
+      CHECK_EQ(profile.registerCount(), 5);
+      for (size_t i = 0; i + 1 < profile.registerCount(); ++i) {
+        CHECK_MSG(profile.reg(i).addr < profile.reg(i + 1).addr, "%s stands before %s", profile.reg(i).name,
+                  profile.reg(i + 1).name);
+      }
+      CHECK(strcmp(profile.reg(0).name, "a") == 0);
+      CHECK(profile.findRegister("a")->writable && profile.findRegister("a")->hasMax);
+      CHECK(profile.modbus().probeRegister == profile.findRegister("a"));
+      CHECK(profile.check(0).below == profile.findRegister("a"));
+      CHECK(profile.check(0).above == profile.findRegister("d"));
+    }
+    // An overlap is found wherever the two entries stand in the file.
+    expectRejected(replaced(shuffled, "\"addr\":\"0xE010\"", "\"addr\":\"0xE013\""), "share an address");
+  }
+  {  // What the profile says about the link is what OptaView starts with.
+    std::string own = replaced(mini, "\"slaveId\":1", "\"slaveId\":5");
+    own = replaced(own, "\"baud\":9600", "\"baud\":19200");
+    own = replaced(own, "\"format\":\"8N2\"", "\"format\":\"8E1\"");
+    own = replaced(own, "\"readFunction\":4", "\"readFunction\":3");
+    own = replaced(own, "\"maxBlock\":3", "\"maxBlock\":2,\"responseTimeoutMs\":250,\"resetWaitMs\":400");
+    OvProfile profile;
+    char error[200];
+    CHECK_MSG(profile.load(own.c_str(), own.size(), error, sizeof(error)), "%s", error);
+    const OvModbusDefaults &link = profile.modbus();
+    CHECK_EQ(link.slaveId, 5);
+    CHECK_EQ(link.baud, 19200u);
+    CHECK_EQ(link.format, MB_8E1);
+    CHECK_EQ(link.readFunction, 3);
+    CHECK_EQ(link.maxBlock, 2);
+    CHECK_EQ(link.responseTimeoutMs, 250);
+    CHECK_EQ(link.resetWaitMs, 400);
+    // And a controller that answers at those settings only is read at once.
+    Rig rig(100.0, own.c_str());
+    rig.sim.slaveId = 5;
+    rig.sim.deviceBaud = 19200;
+    rig.sim.deviceFormat = MB_8E1;
+    rig.sim.readInput = false;  // function 03 only
+    rig.sim.regs[0xE010] = rig.sim.setVolts(12.00);
+    CHECK_HAS(rig.run("status"), "slave 5, 19200 8E1, read function 3, timeout 250 ms");
+    CHECK_HAS(rig.run("get a"), "12.00 V");
+    CHECK_EQ(rig.sim.requests.back()[0], 5);
+    CHECK_EQ(rig.sim.requests.back()[1], 3);
+    CHECK_EQ(rig.master.responseTimeoutMs, 250);
   }
   CHECK_EQ(gAllocLive, 0);
 
@@ -1270,6 +1465,9 @@ static void testProfileRejects() {
   expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":70000"), "bad or missing \"addr\"");
   expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"0xZZ\""), "bad or missing \"addr\"");
   expectRejected(replaced(mini, "\"addr\":57361,", ""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":\"0xFF\"", "\"addr\":65536"), "bad or missing \"addr\" on coil");
+  expectRejected(replaced(mini, "\"addr\":\"0xFF\"", "\"addr\":\"0x100FF\""), "bad or missing \"addr\" on coil");
+  expectRejected(replaced(mini, "\"addr\":\"0xFF\",", ""), "bad or missing \"addr\" on coil");
   expectRejected(replaced(mini, "\"scale\":\"v\"", "\"scale\":\"zz\""), "unknown \"scale\"");
   expectRejected(replaced(mini, "\"labels\":\"st\"", "\"labels\":\"zz\""), "unknown \"labels\"");
   expectRejected(replaced(mini, "\"type\":\"enum\"", "\"type\":\"u64\""), "unknown \"type\"");
@@ -1488,6 +1686,53 @@ static void testReadsAndFallback() {
     }
     CHECK_HAS(rig.run("blocks"), "Block reads: off");
     CHECK_HAS(rig.run("blocks sideways"), "Usage: blocks");
+  }
+  {  // 'blocks on' with a controller that refuses blocks: each register of a refused block is
+     // asked alone, so everything is still read. Blocks stay on, because that was asked for, and
+     // nothing is said about having given them up.
+    Rig rig;
+    rig.sim.blocksRefused = true;
+    rig.run("blocks on");
+    const std::string out = rig.run("dump live");
+    CHECK_EQ(countOf(out, "--"), 0);
+    CHECK_HAS(lineWith(out, "adc_vb_f"), "13.68 V");
+    CHECK_EQ(rig.sim.requests.size(), 1u + 9u);
+    CHECK(!rig.device.blocksFailed());
+    CHECK_HASNT(out, "block reads do not work");
+    CHECK_HAS(rig.run("blocks"), "Block reads: on\r\n");
+    CHECK_HASNT(rig.run("status"), "gave up on blocks");
+  }
+  {  // A long read is cut into blocks of the size the profile allows: 16 for the SunSaver.
+    Rig rig;
+    const std::string out = rig.run("get 0xE000 40");
+    CHECK_HAS(out, "0xE027  ");
+    CHECK_EQ(countOf(out, "--"), 0);
+    CHECK_EQ(rig.sim.requests.size(), 3);
+    const uint16_t starts[] = {0xE000, 0xE010, 0xE020};
+    const uint16_t counts[] = {16, 16, 8};
+    for (size_t i = 0; i < 3 && i < rig.sim.requests.size(); ++i) {
+      CHECK_EQ((rig.sim.requests[i][2] << 8) | rig.sim.requests[i][3], starts[i]);
+      CHECK_EQ((rig.sim.requests[i][4] << 8) | rig.sim.requests[i][5], counts[i]);
+    }
+  }
+  {  // A two-word register is read when both of its words were. With one of them missing it is
+     // shown as not read, never as a number made of the half that came.
+    Rig rig;
+    rig.sim.regs.erase(0x0018);  // the low word of Ahc_t
+    uint16_t words[2] = {0, 0};
+    OvWordStatus status;
+    CHECK(!rig.device.readRegister(*rig.profile.findRegister("Ahc_t"), words, &status));
+    CHECK_EQ(status.status, MB_EXCEPTION);
+    CHECK_EQ(status.exception, 2);
+    CHECK_HAS(lineWith(rig.run("get Ahc_t"), " Ahc_t "), "-- exception 2 (illegal data address)");
+    const std::string dump = rig.run("dump counters");
+    CHECK_HAS(lineWith(dump, " Ahc_t "), "-- exception 2 (illegal data address)");
+    CHECK_HAS(lineWith(dump, " Ahc_r "), "123.4 Ah");  // its neighbours are read as before
+    CHECK_HAS(lineWith(dump, " kWhc "), "8.5 kWh");
+    const std::string span = rig.run("get 0x0017 2");
+    CHECK_HAS(span, "0x0017  0x0001");
+    CHECK_HAS(span, "0x0018  -- exception 2");
+    CHECK_HASNT(span, "Ahc_t");
   }
   {  // 'blocks on' does not fall back: a lost block is reported as lost.
     Rig rig;
@@ -1761,6 +2006,7 @@ static void testProbe() {
     Rig rig;
     const uint64_t t0 = rig.sim.elapsedMs();
     const std::string out = rig.run("probe");
+    CHECK_HAS(out, " (0x0008). Press a key to stop.\r\n");  // where there are keys, it says how to stop
     CHECK_HAS(out, "Found it: slave 1, 9600 8N2, read function 4.");
     CHECK_HAS(out, "Battery voltage reads 13.68 V.");
     CHECK_HAS(out, "vendor \"Morningstar Corp.\", product \"SS-MPPT\", version \"v01.01.01\"");
@@ -1850,6 +2096,7 @@ static void testProbe() {
     CHECK_EQ(rig.master.responseTimeoutMs, 1000);  // the sweep's shorter timeout is put back
     // 'scan' finds a controller at another address.
     const std::string out = rig.run("scan 1 12");
+    CHECK_HAS(out, "Asking slaves 1 to 12 at 9600 8N2. Press a key to stop.\r\n");
     CHECK_HAS(out, "slave 9: answers");
     CHECK_HAS(out, "1 slave answered.");
     CHECK_EQ(rig.master.responseTimeoutMs, 1000);
@@ -2091,15 +2338,30 @@ static void testConsoleBasics() {
   CHECK_HAS(rig.run("link 19200"), "19200 8N2");
   CHECK_HAS(rig.run("link 9600 8e1"), "9600 8E1");
   CHECK_HAS(rig.run("link fast"), "Usage: link");
-  CHECK_HAS(rig.run("link 9600 9X9"), "The format is one of");
+  CHECK_HAS(rig.run("link 19200 9X9"), "The format is one of");
+  CHECK_HAS(rig.run("link"), "9600 8E1");  // a line that is refused changes nothing, the baud rate neither
+  CHECK_HAS(rig.run("link 299"), "Usage: link");
+  CHECK_HAS(rig.run("link 1000001"), "Usage: link");
+  CHECK_HAS(rig.run("link"), "9600 8E1");
+  CHECK_HAS(rig.run("link 300 8E1"), "300 8E1");
   CHECK_HAS(rig.run("link 9600 8N2"), "9600 8N2");
   CHECK_HAS(rig.run("slave 0"), "1 to 247");
   CHECK_HAS(rig.run("slave 248"), "1 to 247");
+  CHECK_HAS(rig.run("slave 256"), "1 to 247");
+  CHECK_HAS(rig.run("slave 257"), "1 to 247");  // not address 1 by the back door
+  CHECK_HAS(rig.run("link"), "slave 1,");
+  CHECK_HAS(rig.run("slave 247"), "slave 247,");
   CHECK_HAS(rig.run("slave 1"), "slave 1,");
   CHECK_HAS(rig.run("fc 5"), "function 3 or 4");
   CHECK_HAS(rig.run("fc 3"), "read function 3");
   CHECK_HAS(rig.run("fc 4"), "read function 4");
   CHECK_HAS(rig.run("timeout 10"), "50 to 10000");
+  CHECK_HAS(rig.run("timeout 49"), "50 to 10000");
+  CHECK_HAS(rig.run("timeout 10001"), "50 to 10000");
+  CHECK_HAS(rig.run("timeout 65636"), "50 to 10000");  // 100 ms, were it cut to 16 bits
+  CHECK_HAS(rig.run("timeout 50"), "Reply timeout: 50 ms");
+  CHECK_HAS(rig.run("timeout 10000"), "Reply timeout: 10000 ms");
+  CHECK_EQ(rig.master.responseTimeoutMs, 10000);
   CHECK_HAS(rig.run("timeout 300"), "Reply timeout: 300 ms");
   CHECK_EQ(rig.master.responseTimeoutMs, 300);
   CHECK_HAS(rig.run("timeout"), "300 ms");
@@ -2207,6 +2469,11 @@ static void testConsoleReads() {
   const std::string two = rig.run("get 0x0017 2");
   CHECK_HAS(two, "Ahc_t = 7000.0 Ah");
   CHECK_HASNT(rig.run("get 0x0017"), "Ahc_t");  // half a two-word register is not decoded
+  // A register is named on the line of its first word, and only there.
+  const std::string pair = rig.run("get 0x0015 4");
+  CHECK_HAS(lineWith(pair, "0x0015  "), "Ahc_r = 123.4 Ah");
+  CHECK_HAS(lineWith(pair, "0x0017  "), "Ahc_t = 7000.0 Ah");
+  CHECK_EQ(countOf(pair, " = "), 2);
   const std::string hole = rig.run("get 0x0034 4");  // 0x0035-0x0037 do not exist
   CHECK_HAS(hole, "0x0034  0x1312");
   CHECK_EQ(countOf(hole, "-- exception 2 (illegal data address)"), 3);
@@ -2227,7 +2494,13 @@ static void testConsoleReads() {
   rig.sim.coils[0x0001] = true;
   CHECK_HAS(lineWith(rig.run("coils"), "load_disconnect"), "on ");
   rig.sim.coils.erase(0x0002);
+  const size_t asked = rig.sim.requests.size();
   CHECK_HAS(lineWith(rig.run("coils"), "charge_disconnect"), "-- exception 2");
+  size_t again = 0;
+  for (size_t i = asked; i < rig.sim.requests.size(); ++i) {
+    again += rig.sim.requests[i][1] == 0x01 && rig.sim.requests[i][3] == 0x02 ? 1 : 0;
+  }
+  CHECK_EQ(again, 1);  // a refusal is an answer: the coil is not asked for a second time
 }
 
 static void testConsoleSet() {
@@ -2303,6 +2576,30 @@ static void testConsoleSet() {
     CHECK_HAS(ask, "After this write, EV_lvd = 13.10 V and EV_lvr = 12.60 V.");
     rig.run("no");
 
+    // The other way round, lowering the LVR to the LVD or below it: what counts is the value
+    // that is about to be written, not the one the register still holds.
+    static const char kLvrAbove[] =
+        "Careful: Low voltage reconnect (EV_lvr) must be above low voltage disconnect (EV_lvd).";
+    const std::string lowered = rig.run("set EV_lvr 11.00");
+    CHECK_HAS(lowered, kLvrAbove);
+    CHECK_HAS(lowered, "After this write, EV_lvd = 11.50 V and EV_lvr = 11.00 V.");
+    rig.run("no");
+    // Equal is not above.
+    const std::string equal = rig.run("set EV_lvr 11.50");
+    CHECK_HAS(equal, kLvrAbove);
+    CHECK_HAS(equal, "After this write, EV_lvd = 11.50 V and EV_lvr = 11.50 V.");
+    rig.run("no");
+    CHECK_HASNT(rig.run("set EV_lvr 11.55"), "Careful: Low voltage reconnect");
+    rig.run("no");
+    // A register that stands in three pairs has all three looked at.
+    const std::string hvd = rig.run("set EV_hvd 13.90");
+    CHECK_HAS(hvd, "(EV_hvr) must be below high voltage disconnect (EV_hvd).");
+    CHECK_HAS(hvd, "After this write, EV_hvr = 14.00 V and EV_hvd = 13.90 V.");
+    CHECK_HAS(hvd, "After this write, EV_reg = 14.00 V and EV_hvd = 13.90 V.");
+    CHECK_HAS(hvd, "After this write, EV_reg2 = 14.40 V and EV_hvd = 13.90 V.");
+    CHECK_EQ(countOf(hvd, "After this write, "), 3);
+    rig.run("no");
+
     // Refusals. None of them reaches the bus as a write.
     CHECK_HAS(rig.run("set"), "Usage: set");
     CHECK_HAS(rig.run("set EV_lvd"), "Usage: set");
@@ -2337,6 +2634,13 @@ static void testConsoleSet() {
     CHECK_HAS(byAddress, "EV_lvr: Low voltage reconnect");
     CHECK_HAS(rig.run("yes"), "EV_lvr = 13.25 V");
     CHECK_HAS(rig.run("set 0xE0FF 1"), "There is no register called");
+    // An address is taken as it was typed. One past the end of the map is no register and must
+    // not wrap round to one (0x1E022 would land on EV_lvd), and the second word of a two-word
+    // register is not a register either.
+    CHECK_HAS(rig.run("set 0x1E022 12.00"), "There is no register called '0x1E022'");
+    CHECK_HAS(rig.run("set 122914 12.00"), "There is no register called '122914'");
+    CHECK_HAS(rig.run("set 0x0016 5"), "There is no register called '0x0016'");
+    CHECK(!rig.console.awaitingConfirmation());
     // 0 is accepted where it switches a feature off.
     rig.run("set EV_float 0");
     CHECK_HAS(rig.run("yes"), "EV_float = 0.00 V [0x0000]");
@@ -2523,7 +2827,9 @@ static void testConsoleSet() {
     CHECK_HASNT(status, "may have been changed");
     // The restart ends it.
     rig.run("reset anyway");
-    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    const std::string restarted = rig.run("yes");
+    CHECK_HAS(restarted, "Restarting the controller. Press a key to stop waiting.\r\n");
+    CHECK_HAS(restarted, "The controller answers again");
     CHECK(!rig.device.resetNeeded());
     CHECK(!rig.device.resetMaybeNeeded());
   }
@@ -2693,6 +2999,32 @@ static void testConsoleSet() {
 }
 
 static void testConsoleCoilsAndReset() {
+  {  // A controller at another slave address. Every request goes there: the reads, a write and
+     // its read-back, a switch, and the restart with the questions that follow it. Nothing
+     // answers at address 1 here, so a request sent there would be a request lost.
+    Rig rig;
+    rig.sim.slaveId = 9;
+    CHECK_HAS(rig.run("slave 9"), "slave 9,");
+    CHECK_HAS(lineWith(rig.run("live"), " adc_vb_f "), "13.68 V");
+    rig.run("set EV_lvr 13.25");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_lvr = 13.25 V");
+    rig.run("set EV_lvd 13.10");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_lvd = 13.10 V");
+    CHECK_HAS(lineWith(rig.run("coils"), "load_disconnect"), "off");
+    rig.run("coil load_disconnect on");
+    CHECK_HAS(rig.run("yes"), "Sent and acknowledged. load_disconnect now reads on.");
+    CHECK(rig.sim.coils[0x0001]);
+    CHECK_HAS(rig.run("reset"), "Type yes to restart it.");
+    const std::string restarted = rig.run("yes");
+    CHECK_HAS(restarted, "Reset acknowledged.");
+    CHECK_HAS(restarted, "The controller answers again after 3.0 s.");
+    CHECK_HAS(lineWith(restarted, "V_lvd"), "13.10 V");
+    CHECK_EQ(rig.sim.resets, 1);
+    CHECK(rig.sim.requests.size() > 20);
+    for (size_t i = 0; i < rig.sim.requests.size(); ++i) {
+      CHECK_MSG(rig.sim.requests[i][0] == 9, "request %zu went to slave %u", i, (unsigned)rig.sim.requests[i][0]);
+    }
+  }
   {
     Rig rig;
     CHECK_HAS(rig.run("coil"), "Usage: coil");
@@ -2815,11 +3147,46 @@ static void testConsoleCoilsAndReset() {
     CHECK_HAS(rig.run("reset anyway"), "Type yes to restart it.");
     rig.run("no");
     CHECK_EQ(rig.sim.resets, 0);
-    // Settings that are switched off (0) are not compared.
+    // Settings that are switched off (0) are not compared: this controller's load high voltage
+    // pair is off, both registers of it.
     rig.run("set EV_lvr 13.25");
     rig.run("yes");
     CHECK_HASNT(rig.run("reset"), "Problem:");
     rig.run("no");
+    // One of a pair being off is enough. With no high voltage disconnect there is nothing for
+    // the reconnect voltage or the absorption voltages to stay below, before the write or
+    // before the restart.
+    const std::string off = rig.run("set EV_hvd 0");
+    CHECK_HAS(lineWith(off, "  new  "), "[0x0000]");
+    CHECK_HASNT(off, "After this write, ");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_hvd = 0.00 V [0x0000]");
+    const std::string restart = rig.run("reset");
+    CHECK_HASNT(restart, "Problem:");
+    CHECK_HAS(restart, "Type yes to restart it.");
+    rig.run("no");
+  }
+  {  // A pair that cannot be checked stands in the way like one that is out of order, whichever
+     // of its two registers does not read.
+    Rig rig;
+    rig.sim.regs.erase(0xE023);  // EV_lvr, the upper one of its pair
+    const std::string upper = rig.run("reset");
+    CHECK_HAS(upper, "  Could not check EV_lvd against EV_lvr: a register did not read.");
+    CHECK_EQ(countOf(upper, "Could not check"), 1);
+    CHECK_HAS(upper, "Put that right first, or use 'reset anyway'.");
+    CHECK(!rig.console.awaitingConfirmation());
+    rig.sim.regs[0xE023] = rig.sim.setVolts(12.60);
+    rig.sim.regs.erase(0xE01C);  // EV_hvr, the lower one of its pair
+    const std::string lower = rig.run("reset");
+    CHECK_HAS(lower, "  Could not check EV_hvr against EV_hvd: a register did not read.");
+    CHECK_EQ(countOf(lower, "Could not check"), 1);
+    CHECK_HAS(lower, "Put that right first, or use 'reset anyway'.");
+    CHECK(!rig.console.awaitingConfirmation());
+    // Only the word 'anyway' overrides that.
+    CHECK_HAS(rig.run("reset now"), "Put that right first, or use 'reset anyway'.");
+    CHECK(!rig.console.awaitingConfirmation());
+    CHECK_HAS(rig.run("reset anyway"), "Type yes to restart it.");
+    rig.run("no");
+    CHECK_EQ(rig.sim.resets, 0);
   }
   {  // The controller restarts without answering the command (the specification allows it).
     Rig rig;
@@ -2900,6 +3267,14 @@ static void testConsoleRawAndExpert() {
   CHECK_HAS(rig.run("raw"), "Usage: raw");
   CHECK_HAS(rig.run("raw 1 4 8"), "Usage: raw");
   CHECK_HAS(rig.run("raw 0 4 8 1"), "Usage: raw");
+  CHECK_HAS(rig.run("raw 248 4 8 1"), "Usage: raw");
+  CHECK_HAS(rig.run("raw 257 4 8 1"), "Usage: raw");      // not slave 1 by the back door
+  CHECK_HAS(rig.run("raw 1 0 8 1"), "Usage: raw");
+  CHECK_HAS(rig.run("raw 1 128 8 1"), "Usage: raw");      // from 0x80 on these are exception replies
+  CHECK_HAS(rig.run("raw 1 4 0x10008 1"), "Usage: raw");  // an address does not wrap round
+  CHECK_HAS(rig.run("raw 1 4 8 65537"), "Usage: raw");    // nor does a count
+  CHECK_HAS(rig.run("raw 1 4 8 0"), "The count runs from 1 to 125");
+  CHECK_HAS(rig.run("raw 1 1 0 0"), "The count runs from 1 to 64");
   CHECK_HAS(rig.run("raw 1 4 8 126"), "The count runs from 1 to 125");
   CHECK_HAS(rig.run("raw 1 1 0 65"), "The count runs from 1 to 64");
 
@@ -2919,6 +3294,12 @@ static void testConsoleRawAndExpert() {
   CHECK_EQ(rig.sim.requests.size(), before);
   CHECK_HAS(rig.run("nope"), "Cancelled");
   CHECK_EQ(rig.sim.regs[0xE022], 0x0EB8);
+  // In expert mode too, neither the address nor the value of a write wraps round into range.
+  CHECK_HAS(rig.run("raw 1 6 0x1E022 0x10C5"), "Usage: raw");
+  CHECK_HAS(rig.run("raw 1 6 0xE022 0x110C5"), "Usage: raw");
+  CHECK_HAS(rig.run("raw 257 6 0xE022 0x10C5"), "Usage: raw");
+  CHECK(!rig.console.awaitingConfirmation());
+  CHECK_EQ(rig.sim.requests.size(), before);
   rig.run("raw 1 6 0xE022 0x10C5");
   const std::string done = rig.run("yes");
   CHECK_HAS(done, "> 01 06 E0 22 10 C5");
@@ -3249,10 +3630,14 @@ static void testScaleCheck() {
   {  // Blank or damaged EEPROM cells are not settings that somebody chose. 0xFFFF would look
      // perfectly round at x100 (199.997 V) and must not vote.
     Rig rig(96.667);
-    const uint16_t blanked[] = {0xE000, 0xE001, 0xE00D, 0xE00E, 0xE014, 0xE01B, 0xE01C, 0xE030, 0xE031, 0xE032};
+    const uint16_t blanked[] = {0xE000, 0xE001, 0xE00D, 0xE00E, 0xE014, 0xE01B, 0xE01C, 0xE030};
     for (size_t i = 0; i < sizeof(blanked) / sizeof(blanked[0]); ++i) {
       rig.sim.regs[blanked[i]] = 0xFFFF;
     }
+    // A cell with a few stray bits in it is no setting either. These two would be 0.003 V and
+    // 0.05 V, round under every candidate, far below anything the profile allows.
+    rig.sim.regs[0xE031] = 0x0001;
+    rig.sim.regs[0xE032] = 0x0010;
     const std::string out = rig.run("scalecheck");
     CHECK_HAS(out, "  1. Setpoints: 3 in use (14 of 14 read)");
     CHECK_HAS(out, "     -> too few round setpoints to tell");
@@ -3278,6 +3663,39 @@ static void testScaleCheck() {
     CHECK_HAS(blind, "  Live readings:   x100, which is what OptaView uses now.");
     rig.sim.regs.erase(0x0008);
     CHECK_HAS(rig.run("scalecheck 13.68"), "  3. Multimeter: the register could not be read.");
+  }
+  {  // A profile of one's own may name no alternates and give a setpoint no limits. Then there is
+     // one candidate, which any match confirms, and nothing but its value says whether a setpoint
+     // is in use. A register that reads 0 is still not a measurement and not a setting.
+    const std::string own = replaced(replaced(std::string(kScaleProfile), "\"alternates\":[96.667],", ""),
+                                     ",\"min\":9,\"max\":17}]", "}]");  // sp2 has no limits now
+    Rig rig(100.0, own.c_str());
+    rig.sim.regs[0xE000] = rig.sim.setVolts(14.00);  // sp1
+    rig.sim.regs[0xE001] = 0;                        // sp2: switched off
+    rig.sim.regs[11] = 1;                            // state: HOLD, the one that regulates
+    rig.sim.regs[9] = 0;                             // slow: the battery reads nothing
+    rig.sim.regs[10] = 30;                           // target: 0.09 V
+    const std::string dead = rig.run("scalecheck");
+    CHECK_HAS(dead, "Stored settings (scale vs, now x100/32768). Candidates: x100.\r\n");
+    CHECK_HAS(dead, "  1. Setpoints: 1 in use (2 of 2 read)");
+    CHECK_HAS(dead, "at x100, 1 of 1 is a multiple of 0.05 V");
+    CHECK_HAS(dead, "Live readings (scale vl, now x100/32768). Candidates: x100.\r\n");
+    CHECK_HAS(dead, "  2. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
+    CHECK_HAS(dead, "  Live readings:   cannot tell yet.");
+    // The same with a battery reading and no target.
+    rig.sim.regs[9] = 30;
+    rig.sim.regs[10] = 0;
+    const std::string aimless = rig.run("scalecheck");
+    CHECK_HAS(aimless, "  2. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
+    CHECK_HAS(aimless, "  Live readings:   cannot tell yet.");
+    CHECK_HAS(rig.run("status"), "not confirmed on this controller");
+    // With both there, the one candidate is confirmed by a battery at its target.
+    rig.sim.regs[9] = rig.sim.volts(13.70);
+    rig.sim.regs[10] = rig.sim.refVolts(13.70);
+    const std::string held = rig.run("scalecheck");
+    CHECK_HAS(held, "the controller is holding the battery at its target (target = 13.70 V).");
+    CHECK_HAS(held, "slow reads 13.70 V at x100\r\n     -> x100\r\n");
+    CHECK_HAS(held, "  Live readings:   x100, which is what OptaView uses now.");
   }
   {  // No link.
     Rig rig;
@@ -3326,6 +3744,33 @@ static void testScaleCheck() {
     // Values on a 0.01 V grid only: no pattern, no verdict.
     const uint16_t odd[] = {4594, 4496, 3775, 4135, 4300, 4391};
     ovJudgeSetpoints(&settings, odd, 6, 32768.0, 0.05);
+    CHECK_EQ(settings.verdict, -1);
+    // Most of the setpoints have to be round under the winner: six of ten are enough, five of
+    // ten are not. The others here sit 0.02 V off a round value and are round under neither.
+    const uint16_t sixOfTen[] = {4588, 4489, 3768, 4129, 4293, 4719,  // 14.00 13.70 11.50 12.60 13.10 14.40
+                                 4496, 3775, 4299, 4725};             // 13.72 11.52 13.12 14.42
+    ovJudgeSetpoints(&settings, sixOfTen, 10, 32768.0, 0.05);
+    CHECK_EQ(settings.fits[0], 6);
+    CHECK_EQ(settings.fits[1], 0);
+    CHECK_EQ(settings.verdict, 0);
+    const uint16_t fiveOfTen[] = {4588, 4489, 3768, 4129, 4293, 4037,  // the sixth is 12.32 now
+                                  4496, 3775, 4299, 4725};
+    ovJudgeSetpoints(&settings, fiveOfTen, 10, 32768.0, 0.05);
+    CHECK_EQ(settings.fits[0], 5);
+    CHECK_EQ(settings.fits[1], 0);
+    CHECK_EQ(settings.verdict, -1);
+    // And the winner needs twice the fits of any other candidate. 12.00, 13.50 and 15.00 V are
+    // round at x96.667 as well (11.60, 13.05 and 14.50 V). With three of six setpoints like that,
+    // x100 is ahead by two to one. With a fourth it is six against four: too close to call.
+    const uint16_t twoToOne[] = {4588, 4489, 3768, 3932, 4424, 4915};
+    ovJudgeSetpoints(&settings, twoToOne, 6, 32768.0, 0.05);
+    CHECK_EQ(settings.fits[0], 6);
+    CHECK_EQ(settings.fits[1], 3);
+    CHECK_EQ(settings.verdict, 0);
+    const uint16_t tooClose[] = {4588, 4489, 3441, 3932, 4424, 4915};  // 10.50 V is 10.15 V at x96.667
+    ovJudgeSetpoints(&settings, tooClose, 6, 32768.0, 0.05);
+    CHECK_EQ(settings.fits[0], 6);
+    CHECK_EQ(settings.fits[1], 4);
     CHECK_EQ(settings.verdict, -1);
     // None at all.
     ovJudgeSetpoints(&settings, odd, 0, 32768.0, 0.05);
@@ -3454,6 +3899,7 @@ static void testScaleCheck() {
     CHECK_HAS(rig.run("scale nope 1"), "There is no scale called 'nope'");
     CHECK_HAS(rig.run("scale vlive"), "Usage: scale <name> <x>");
     CHECK_HAS(rig.run("scale vlive 0"), "Usage: scale <name> <x>");
+    CHECK_HAS(rig.run("scale vlive -96.667"), "Usage: scale <name> <x>");
     CHECK_HAS(rig.run("scale vlive lots"), "Usage: scale <name> <x>");
     CHECK_HAS(rig.run("scale i79 80"), "i79 is now x80/32768");
     CHECK_HAS(rig.run("scale VREF 100"), "vref is now x100/32768");
@@ -3519,9 +3965,14 @@ static void testScaleCheck() {
     // Taking the reading at its word is then a matter for the next check.
     rig.run("scale vlive 87.71");
     CHECK_HAS(rig.run("scalecheck 12.00"), "  Live readings:   x87.71, which is what OptaView uses now.");
-    // With no earlier verdict there is nothing to take back.
+    // With no earlier verdict there is nothing to take back. The reminder comes back all the
+    // same: the reading has just contradicted every candidate, the scale in use included.
     Rig fresh;
+    CHECK_HAS(fresh.run("live"), "Note: voltages are shown");
+    CHECK_HASNT(fresh.run("live"), "Note: voltages are shown");
     CHECK_HASNT(fresh.run("scalecheck 12.00"), "takes back");
+    CHECK_HAS(fresh.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");
+    CHECK_HASNT(fresh.run("live"), "Note: voltages are shown");
     // A check that merely cannot tell leaves an earlier verdict alone.
     Rig night;
     night.run("scalecheck 13.68");
@@ -3588,6 +4039,27 @@ static void testScaleCheck() {
     CHECK_HASNT(twice.run("slave 2"), "Note:");
     twice.run("slave 1");
     CHECK_HAS(twice.run("live"), "Note: voltages are shown");
+    // The stored settings have a reminder of their own, and the same holds for it. It waits for
+    // a command that shows a stored setting: 'live' shows none.
+    Rig stored;
+    CHECK_HAS(stored.run("dump load"), "      (stored settings x100/32768). 'scalecheck' tests it.");
+    CHECK_HASNT(stored.run("dump load"), "Note: voltages are shown");
+    stored.run("slave 2");
+    stored.run("slave 1");
+    CHECK_HAS(stored.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");
+    CHECK_HAS(stored.run("dump load"), "      (stored settings x100/32768). 'scalecheck' tests it.");
+  }
+  {  // The device counts every change to what was found, a finding that is taken back included,
+     // and each scale by itself. A console that gave its reminder at an earlier count gives it again.
+    Rig rig;
+    const uint32_t settingsAt = rig.device.settingsScaleEpoch();
+    const uint32_t liveAt = rig.device.liveScaleEpoch();
+    rig.device.setSettingsScaleFound(0.0);
+    CHECK(rig.device.settingsScaleEpoch() != settingsAt);
+    CHECK(rig.device.liveScaleEpoch() == liveAt);
+    rig.device.setLiveScaleFound(0.0);
+    CHECK(rig.device.liveScaleEpoch() != liveAt);
+    CHECK(rig.device.settingsScaleOpen() && rig.device.liveScaleOpen());
   }
   {  // A profile without a scale check.
     Rig rig(100.0, kMiniProfile);
@@ -3600,6 +4072,20 @@ static void testScaleCheck() {
 }
 
 static void testSnapshot() {
+  {  // Text in a snapshot is a JSON string whatever it holds. Names and labels come from the
+     // profile, which may carry a quote, a backslash or a control character.
+    static const char kAwkward[] = "5\" panel \\ C:\\x\ttab\nline\x01\x1F end";
+    StringOut out;
+    ovPrintJsonString(out, kAwkward);
+    CHECK(out.text == "\"5\\\" panel \\\\ C:\\\\x\\u0009tab\\u000Aline\\u0001\\u001F end\"");
+    JsonDocument doc;
+    const DeserializationError error = deserializeJson(doc, out.text);
+    CHECK_MSG(!error, "not a JSON string: %s", error.c_str());
+    CHECK(strcmp(doc.as<const char *>() != nullptr ? doc.as<const char *>() : "", kAwkward) == 0);
+    StringOut plain;
+    ovPrintJsonString(plain, "");
+    CHECK(plain.text == "\"\"");
+  }
   {
     Rig rig;
     const std::string out = rig.run("snapshot");
@@ -3724,7 +4210,7 @@ static void testWatchSniffTrace() {
     rig.sim.inject(120, bytes({0x55, 0xAA, 0x55}));
     const size_t before = rig.sim.requests.size();
     const std::string out = rig.run("sniff 300");
-    CHECK_HAS(out, "Listening for 300 ms without sending.");
+    CHECK_HAS(out, "Listening for 300 ms without sending. Press a key to stop.\r\n");
     CHECK_HAS(out, "01 04 00 08 00 01 B0 08  (a complete Modbus frame)");
     CHECK_HAS(out, "ms  55 AA 55\r\n");
     CHECK_HAS(out, "Heard 11 bytes.");
@@ -3794,6 +4280,20 @@ struct PingExtra : OvConsoleExtra {
   void status(OvOut &out) override { out.println("Ping      ready"); }
 };
 
+struct PongExtra : OvConsoleExtra {
+  unsigned calls = 0;
+  bool command(int, char **argv, OvOut &out) override {
+    if (!ovEqualsIgnoreCase(argv[0], "pong")) {
+      return false;
+    }
+    ++calls;
+    out.println("ping");
+    return true;
+  }
+  void help(OvOut &out) override { out.println("  pong                    answers ping"); }
+  void status(OvOut &out) override { out.println("Pong      ready"); }
+};
+
 static void testTwoConsoles() {
   static const char kStale[] = "Not sent: the controller or the link was changed from elsewhere after this was asked.";
   {
@@ -3840,6 +4340,22 @@ static void testTwoConsoles() {
     web.run("coil load_disconnect on");
     CHECK_HAS(web.run("yes"), "Sent and acknowledged.");
     CHECK_HAS(rig.run("yes"), kStale);
+
+    // A raw request from the other side goes to the controller past everything OptaView keeps
+    // track of. A raw write has changed the very register the question was about.
+    web.run("expert on");
+    rig.run("set EV_lvd 11.50");
+    web.run("raw 1 6 0xE022 0x1000");
+    CHECK_HAS(web.run("yes"), "Acknowledged.");
+    CHECK_HAS(rig.run("yes"), kStale);
+    CHECK_EQ(rig.sim.regs[0xE022], 0x1000);
+    // And what a function that OptaView does not know has done, nobody can tell.
+    rig.run("set EV_lvd 11.50");
+    web.run("raw 1 0x2B 0E 01 00");
+    CHECK_HAS(web.run("yes"), "4D 6F 72 6E 69 6E 67 73 74 61 72");
+    CHECK_HAS(rig.run("yes"), kStale);
+    CHECK_EQ(rig.sim.regs[0xE022], 0x1000);
+    web.run("expert off");
 
     // It works both ways round.
     web.run("coil load_disconnect off");
@@ -3917,6 +4433,22 @@ static void testTwoConsoles() {
     web.run("scale vlive 100");
     CHECK_HASNT(rig.run("live"), kNote);
     CHECK_HASNT(web.run("live"), kNote);
+  }
+  {
+    // The stored settings have a count of their own, and it follows the same rule.
+    static const char kNote[] = "Note: voltages are shown with a scale that is not confirmed on this controller";
+    Rig rig;
+    OtherConsole web(rig);
+    CHECK_HAS(rig.run("dump load"), kNote);
+    CHECK_HASNT(rig.run("dump load"), kNote);
+    CHECK_HAS(web.run("get EV_lvd"), kNote);
+    CHECK_HASNT(web.run("get EV_lvd"), kNote);
+    web.run("scale vset 96.667");
+    CHECK_HAS(rig.run("dump load"), "      (stored settings x96.667/32768). 'scalecheck' tests it.");
+    CHECK_HAS(web.run("get EV_lvd"), kNote);
+    CHECK_HASNT(rig.run("dump load"), kNote);
+    // None of that used up the reminder about live readings, which nobody has been given yet.
+    CHECK_HAS(rig.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");
   }
   {
     // Settings written from one side wait for a restart on both, until either side restarts.
@@ -4015,6 +4547,23 @@ static void testTwoConsoles() {
     web.console.newVisitor();
     CHECK(rig.master.trace == &rig.console);
     rig.run("trace off");
+
+    // Everything that is said once is said once to each visitor: the reminder about each of the
+    // two scales, and that block reads were given up on this link.
+    Rig mrc;
+    OtherConsole page(mrc);
+    mrc.sim.blocksAnswered = false;
+    const std::string first = page.run("dump");
+    CHECK_HAS(first, "(live readings x100/32768, stored settings x100/32768). 'scalecheck' tests them.");
+    CHECK_HAS(first, "Note: block reads do not work on this link");
+    const std::string second = page.run("dump");
+    CHECK_HASNT(second, "Note: voltages are shown");
+    CHECK_HASNT(second, "Note: block reads do not work");
+    page.console.newVisitor();
+    const std::string third = page.run("dump");
+    CHECK_HAS(third, "(live readings x100/32768, stored settings x100/32768). 'scalecheck' tests them.");
+    CHECK_HAS(third, "Note: block reads do not work on this link");
+    CHECK(mrc.device.blocksFailed());  // the device still knows; only the telling starts again
   }
   {
     // Commands from outside the console.
@@ -4041,9 +4590,23 @@ static void testTwoConsoles() {
     rig.run("set EV_lvd 12.00");
     CHECK_HAS(rig.run("ping"), "Cancelled. Nothing was sent.");
     CHECK_EQ(ping.calls, 2);
+    // A second one, as in the sketch (the network and the web page): each is asked in the
+    // order it was added until one takes the command, and both show in 'help' and 'status'.
+    PongExtra pong;
+    CHECK(rig.console.addExtra(&pong));
+    CHECK(rig.run("pong") == "ping\r\n");
+    CHECK(rig.run("ping") == "pong 1\r\n");
+    CHECK_EQ(pong.calls, 1);
+    CHECK_EQ(ping.calls, 3);
+    const std::string helpBoth = rig.run("help");
+    CHECK_HAS(helpBoth, "  ping                    answers pong");
+    CHECK_HAS(helpBoth, "  pong                    answers ping");
+    CHECK(helpBoth.find("answers pong") < helpBoth.find("answers ping"));
+    const std::string statusBoth = rig.run("status");
+    CHECK_HAS(statusBoth, "Ping      ready\r\nPong      ready\r\n");
     // There is room for four.
     PingExtra more[OV_MAX_EXTRAS];
-    for (uint8_t i = 0; i + 1 < OV_MAX_EXTRAS; ++i) {
+    for (uint8_t i = 0; i + 2 < OV_MAX_EXTRAS; ++i) {
       CHECK(rig.console.addExtra(&more[i]));
     }
     CHECK(!rig.console.addExtra(&more[OV_MAX_EXTRAS - 1]));
