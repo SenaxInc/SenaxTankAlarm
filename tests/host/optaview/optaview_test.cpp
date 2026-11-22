@@ -4093,6 +4093,7 @@ static void testTranscript() {
 }
 
 int main() {
+  startTestTimeLimit();
   testCrcAndFrames();
   testReplyValidation();
   testTimeouts();

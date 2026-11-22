@@ -414,6 +414,10 @@ cables that go in late and DHCP servers that never answer. Run
 everything the console printed, which shows what a session looks like without a controller on
 the bench.
 
+A test program that has not finished after ten minutes stops and says so, so that a test which
+waits for something that never happens fails instead of holding CI for hours. They take a few
+seconds. `OPTAVIEW_TEST_SECONDS` sets another limit, and 0 switches it off.
+
 ### The page without an Opta
 
 ```bash

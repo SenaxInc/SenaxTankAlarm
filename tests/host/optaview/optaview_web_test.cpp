@@ -68,6 +68,8 @@ struct FakeConn : OvConn {
   std::function<void()> tick;
   bool failed = false;
   unsigned writes = 0;
+  uint64_t refusedAt = kNever;       // the moment of the last write that took nothing
+  unsigned refusedThen = 0;          // ...and how many writes that moment has seen
   unsigned writesAfterFailure = 0;
   unsigned writesAfterClose = 0;
   unsigned readsAfterClose = 0;
@@ -122,6 +124,15 @@ struct FakeConn : OvConn {
       return -1;
     }
     if (now >= deafFrom || now < deafUntil || (!sentAt.empty() && now - sentAt.back() < takeEveryMs)) {
+      // Whoever sends has to let time pass before it tries again. A sender that does not would
+      // try for ever, and the test with it.
+      if (now != refusedAt) {
+        refusedAt = now;
+        refusedThen = 0;
+      }
+      if (++refusedThen > 100000) {
+        throw std::runtime_error("the sender tried 100000 times in one millisecond: it waits without its clock moving");
+      }
       return 0;
     }
     const size_t taken = len < takeAtMost ? len : takeAtMost;
@@ -1893,6 +1904,14 @@ struct WebRig {
 
   // Lets loop() run for `ms`.
   void idle(uint64_t ms) {
+    if (ms > 24ULL * 3600ULL * 1000ULL) {
+      // No test waits a day. A time like this comes from a subtraction that went below zero,
+      // because a wait the test counted on is not there. Saying so beats waiting it out.
+      ++gChecks;
+      reportFailure(__FILE__, __LINE__, "the test waits for a time that makes sense",
+                    fmtStr("it would wait %llu ms", (unsigned long long)ms));
+      return;
+    }
     for (uint64_t i = 0; i < ms; ++i) {
       web.poll();
       rig.sim.advance(1);
@@ -3700,6 +3719,7 @@ static void testWebUsbCommands() {
 }
 
 int main() {
+  startTestTimeLimit();
   testHttpReader();
   testHttpHelpers();
   testHttpResponse();

@@ -12,6 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 #include <limits>
 #include <stdexcept>
@@ -58,6 +62,42 @@ using namespace optaview;
 static long gChecks = 0;
 static long gFailures = 0;
 static std::string gTranscript;  // everything the console printed, checked for plain ASCII at the end
+
+// A test that waits for something that never happens must not hold CI until the runner's own
+// limit, which is hours. A wait inside the code under test ends on the simulated clock (see
+// SimSunSaver::idle). This is for everything else: after ten minutes of real time the program
+// says so and fails. OPTAVIEW_TEST_SECONDS sets another limit, and 0 switches it off, as for a
+// debugger or for a tool that runs the tests many times slower. A value that is not a number of
+// seconds, a day at most, changes nothing.
+#if defined(__unix__) || defined(__APPLE__)
+static void testTimeIsUp(int) {
+  static const char text[] =
+      "\noptaview: the tests did not finish within their time limit (OPTAVIEW_TEST_SECONDS, 600 if not set).\n"
+      "One of them probably waits for something that never happens.\n";
+  if (write(2, text, sizeof(text) - 1) < 0) {
+    // Nothing to be done about that here.
+  }
+  _exit(124);
+}
+
+inline void startTestTimeLimit() {
+  unsigned long seconds = 600;
+  const char *text = getenv("OPTAVIEW_TEST_SECONDS");
+  if (text != nullptr && text[0] != '\0') {
+    char *end = nullptr;
+    const unsigned long asked = strtoul(text, &end, 10);
+    if (end != text && *end == '\0' && asked <= 86400UL) {
+      seconds = asked;
+    }
+  }
+  if (seconds > 0) {
+    signal(SIGALRM, testTimeIsUp);
+    alarm((unsigned)seconds);
+  }
+}
+#else
+inline void startTestTimeLimit() {}
+#endif
 
 inline std::string fmtStr(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 inline std::string fmtStr(const char *fmt, ...) {
