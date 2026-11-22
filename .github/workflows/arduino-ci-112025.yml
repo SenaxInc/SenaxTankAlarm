@@ -304,6 +304,35 @@ jobs:
       - name: Compile OptaView
         run: arduino-cli compile --fqbn arduino:mbed_opta:opta --warnings all OptaView/OptaView.ino
 
+  optaview-page:
+    # Drives OptaView's web page in Chromium. The page is served by the firmware's own web
+    # server, built for the runner with a simulated SunSaver behind it. Like compile-optaview
+    # this is a check of its own and never holds up build-firmware.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Fetch ArduinoJson 7.4.3 headers (the version the host tests are pinned to)
+        run: git clone --quiet --depth 1 --branch v7.4.3 https://github.com/bblanchon/ArduinoJson.git "$RUNNER_TEMP/ArduinoJson"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Playwright and its Chromium
+        run: |
+          npm install --no-save --no-audit --no-fund --ignore-scripts --prefix "$RUNNER_TEMP/playwright" playwright@1.63.0
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Drive the page in Chromium
+        env:
+          NODE_PATH: ${{ runner.temp }}/playwright/node_modules
+        run: make -C tests/host/optaview browser-test ARDUINOJSON_DIR="$RUNNER_TEMP/ArduinoJson/src"
+
   check-version:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
