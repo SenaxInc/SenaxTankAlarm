@@ -62,15 +62,30 @@ static uint64_t realMs() {
   return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)(now.tv_nsec / 1000000L);
 }
 
-// The simulated controller on a clock that keeps step with the PC's: a millisecond of waiting
-// takes a millisecond. (The tests run it on a clock that only counts.)
+// The simulated controller on a clock that keeps step with the PC's, as millis() does on the
+// Opta: a millisecond takes a millisecond, whether the firmware spends it waiting or working.
+// (The tests run it on a clock that only counts.)
 class LiveSunSaver : public SimSunSaver {
  public:
   unsigned writes;  // requests that change something: a coil (function 5) or a register (6)
 
   LiveSunSaver() : writes(0), startMs_(realMs()), skippedMs_(0) {}
 
+  // Everything that asks for the time, or for what has arrived by now, first lets the time pass
+  // that the firmware has spent working. A loop that never waits still has to see its time limit
+  // come: ovHttpDrain() takes bytes for as long as they keep arriving, and for half a second.
+  uint32_t nowMs() override {
+    catchUp();
+    return SimSunSaver::nowMs();
+  }
+
+  int read() override {
+    catchUp();
+    return SimSunSaver::read();
+  }
+
   void send(const uint8_t *data, size_t len) override {
+    catchUp();
     if (len > 1 && (data[1] == 0x05 || data[1] == 0x06)) {
       ++writes;
     }
@@ -80,10 +95,13 @@ class LiveSunSaver : public SimSunSaver {
     requestTimes.clear();
   }
 
+  // Waits a millisecond. Where the simulation is ahead of the PC's clock, as it is by the time
+  // a frame takes to send, this waits until the PC's clock is there as well.
   void idle() override {
+    catchUp();
     advance(1);
-    const uint64_t due = startMs_ + (elapsedMs() - skippedMs_);
     const uint64_t now = realMs();
+    const uint64_t due = startMs_ + (elapsedMs() - skippedMs_);
     if (due > now) {
       struct timespec wait;
       wait.tv_sec = (time_t)((due - now) / 1000ULL);
@@ -101,8 +119,19 @@ class LiveSunSaver : public SimSunSaver {
  private:
   uint64_t startMs_;
   uint64_t skippedMs_;
+
+  // Brings the simulation's clock up to the PC's where it has fallen behind.
+  void catchUp() {
+    const uint64_t byThePc = realMs() - startMs_ + skippedMs_;
+    while (byThePc > elapsedMs()) {
+      const uint64_t behind = byThePc - elapsedMs();
+      advance((uint32_t)(behind > 0x40000000ULL ? 0x40000000ULL : behind));
+    }
+  }
 };
 
+// The web server's clock is the same one, so that a session's half hour and a reply's timeout
+// are counted alike.
 struct LiveClock : OvClock {
   LiveSunSaver &sim;
   explicit LiveClock(LiveSunSaver &s) : sim(s) {}

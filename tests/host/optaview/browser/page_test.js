@@ -21,6 +21,7 @@
 const { chromium } = require('playwright');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 
 const PIN = '2468';
@@ -911,6 +912,46 @@ async function optaGone(win) {
   return win.preview;
 }
 
+// One scenario is about the preview and not about the page. After a request it cannot read, the
+// firmware takes what is still arriving for half a second and then closes (ovHttpDrain, which
+// optaview_web_test.cpp tests on a clock that only counts). The preview has a clock of its own,
+// and it keeps that limit only if its clock moves while the firmware works as well as while it
+// waits. With a clock that stands still in a loop that never waits, one sender that never
+// pauses holds the page and the console for as long as it keeps sending.
+async function neverPauses(preview) {
+  const started = performance.now();
+  const socket = net.connect(preview.port, '127.0.0.1');
+  const chunk = Buffer.alloc(16384, 0x61);
+  let sending = true;
+  let answer = '';
+  const send = () => {
+    while (sending && socket.write(chunk)) { /* until the socket takes no more for now */ }
+  };
+  socket.on('connect', () => {
+    socket.write('GET / HTTP/1.1\r\nA: be\x01ll\r\n\r\n');  // refused at the control character
+    send();
+  });
+  socket.on('drain', send);
+  socket.on('data', (data) => { answer += data.toString(); });
+  // A connection that is closed with bytes unread ends in a reset. 'close' follows either way.
+  socket.on('error', () => {});
+  const heldMs = await new Promise((resolve) => {
+    const giveUp = setTimeout(() => socket.destroy(), 6000);  // the sender's own patience
+    socket.on('close', () => {
+      sending = false;
+      clearTimeout(giveUp);
+      resolve(Math.round(performance.now() - started));
+    });
+  });
+  checkHas(answer, 'HTTP/1.1 400 ', 'a request that cannot be read is refused');
+  // Half a second by the firmware's limit. The bound leaves room for a slow machine: without a
+  // clock that moves, this connection is held until the sender gives up, six seconds from now.
+  check(heldMs < 3000, `a sender that never pauses is let go of after half a second: it was held for ${heldMs} ms`);
+  const asked = performance.now();
+  await preview.line('timeout', /Reply timeout: \d+ ms/);
+  check(performance.now() - asked < 2000, 'and the console answers again at once');
+}
+
 // ---------------------------------------------------------------------------------------------
 
 async function main() {
@@ -935,6 +976,8 @@ async function main() {
     scenario = 'phone';
     await phone(browser, fresh, desktop);
     await desktop.context.close();
+    scenario = 'a sender that never pauses';
+    await neverPauses(fresh);
 
     // An Opta that starts with a PIN, as OptaViewConfig.h gives it one.
     scenario = 'wrong PIN';
