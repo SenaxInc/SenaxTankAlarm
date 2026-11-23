@@ -429,6 +429,27 @@ try {
   checkEq('(i) two emails', br.sent.length, 2);
 }
 
+// (i2) S3: a float (sensorType "digital") prints ON/OFF and no mA; analog lines are unchanged
+{
+  const br = makeBridge(source);
+  checkEq('(i2) daily with floats ok', br.post(routed('ev-0502', {
+    to: 'ops@example.com', subject: 'Daily Sensor Summary - 2026-09-24', id: 'dev:1-1790000420-9',
+    sensors: [
+      { client: 'dev:4', site: 'East', label: 'High Float', sensorIndex: 3, levelInches: 1,
+        sensorMa: 0, alarm: true, alarmType: 'triggered', sensorType: 'digital' },
+      { client: 'dev:4', site: 'East', label: 'Low Float', sensorIndex: 4, levelInches: 0,
+        sensorMa: 0, alarm: false, alarmType: 'clear', sensorType: 'digital' },
+      { client: 'dev:2', site: 'Silas', label: 'Cox Wellhead', sensorIndex: 1, levelInches: 43.8,
+        sensorMa: 8.2, alarm: false, alarmType: 'clear' },
+    ],
+  })), 'ok');
+  checkEq('(i2) float lines', (br.sent[0] || {}).body, [
+    'East High Float #3: ON  ** ALARM: triggered **',
+    'East Low Float #4: OFF',
+    'Silas Cox Wellhead #1: 43.8 (8.2 mA)',
+  ].join('\n'));
+}
+
 // (k) a repeat that arrives while the first call is sending waits, and is a duplicate
 // once that send has worked
 {
