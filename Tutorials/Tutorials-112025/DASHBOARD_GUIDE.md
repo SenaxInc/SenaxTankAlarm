@@ -409,6 +409,23 @@ Each client supports up to 8 tanks (A-H):
 > delivery end-to-end. While an alarm stays active, the server re-sends a reminder SMS
 > every 6 hours (configurable `smsReminderHours`, 0 disables) until the alarm clears.
 
+### Charger Check (SunSaver MPPT)
+
+A client that reads its SunSaver MPPT over RS-485 (**Voltage Monitor** set to **RS485**) also reads what the charger has stored: the charging profile of both banks, the low voltage disconnect and reconnect, and the DIP switches. It compares that with the **Battery** selected in its configuration and sends the result to the server. The client only reads; it changes nothing in the charger.
+
+**Where to find it:**
+- On a site page (`/site-config?site=...`), each client shows a badge next to its RS-485 badge: **Charger settings OK**, **Charger settings WRONG**, **Charger: cannot tell** or **Charger: not judged**. Click it for the details.
+- In the configuration console, the hardware note under **Power Configuration** links to the same page for the client you are editing.
+- The page itself is `/charger?uid=<device UID>`. It lists what was found and every register with its value.
+
+**What the verdicts mean:**
+- **Settings suit the battery**: nothing wrong was found.
+- **Settings do not suit the battery**: for example a lithium battery on a charger whose DIP switch 1 is OFF (it then charges with a built-in lead-acid profile), a stored equalize voltage, or temperature compensation switched on.
+- **Could not be judged in full**: a register did not answer, or the charger's voltage encoding could not be told from its setpoints. What could be checked showed nothing wrong.
+- **Not judged**: there are no rules for the battery that is configured (none, custom, LiPo).
+
+The client checks after it starts, after a change to its battery or charger settings, and once a day. It sends a new report when something has changed, and once a week otherwise. A page that says no check has arrived means the client has no SunSaver configured, has not reached it yet, or runs firmware from before the charger check.
+
 ### Saving Configuration
 
 **Send to Device:**
@@ -1123,6 +1140,10 @@ See [Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md) for detailed network diagn
 **`GET /api/clients`**
 - Returns list of all known clients
 - Includes last seen, firmware version, configuration summary
+
+**`GET /api/charger?client=<device UID>`**
+- Returns the client's last charger check (JSON): `have` (false when none has arrived), `vd` and `verdict`, `battery`, `system` (12 or 24 as measured), `findings` (text `t`, and `p` true when it makes the settings wrong for the battery) and `groups` of registers as `[name, description, value, raw]`
+- Needs a session, like every `/api/` route
 
 ### POST Endpoints
 
