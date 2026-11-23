@@ -92,6 +92,21 @@ SunSaver MPPT solar charger monitoring via Modbus RTU over RS-485:
   green either way; switch OFF = RS-485 side inert)
 - SunSaver MPPT solar charge controller
 
+### TankAlarm_SunSaverSettings.h
+The charger check: what a SunSaver MPPT has stored, and whether it suits the battery. Included by `TankAlarm_Solar.h`. It has no Arduino dependency, so `tests/host/sunsaver_settings` runs it on a PC.
+- The registers the check reads, in a fixed order: the custom charge settings of both banks, LVD and LVR, the LED thresholds, and the status words that say how they are used (DIP switches, faults, the LVD in effect)
+- `SnapshotReader` - Reads them a few at a time through a `Reader`, so that `loop()` keeps running
+- `judgeSettingsScale()`, `judgeLiveScale()` - How the controller encodes its voltages (x100 or x96.667), told from the stored setpoints and from the controller's own LVD
+- `evaluate()` - Findings and a verdict for a battery chemistry
+- `floatReferenceVolts()` - Where the charger holds a full battery, for the no-charge alert
+- `SolarManager::startChargerCheck()` and `serviceChargerCheck()` in `TankAlarm_Solar.h` run it on the Opta. It only reads.
+
+### TankAlarm_SunSaverReport.h
+The charger check as JSON. It needs ArduinoJson, so the sketches include it themselves (`TankAlarm_Common.h` does not).
+- `encodeReport()` - The compact report a client sends to the server (`chg-check` on `config_ack.qo`)
+- `decodeReport()` - Reads it back; a report from a newer or an older client still decodes
+- `describeReport()` - Verdict, findings and every register with its value as text, for the server's `/charger` page
+
 ### TankAlarm_Battery.h
 Battery voltage monitoring sourced from the SunSaver MPPT (Modbus RS-485) or an external analog Vin voltage divider — auto-selected by the client's `getEffectiveBatteryVoltage()` with strict MPPT > Vin-divider priority. The Notecard `card.voltage` API is **not** used on the Blues "Wireless for Opta" carrier (the Notecard V+ is the regulated ~5V DC-DC rail, not the battery).
 

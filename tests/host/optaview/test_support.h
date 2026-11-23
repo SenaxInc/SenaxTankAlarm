@@ -2,7 +2,8 @@
 // test framework, and rigs that put the code under test on a simulated SunSaver.
 //
 // Each test program (optaview_test.cpp, optaview_web_test.cpp) is one translation unit and
-// includes this file once.
+// includes this file once. So does ../sunsaver_settings/sunsaver_settings_test.cpp, which tests
+// the TankAlarm client's charger check on the same simulated SunSaver.
 
 #ifndef OPTAVIEW_TEST_SUPPORT_H
 #define OPTAVIEW_TEST_SUPPORT_H
