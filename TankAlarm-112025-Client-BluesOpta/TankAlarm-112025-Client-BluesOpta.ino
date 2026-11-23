@@ -65,6 +65,8 @@
 #endif
 
 #include <ArduinoJson.h>
+// The charger check as JSON (needs ArduinoJson, so TankAlarm_Common.h does not include it)
+#include <TankAlarm_SunSaverReport.h>
 #include <memory>
 #include <math.h>
 #include <string.h>
@@ -876,6 +878,22 @@ static unsigned long gLastSolarAlarmMillis = 0;
 static SolarAlertType gLastSolarAlert = SOLAR_ALERT_NONE;
 #define SOLAR_ALARM_MIN_INTERVAL_MS 3600000UL  // Min 1 hour between same solar alarm
 
+// Charger check: the client reads what the SunSaver has stored (its charging profile, LVD and
+// LVR, the DIP switches), judges it against the configured battery and reports it to the server.
+// It only reads. A pass runs once the RS-485 link works after boot, after a change to the
+// battery or charger config, and once a day.
+#define CHARGER_CHECK_INTERVAL_MS   (24UL * 60UL * 60UL * 1000UL)        // a new pass once a day
+#define CHARGER_CHECK_RETRY_MS      (10UL * 60UL * 1000UL)               // after a pass the link did not carry
+#define CHARGER_CHECK_MAX_FAILURES  3                                    // such passes in a row, then wait a day
+#define CHARGER_REPORT_REFRESH_MS   (7UL * 24UL * 60UL * 60UL * 1000UL)  // an unchanged report is sent again weekly
+static bool gChargerCheckWanted = false;          // a config change asks for a pass now
+static bool gChargerReportSyncNow = false;        // and for its report to be sent at once
+static unsigned long gChargerCheckEndMillis = 0;  // when the last pass ended, done or failed
+static uint8_t gChargerCheckFailures = 0;         // passes in a row that the link did not carry
+static bool gChargerReportSent = false;           // a report has gone out since boot
+static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
+static unsigned long gChargerReportMillis = 0;    // when it went out
+
 // Battery voltage monitoring via Notecard (when wired directly to battery)
 static BatteryData gBatteryData;
 static unsigned long gLastBatteryPollMillis = 0;
@@ -959,7 +977,6 @@ static char gPendingConfigAckMessage[48] = "Config applied and persisted";
 static unsigned long gPendingConfigAckRetryAt = 0;
 static unsigned long gPendingConfigAckRetryDelayMs = 5000UL;
 static bool gHardwareSummaryPrinted = false;
-static bool gChemistryChecked = false;
 
 // Network failure handling
 static unsigned long gLastSuccessfulNotecardComm = 0;
@@ -1505,6 +1522,9 @@ static void sendSolarAlarm(SolarAlertType alertType);
 static void logSolarHardwareTestHeartbeat(unsigned long now);
 static void logSolarPollSnapshot(unsigned long now, SolarAlertType alertType);
 static bool appendSolarDataToDaily(JsonDocument &doc);
+static void requestChargerCheck();
+static void serviceChargerCheck(unsigned long now);
+static void finishChargerCheck(unsigned long now);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
 // Battery voltage monitoring (sourced from SunSaver MPPT or Vin divider via
@@ -2313,26 +2333,6 @@ void loop() {
   // battery recovery, but at reduced frequency (controlled by sleep duration).
   if (gSolarManager.isEnabled()) {
     if (gSolarManager.poll(now)) {
-      // Chemistry verification: once setpoints are read, cross-check them
-      // against the user-selected battery type / pack voltage. This is a
-      // one-shot log so it doesn't spam the serial console.
-      if (!gChemistryChecked && gSolarManager.getData().setpointsValid) {
-        gChemistryChecked = true;
-        char chemMsg[160];
-        SolarManager::ChemistryCheck cc = gSolarManager.verifyChemistry(
-          (uint8_t)gConfig.batteryMonitor.batteryType,
-          gConfig.batteryMonitor.nominalVoltage,
-          chemMsg, sizeof(chemMsg));
-        Serial.print(F("Solar: chemistry check: "));
-        switch (cc) {
-          case SolarManager::CHEMISTRY_CHECK_OK:               Serial.print(F("OK — "));        break;
-          case SolarManager::CHEMISTRY_CHECK_MISMATCH:         Serial.print(F("MISMATCH — ")); break;
-          case SolarManager::CHEMISTRY_CHECK_VOLTAGE_MISMATCH: Serial.print(F("V_PACK MISMATCH — ")); break;
-          case SolarManager::CHEMISTRY_CHECK_PENDING:          Serial.print(F("pending — ")); break;
-        }
-        Serial.println(chemMsg);
-      }
-
       // A poll was attempted - check alerts using the refreshed communication state
       // (suppress alarm sending in CRITICAL to save power).
       SolarAlertType alert = gSolarManager.checkAlerts();
@@ -2351,6 +2351,10 @@ void loop() {
 
       // Optional serial output for hardware bring-up.
       logSolarPollSnapshot(now, alert);
+    } else {
+      // No poll in this pass of loop(): read a few more registers of the charger check, if one
+      // is under way or due. Both talk to the charger, so they take turns.
+      serviceChargerCheck(now);
     }
   }
   
@@ -5026,12 +5030,9 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       Serial.print(nominalV);
       Serial.print(F(" enabled="));
       Serial.println(gConfig.batteryMonitor.enabled ? F("yes") : F("no"));
-      // Re-arm the chemistry cross-check so the next solar poll re-verifies
-      // against the new selection.
-      if (gSolarManager.isEnabled()) {
-        gChemistryChecked = false;
-        Serial.println(F("Solar: retrace chemistry verification on next poll"));
-      }
+      // The charger's settings are judged against the battery: judge them again, and send the
+      // server the new report at once, since someone is waiting for it at the config page.
+      requestChargerCheck();
     }
   }
 
@@ -5074,6 +5075,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       if (gSolarManager.begin(gConfig.solarCharger)) {
         Serial.println(F("Solar charger reinitialized via config update"));
         addSerialLog("Solar charger reinitialized via config update");
+        requestChargerCheck();
       } else {
         Serial.println(F("Solar charger reinit FAILED via config update"));
         addSerialLog("Solar charger reinit failed via config update");
@@ -6624,7 +6626,7 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
       const SolarData &sd = gSolarManager.getData();
       doc["scOk"]     = sd.communicationOk ? 1 : 0;  // 5-poll smoothed (drives SMS escalation)
       doc["scLast"]   = sd.lastPollOk ? 1 : 0;       // R6: single-poll truth (no smoothing)
-      doc["scSpv"]    = sd.setpointsValid ? 1 : 0;   // R4: setpoint registers ever read OK
+      doc["scSpv"]    = gSolarManager.chargerSettingsRead() ? 1 : 0;  // the charger check has read the stored settings since boot
       doc["scOkEver"] = (sd.firstReadMillis > 0) ? 1 : 0;  // R2: link has succeeded since boot
       if (!sd.communicationOk) {
         // v2.0.45: when the link READS but the values are rejected by the plausibility clamp
@@ -7356,6 +7358,160 @@ static void sendSolarAlarm(SolarAlertType alertType) {
   
   publishNote(ALARM_FILE, doc, true);
   Serial.println(F("Solar alarm sent to server"));
+}
+
+// ============================================================================
+// Charger check (SunSaver MPPT)
+// ============================================================================
+// What the controller has stored, judged against the configured battery and reported to the
+// server. The registers and the rules are in TankAlarm_SunSaverSettings.h (Common library),
+// which tests/host/sunsaver_settings runs on a PC; SolarManager does the reading.
+
+// The battery the charger's settings are judged against.
+static uint8_t chargerCheckChemistry() {
+  switch (gConfig.batteryMonitor.batteryType) {
+    case BATTERY_TYPE_AGM:
+    case BATTERY_TYPE_GEL:
+    case BATTERY_TYPE_SLA:
+      return sunsaver::CHEMISTRY_LEAD_SEALED;
+    case BATTERY_TYPE_FLOODED:
+      return sunsaver::CHEMISTRY_LEAD_FLOODED;
+    case BATTERY_TYPE_LIFEPO4:
+      return sunsaver::CHEMISTRY_LIFEPO4;
+    case BATTERY_TYPE_LI_ION:
+      return sunsaver::CHEMISTRY_LI_ION;
+    default:
+      return sunsaver::CHEMISTRY_NOT_JUDGED;  // no battery, custom thresholds, or the LiPo cell
+  }
+}
+
+// Asks for a pass now, and for its report to reach the server at once: the battery or the
+// charger config changed.
+static void requestChargerCheck() {
+  gChargerCheckWanted = true;
+  gChargerReportSyncNow = true;
+  gChargerCheckFailures = 0;
+  gSolarManager.cancelChargerCheck();  // a pass under way would be judged against the old config
+}
+
+// Call from loop() while the charger is enabled. Starts a pass when one is due and reads a few
+// registers of it per call, so that loop() is never held for longer than a poll holds it.
+static void serviceChargerCheck(unsigned long now) {
+  // Not while a firmware update is being staged, and not in hibernation: the check can wait.
+  if (gDfuInProgress || gPowerState == POWER_STATE_CRITICAL_HIBERNATE) {
+    gSolarManager.cancelChargerCheck();
+    return;
+  }
+
+  if (!gSolarManager.chargerCheckActive()) {
+    const unsigned long sinceLast = now - gChargerCheckEndMillis;
+    bool due;
+    if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
+      due = sinceLast >= CHARGER_CHECK_INTERVAL_MS;
+    } else if (gChargerCheckFailures > 0) {
+      due = sinceLast >= CHARGER_CHECK_RETRY_MS;
+    } else {
+      // No pass has completed since the link was set up, a config change asked for one, or the
+      // last one is a day old.
+      due = gChargerCheckWanted || !gSolarManager.chargerSettingsRead() || sinceLast >= CHARGER_CHECK_INTERVAL_MS;
+    }
+    if (due) {
+      // False until a poll has succeeded: the check waits for a working link.
+      gSolarManager.startChargerCheck();
+    }
+    return;
+  }
+
+  if (!gSolarManager.serviceChargerCheck(now)) {
+    return;  // not time for the next registers yet, or the pass is still under way
+  }
+
+  // The pass ended.
+  gChargerCheckEndMillis = now;
+  if (gSolarManager.chargerCheckDone()) {
+    gChargerCheckFailures = 0;
+    gChargerCheckWanted = false;
+    finishChargerCheck(now);
+  } else {
+    if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
+      gChargerCheckFailures = 0;  // the daily try after a run of failures
+    }
+    ++gChargerCheckFailures;
+    Serial.print(F("Charger check: the charger stopped answering part way ("));
+    Serial.print(gChargerCheckFailures);
+    Serial.print(F(" of "));
+    Serial.print(CHARGER_CHECK_MAX_FAILURES);
+    Serial.println(gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES ? F("), next try in a day")
+                                                                      : F("), next try in 10 minutes"));
+  }
+}
+
+// A pass is complete: judge it, tell the no-charge alert where the charger holds a full battery,
+// and report to the server when the result is new.
+static void finishChargerCheck(unsigned long now) {
+  const sunsaver::Snapshot &snapshot = gSolarManager.chargerSnapshot();
+  const sunsaver::Expectation want = {chargerCheckChemistry(), gConfig.batteryMonitor.nominalVoltage,
+                                      (uint8_t)SS_VOLTAGE_SCALE_ID};
+  sunsaver::Evaluation evaluation;
+  sunsaver::evaluate(snapshot, want, &evaluation);
+
+  gSolarManager.setFloatReference(
+      (float)sunsaver::floatReferenceVolts(snapshot, evaluation, (uint8_t)SS_VOLTAGE_SCALE_ID));
+
+  const uint32_t fingerprint = sunsaver::settingsFingerprint(snapshot, evaluation);
+  const bool changed = !gChargerReportSent || fingerprint != gChargerReportFingerprint;
+
+  char line[160];
+  {
+    sunsaver::Text text(line, sizeof(line));
+    text.add("Charger check: ").add(sunsaver::verdictName(evaluation.verdict));
+    text.add(", battery ").add(sunsaver::chemistryName(evaluation.chemistry));
+    text.add(", findings 0x").addHex16((uint16_t)(evaluation.findings & 0xFFFFu));
+    if (!changed) {
+      text.add(" (unchanged)");
+    }
+  }
+  Serial.println(line);
+  if (changed) {
+    addSerialLog(line);
+    for (uint8_t bit = 0; bit < sunsaver::FINDING_BITS; ++bit) {
+      const uint32_t finding = (uint32_t)1 << bit;
+      if ((evaluation.findings & finding) != 0) {
+        Serial.print(F("  - "));
+        Serial.println(sunsaver::findingText(finding));
+      }
+    }
+    {
+      sunsaver::Text text(line, sizeof(line));
+      sunsaver::describeSettingsScale(evaluation.settingsScale, &text);
+    }
+    Serial.print(F("  Stored voltages: "));
+    Serial.println(line);
+    {
+      sunsaver::Text text(line, sizeof(line));
+      sunsaver::describeLiveScale(evaluation.liveScale, evaluation.liveSource, &text);
+    }
+    Serial.print(F("  Live readings: "));
+    Serial.println(line);
+  }
+
+  if (!changed && !gChargerReportSyncNow && (now - gChargerReportMillis) < CHARGER_REPORT_REFRESH_MS) {
+    return;  // the server has this report
+  }
+
+  // The report travels on the config-ack notefile, which is already routed to the server. The
+  // server tells it from an ack by the "chg-" status, as it tells the "ota-" reports.
+  JsonDocument doc;
+  JsonObject body = doc.to<JsonObject>();
+  body["c"] = gDeviceUID;
+  body["st"] = "chg-check";
+  body["epoch"] = (uint32_t)currentEpoch();  // whole seconds: ArduinoJson writes some doubles with 7 digits
+  sunsaver::encodeReport(snapshot, evaluation, body);
+  publishNote(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow);
+  gChargerReportSent = true;
+  gChargerReportFingerprint = fingerprint;
+  gChargerReportMillis = now;
+  gChargerReportSyncNow = false;
 }
 
 // Append solar charger data to daily report (called from sendDailyReport)

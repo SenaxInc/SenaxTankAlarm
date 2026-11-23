@@ -94,6 +94,16 @@ The server adds `_target` (device UID) and `_type` (command type) fields to the 
 | `CONFIG_ACK_OUTBOX_FILE` | `"config_ack.qo"` | Client → Server |
 | `CONFIG_ACK_INBOX_FILE` | `"config_ack.qi"` | Server reads |
 
+`config_ack.qo` carries more than config acknowledgments. The server tells the notes apart by the start of their status field `st`, so none of them needs a route of its own:
+
+| `st` | What it is |
+|------|------------|
+| `applied`, `failed` | Acknowledgment of a config the server sent (`cv` names the config version) |
+| `ota-applied`, `ota-reverted`, `ota-stage-failed` | Outcome of a firmware update |
+| `chg-check` | Charger check of a client with a SunSaver MPPT: the registers it read and its verdict (see `TankAlarm_SunSaverReport.h`). The client sends it when the charger's stored settings or the verdict have changed, once after it starts, and once a week. |
+
+A server that does not know a status keeps it as the last acknowledgment status of that client and does nothing else with it, so update the server before the clients.
+
 ### Viewer Summary
 
 | Constant | Value | Direction |

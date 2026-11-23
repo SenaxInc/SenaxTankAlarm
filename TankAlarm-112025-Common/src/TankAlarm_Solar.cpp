@@ -51,18 +51,6 @@ static uint32_t sSolarErrIllegalFunc  = 0;  // "Illegal function"
 static uint32_t sSolarErrOther        = 0;  // catch-all (unknown / library-init failure)
 static char     sSolarLastErrorTag[8]  = {0};  // short tag: "to"|"crc"|"ida"|"ifu"|"?"
 
-// v2.1.5: consecutive CRC-valid-but-implausible setpoint probe results. On some SunSaver
-// firmware revisions the coded setpoint addresses (SS_REG_V_REG/V_FLOAT/V_EQ) hold other
-// data, so the plausibility check rejects them on EVERY poll and the old code re-read all
-// three registers + printed a warning once per poll, forever (~4,300 wasted transactions
-// per day at the 60 s poll cadence, bench-observed 2026-07-03). The values are a property
-// of the controller firmware and cannot change at runtime, so after this many consecutive
-// plausibility rejections we stop probing until the next begin(). Transport failures do
-// NOT count toward the give-up — a flaky bus must not permanently disable chemistry
-// verification on units where the addresses are correct.
-static uint8_t  sSetpointPlausibilityRejects = 0;
-#define SOLAR_SETPOINT_PROBE_MAX_REJECTS 3
-
 // Classify the last ModbusRTUClient.lastError() string into one of five short tags.
 // Uses substring match because the library returns prose like "Illegal data address"
 // not enum codes. Tag set here is read by readRegistersWithFallback() to pick the
@@ -252,7 +240,8 @@ static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, ui
 }
 
 SolarManager::SolarManager() 
-  : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0) {
+  : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
+    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -276,6 +265,12 @@ SolarManager::SolarManager()
 }
 
 bool SolarManager::begin(const SolarConfig& config) {
+  // A charger check that was under way belongs to the link as it was, and so does what the
+  // last one found: another charger may be on the line now, or none.
+  _chargerCheck.cancel();
+  _chargerSettingsRead = false;
+  _floatReferenceV = 0.0f;
+
   if (!config.enabled) {
     _initialized = false;
     return true;  // Not an error, just disabled
@@ -338,7 +333,6 @@ bool SolarManager::begin(const SolarConfig& config) {
   _initialized = true;
   _data.communicationOk = false;
   _data.consecutiveErrors = 0;
-  sSetpointPlausibilityRejects = 0;  // v2.1.5: re-arm the setpoint probe on re-init
   
   // Probe both holding and input register models before first full poll.
   uint16_t startupProbe = 0;
@@ -368,6 +362,7 @@ bool SolarManager::begin(const SolarConfig& config) {
 }
 
 void SolarManager::end() {
+  _chargerCheck.cancel();
   if (_initialized) {
     ModbusRTUClient.end();
     _initialized = false;
@@ -515,61 +510,6 @@ bool SolarManager::readRegisters() {
     success = false;
   }
 
-  // Charge setpoints — read once per session after first successful realtime
-  // read, used by verifyChemistry() to confirm the SunSaver DIP-switch chemistry
-  // matches what the user selected in the web UI. The setpoints reflect the
-  // controller's active battery service (Sealed/Gel/Flooded/Custom) and only
-  // change at boot or DIP-switch change. Best-effort: failure does not mark the
-  // overall poll as failed. v2.1.5: gives up after SOLAR_SETPOINT_PROBE_MAX_REJECTS
-  // consecutive plausibility rejections (see sSetpointPlausibilityRejects).
-  if (success && !nextData.setpointsValid &&
-      sSetpointPlausibilityRejects < SOLAR_SETPOINT_PROBE_MAX_REJECTS) {
-    // Read the three setpoints we actually use at their exact addresses, SKIPPING the
-    // gap register 0x0034 (AH_DAILY) that sits between V_reg and V_float. A NACK on the
-    // gap must not abort the (best-effort) setpoint read nor perturb the FC cache.
-    uint16_t vRegRaw = 0, vFloatRaw = 0, vEqRaw = 0;
-    bool setpointOk = readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_REG, 1, &vRegRaw, _cachedHoldingFC);
-    if (setpointOk) setpointOk = readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_FLOAT, 1, &vFloatRaw, _cachedHoldingFC);
-    if (setpointOk) setpointOk = readRegistersWithFallback(_config.modbusSlaveId, SS_REG_V_EQ, 1, &vEqRaw, _cachedHoldingFC);
-    if (setpointOk) {
-#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-  TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
-#elif defined(ARDUINO_ARCH_STM32)
-      IWatchdog.reload();
-#endif
-      float vReg   = scaleVoltage(vRegRaw);
-      float vFloat = scaleVoltage(vFloatRaw);
-      float vEq    = scaleVoltage(vEqRaw);
-      // Sanity: setpoints must look like plausible battery voltages.
-      // Accept anything in 8..32V (covers 12V and 24V chargers, allows L16/equalize).
-      if (vReg >= 8.0f && vReg <= 32.0f && vFloat >= 8.0f && vFloat <= 32.0f) {
-        nextData.vRegSetpoint   = vReg;
-        nextData.vFloatSetpoint = vFloat;
-        nextData.vEqSetpoint    = (vEq >= 8.0f && vEq <= 32.0f) ? vEq : 0.0f;
-        nextData.setpointsValid = true;
-        sSetpointPlausibilityRejects = 0;
-        Serial.print(F("Solar: setpoints read V_reg="));
-        Serial.print(vReg, 2);
-        Serial.print(F(" V_float="));
-        Serial.print(vFloat, 2);
-        Serial.print(F(" V_eq="));
-        Serial.println(nextData.vEqSetpoint, 2);
-      } else {
-        // CRC-valid read but the values are not battery setpoints — on this controller
-        // firmware revision the coded addresses hold other data. Count it; after the
-        // give-up threshold stop probing (and stop the once-per-poll warning spam).
-        ++sSetpointPlausibilityRejects;
-        Serial.print(F("Solar: setpoint read returned implausible values, skipping verify (V_reg="));
-        Serial.print(vReg, 2);
-        if (sSetpointPlausibilityRejects >= SOLAR_SETPOINT_PROBE_MAX_REJECTS) {
-          Serial.println(F(") - giving up until next re-init (addresses wrong for this firmware revision)"));
-        } else {
-          Serial.println(F(")"));
-        }
-      }
-    }
-  }
-
   // Suspect register blocks: only read when explicitly enabled for bench work.
   // In production these stay zeroed so derived health logic does not false-trip.
 #ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
@@ -628,11 +568,20 @@ bool SolarManager::readRegisters() {
 
   // Track no-charge alert (Task 2.2, R-1 & SR-2)
   if (success) {
-    // Dynamically calculate float charge target based on battery type multiplier
+    // The voltage a full battery is held at. The charger check supplies it when the custom
+    // charge settings are in use and can be trusted (setFloatReference). Otherwise it is
+    // BATTERY_VOLTAGE_FLOAT per 12 V of pack, scaled down for a battery whose low-voltage
+    // threshold says it sits lower than lead-acid. It is never scaled up: a LiFePO4 battery
+    // has a low threshold of 13 V and more, and scaling by that put the float target near
+    // 15 V, where a full battery in daylight looked like one that was not being charged.
+    float packs = (nextData.systemNominalV == 24) ? 2.0f : 1.0f;
     float scale = _config.batteryLowVoltage / BATTERY_VOLTAGE_LOW;
+    if (!(scale > 0.0f) || scale > packs) {
+      scale = packs;
+    }
     float floatThreshold = BATTERY_VOLTAGE_FLOAT * scale;
-    if (nextData.setpointsValid && nextData.vFloatSetpoint > 8.0f) {
-      floatThreshold = nextData.vFloatSetpoint;
+    if (_floatReferenceV > 8.0f) {
+      floatThreshold = _floatReferenceV;
     }
 
     bool batteryNeedsCharge = (nextData.batteryVoltage < (floatThreshold - 0.2f));
@@ -961,157 +910,107 @@ void SolarManager::resetDailyStats() {
   _data.dailyStatsSeeded = false;
 }
 
-SolarManager::ChemistryCheck SolarManager::verifyChemistry(uint8_t expectedType,
-                                                            uint8_t nominalVoltage,
-                                                            char* outDescription,
-                                                            size_t descriptionLen) const {
-  if (!_data.setpointsValid) {
-    if (outDescription && descriptionLen) {
-      strncpy(outDescription, "setpoints not yet read from controller", descriptionLen - 1);
-      outDescription[descriptionLen - 1] = '\0';
+// ---------------------------------------------------------------------------------------------
+// Charger check: what the controller has stored, read a few registers at a time
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// How the charger check reads: one register per request, with the function code the poll found
+// to work. The other function code is not tried, so a register this controller does not have
+// costs one request and no more.
+class ChargerCheckBus : public sunsaver::Reader {
+ public:
+  ChargerCheckBus(uint8_t slaveId, uint8_t functionCode) : _slaveId(slaveId), _functionCode(functionCode) {}
+
+  sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+
+    // The poll's diagnostics (scErr, scMaddr, scResMs in the telemetry) describe the polls. A
+    // register that an older controller refuses here is no failing link, so they are put back.
+    char keptError[sizeof(sSolarLastModbusError)];
+    char keptTag[sizeof(sSolarLastErrorTag)];
+    memcpy(keptError, sSolarLastModbusError, sizeof(keptError));
+    memcpy(keptTag, sSolarLastErrorTag, sizeof(keptTag));
+    const uint16_t keptAddress = sSolarLastFailAddress;
+    const uint16_t keptResponseMs = sSolarLastResponseMs;
+
+    sSolarLastModbusError[0] = '\0';
+    uint16_t word = 0;
+    const bool ok = (_functionCode == 4) ? readInputRegisters(_slaveId, addr, 1, &word)
+                                         : readHoldingRegisters(_slaveId, addr, 1, &word);
+    sunsaver::IoStatus status = sunsaver::SSIO_OK;
+    if (ok) {
+      *raw = word;
+    } else {
+      // The controller answered with a Modbus exception, or nothing usable came back.
+      const bool refused = strcmp(sSolarLastModbusError, "Illegal data address") == 0 ||
+                           strcmp(sSolarLastModbusError, "Illegal function") == 0 ||
+                           strcmp(sSolarLastModbusError, "Illegal data value") == 0 ||
+                           strcmp(sSolarLastModbusError, "Slave device or server failure") == 0;
+      status = refused ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
     }
-    return CHEMISTRY_CHECK_PENDING;
+
+    memcpy(sSolarLastModbusError, keptError, sizeof(keptError));
+    memcpy(sSolarLastErrorTag, keptTag, sizeof(keptTag));
+    sSolarLastFailAddress = keptAddress;
+    sSolarLastResponseMs = keptResponseMs;
+    return status;
   }
 
-  if (nominalVoltage == 0) nominalVoltage = 12;
-  const float scale = (float)nominalVoltage / 12.0f;
-  const float vReg   = _data.vRegSetpoint;
-  const float vFloat = _data.vFloatSetpoint;
-  const float vEq    = _data.vEqSetpoint;
+ private:
+  uint8_t _slaveId;
+  uint8_t _functionCode;
+};
 
-  // Pack-voltage sanity: V_float should be within ~30% of nominal*1.13 (e.g. 13.6V on 12V).
-  // If it's roughly half or double, the user picked the wrong pack voltage.
-  const float expectedFloat = 13.6f * scale;
-  if (vFloat < expectedFloat * 0.6f || vFloat > expectedFloat * 1.4f) {
-    if (outDescription && descriptionLen) {
-      snprintf(outDescription, descriptionLen,
-               "V_float=%.1fV does not match %dV pack (expected ~%.1fV)",
-               vFloat, (int)nominalVoltage, expectedFloat);
-    }
-    return CHEMISTRY_CHECK_VOLTAGE_MISMATCH;
+}  // namespace
+
+bool SolarManager::startChargerCheck() {
+  // The poll comes first: it finds the function code, and a link it cannot use is not fit for
+  // 49 more requests.
+  if (!_config.enabled || !_initialized || !_data.lastPollOk || (_cachedHoldingFC != 3 && _cachedHoldingFC != 4)) {
+    return false;
   }
+  _chargerCheck.start();
+  _chargerCheckStepMillis = millis();
+  _chargerCheckGapMs = 0;
+  return true;
+}
 
-  // Chemistry-specific checks.
-  // The SunSaver MPPT has only lead-acid DIP presets (Sealed/Gel/Flooded/L16).
-  // Lithium chemistries REQUIRE custom EEPROM setpoints loaded via Morningstar
-  // MSView (USB MeterBus) or Modbus EEPROM writes — there is no lithium DIP
-  // preset, so a lithium selection in our UI must be cross-checked against the
-  // actual setpoints to catch installers who forgot to load the custom profile.
-  //
-  // Reference setpoints at 12V (24V scales 2x):
-  //   Sealed/AGM:  V_reg ~14.15V, V_float ~13.4V,  V_eq = 0
-  //   Gel:         V_reg ~14.0V,  V_float ~13.4V,  V_eq = 0
-  //   Flooded:     V_reg ~14.4V,  V_float ~13.4V,  V_eq ~15.1V
-  //   LiFePO4:     V_reg ~14.2V,  V_float ~13.6V,  V_eq = 0  (typical MSView profile)
-  //   Li-ion 3S:   V_reg ~12.6V,  V_float ~12.4V,  V_eq = 0
-  const bool eqActive = (vEq > 1.0f);  // >1V counts as enabled
+void SolarManager::cancelChargerCheck() {
+  _chargerCheck.cancel();
+}
 
-  switch ((BatteryType)expectedType) {
-    case BATTERY_TYPE_FLOODED: {
-      if (!eqActive) {
-        if (outDescription && descriptionLen) {
-          snprintf(outDescription, descriptionLen,
-                   "Flooded selected but V_eq=%.1fV (expected non-zero); check DIP switches",
-                   vEq);
-        }
-        return CHEMISTRY_CHECK_MISMATCH;
-      }
-      break;
-    }
-
-    case BATTERY_TYPE_AGM:
-    case BATTERY_TYPE_SLA:
-    case BATTERY_TYPE_GEL: {
-      if (eqActive) {
-        if (outDescription && descriptionLen) {
-          snprintf(outDescription, descriptionLen,
-                   "%s selected but V_eq=%.1fV is enabled; check DIP switches",
-                   batteryTypeLabel((BatteryType)expectedType), vEq);
-        }
-        return CHEMISTRY_CHECK_MISMATCH;
-      }
-      break;
-    }
-
-    case BATTERY_TYPE_LIFEPO4: {
-      // LiFePO4 needs custom MSView profile. Catch the common failure mode:
-      // installer left DIP on Sealed/Gel/Flooded so V_float reads ~13.4V instead
-      // of ~13.6V, or V_eq is enabled (which would damage a LiFePO4 pack).
-      if (eqActive) {
-        if (outDescription && descriptionLen) {
-          snprintf(outDescription, descriptionLen,
-                   "LiFePO4 selected but V_eq=%.1fV is ENABLED — DANGER, load lithium profile via MSView",
-                   vEq);
-        }
-        return CHEMISTRY_CHECK_MISMATCH;
-      }
-      const float liFloatMin = 13.5f * scale;
-      const float liFloatMax = 13.9f * scale;
-      const float liRegMin   = 13.8f * scale;
-      const float liRegMax   = 14.6f * scale;
-      if (vFloat < liFloatMin || vFloat > liFloatMax ||
-          vReg   < liRegMin   || vReg   > liRegMax) {
-        if (outDescription && descriptionLen) {
-          snprintf(outDescription, descriptionLen,
-                   "LiFePO4 selected but setpoints look like a lead-acid DIP preset "
-                   "(V_reg=%.2f V_float=%.2f). Load lithium profile via MSView.",
-                   vReg, vFloat);
-        }
-        return CHEMISTRY_CHECK_MISMATCH;
-      }
-      break;
-    }
-
-    case BATTERY_TYPE_LI_ION: {
-      // Li-ion 3S full charge ~12.6V — very different from any lead preset
-      // (which sit in the 13.4–14.4V band), so a wrong DIP is easy to flag.
-      if (eqActive) {
-        if (outDescription && descriptionLen) {
-          snprintf(outDescription, descriptionLen,
-                   "Li-ion selected but V_eq=%.1fV is ENABLED — DANGER, load lithium profile via MSView",
-                   vEq);
-        }
-        return CHEMISTRY_CHECK_MISMATCH;
-      }
-      const float liFloatMin = 12.0f * scale;
-      const float liFloatMax = 12.8f * scale;
-      const float liRegMin   = 12.4f * scale;
-      const float liRegMax   = 12.9f * scale;
-      if (vFloat < liFloatMin || vFloat > liFloatMax ||
-          vReg   < liRegMin   || vReg   > liRegMax) {
-        if (outDescription && descriptionLen) {
-          snprintf(outDescription, descriptionLen,
-                   "Li-ion selected but setpoints look like a lead-acid DIP preset "
-                   "(V_reg=%.2f V_float=%.2f). Load lithium profile via MSView.",
-                   vReg, vFloat);
-        }
-        return CHEMISTRY_CHECK_MISMATCH;
-      }
-      break;
-    }
-
-    case BATTERY_TYPE_CUSTOM:
-    case BATTERY_TYPE_NONE:
-    case BATTERY_TYPE_LIPO:
-    default:
-      // Cannot meaningfully verify — accept anything.
-      if (outDescription && descriptionLen) outDescription[0] = '\0';
-      return CHEMISTRY_CHECK_OK;
+bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
+  if (!_chargerCheck.active()) {
+    return false;
   }
-
-  if (outDescription && descriptionLen) {
-    snprintf(outDescription, descriptionLen,
-             "OK: V_reg=%.2f V_float=%.2f V_eq=%.2f matches %s/%dV",
-             vReg, vFloat, vEq,
-             batteryTypeLabel((BatteryType)expectedType), (int)nominalVoltage);
+  if (!_config.enabled || !_initialized) {
+    _chargerCheck.cancel();
+    return false;
   }
-  return CHEMISTRY_CHECK_OK;
+  if (nowMillis - _chargerCheckStepMillis < _chargerCheckGapMs) {
+    return false;
+  }
+  ChargerCheckBus bus(_config.modbusSlaveId, _cachedHoldingFC);
+  const bool ended = _chargerCheck.step(bus, SOLAR_CHARGER_CHECK_REGISTERS_PER_STEP);
+  _chargerCheckStepMillis = millis();
+  // After a request that got no reply, its reply may still be on the way: leave the line alone
+  // for one Modbus timeout, so that it is not taken for the answer to the next request.
+  _chargerCheckGapMs = _chargerCheck.missed() ? (unsigned long)_config.modbusTimeoutMs
+                                              : (unsigned long)SOLAR_CHARGER_CHECK_STEP_GAP_MS;
+  if (ended && _chargerCheck.done()) {
+    _chargerSettingsRead = true;
+  }
+  return ended;
 }
 
 #else // Platform not supported
 
 // Stub implementation for non-RS485 platforms
-SolarManager::SolarManager() : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0) {
+SolarManager::SolarManager()
+  : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
+    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }
@@ -1148,13 +1047,8 @@ uint32_t SolarManager::getModbusErrCrc()          const { return 0; }
 uint32_t SolarManager::getModbusErrIllegalAddr()  const { return 0; }
 uint32_t SolarManager::getModbusErrIllegalFunc()  const { return 0; }
 uint32_t SolarManager::getModbusErrOther()        const { return 0; }
-SolarManager::ChemistryCheck SolarManager::verifyChemistry(uint8_t expectedType,
-                                                            uint8_t nominalVoltage,
-                                                            char* outDescription,
-                                                            size_t descriptionLen) const {
-  (void)expectedType; (void)nominalVoltage;
-  if (outDescription && descriptionLen) outDescription[0] = '\0';
-  return CHEMISTRY_CHECK_PENDING;
-}
+bool SolarManager::startChargerCheck() { return false; }
+void SolarManager::cancelChargerCheck() {}
+bool SolarManager::serviceChargerCheck(unsigned long nowMillis) { (void)nowMillis; return false; }
 
 #endif // Platform check
