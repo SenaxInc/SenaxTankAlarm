@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
+#include "TankAlarm_DailyParts.h"  // S-D08: first part of a multi-part daily report (host-tested in tests/host/daily_parts)
 #include "WarmTierStore.h"  // S-D03: warm-tier daily summary storage (host-tested in tests/host/warm_store)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4)
   #include <PortentaEthernet.h>
@@ -13396,9 +13397,11 @@ static void handleDaily(JsonDocument &doc, double epoch) {
   noteClientFirmwareAndReconcile(clientUid, doc["fv"] | "", epoch);
 
   // Extract VIN voltage from daily report if present
-  // Check if this is part 0 (new) or part 1 (legacy) of the daily report
+  // S-D08: in a report that carries a schema version, only part 0 is the first part (the one
+  // with the voltage, signal and alarm list). A report without one keeps the old rule (part 0
+  // or 1). See TankAlarm_DailyParts.h.
   uint8_t part = doc["p"].as<uint8_t>();
-  bool isFirstPart = (part == 0 || part == 1);
+  bool isFirstPart = dailyIsFirstPart(doc["_sv"] | 0, part);
   // Prefer the SunSaver MPPT battery voltage (the real 12V pack, read over RS-485 Modbus)
   // over the top-level "v" field. On clients without a Vin divider, "v" can be the Notecard's
   // ~5V supply rail rather than the actual battery, which misrepresents the system voltage on
