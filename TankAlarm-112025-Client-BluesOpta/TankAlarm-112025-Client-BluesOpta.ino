@@ -65,6 +65,8 @@
 #endif
 
 #include <ArduinoJson.h>
+// S-T01/CL-4: Clear Relay by stable sensor number; pure decisions, host-tested in tests/host/relay_command
+#include "TankAlarm_RelayCommand.h"
 #include <memory>
 #include <math.h>
 #include <string.h>
@@ -182,6 +184,18 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 
 #ifndef DEFAULT_PRODUCT_UID
 #define DEFAULT_PRODUCT_UID ""  // Set via ClientConfig.h or Config Generator
+#endif
+
+// CL-4: grid-powered inbound poll interval (config.qi, relay.qi, serial/location requests). A bench
+// build may shorten it from ClientConfig.h, e.g. #define GRID_INBOUND_INTERVAL_MS 60000UL, to test
+// Clear Relay without 10-minute waits; field builds keep 10 minutes.
+#ifndef GRID_INBOUND_INTERVAL_MS
+#define GRID_INBOUND_INTERVAL_MS 600000UL
+#endif
+// Each poll reads one relay.qi note, and a command within RELAY_COMMAND_COOLDOWN_MS of the last one
+// is dropped, so a faster poll would lose the second OFF of a multi-relay clear.
+#if GRID_INBOUND_INTERVAL_MS < (2UL * RELAY_COMMAND_COOLDOWN_MS)
+#error "GRID_INBOUND_INTERVAL_MS must be at least 2 x RELAY_COMMAND_COOLDOWN_MS"
 #endif
 
 // SOLAR_OUTBOUND_INTERVAL_MINUTES and SOLAR_INBOUND_INTERVAL_MINUTES
@@ -1485,6 +1499,8 @@ static float readVinDividerVoltage();
 static void checkRelayMomentaryTimeout(unsigned long now);
 static bool fetchNotecardLocation(float &latitude, float &longitude);
 static void resetRelayForMonitor(uint8_t idx);
+static RelayClearResult clearRelaysForSensorNumber(uint8_t sensorNumber);
+static void logRelayClearLine(const char *line);
 static void initializeClearButton();
 static void checkClearButton(unsigned long now);
 static void initializeUserButton();
@@ -2240,7 +2256,7 @@ void loop() {
   } else if (gConfig.solarPowered) {
     baseInboundInterval = (unsigned long)SOLAR_INBOUND_INTERVAL_MINUTES * 60000UL;
   } else {
-    baseInboundInterval = 600000UL; // 10 minutes for grid power
+    baseInboundInterval = GRID_INBOUND_INTERVAL_MS; // 10 minutes for grid power (bench builds may override)
   }
 
   // Apply power-state multiplier (skipped when awaiting config)
@@ -9468,6 +9484,18 @@ static void processRelayCommand(const JsonDocument &doc) {
       return;
     }
   }
+  // CL-4: server commands carry the routing field "_target". Route #2 delivers to that device and
+  // normally strips it; if it survives, it must still name this device (a sensor number means
+  // nothing on another client).
+  if (!doc["_target"].isNull()) {
+    const char *routedUid = doc["_target"].as<const char*>();
+    if (routedUid && routedUid[0] != '\0' && strcmp(routedUid, gDeviceUID) != 0) {
+      Serial.print(F("Relay command not for this device (_target: "));
+      Serial.print(routedUid);
+      Serial.println(F(") — ignored"));
+      return;
+    }
+  }
 
   // Rate limit: reject commands arriving faster than the minimum cooldown
   // to prevent rapid toggling from stale queued Notes or route replays
@@ -9481,15 +9509,25 @@ static void processRelayCommand(const JsonDocument &doc) {
     lastRelayCommandMillis = now;
   }
 
-  // Handle monitor relay reset command from server first
-  // Command format: { "relay_reset_sensor": 0-7 }
-  // This is a standalone command that doesn't require relay/state fields
-  if (!doc["relay_reset_sensor"].isNull()) {
-    uint8_t sensorIdx = doc["relay_reset_sensor"].as<uint8_t>();
-    if (sensorIdx < MAX_MONITORS) {
-      resetRelayForMonitor(sensorIdx);
+  // Clear Relay (S-T01/CL-4): { "relay_reset_sensor_number": k } names the sensor by its stable number
+  // (the config "number", the "k" in every note). It is a complete command and wins over
+  // relay/state in the same note. The legacy "relay_reset_sensor" carried the dashboard's list
+  // position, which is not a monitor slot, so it is logged and never acted on.
+  {
+    RelayCommand cmd;
+    switch (relayClassifyCommand(doc.as<JsonObjectConst>(), cmd)) {
+      case RELAY_CMD_RESET_BY_NUMBER:
+        clearRelaysForSensorNumber(cmd.sensorNumber);
+        return;
+      case RELAY_CMD_RESET_INVALID:
+        logRelayClearLine("Clear Relay: relay_reset_sensor_number is not a whole number 1-255 - ignored");
+        return;
+      case RELAY_CMD_RESET_LEGACY_IGNORED:
+        logRelayClearLine("Clear Relay by list position (relay_reset_sensor) ignored - update the server");
+        return;
+      case RELAY_CMD_NONE:
+        break;  // relay/state command: unchanged path below
     }
-    return;  // This is a complete command
   }
   
   // Command format for standard relay control:
@@ -9684,6 +9722,51 @@ static void resetRelayForMonitor(uint8_t idx) {
     Serial.println(idx);
   }
   deactivateRelayForMonitor(idx, activeMask);
+}
+
+static void logRelayClearLine(const char *line) {
+  Serial.println(line);
+  addSerialLog(line);  // server-visible serial log; 160-byte entries, every line here is shorter
+}
+
+// Clear Relay for sensor number k (S-T01/CL-4). Numbers belong to this client, so k is resolved here and
+// never forwarded; a monitor bound to another client's relays is released by resetRelayForMonitor,
+// which asks the server to forward relay/state OFF to that client (queued only: not confirmed and not
+// retried; C-A02 retries, C-T02 confirms). Local tracking is cleared either way, so the log line says
+// "off-requested" rather than "released" for a remote binding (relayClearLogWord). Nothing is
+// actuated unless exactly one monitor has number k. C-A02 replaces resetRelayForMonitor's body behind
+// this function; C-T02 reports the returned result to the server.
+static void logRelayClearOutcome(uint8_t sensorNumber, const RelayClearOutcome &o) {
+  char line[160];
+  if (o.resolve == RELAY_RESOLVE_OK) {
+    const MonitorConfig &cfg = gConfig.monitors[o.slot];
+    const RelayScope scope = relayScopeOf(cfg.relayMask, cfg.relayTargetClient, gDeviceUID);
+    snprintf(line, sizeof(line), "Clear Relay sensor #%u -> monitor %u (%s): %s, active 0x%X, binding %s%s",
+             (unsigned)sensorNumber, (unsigned)o.slot, cfg.name, relayClearLogWord(o.result, scope),
+             (unsigned)o.activeMask,
+             scope == RELAY_SCOPE_NONE ? "none" : (scope == RELAY_SCOPE_LOCAL ? "local" : "remote "),
+             scope == RELAY_SCOPE_REMOTE ? cfg.relayTargetClient : "");
+  } else {
+    snprintf(line, sizeof(line), "Clear Relay sensor #%u: %s - nothing changed",
+             (unsigned)sensorNumber, relayClearResultName(o.result));
+  }
+  logRelayClearLine(line);
+}
+
+static RelayClearResult clearRelaysForSensorNumber(uint8_t sensorNumber) {
+  uint8_t numbers[MAX_MONITORS];
+  const uint8_t count = (gConfig.monitorCount < MAX_MONITORS) ? gConfig.monitorCount : MAX_MONITORS;
+  for (uint8_t i = 0; i < count; ++i) {
+    numbers[i] = gConfig.monitors[i].sensorIndex;
+  }
+  // relayClearSensorNumber (TankAlarm_RelayCommand.h) is the host-tested step; this supplies the side
+  // effects. resetRelayForMonitor's body is unchanged (C-A02 replaces it).
+  const RelayClearOutcome o = relayClearSensorNumber(
+      numbers, count, sensorNumber,
+      [](uint8_t slot) { return getMonitorActiveRelayMask(slot); },
+      [sensorNumber](const RelayClearOutcome &out) { logRelayClearOutcome(sensorNumber, out); },
+      [](uint8_t slot) { resetRelayForMonitor(slot); });
+  return o.result;
 }
 
 // ============================================================================
