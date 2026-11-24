@@ -118,9 +118,13 @@ struct TestBus : ss::Bus {
   std::vector<Asked> log;
   std::function<void(size_t index, char kind, uint16_t addr)> before;
   long disorder;
-  uint8_t slave;  // the Modbus id the requests go to
+  uint8_t slave;       // the Modbus id the requests go to
+  size_t stretchFrom;  // from this request on, each one gets a reply that does not answer it, and
+                       // takes as long as ArduinoModbus may then take (ss::modbusRequestLimitMs())
+  uint32_t overrunMs;  // and this much longer: more than the bus says a request may take
 
-  TestBus(SimSunSaver &s, ModbusMaster &m) : sim(s), master(m), function(MB_FC_READ_INPUT), disorder(0), slave(1) {}
+  TestBus(SimSunSaver &s, ModbusMaster &m)
+      : sim(s), master(m), function(MB_FC_READ_INPUT), disorder(0), slave(1), stretchFrom((size_t)-1), overrunMs(0) {}
 
   ss::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
     const uint64_t at = announce('r', addr);
@@ -145,6 +149,8 @@ struct TestBus : ss::Bus {
   // The simulator's clock is the client's here: a Station waits on it, and only on it.
   uint32_t millisNow() override { return (uint32_t)sim.elapsedMs(); }
   uint16_t timeoutMs() const override { return (uint16_t)master.responseTimeoutMs; }
+  // The client's port is ArduinoModbus: the tests hold a run to what that may take.
+  uint32_t requestLimitMs() const override { return ss::modbusRequestLimitMs(timeoutMs()); }
 
   size_t count(char kind) const {
     size_t n = 0;
@@ -177,6 +183,9 @@ struct TestBus : ss::Bus {
     if (before) {
       before(log.size(), kind, addr);
     }
+    if (log.size() >= stretchFrom) {
+      sim.failNext(SimSunSaver::FAULT_WRONG_SLAVE);  // it is carried out, and its reply is another slave's
+    }
     if (!settingsInOrder(sim)) {
       ++disorder;
     }
@@ -189,6 +198,14 @@ struct TestBus : ss::Bus {
       status = ss::SSIO_OK;
     } else if (result.status == MB_EXCEPTION) {
       status = ss::SSIO_REFUSED;
+    }
+    if (log.size() >= stretchFrom) {
+      // libmodbus sleeps for a response timeout after such a reply: the request takes the most
+      // that one may take.
+      const uint64_t until = at + requestLimitMs() + overrunMs;
+      if (sim.elapsedMs() < until) {
+        sim.advance((uint32_t)(until - sim.elapsedMs()));
+      }
     }
     const Asked asked = {kind, addr, value, status, at, sim.elapsedMs()};
     log.push_back(asked);
@@ -3693,6 +3710,8 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
   }
   uint8_t controller() const override { return bus.slave; }
   uint16_t timeoutMs() const override { return (uint16_t)master.responseTimeoutMs; }
+  // As ChargerProgramPort: a read that looks for the function may ask twice.
+  uint32_t requestLimitMs() const override { return choice.readLimitMs(bus.requestLimitMs(), timeoutMs()); }
   bool saveJournal(const ss::Journal &journal) override {
     const size_t index = saves.size();
     if (index == dieAtSave && !dieAfterSave) {
@@ -5579,6 +5598,20 @@ static void testReadFunction() {
     CHECK_EQ(choice.function(), 4);
   }
 
+  // How long one read may take: while the function is to be found, a register refused with
+  // function 3 is asked again, and the refusal may come as the timeout ends. Known, one request.
+  {
+    FunctionDesk desk;
+    desk.sim.readHolding = false;
+    ss::FunctionChoice choice;
+    CHECK_EQ(choice.readLimitMs(8100, 4000), 8100u + 4000u + ss::MODBUS_FRAMES_MS);
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_OK);
+    CHECK_EQ(choice.readLimitMs(8100, 4000), 8100u);
+    CHECK_EQ(ss::FunctionChoice(3).readLimitMs(2600, 500), 2600u);
+    CHECK_EQ(ss::FunctionChoice(4).readLimitMs(2600, 500), 2600u);
+    CHECK_EQ(ss::FunctionChoice(0).readLimitMs(2600, 500), 2600u + 500u + ss::MODBUS_FRAMES_MS);
+  }
+
   // Which function the Supervisor gives a port.
   {
     ss::Supervisor supervisor;
@@ -5782,17 +5815,38 @@ static void testSupervisorSweeps() {
 // ============================================================================
 
 // The moment from a run's first step at which only its shortest safe end is left.
-static uint32_t cutFor(uint16_t timeoutMs) {
-  return ss::RUN_LIMIT_MS - ss::RUN_END_TIMEOUTS * (uint32_t)timeoutMs - ss::RUN_END_SLACK_MS;
+static uint32_t cutFor(uint16_t timeoutMs) { return ss::runCutMs(timeoutMs, ss::modbusRequestLimitMs(timeoutMs)); }
+
+// Moves the clock on to the cut of the run under way, as if the run had come so far by then. The
+// run began with the first request in the log.
+static void toCut(Station &station) {
+  const uint32_t cut = cutFor((uint16_t)station.master.responseTimeoutMs);
+  const uint64_t into = station.bus.log.empty() ? 0 : station.sim.elapsedMs() - station.bus.log.front().at;
+  if (into < cut) {
+    station.sim.advance((uint32_t)(cut - into));
+  }
 }
 
 // A hook that moves the clock on to the cut just before the request with index `at` goes out.
 static void cutAt(Station &station, size_t at) {
   station.bus.before = [&station, at](size_t index, char, uint16_t) {
     if (index == at) {
-      station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+      toCut(station);
     }
   };
+}
+
+// A run that wrote sends a restart command after its last write.
+static bool restartFollowsWrites(const std::vector<Asked> &log) {
+  bool owed = false;
+  for (size_t i = 0; i < log.size(); ++i) {
+    if (log[i].kind == 'w') {
+      owed = true;
+    } else if (log[i].kind == 'c') {
+      owed = false;
+    }
+  }
+  return !owed;
 }
 
 // The client's loop is held for the whole of a run: never longer than RUN_LIMIT_MS, whatever the
@@ -5805,6 +5859,20 @@ static void testTimeLimit() {
   CHECK_EQ(ss::RUN_LIMIT_MS, 60000u);
   CHECK_EQ(cutFor(4000), 30000u);  // the longest timeout a client's config allows leaves half a minute
   CHECK_EQ(cutFor(1000), 51000u);
+  // How long ArduinoModbus may hold one request: a reply that stops part way costs up to 2 s more,
+  // and one that answers another request a whole timeout more.
+  CHECK_EQ(ss::modbusRequestLimitMs(500), 2600u);
+  CHECK_EQ(ss::modbusRequestLimitMs(1000), 3100u);
+  CHECK_EQ(ss::modbusRequestLimitMs(2000), 4100u);
+  CHECK_EQ(ss::modbusRequestLimitMs(2500), 5100u);
+  CHECK_EQ(ss::modbusRequestLimitMs(4000), 8100u);
+  CHECK_EQ(ss::runRestMs(400), 500u);
+  CHECK_EQ(ss::runRestMs(1000), 1000u);
+  CHECK_EQ(ss::runRestMs(4000), 4000u);
+  // At the shortest timeout, the room that the writes leave the last restart command decides.
+  CHECK_EQ(cutFor(500), 54300u);
+  CHECK_EQ(ss::runCutMs(1000, 20000), 19000u);
+  CHECK_EQ(ss::runCutMs(9000, ss::modbusRequestLimitMs(9000)), 0u);
 
   // The run of the finding: a 4 s timeout, and a controller that is gone after the restart
   // command that follows the writes. Twenty probes, each with its rest, would take 160 s.
@@ -5935,7 +6003,7 @@ static void testTimeLimit() {
     Station station;
     station.bus.before = [&station, thirdWrite](size_t index, char, uint16_t) {
       if (index == thirdWrite) {
-        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+        toCut(station);
       } else if (index == thirdWrite + 1) {
         station.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
       }
@@ -5950,6 +6018,287 @@ static void testTimeLimit() {
     CHECK_EQ(station.bus.count('w'), 3);
     CHECK(result.followUp);
     checkPauses(station);
+  }
+
+  // The third register is written just before the cut at a 4 s timeout, and from that write on
+  // every reply answers another request: ArduinoModbus holds each request twice the timeout and
+  // more then. A read-back would leave the last restart command no room, so the command follows
+  // the write at once, and the run ends within RUN_LIMIT_MS owing the controller a look.
+  {
+    const size_t thirdWrite = ss::ITEM_COUNT + 4 + 4;
+    Station station;
+    station.master.responseTimeoutMs = 4000;
+    station.bus.stretchFrom = thirdWrite;
+    unsigned stepsBefore = 0;
+    station.bus.before = [&station, &stepsBefore, thirdWrite](size_t index, char, uint16_t) {
+      if (index == thirdWrite - 1) {
+        const uint64_t into = station.sim.elapsedMs() - station.bus.log.front().at;
+        CHECK(into < cutFor(4000) - 1000);
+        station.sim.advance((uint32_t)(cutFor(4000) - 1000 - into));  // to a second before the cut
+      }
+      stepsBefore = station.steps;
+    };
+    const ss::ProgramResult &result = station.run();
+    const std::vector<Asked> &log = station.bus.log;
+    const uint64_t start = log.front().at;
+    CHECK_EQ(log.size(), thirdWrite + 2);
+    CHECK_EQ(log[thirdWrite].kind, 'w');
+    CHECK(log[thirdWrite].at - start < cutFor(4000));
+    CHECK_EQ(log[thirdWrite + 1].kind, 'c');  // without the read-back
+    CHECK_MSG(log.back().end - start <= ss::RUN_LIMIT_MS, "the run took %llu ms",
+              (unsigned long long)(log.back().end - start));
+    // No request fits after the rest that would follow the command: the run ends with its step,
+    // and does not rest first.
+    CHECK_EQ(station.steps, stepsBefore + 1);
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 2);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_NO_ANSWER), 1);  // written, and not read back
+    CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    CHECK_EQ(station.bus.disorder, 0);
+    checkPauses(station);
+    // The controller did take both: the write, and the restart.
+    CHECK_EQ(reg(station.sim, log[thirdWrite].addr), log[thirdWrite].value);
+    CHECK(!editPending(station.sim));
+    // The look that is owed finds it restarted, and leaves nothing owed.
+    station.bus.stretchFrom = (size_t)-1;
+    station.bus.before = nullptr;
+    station.sim.advance(5000);
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK(!result.followUp);
+    CHECK(!station.programmer.controllerUnknown());
+  }
+
+  // At the edge of the time limit: a request that may end at the limit exactly is still made.
+  // The same timeout and replies; the third register is written 27.7 s into the run. Its
+  // read-back follows the 8.1 s the write takes and a 4 s rest, at 39.8 s, which leaves the last
+  // restart command its 8.1 s after another rest: the read-back is made, the command goes out at
+  // 51.9 s, and the run ends at 60 s exactly. A millisecond later the read-back would not leave the
+  // command that room, and the command follows the write without it.
+  for (const uint32_t late : {0u, 1u}) {
+    const size_t thirdWrite = ss::ITEM_COUNT + 4 + 4;
+    const uint32_t request = ss::modbusRequestLimitMs(4000);
+    const uint32_t readBackAt = ss::RUN_LIMIT_MS - 2 * request - ss::runRestMs(4000);
+    CHECK_EQ(readBackAt, 39800u);
+    Station station;
+    station.master.responseTimeoutMs = 4000;
+    station.bus.stretchFrom = thirdWrite;
+    unsigned stepsBefore = 0;
+    station.bus.before = [&station, &stepsBefore, thirdWrite, request, readBackAt, late](size_t index, char, uint16_t) {
+      if (index == thirdWrite) {
+        const uint64_t into = station.sim.elapsedMs() - station.bus.log.front().at;
+        const uint64_t writeAt = readBackAt - request - 4000 + late;  // the line rests 4 s after its miss
+        CHECK(into <= writeAt);
+        station.sim.advance((uint32_t)(writeAt - into));
+      }
+      stepsBefore = station.steps;
+    };
+    const ss::ProgramResult &result = station.run();
+    const std::vector<Asked> &log = station.bus.log;
+    const uint64_t start = log.front().at;
+    CHECK_EQ(log[thirdWrite].kind, 'w');
+    CHECK_EQ(log[thirdWrite].status, ss::SSIO_NO_REPLY);
+    if (late == 0) {
+      CHECK_EQ(log.size(), thirdWrite + 3);
+      CHECK_EQ(log[thirdWrite + 1].kind, 'r');
+      CHECK_EQ(log[thirdWrite + 1].at - start, readBackAt);
+      CHECK_EQ(log[thirdWrite + 2].kind, 'c');
+      CHECK_EQ(log[thirdWrite + 2].at - start, ss::RUN_LIMIT_MS - request);
+      CHECK_EQ(log.back().end - start, ss::RUN_LIMIT_MS);
+    } else {
+      CHECK_EQ(log.size(), thirdWrite + 2);
+      CHECK_EQ(log[thirdWrite + 1].kind, 'c');  // without the read-back
+      CHECK_EQ(log[thirdWrite + 1].at - start, readBackAt + late);
+      CHECK(log.back().end - start < ss::RUN_LIMIT_MS);
+    }
+    CHECK_EQ(station.steps, stepsBefore + 1);
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 2);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_NO_ANSWER), 1);
+    CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+    CHECK(result.followUp);
+    CHECK_EQ(reg(station.sim, log[thirdWrite].addr), log[thirdWrite].value);
+    CHECK(!editPending(station.sim));
+    CHECK_EQ(station.bus.disorder, 0);
+    checkPauses(station);
+  }
+
+  // The same timeout, and the request before the last restart command takes far longer than the
+  // bus says one may (a line that sends a byte at a time): the read-back of the third register,
+  // past the cut, holds the client 16 s. No time is left for the restart command then, so the
+  // run ends without it and owes the controller the look that sends it.
+  {
+    const size_t thirdWrite = ss::ITEM_COUNT + 4 + 4;
+    Station station;
+    station.master.responseTimeoutMs = 4000;
+    station.bus.stretchFrom = thirdWrite + 1;
+    station.bus.overrunMs = 8000;
+    unsigned stepsBefore = 0;
+    station.bus.before = [&station, &stepsBefore, thirdWrite](size_t index, char, uint16_t) {
+      stepsBefore = station.steps;
+      if (index == thirdWrite - 1) {
+        const uint64_t into = station.sim.elapsedMs() - station.bus.log.front().at;
+        CHECK(into < cutFor(4000) - 1000);
+        station.sim.advance((uint32_t)(cutFor(4000) - 1000 - into));
+      } else if (index == thirdWrite) {
+        station.sim.responseDelayMs = 3850;  // its acknowledgement comes as the timeout ends
+      } else if (index == thirdWrite + 1) {
+        station.sim.responseDelayMs = 20;
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    const std::vector<Asked> &log = station.bus.log;
+    const uint64_t start = log.front().at;
+    CHECK_EQ(log.size(), thirdWrite + 2);
+    CHECK_EQ(log[thirdWrite].kind, 'w');
+    CHECK_EQ(log[thirdWrite].status, ss::SSIO_OK);
+    CHECK(log[thirdWrite].at - start < cutFor(4000));
+    CHECK_EQ(log[thirdWrite + 1].kind, 'r');  // the read-back, past the cut
+    CHECK(log[thirdWrite + 1].at - start >= cutFor(4000));
+    CHECK_EQ(log[thirdWrite + 1].status, ss::SSIO_NO_REPLY);
+    CHECK_MSG(log.back().end - start <= ss::RUN_LIMIT_MS, "the run took %llu ms", (unsigned long long)(log.back().end - start));
+    CHECK_EQ(station.bus.count('c'), 1);  // the one before the writes only
+    CHECK_EQ(station.steps, stepsBefore + 1);  // it ends as soon as it sees the time gone
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_NO_ANSWER), 1);
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    CHECK(editPending(station.sim));  // the controller waits for its restart
+    checkPauses(station);
+    // The look sends the restart command, and settles it.
+    station.bus.stretchFrom = (size_t)-1;
+    station.bus.before = nullptr;
+    station.sim.advance(5000);
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(station.bus.count('c'), 2);
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK(!result.followUp);
+    CHECK(!editPending(station.sim));
+  }
+
+  // And once every register is written: the first look at the controller while it waits for
+  // its restart holds the client 20 s. Without its last restart command the run is no
+  // programming, though every register read back what was written: the controller waits.
+  {
+    Station station;
+    station.master.responseTimeoutMs = 4000;
+    station.bus.overrunMs = 12000;
+    unsigned stepsBefore = 0;
+    station.bus.before = [&station, &stepsBefore](size_t index, char kind, uint16_t addr) {
+      stepsBefore = station.steps;
+      if (kind == 'r' && addr == A_LOAD_STATE && station.bus.count('w') == 15 && station.bus.count('c') == 1) {
+        const uint64_t into = station.sim.elapsedMs() - station.bus.log.front().at;
+        CHECK(into < cutFor(4000) - 100);
+        station.sim.advance((uint32_t)(cutFor(4000) - 100 - into));
+        station.bus.stretchFrom = index;
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    const std::vector<Asked> &log = station.bus.log;
+    const uint64_t start = log.front().at;
+    CHECK_EQ(log.back().addr, A_LOAD_STATE);
+    CHECK_EQ(log.back().status, ss::SSIO_NO_REPLY);
+    CHECK_MSG(log.back().end - start <= ss::RUN_LIMIT_MS, "the run took %llu ms", (unsigned long long)(log.back().end - start));
+    CHECK_EQ(station.bus.count('c'), 1);
+    CHECK_EQ(station.steps, stepsBefore + 1);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 15);
+    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    CHECK(editPending(station.sim));
+    station.bus.stretchFrom = (size_t)-1;
+    station.bus.before = nullptr;
+    station.sim.advance(5000);
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(station.bus.count('c'), 2);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK(!result.followUp);
+    CHECK(!editPending(station.sim));
+  }
+
+  // And after the last restart command, which the controller took: the read of its load faults
+  // holds the client 20 s. It answered the first fault word, so its restart is unconfirmed, and
+  // the registers that could not be read again are marked so.
+  {
+    Station station;
+    station.master.responseTimeoutMs = 4000;
+    station.bus.overrunMs = 12000;
+    unsigned stepsBefore = 0;
+    station.bus.before = [&station, &stepsBefore](size_t index, char kind, uint16_t addr) {
+      stepsBefore = station.steps;
+      if (kind == 'r' && addr == A_LOAD_FAULT && station.bus.count('c') == 2 && station.bus.stretchFrom == (size_t)-1) {
+        const uint64_t into = station.sim.elapsedMs() - station.bus.log.front().at;
+        CHECK(into < cutFor(4000) - 100);
+        station.sim.advance((uint32_t)(cutFor(4000) - 100 - into));
+        station.bus.stretchFrom = index;
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    const std::vector<Asked> &log = station.bus.log;
+    const uint64_t start = log.front().at;
+    CHECK_EQ(log.back().addr, A_LOAD_FAULT);
+    CHECK_EQ(log.back().status, ss::SSIO_NO_REPLY);
+    CHECK_EQ(log[log.size() - 2].addr, A_ARRAY_FAULT);
+    CHECK_MSG(log.back().end - start <= ss::RUN_LIMIT_MS, "the run took %llu ms", (unsigned long long)(log.back().end - start));
+    CHECK_EQ(station.steps, stepsBefore + 1);
+    CHECK_EQ(station.bus.count('c'), 2);
+    CHECK_EQ(result.restart, ss::RESTART_UNCONFIRMED);
+    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK((result.notes & ss::NOTE_VERIFY_INCOMPLETE) != 0);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_UNREAD), ss::PLAN_ENTRIES);  // the 2 it left as they were too
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    CHECK(!editPending(station.sim));  // it did restart
+    station.bus.stretchFrom = (size_t)-1;
+    station.bus.overrunMs = 0;
+    station.bus.before = nullptr;
+    station.sim.advance(5000);
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(station.bus.count('c'), 2);  // nothing waits: no command
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 15);
+    CHECK(!result.followUp);
+  }
+
+  // A caller that leaves the run alone past its time limit (its loop held elsewhere) gets no
+  // request from it after that: the run ends, and owes the controller a look.
+  {
+    Station station;
+    station.bus.before = [&station](size_t, char kind, uint16_t) {
+      if (kind == 'c' && station.bus.count('c') == 1) {
+        station.gapMs = 70000;  // after the step of the last restart command
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(station.bus.log.back().kind, 'c');
+    CHECK_EQ(station.bus.count('c'), 2);
+    CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    station.bus.before = nullptr;
+    station.gapMs = 250;
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK(!result.followUp);
   }
 
   // A timeout so long that no safe end fits in RUN_LIMIT_MS (no config allows one): neither a
@@ -5976,7 +6325,7 @@ static void testTimeLimit() {
     Station station;
     station.bus.before = [&](size_t, char kind, uint16_t addr) {
       if (kind == 'r' && addr == A_LOAD_STATE && station.bus.count('w') == 15 && station.bus.count('c') == 1) {
-        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+        toCut(station);
       }
     };
     const ss::ProgramResult &result = station.run();
@@ -5989,12 +6338,16 @@ static void testTimeLimit() {
   }
 
   // The cut comes as the registers are read again after the restart: those not read are
-  // unconfirmed, and the run says so.
-  {
+  // unconfirmed, and the run says so. At the default timeout, and at the shortest, where the
+  // cut is set by the room the writes leave the last restart command (54.3 s, not 54.5 s), with
+  // the steps close enough together that the next one comes before 54.5 s.
+  for (const uint16_t timeout : {(uint16_t)1000, (uint16_t)500}) {
     Station station;
+    station.master.responseTimeoutMs = timeout;
+    station.gapMs = 50;
     station.bus.before = [&](size_t index, char, uint16_t) {
       if (station.bus.count('c') == 2 && index == station.bus.nth('c', 1) + 6) {
-        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+        toCut(station);
       }
     };
     const ss::ProgramResult &result = station.run();
@@ -6015,7 +6368,7 @@ static void testTimeLimit() {
     station.bus.before = [&](size_t, char kind, uint16_t) {
       if (kind == 'c' && station.bus.count('c') == 1) {
         station.sim.resetWorks = false;
-        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+        toCut(station);
       }
     };
     const ss::ProgramResult &result = station.run();
@@ -6076,6 +6429,8 @@ static void testTimeLimit() {
                       (unsigned)timeouts[t], (unsigned long long)(desk.bus.log[i].at - start));
           }
         }
+        CHECK_MSG(restartFollowsWrites(desk.bus.log), "timeout %u, %s replies, dead from request %u: no restart command after the writes",
+                  (unsigned)timeouts[t], slow == 1 ? "slow" : "quick", (unsigned)dead);
         CHECK_EQ(desk.reports.size(), 1);
         if (editPending(desk.sim)) {
           CHECK_MSG(supervisor.dutyOwed(), "timeout %u, %s replies, dead from request %u: the controller waits, and no look is owed",
@@ -6092,6 +6447,73 @@ static void testTimeLimit() {
     }
   }
   CHECK(cut > 100);  // the cut was reached in many of those runs, not only in a few
+
+  // And with replies that do not answer the request, from each request of a run on: ArduinoModbus
+  // then sleeps a timeout before it gives up, so each request takes as long as one may take there
+  // (ss::modbusRequestLimitMs()), twice the timeout and more. With replies before that that come
+  // at once or just in time. The run still ends within RUN_LIMIT_MS, no request ends past it,
+  // nothing is written past the cut, and a run that wrote still sends its last restart command.
+  // Then once more with requests that take a timeout longer still, more than the bus says one may
+  // (a line that sends a byte at a time): the run may overrun by that much, once, and where it
+  // has no time left for its last restart command it leaves it owed, and does not report the
+  // charger programmed.
+  unsigned stretchedCut = 0;
+  for (size_t t = 0; t < sizeof(timeouts) / sizeof(timeouts[0]); ++t) {
+    for (int mode = 0; mode < 4; ++mode) {
+      const bool slow = (mode & 1) != 0;
+      const uint32_t overrun = mode >= 2 ? timeouts[t] : 0;
+      const char *how = mode == 0 ? "quick" : mode == 1 ? "slow" : mode == 2 ? "quick, overrunning" : "slow, overrunning";
+      for (size_t from = 0;; ++from) {
+        Desk desk;
+        desk.master.responseTimeoutMs = timeouts[t];
+        if (slow) {
+          desk.sim.responseDelayMs = timeouts[t] - 150;
+        }
+        desk.bus.stretchFrom = from;
+        desk.bus.overrunMs = overrun;
+        ss::Supervisor supervisor;
+        desk.boot(supervisor);
+        desk.ask(supervisor, kRequestId);
+        const uint64_t began = desk.clockMs;
+        CHECK(desk.pass(supervisor));
+        const uint64_t took = desk.clockMs - began;
+        CHECK_MSG(took <= ss::RUN_LIMIT_MS + overrun, "timeout %u, %s replies, stretched from request %u: the run took %llu ms",
+                  (unsigned)timeouts[t], how, (unsigned)from, (unsigned long long)took);
+        const uint64_t start = desk.bus.log.empty() ? 0 : desk.bus.log.front().at;
+        for (size_t i = 0; i < desk.bus.log.size(); ++i) {
+          CHECK_MSG(desk.bus.log[i].end - start <= ss::RUN_LIMIT_MS + overrun, "timeout %u, %s replies, stretched from request %u: request %u ended %llu ms into the run",
+                    (unsigned)timeouts[t], how, (unsigned)from, (unsigned)i, (unsigned long long)(desk.bus.log[i].end - start));
+          if (desk.bus.log[i].kind == 'w') {
+            CHECK_MSG(desk.bus.log[i].at - start < cutFor(timeouts[t]), "timeout %u: a write %llu ms into the run",
+                      (unsigned)timeouts[t], (unsigned long long)(desk.bus.log[i].at - start));
+          }
+        }
+        CHECK_EQ(desk.reports.size(), 1);
+        if (!restartFollowsWrites(desk.bus.log)) {
+          CHECK_MSG(overrun > 0, "timeout %u, %s replies, stretched from request %u: no restart command after the writes",
+                    (unsigned)timeouts[t], how, (unsigned)from);
+          if (!desk.reports.empty()) {
+            const ss::ProgramResult &result = desk.reports.back().result;
+            CHECK(result.followUp);
+            CHECK(result.outcome == ss::OUTCOME_STOPPED || result.outcome == ss::OUTCOME_RESTART_FAILED);
+          }
+          CHECK(supervisor.dutyOwed());
+        }
+        if (editPending(desk.sim)) {
+          CHECK_MSG(supervisor.dutyOwed(), "timeout %u, %s replies, stretched from request %u: the controller waits, and no look is owed",
+                    (unsigned)timeouts[t], how, (unsigned)from);
+        }
+        CHECK(desk.bus.disorder == 0);
+        if (!desk.reports.empty() && (desk.reports.back().result.notes & ss::NOTE_TIME_LIMIT) != 0) {
+          ++stretchedCut;
+        }
+        if (from >= desk.bus.log.size()) {
+          break;  // the line answered the whole run
+        }
+      }
+    }
+  }
+  CHECK(stretchedCut > 100);  // here too the cut was reached in many runs
 }
 
 // ============================================================================

@@ -1044,6 +1044,13 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
 
   uint16_t timeoutMs() const override { return _timeoutMs; }
 
+  // ArduinoModbus may hold a request a timeout longer than _timeoutMs, and more for a reply that
+  // stops part way (sunsaver::modbusRequestLimitMs()); a read that looks for the function may ask
+  // twice (sunsaver::FunctionChoice). A run keeps to its time limit by this.
+  uint32_t requestLimitMs() const override {
+    return _function.readLimitMs(sunsaver::modbusRequestLimitMs(_timeoutMs), _timeoutMs);
+  }
+
   sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override { return _function.read(*this, addr, raw); }
 
   uint8_t readFunction() const override { return _function.function(); }

@@ -2215,6 +2215,8 @@ window.updatePowerConfigInfo=function(){
     cp.style.display=on?'block':'none';
     /* A hidden field must not hold the form back: a disabled one is left out of its checks */
     cp.querySelectorAll('input').forEach(el=>{el.disabled=!on;});
+    /* and a tick to write must not outlast the section: shown again, it asks for a fresh one */
+    if(!on){const ap=document.getElementById('cpApply');if(ap)ap.checked=false;}
     const cl=document.getElementById('cpCheckLink');if(cl)cl.innerHTML=on?chargerCheckLink(' The result of each write shows on the ','charger page of this client','.'):'';
   }
   /* Vin divider config section */
@@ -2298,7 +2300,7 @@ sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monito
 const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
 /* SUBMIT & DOWNLOAD */
 const retryBtn=document.getElementById('retryConfigBtn');
-async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const askedWrite=!!(cfg.solarCharger&&cfg.solarCharger.program&&cfg.solarCharger.program.apply);const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast(askedWrite?'Configuration saved and queued for device. The client writes the charger values when it gets it: its charger page shows the result.':'Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}if(askedWrite&&(res.status===200||res.status===202)){const ap=document.getElementById('cpApply');if(ap)ap.checked=false;}}catch(err){showToast('Error: '+err.message,true);}}
+async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const askedWrite=!!(cfg.solarCharger&&cfg.solarCharger.program&&cfg.solarCharger.program.apply);const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast(askedWrite?'Configuration saved and queued for device. The client writes the charger values when it gets it: its charger page shows the result.':'Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}if(res.status===200||res.status===202){const ap=document.getElementById('cpApply');if(ap)ap.checked=false;}}catch(err){showToast('Error: '+err.message,true);}}
 async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
 if(retryBtn)retryBtn.addEventListener('click',retryConfig);
 const syncBtn=document.getElementById('syncRequestBtn');
@@ -2776,6 +2778,7 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
 static bool chargerProgramAnswered(const ClientMetadata &meta);
 static int stampChargerProgramRequest(const char *clientUid, JsonVariant config, char *message, size_t messageSize);
 static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantConst config);
+static void recoverChargerProgramRequests();
 static bool saveChargerPrograms();
 static void loadChargerPrograms();
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
@@ -4668,6 +4671,7 @@ void setup() {
   loadClientMetadataCache();  // Restore client metadata from LittleFS
   loadChargerReports();       // and each client's last charger check
   loadChargerPrograms();      // and its charger programming
+  recoverChargerProgramRequests();  // with any request its cached config holds and the record does not
   printHardwareRequirements();
 
   Wire.begin();
@@ -13270,6 +13274,37 @@ static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantCons
   snprintf(line, sizeof(line), "Charger programming asked of %s (request %lu)", clientUid, (unsigned long)requestId);
   Serial.println(line);
   addServerSerialLog(line, "info", "charger");
+}
+
+// At boot, once the config snapshots and the charger programming are loaded: a request that a
+// client's cached config holds and the record does not. The server may have stopped after it
+// cached that config, which goes out from then on (dispatchClientConfig()), and before it recorded
+// the request (noteChargerProgramRequestSent()). Then the page would not show the request, and a
+// later save of the same values without "apply" would not carry it, which withdraws it on the
+// client. Only a request newer than the one recorded counts: an older one has been replaced.
+static void recoverChargerProgramRequests() {
+  for (uint8_t i = 0; i < gClientConfigCount; ++i) {
+    const ClientConfigSnapshot &snap = gClientConfigs[i];
+    if (snap.uid[0] == '\0' || strstr(snap.payload, "\"program\"") == nullptr) {
+      continue;  // most configs hold no charger values: not parsed
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, snap.payload) != DeserializationError::Ok) {
+      continue;
+    }
+    JsonObjectConst program = doc["solarCharger"]["program"].as<JsonObjectConst>();
+    const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
+    const ClientMetadata *meta = findClientMetadata(snap.uid);
+    if (requestId == 0 || (meta && requestId <= meta->chargerProgramAsked)) {
+      continue;
+    }
+    Serial.print(F("Charger programming: request "));
+    Serial.print((unsigned long)requestId);
+    Serial.print(F(" of "));
+    Serial.print(snap.uid);
+    Serial.println(F(" is in its cached config and was not recorded"));
+    noteChargerProgramRequestSent(snap.uid, doc.as<JsonVariantConst>());
+  }
 }
 
 // A "chg-prog" report: the result of a request, or of the look at the controller that a client

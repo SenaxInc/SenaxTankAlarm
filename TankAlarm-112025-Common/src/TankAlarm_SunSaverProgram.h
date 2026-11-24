@@ -102,7 +102,34 @@ class Bus : public Reader {
   // How long a request waits for its reply before it counts as unanswered. A run keeps the time
   // that its end may need by it.
   virtual uint16_t timeoutMs() const = 0;
+  // The longest one call of readRegister(), writeRegister() or writeCoil() may hold the client,
+  // whatever the controller sends back: with ArduinoModbus, modbusRequestLimitMs(), and more
+  // while a read looks for its Modbus function (FunctionChoice::readLimitMs()). A run reads it at
+  // its first step, and starts no request that could end past its time limit by it.
+  virtual uint32_t requestLimitMs() const = 0;
 };
+
+// How long one request may hold the client with ArduinoModbus, which it talks through: the
+// Modbus timeout for a reply to begin, and what libmodbus may add to it.
+//   - A reply that comes whole but does not answer the request (another slave's, another
+//     function's, or one whose length does not fit) costs one timeout more: with
+//     MODBUS_ERROR_RECOVERY_PROTOCOL, which ModbusClient::begin() sets, libmodbus sleeps for a
+//     whole response timeout before it flushes the line and gives up.
+//   - A reply that stops part way costs up to MODBUS_PARTIAL_REPLY_MS more: after its first
+//     bytes, libmodbus waits its byte timeout of 500 ms for the next part, the RS-485 stream its
+//     read timeout of 1 s for the bytes that part lacks, and libmodbus 500 ms more before it
+//     gives up.
+// And the frames themselves, a few tens of milliseconds at 9600 baud. Bytes that came one at a
+// time, each just inside those waits, could hold a request longer; a controller sends its reply
+// at the speed of the line.
+static const uint16_t MODBUS_PARTIAL_REPLY_MS = 2000;
+static const uint16_t MODBUS_FRAMES_MS = 100;
+
+inline uint32_t modbusRequestLimitMs(uint16_t timeoutMs) {
+  const uint32_t timeout = timeoutMs;
+  const uint32_t more = timeout > MODBUS_PARTIAL_REPLY_MS ? timeout : (uint32_t)MODBUS_PARTIAL_REPLY_MS;
+  return timeout + more + MODBUS_FRAMES_MS;
+}
 
 // Restarts the controller. Its acknowledgement may never come: the controller may restart first.
 static const uint16_t COIL_RESTART = 0x00FF;
@@ -704,6 +731,30 @@ static const uint32_t RUN_LIMIT_MS = 60000;    // no run takes longer than this 
 static const uint8_t RUN_END_TIMEOUTS = 7;     // Modbus timeouts that the shortest safe end of a run may take
 static const uint16_t RUN_END_SLACK_MS = 2000; // and the requests that are answered on its way
 
+// The longest the caller leaves the line alone between two requests of a run: a Modbus timeout
+// after a request without a reply, and the pauses the run asks for.
+inline uint32_t runRestMs(uint16_t timeoutMs) {
+  uint32_t rest = timeoutMs;
+  if (rest < RESTART_WAIT_MS) {
+    rest = RESTART_WAIT_MS;
+  }
+  return rest < PROBE_GAP_MS ? (uint32_t)PROBE_GAP_MS : rest;
+}
+
+// The time after its first step at which a run turns to its end (see Programmer). That is when
+// only the time is left that the shortest safe end needs while its requests are answered or time
+// out: the request under way may take a timeout and the rest after it, and the end that follows
+// at most five timeouts more (a write's read-back and the restart command, each with its rest,
+// and one for the requests that look for the controller after that command). And it is no later
+// than the last moment at which a request of the writes still leaves the last restart command
+// room, however long the bus takes for each (requestLimitMs).
+inline uint32_t runCutMs(uint16_t timeoutMs, uint32_t requestLimitMs) {
+  const uint32_t end = (uint32_t)RUN_END_TIMEOUTS * timeoutMs + RUN_END_SLACK_MS;
+  const uint32_t room = 2 * requestLimitMs + runRestMs(timeoutMs);
+  const uint32_t reserve = end > room ? end : room;
+  return reserve < RUN_LIMIT_MS ? RUN_LIMIT_MS - reserve : 0;
+}
+
 // The two points at which a run waits for its caller before it goes on.
 enum Commit : uint8_t {
   COMMIT_NONE = 0,
@@ -721,12 +772,19 @@ enum Commit : uint8_t {
 //
 // It asks for the pauses it needs, and counts requests where it has to give up. It reads the
 // bus's clock for one thing only, its time limit: no run takes longer than RUN_LIMIT_MS, a
-// minute. Once only the time is left that the shortest safe end may need (RUN_END_TIMEOUTS
-// Modbus timeouts and RUN_END_SLACK_MS), the run takes that end: nothing more is written, a
-// register gets one request where it would get two, nothing is read that the end does not need,
-// and the run ends unless it has written. Then the controller still gets one restart command,
-// and when the run cannot see it restart, the client owes it a look (controllerUnknown()). A run
-// on a line that answers takes about 10 seconds.
+// minute. Once only the time is left that the shortest safe end may need (runCutMs()), the run
+// takes that end: nothing more is written, a register gets one request where it would get two,
+// nothing is read that the end does not need, and the run ends unless it has written. Then the
+// controller still gets one restart command, and when the run cannot see it restart, the client
+// owes it a look (controllerUnknown()). A run on a line that answers takes about 10 seconds.
+//
+// A request can take longer than the Modbus timeout (Bus::requestLimitMs()). So no request
+// starts that could end past the limit, and while a run that writes still owes its last restart
+// command, no other request starts that could leave that command no room: from there a register
+// just written is not read back, and the run goes on to the command. A request that takes longer
+// still than the bus says one may (a line that sends a byte at a time) holds a run past the limit
+// by that much, once: the run then ends at once, and leaves a restart command it has no time for
+// to a later look.
 class Programmer {
  public:
   Programmer() { reset(); }
@@ -785,18 +843,23 @@ class Programmer {
     while (budget > 0 && active() && awaiting() == COMMIT_NONE && !missed_ && pauseMs_ == 0) {
       const uint32_t now = bus.millisNow();
       if (!timed_) {
-        // The request under way when the cut comes may take a timeout and the rest after it. The
-        // end that follows takes at most five timeouts more: a write's read-back and the restart
-        // command, each with its rest, and one for the requests that look for the controller
-        // after that command.
         timed_ = true;
         startMs_ = now;
-        const uint32_t reserve = (uint32_t)RUN_END_TIMEOUTS * bus.timeoutMs() + RUN_END_SLACK_MS;
-        cutMs_ = reserve < RUN_LIMIT_MS ? RUN_LIMIT_MS - reserve : 0;
+        requestMs_ = bus.requestLimitMs();
+        if (requestMs_ < bus.timeoutMs()) {
+          requestMs_ = bus.timeoutMs();
+        }
+        restMs_ = runRestMs(bus.timeoutMs());
+        cutMs_ = runCutMs(bus.timeoutMs(), requestMs_);
       }
-      if (!overdue_ && (uint32_t)(now - startMs_) >= cutMs_) {
+      const uint32_t elapsed = (uint32_t)(now - startMs_);
+      if (!overdue_ && elapsed >= cutMs_) {
         overdue_ = true;
         result_.notes |= NOTE_TIME_LIMIT;
+      }
+      if (!roomForRequest(elapsed)) {
+        outOfTime();  // the phase comes to its end without the request it would make
+        continue;
       }
       bool asked = false;
       switch (phase_) {
@@ -810,6 +873,23 @@ class Programmer {
       }
       if (asked) {
         --budget;
+      }
+    }
+    // When no request could end within the time limit after the rest that is to come, the rest
+    // would only hold the client longer: the run ends here, without the requests its phases would
+    // make. While a run that wrote still owes its last restart command, that happens only after a
+    // request took longer than the bus said one may: the writes leave that command room otherwise.
+    // The command is then left to a later look (restartCut_).
+    if (timed_ && active() && awaiting() == COMMIT_NONE) {
+      uint32_t rest = pauseMs_;
+      if (missed_ && rest < bus.timeoutMs()) {
+        rest = bus.timeoutMs();
+      }
+      const uint32_t elapsed = (uint32_t)(bus.millisNow() - startMs_);
+      if (elapsed > RUN_LIMIT_MS || rest + requestMs_ > RUN_LIMIT_MS - elapsed) {
+        for (uint8_t guard = 0; guard < 8 && active(); ++guard) {
+          outOfTime();
+        }
       }
     }
     return !active();
@@ -896,7 +976,7 @@ class Programmer {
   bool editSeen_;        // and after the writes
   bool sawPending_;      // it reported a pending edit when the restart command under way went out
   bool silent_;          // it has missed a request since that command: it went away to restart
-  bool timed_;           // startMs_ and cutMs_ are set: the run has made its first step
+  bool timed_;           // startMs_, cutMs_, requestMs_ and restMs_ are set: the run has made its first step
   bool overdue_;         // the run has reached cutMs_, and takes the shortest safe way to its end
   bool restartCut_;      // the time limit left a second restart command unsent
   IoStatus lastWrite_;
@@ -912,6 +992,8 @@ class Programmer {
   uint16_t heldFault_;   // array_fault, kept until load_fault has been read too
   uint32_t startMs_;
   uint32_t cutMs_;       // from startMs_ to the moment the run turns to its end
+  uint32_t requestMs_;   // the longest one request may take (Bus::requestLimitMs())
+  uint32_t restMs_;      // and the longest rest between two (runRestMs())
 
   void reset() {
     clearResult(&result_);
@@ -943,6 +1025,8 @@ class Programmer {
     heldFault_ = 0;
     startMs_ = 0;
     cutMs_ = 0;
+    requestMs_ = 0;
+    restMs_ = 0;
   }
 
   void finish(uint8_t outcome) {
@@ -955,6 +1039,77 @@ class Programmer {
     result_.followUp =
         recovery_ ? (restartOpen || (result_.notes & NOTE_NOT_ANSWERED) != 0) : (restartOpen && result_.wroteAny);
     phase_ = PHASE_ENDED;
+  }
+
+  // Whether a request may start `elapsed` after the run's first step: it has to end within the
+  // time limit however long the bus takes for it. A request of the writes, or of the look at the
+  // controller that follows them, has to leave room for the last restart command as well, and
+  // for the rest between the two.
+  bool roomForRequest(uint32_t elapsed) const {
+    if (elapsed > RUN_LIMIT_MS) {
+      return false;
+    }
+    uint32_t need = requestMs_;
+    if (phase_ == PHASE_WRITE || phase_ == PHASE_OBSERVE) {
+      need += restMs_ + requestMs_;
+    }
+    return need <= RUN_LIMIT_MS - elapsed;
+  }
+
+  // The request this phase would make does not fit in the time that is left (roomForRequest()):
+  // the phase comes to its end without it, as it does past the cut when a request goes
+  // unanswered. That leads to the end of the run, or to the last restart command, which the
+  // writes left room for.
+  void outOfTime() {
+    if (!overdue_) {
+      overdue_ = true;
+      result_.notes |= NOTE_TIME_LIMIT;
+    }
+    switch (phase_) {
+      case PHASE_READ_BEFORE:
+        finish(OUTCOME_NO_LINK);  // nothing has been sent that changes the controller
+        break;
+      case PHASE_RECOVER:
+        if (recovery_) {
+          notAnswered();
+        } else {
+          conclude();  // it still does not know
+        }
+        break;
+      case PHASE_RESTART:
+        if (firstRestart_) {
+          finish(OUTCOME_NO_LINK);  // nothing is written yet
+        } else {
+          restartCut_ = true;  // a later look sends it
+          conclude();
+        }
+        break;
+      case PHASE_WAIT_BACK:
+        restartSettled(stage_ == 0 && (silent_ || quiet_ == 0) ? (uint8_t)RESTART_NO_ANSWER
+                                                               : (uint8_t)RESTART_UNCONFIRMED);
+        break;
+      case PHASE_WRITE:
+        if (readingBack_) {
+          readingBack_ = false;
+          result_.entries[entry_].status = ENTRY_NO_ANSWER;  // written, and not read back
+          stopWrites();
+        } else {
+          stopped_ = true;
+          if (result_.wroteAny) {
+            beginRestart(false, false);
+          } else {
+            finish(OUTCOME_NO_LINK);
+          }
+        }
+        break;
+      case PHASE_OBSERVE:
+        beginRestart(false, editSeen_);
+        break;
+      default:  // PHASE_VERIFY
+        leaveUnread();
+        conclude();
+        break;
+    }
   }
 
   static bool editPending(uint16_t arrayFault, uint16_t loadFault) {
@@ -1432,7 +1587,7 @@ class Programmer {
       finish(OUTCOME_INTERRUPTED);
     } else if (stopped_) {
       finish(OUTCOME_STOPPED);
-    } else if (result_.restart != RESTART_DONE) {
+    } else if (result_.restart != RESTART_DONE || restartCut_) {
       finish(OUTCOME_RESTART_FAILED);
     } else if (countEntries(result_, ENTRY_LOST) != 0) {
       finish(OUTCOME_VERIFY_FAILED);
@@ -1567,6 +1722,13 @@ class FunctionChoice {
 
   // 3 or 4, or 0 while no register has answered.
   uint8_t function() const { return known_ ? function_ : 0; }
+
+  // The longest one read() may take when one request may take `requestMs`: while the function
+  // is not known, a register refused with function 3 is asked once more, and a refusal, a whole
+  // reply, comes within the Modbus timeout `timeoutMs` and its frames.
+  uint32_t readLimitMs(uint32_t requestMs, uint16_t timeoutMs) const {
+    return known_ ? requestMs : requestMs + timeoutMs + MODBUS_FRAMES_MS;
+  }
 
  private:
   uint8_t function_;  // 3 while the function is not known
