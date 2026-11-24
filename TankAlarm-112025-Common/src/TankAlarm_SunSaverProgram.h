@@ -51,10 +51,15 @@
  *   No repeats. A register that does not take its value is written once more, and then the run
  *     stops. A whole run is never repeated by itself.
  *   The order. What a lithium battery must not get goes first (equalization, temperature
- *     compensation), then the limits, then the charge voltages, then the load thresholds. Within
- *     a pair that has to stay in order (LVD and LVR, say) the register that keeps the pair in
- *     order is written first. So a run that is cut short leaves settings that are no worse for
- *     the battery than the ones it found.
+ *     compensation). The limits on the charge voltage (the HVD and the regulation ceiling) come
+ *     next where they come down, and after the charge voltages and times of both banks where
+ *     they go up, so that no limit is raised while a charge voltage it holds down has yet to
+ *     come down. The load thresholds come last, the load current compensation (which pulls the
+ *     LVD in effect down under load) before the LVD. Within a pair that has to stay in order
+ *     (LVD and LVR, say) the register that keeps the pair in order is written first. So wherever
+ *     a run stops, each charge voltage in effect is no higher than the higher of the one the run
+ *     found and the one it was to write, and the LVD in effect is no lower than the lower of
+ *     the two.
  *
  * What it does not do
  * -------------------
@@ -119,9 +124,10 @@ class Bus : public Reader {
 //     bytes, libmodbus waits its byte timeout of 500 ms for the next part, the RS-485 stream its
 //     read timeout of 1 s for the bytes that part lacks, and libmodbus 500 ms more before it
 //     gives up.
-// And the frames themselves, a few tens of milliseconds at 9600 baud. Bytes that came one at a
-// time, each just inside those waits, could hold a request longer; a controller sends its reply
-// at the speed of the line.
+// And the frames themselves, with the silence of 3.5 characters that the client's port keeps
+// before each request of a run, a few tens of milliseconds at 9600 baud, the slowest a config
+// allows. Bytes that came one at a time, each just inside those waits, could hold a request
+// longer; a controller sends its reply at the speed of the line.
 static const uint16_t MODBUS_PARTIAL_REPLY_MS = 2000;
 static const uint16_t MODBUS_FRAMES_MS = 100;
 
@@ -379,6 +385,13 @@ struct PlanStep {
 static const uint8_t PLAN_SINGLE = 0xFF;
 static const uint8_t PLAN_STEPS = 13;
 
+// Steps PLAN_LIMITS_FIRST to PLAN_LIMITS_LAST set the limits on the charge voltage: the HVD with
+// its HVR, and the regulation ceiling. A limit that goes up is written just before step
+// PLAN_RAISED_LIMITS_AT instead, after the charge voltages and times of both banks (buildPlan()).
+static const uint8_t PLAN_LIMITS_FIRST = 3;
+static const uint8_t PLAN_LIMITS_LAST = 4;
+static const uint8_t PLAN_RAISED_LIMITS_AT = 11;
+
 // Both custom banks get the same settings: the battery jumper picks the bank, and it cannot be
 // read over Modbus. The regulation ceiling (Evb_ref_lim) is set to the HVD, so that a ceiling
 // somebody stored below the new absorption voltage cannot hold the charger under it.
@@ -388,8 +401,18 @@ inline const PlanStep &planStep(uint8_t index) {
       {I_EV_HVR, I_EV_HVD},         {I_EVB_REF_LIM, PLAN_SINGLE},
       {I_EV_FLOAT, I_EV_REG},       {I_ET_FLOAT, PLAN_SINGLE},  {I_ET_FLOATLB, PLAN_SINGLE},
       {I_EV_FLOAT2, I_EV_REG2},     {I_ET_FLOAT2, PLAN_SINGLE}, {I_ET_FLOATLB2, PLAN_SINGLE},
-      {I_EV_LVD, I_EV_LVR},         {I_ER_ICOMP, PLAN_SINGLE}};
+      {I_ER_ICOMP, PLAN_SINGLE},    {I_EV_LVD, I_EV_LVR}};
   return kSteps[index < PLAN_STEPS ? index : 0];
+}
+
+// A limit on the charge voltage as a level to compare: 0 is no limit (the HVD off, no ceiling),
+// above every word.
+inline uint32_t limitLevel(uint16_t word) { return word == 0 ? 0x10000ul : (uint32_t)word; }
+
+// True for a step of limits whose limit goes up: the HVD of the pair, or the ceiling.
+inline bool limitRaised(const PlanStep &step, const Snapshot &before, const Profile &profile, uint8_t scale) {
+  const uint8_t limit = step.second != PLAN_SINGLE ? step.second : step.first;
+  return limitLevel(targetWord(limit, profile, scale)) > limitLevel(before.raw[limit]);
 }
 
 // True for a register the plan writes.
@@ -405,36 +428,57 @@ inline bool inPlan(uint8_t index) {
   return false;
 }
 
+// Adds the registers of one step to the plan, in the order of writing.
+inline void addPlanStep(const PlanStep &step, const Snapshot &before, const Profile &profile, uint8_t scale,
+                        PlanEntry *entries, uint8_t *count, uint8_t *toWrite) {
+  uint8_t order[2] = {step.first, step.second};
+  uint8_t items = 1;
+  if (step.second != PLAN_SINGLE) {
+    items = 2;
+    // The upper register goes first when its new word is above the word the lower one holds
+    // now: the pair is then in order after either write. Otherwise the lower one goes first.
+    // Its new word is below the new upper one, which is then no higher than the old lower
+    // one, which was below the old upper one.
+    if (targetWord(step.second, profile, scale) > before.raw[step.first]) {
+      order[0] = step.second;
+      order[1] = step.first;
+    }
+  }
+  for (uint8_t i = 0; i < items; ++i) {
+    PlanEntry &entry = entries[(*count)++];
+    entry.item = order[i];
+    entry.before = before.raw[order[i]];
+    entry.target = targetWord(order[i], profile, scale);
+    entry.found = entry.before;
+    entry.status = entry.before == entry.target ? (uint8_t)ENTRY_UNCHANGED : (uint8_t)ENTRY_PENDING;
+    if (entry.status == ENTRY_PENDING) {
+      ++*toWrite;
+    }
+  }
+}
+
 // Fills entries[PLAN_ENTRIES] in the order of writing and returns how many of them have to be
 // written. `before` must hold every register of the plan.
+//
+// A limit on the charge voltage that comes down (or stays) is written in its place, before the
+// charge voltages; one that goes up only after the charge voltages and times of both banks. A run
+// that stops in between then leaves each bank's charge voltage held down by the lower of a
+// limit's two values: it charges no higher than it did before, until its own voltages are
+// written, and after that no higher than the run is to leave it.
 inline uint8_t buildPlan(const Snapshot &before, const Profile &profile, uint8_t scale, PlanEntry *entries) {
   uint8_t count = 0;
   uint8_t toWrite = 0;
   for (uint8_t s = 0; s < PLAN_STEPS; ++s) {
-    const PlanStep &step = planStep(s);
-    uint8_t order[2] = {step.first, step.second};
-    uint8_t items = 1;
-    if (step.second != PLAN_SINGLE) {
-      items = 2;
-      // The upper register goes first when its new word is above the word the lower one holds
-      // now: the pair is then in order after either write. Otherwise the lower one goes first.
-      // Its new word is below the new upper one, which is then no higher than the old lower
-      // one, which was below the old upper one.
-      if (targetWord(step.second, profile, scale) > before.raw[step.first]) {
-        order[0] = step.second;
-        order[1] = step.first;
+    if (s == PLAN_RAISED_LIMITS_AT) {
+      for (uint8_t l = PLAN_LIMITS_FIRST; l <= PLAN_LIMITS_LAST; ++l) {
+        if (limitRaised(planStep(l), before, profile, scale)) {
+          addPlanStep(planStep(l), before, profile, scale, entries, &count, &toWrite);
+        }
       }
     }
-    for (uint8_t i = 0; i < items; ++i) {
-      PlanEntry &entry = entries[count++];
-      entry.item = order[i];
-      entry.before = before.raw[order[i]];
-      entry.target = targetWord(order[i], profile, scale);
-      entry.found = entry.before;
-      entry.status = entry.before == entry.target ? (uint8_t)ENTRY_UNCHANGED : (uint8_t)ENTRY_PENDING;
-      if (entry.status == ENTRY_PENDING) {
-        ++toWrite;
-      }
+    const bool limit = s >= PLAN_LIMITS_FIRST && s <= PLAN_LIMITS_LAST;
+    if (!limit || !limitRaised(planStep(s), before, profile, scale)) {
+      addPlanStep(planStep(s), before, profile, scale, entries, &count, &toWrite);
     }
   }
   return toWrite;

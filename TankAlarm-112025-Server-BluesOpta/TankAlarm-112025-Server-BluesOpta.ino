@@ -18141,7 +18141,9 @@ static bool saveClientConfigSnapshots() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) {
-      return true;
+      // The flash could not be mounted (initializeStorage()): nothing is saved, as for the other
+      // files the server keeps, so a config whose time must be saved first is not sent.
+      return false;
     }
     
     // Accumulate output into a buffer first, then write atomically.

@@ -16,6 +16,7 @@
 
 #include "test_support.h"  // ../optaview: the test macros, the simulator and the OptaView headers
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 
@@ -58,7 +59,7 @@ static const uint16_t A_EV_LVD = 0xE022, A_EV_LVR = 0xE023, A_ER_ICOMP = 0xE026;
 static const uint16_t kPlanAddrs[ss::PLAN_ENTRIES] = {
     A_EV_EQ,      A_EV_EQ2,    A_EV_TEMPCOMP, A_EV_HVD,      A_EV_HVR,   A_EVB_REF_LIM,
     A_EV_REG,     A_EV_FLOAT,  A_ET_FLOAT,    A_ET_FLOATLB,  A_EV_REG2,  A_EV_FLOAT2,
-    A_ET_FLOAT2,  A_ET_FLOATLB2, A_EV_LVR,    A_EV_LVD,      A_ER_ICOMP};
+    A_ET_FLOAT2,  A_ET_FLOATLB2, A_ER_ICOMP,  A_EV_LVR,      A_EV_LVD};
 
 // One request a test's bus sent.
 struct Asked {
@@ -108,6 +109,82 @@ static bool editPending(const SimSunSaver &sim) {
 // recommended profile's LVR of 13.25 V either way. The default 13.68 V is not (13.23 V).
 static void chargeForPending(SimSunSaver &sim) { sim.regs[0x0008] = sim.volts(13.80); }
 
+// What a battery gets from the settings a controller holds, where the order of a run's writes
+// could make it worse: the highest voltage each bank charges to in each stage, held under the
+// regulation ceiling (which is not temperature-compensated) and the HVD (which is), with the
+// battery cold and at 25 C; and the LVD in effect, which the load current compensation pulls
+// down, at a few load currents. 0 is off in EV_eq, EV_hvd and Evb_ref_lim.
+struct Harm {
+  double charge[2][3][2];  // bank, stage (absorption, float, equalization), battery at 0 C and at 25 C
+  double lvd[3];           // with no load current, 5 A and 15 A
+};
+
+static uint16_t wordIn(const std::map<uint16_t, uint16_t> &regs, uint16_t addr) {
+  const std::map<uint16_t, uint16_t>::const_iterator it = regs.find(addr);
+  return it == regs.end() ? 0 : it->second;
+}
+
+static Harm harmOf(const std::map<uint16_t, uint16_t> &regs) {
+  static const uint16_t kStages[2][3] = {{A_EV_REG, A_EV_FLOAT, A_EV_EQ}, {A_EV_REG2, A_EV_FLOAT2, A_EV_EQ2}};
+  static const double kCelsius[2] = {0.0, 25.0};
+  static const double kAmps[3] = {0.0, 5.0, 15.0};
+  const double voltsPerC = wordIn(regs, A_EV_TEMPCOMP) * 100.0 / 65536.0;
+  const uint16_t hvd = wordIn(regs, A_EV_HVD);
+  const uint16_t ceiling = wordIn(regs, A_EVB_REF_LIM);
+  Harm harm;
+  for (int b = 0; b < 2; ++b) {
+    for (int s = 0; s < 3; ++s) {
+      const uint16_t word = wordIn(regs, kStages[b][s]);
+      for (int t = 0; t < 2; ++t) {
+        const double compensation = voltsPerC * (25.0 - kCelsius[t]);
+        double volts = (s == 2 && word == 0) ? 0.0 : ss::voltsFromRaw(word, ss::SCALE_100) + compensation;
+        if (hvd != 0) {
+          volts = std::min(volts, ss::voltsFromRaw(hvd, ss::SCALE_100) + compensation);
+        }
+        if (ceiling != 0) {
+          volts = std::min(volts, ss::voltsFromRaw(ceiling, ss::SCALE_100));
+        }
+        harm.charge[b][s][t] = volts;
+      }
+    }
+  }
+  const double ohms = ss::ohmsFromRaw(wordIn(regs, A_ER_ICOMP));
+  for (int a = 0; a < 3; ++a) {
+    harm.lvd[a] = ss::voltsFromRaw(wordIn(regs, A_EV_LVD), ss::SCALE_100) - ohms * kAmps[a];
+  }
+  return harm;
+}
+
+// Empty while `now` is no worse for the battery than the worse of `before` and `after`: no
+// charge voltage above the higher of the two, no LVD below the lower. Otherwise what is worse.
+static std::string harmBeyond(const Harm &now, const Harm &before, const Harm &after) {
+  static const char *const kStage[3] = {"absorption", "float", "equalization"};
+  char text[200];
+  for (int b = 0; b < 2; ++b) {
+    for (int s = 0; s < 3; ++s) {
+      for (int t = 0; t < 2; ++t) {
+        const double most = std::max(before.charge[b][s][t], after.charge[b][s][t]);
+        if (now.charge[b][s][t] > most + 1e-9) {
+          snprintf(text, sizeof(text), "bank %d charges to %.3f V in %s at %s, above %.3f V before and %.3f V after",
+                   b + 1, now.charge[b][s][t], kStage[s], t == 0 ? "0 C" : "25 C", before.charge[b][s][t],
+                   after.charge[b][s][t]);
+          return text;
+        }
+      }
+    }
+  }
+  static const int kAmps[3] = {0, 5, 15};
+  for (int a = 0; a < 3; ++a) {
+    const double least = std::min(before.lvd[a], after.lvd[a]);
+    if (now.lvd[a] < least - 1e-9) {
+      snprintf(text, sizeof(text), "the LVD in effect at %d A is %.3f V, below %.3f V before and %.3f V after", kAmps[a],
+               now.lvd[a], before.lvd[a], after.lvd[a]);
+      return text;
+    }
+  }
+  return std::string();
+}
+
 // The Bus of these tests. It keeps a list of what was asked, lets a test act just before a
 // request goes out, and looks at the controller's memory before every request: the settings
 // must be in order at every moment of a run, not only at its end.
@@ -122,9 +199,24 @@ struct TestBus : ss::Bus {
   size_t stretchFrom;  // from this request on, each one gets a reply that does not answer it, and
                        // takes as long as ArduinoModbus may then take (ss::modbusRequestLimitMs())
   uint32_t overrunMs;  // and this much longer: more than the bus says a request may take
+  // With watchHarm set, the settings are also judged before every request: never worse for the
+  // battery than the worse of harmBefore and harmAfter (harmBeyond()).
+  bool watchHarm;
+  Harm harmBefore;
+  Harm harmAfter;
+  long harmful;
+  std::string firstHarm;
 
   TestBus(SimSunSaver &s, ModbusMaster &m)
-      : sim(s), master(m), function(MB_FC_READ_INPUT), disorder(0), slave(1), stretchFrom((size_t)-1), overrunMs(0) {}
+      : sim(s),
+        master(m),
+        function(MB_FC_READ_INPUT),
+        disorder(0),
+        slave(1),
+        stretchFrom((size_t)-1),
+        overrunMs(0),
+        watchHarm(false),
+        harmful(0) {}
 
   ss::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
     const uint64_t at = announce('r', addr);
@@ -188,6 +280,12 @@ struct TestBus : ss::Bus {
     }
     if (!settingsInOrder(sim)) {
       ++disorder;
+    }
+    if (watchHarm) {
+      const std::string why = harmBeyond(harmOf(sim.regs), harmBefore, harmAfter);
+      if (!why.empty() && harmful++ == 0) {
+        firstHarm = why;
+      }
     }
     return sim.elapsedMs();
   }
@@ -407,13 +505,13 @@ static uint8_t statusOf(const ss::ProgramResult &result, uint16_t addr) {
   return entry != nullptr ? entry->status : (uint8_t)0xFF;
 }
 
-static ss::Snapshot snapshotOf(const SimSunSaver &sim) {
+static ss::Snapshot snapshotOf(const std::map<uint16_t, uint16_t> &regs) {
   ss::Snapshot snapshot;
   ss::clearSnapshot(&snapshot);
   for (uint8_t i = 0; i < ss::ITEM_COUNT; ++i) {
-    uint16_t word = 0;
-    if (wordAt(sim, ss::item(i).addr, &word)) {
-      snapshot.raw[i] = word;
+    const std::map<uint16_t, uint16_t>::const_iterator it = regs.find(ss::item(i).addr);
+    if (it != regs.end()) {
+      snapshot.raw[i] = it->second;
       snapshot.status[i] = ss::SSIO_OK;
     } else {
       snapshot.status[i] = ss::SSIO_REFUSED;
@@ -421,6 +519,8 @@ static ss::Snapshot snapshotOf(const SimSunSaver &sim) {
   }
   return snapshot;
 }
+
+static ss::Snapshot snapshotOf(const SimSunSaver &sim) { return snapshotOf(sim.regs); }
 
 template <typename Describe>
 static std::string textFrom(Describe describe) {
@@ -715,7 +815,7 @@ static void testPlan() {
     memset(entries, 0xEE, sizeof(entries));
     CHECK_EQ(ss::buildPlan(snapshotOf(sim), profile, ss::SCALE_100, entries), 15);
     const uint16_t words[ss::PLAN_ENTRIES] = {0,    0,   0,   4735, 4456, 4735, 4653, 4424, 900,
-                                              900,  4653, 4424, 900, 900,  4342, 4293, 0};
+                                              900,  4653, 4424, 900, 900,  0,    4342, 4293};
     for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
       CHECK_MSG(ss::item(entries[i].item).addr == kPlanAddrs[i], "entry %u is %s", (unsigned)i,
                 ss::item(entries[i].item).name);
@@ -731,7 +831,64 @@ static void testPlan() {
     for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
       CHECK_EQ(entries[i].target, wantedWord(other, kPlanAddrs[i], profile));
     }
-    CHECK_EQ(entries[15].target, 4441);  // EV_lvd: 13.10 V
+    CHECK_EQ(entries[16].target, 4441);  // EV_lvd: 13.10 V
+  }
+
+  // A limit on the charge voltage that goes up is written after the charge voltages and times of
+  // both banks; one that comes down, or stays, in its place before them. A limit that is off (0)
+  // comes down to its value. The load current compensation comes before the LVD and LVR.
+  {
+    const ss::Profile wanted = {1460, 1350, 900, 1500, 1360, 1310, 1325};
+    const auto orderIs = [&](const SimSunSaver &sim, const uint16_t (&want)[ss::PLAN_ENTRIES], const char *what) {
+      ss::PlanEntry entries[ss::PLAN_ENTRIES];
+      ss::buildPlan(snapshotOf(sim), wanted, ss::SCALE_100, entries);
+      for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
+        CHECK_MSG(ss::item(entries[i].item).addr == want[i], "%s: entry %u is %s", what, (unsigned)i,
+                  ss::item(entries[i].item).name);
+      }
+    };
+    // The case of the review: a ceiling holds an absorption voltage of 15.50 V down to 13.80 V,
+    // and the run is to lower the HVD from 16.00 V and raise the ceiling, both to 15.00 V.
+    SimSunSaver sim;
+    sim.regs[A_EV_REG] = sim.setVolts(15.50);
+    sim.regs[A_EV_HVD] = sim.setVolts(16.00);
+    sim.regs[A_EVB_REF_LIM] = sim.setVolts(13.80);
+    const uint16_t ceilingLate[ss::PLAN_ENTRIES] = {
+        A_EV_EQ,     A_EV_EQ2,      A_EV_TEMPCOMP, A_EV_HVD,      A_EV_HVR,   A_EV_REG,
+        A_EV_FLOAT,  A_ET_FLOAT,    A_ET_FLOATLB,  A_EV_REG2,     A_EV_FLOAT2, A_ET_FLOAT2,
+        A_ET_FLOATLB2, A_EVB_REF_LIM, A_ER_ICOMP,  A_EV_LVR,      A_EV_LVD};
+    orderIs(sim, ceilingLate, "ceiling up, HVD down");
+    // Both go up: the pair as one, its upper register first as ever.
+    sim.regs[A_EV_HVD] = sim.setVolts(14.20);
+    sim.regs[A_EV_HVR] = sim.setVolts(13.40);
+    const uint16_t bothLate[ss::PLAN_ENTRIES] = {
+        A_EV_EQ,     A_EV_EQ2,      A_EV_TEMPCOMP, A_EV_REG,      A_EV_FLOAT, A_ET_FLOAT,
+        A_ET_FLOATLB, A_EV_REG2,    A_EV_FLOAT2,   A_ET_FLOAT2,   A_ET_FLOATLB2, A_EV_HVD,
+        A_EV_HVR,    A_EVB_REF_LIM, A_ER_ICOMP,    A_EV_LVR,      A_EV_LVD};
+    orderIs(sim, bothLate, "both up");
+    // One count up is up.
+    sim.regs[A_EV_HVD] = (uint16_t)(sim.setVolts(15.00) - 1);
+    sim.regs[A_EVB_REF_LIM] = (uint16_t)(sim.setVolts(15.00) - 1);
+    orderIs(sim, bothLate, "both one count up");
+    // Off, or at the value already: in their place.
+    const uint16_t inPlace[ss::PLAN_ENTRIES] = {
+        A_EV_EQ,     A_EV_EQ2,      A_EV_TEMPCOMP, A_EV_HVD,      A_EV_HVR,   A_EVB_REF_LIM,
+        A_EV_REG,    A_EV_FLOAT,    A_ET_FLOAT,    A_ET_FLOATLB,  A_EV_REG2,  A_EV_FLOAT2,
+        A_ET_FLOAT2, A_ET_FLOATLB2, A_ER_ICOMP,    A_EV_LVR,      A_EV_LVD};
+    sim.regs[A_EV_HVD] = 0;
+    sim.regs[A_EVB_REF_LIM] = 0;
+    orderIs(sim, inPlace, "both off");
+    sim.regs[A_EV_HVD] = sim.setVolts(15.00);
+    sim.regs[A_EVB_REF_LIM] = sim.setVolts(15.00);
+    orderIs(sim, inPlace, "both at the value asked for");
+    // Each limit decides for itself: the HVD up, the ceiling off.
+    sim.regs[A_EV_HVD] = sim.setVolts(14.20);
+    sim.regs[A_EVB_REF_LIM] = 0;
+    const uint16_t hvdLate[ss::PLAN_ENTRIES] = {
+        A_EV_EQ,     A_EV_EQ2,      A_EV_TEMPCOMP, A_EVB_REF_LIM, A_EV_REG,   A_EV_FLOAT,
+        A_ET_FLOAT,  A_ET_FLOATLB,  A_EV_REG2,     A_EV_FLOAT2,   A_ET_FLOAT2, A_ET_FLOATLB2,
+        A_EV_HVD,    A_EV_HVR,      A_ER_ICOMP,    A_EV_LVR,      A_EV_LVD};
+    orderIs(sim, hvdLate, "HVD up, ceiling off");
   }
 
   // A controller that holds the profile: nothing to write.
@@ -756,16 +913,16 @@ static void testPlan() {
     sim.regs[A_EV_LVR] = sim.setVolts(13.80);
     ss::PlanEntry entries[ss::PLAN_ENTRIES];
     ss::buildPlan(snapshotOf(sim), profile, ss::SCALE_100, entries);
-    CHECK_EQ(ss::item(entries[14].item).addr, A_EV_LVD);
-    CHECK_EQ(ss::item(entries[15].item).addr, A_EV_LVR);
+    CHECK_EQ(ss::item(entries[15].item).addr, A_EV_LVD);
+    CHECK_EQ(ss::item(entries[16].item).addr, A_EV_LVR);
     // The new upper word equal to the old lower one: writing the upper register first would
     // leave the two equal for a moment, so the lower one goes first.
     sim.regs[A_EV_LVD] = sim.setVolts(13.25);
     ss::buildPlan(snapshotOf(sim), profile, ss::SCALE_100, entries);
-    CHECK_EQ(ss::item(entries[14].item).addr, A_EV_LVD);
+    CHECK_EQ(ss::item(entries[15].item).addr, A_EV_LVD);
     sim.regs[A_EV_LVD] = (uint16_t)(sim.setVolts(13.25) - 1);
     ss::buildPlan(snapshotOf(sim), profile, ss::SCALE_100, entries);
-    CHECK_EQ(ss::item(entries[14].item).addr, A_EV_LVR);
+    CHECK_EQ(ss::item(entries[15].item).addr, A_EV_LVR);
   }
   // Whatever an ordered pair holds, and whatever ordered pair it is to hold: the pair is in
   // order after the first of its two writes as well.
@@ -783,12 +940,12 @@ static void testPlan() {
             wanted.lvrCv = lvr;
             ss::PlanEntry entries[ss::PLAN_ENTRIES];
             ss::buildPlan(snapshotOf(sim), wanted, ss::SCALE_100, entries);
-            for (uint8_t i = 14; i <= 15; ++i) {
+            for (uint8_t i = 15; i <= 16; ++i) {
               if (entries[i].status == ss::ENTRY_PENDING) {
                 sim.regs[ss::item(entries[i].item).addr] = entries[i].target;
               }
               CHECK_MSG(reg(sim, A_EV_LVD) < reg(sim, A_EV_LVR), "from %u/%u to %u/%u: out of order after write %u",
-                        (unsigned)low, (unsigned)high, (unsigned)lvd, (unsigned)lvr, (unsigned)(i - 13));
+                        (unsigned)low, (unsigned)high, (unsigned)lvd, (unsigned)lvr, (unsigned)(i - 14));
             }
             CHECK_EQ(reg(sim, A_EV_LVD), sim.setVolts(lvd / 100.0));
             CHECK_EQ(reg(sim, A_EV_LVR), sim.setVolts(lvr / 100.0));
@@ -798,6 +955,120 @@ static void testPlan() {
       }
     }
     CHECK(checked > 1000);
+  }
+
+  // Wherever a run stops, the battery gets nothing worse than the worse of what the controller
+  // held and what the run is to leave (harmOf()). Every prefix of the plan is judged, from
+  // controllers whose HVD and ceiling hold the charge voltages down or not (either of them off,
+  // below the charge voltages, between, above), with the load current compensation off and on,
+  // and with LVDs above and below the ones asked for. A pair in order before stays in order after
+  // each write.
+  {
+    const ss::Profile profiles[3] = {profile,
+                                     {1460, 1350, 900, 1500, 1360, 1310, 1325},
+                                     {1380, 1320, 600, 1390, 1320, 1000, 1010}};
+    const double banks[][2] = {{13.20, 13.80}, {13.50, 14.20}, {13.70, 14.40}, {13.90, 15.50}};  // float, absorption
+    const double banks2[][2] = {{13.20, 13.80}, {13.70, 14.40}, {13.90, 15.50}};
+    const double limits[][2] = {{0.0, 13.00}, {13.80, 13.00}, {14.45, 13.60}, {15.20, 14.00}, {16.00, 14.00}};  // HVD, HVR
+    const double ceilings[] = {0.0, 13.80, 14.45, 15.00};
+    const double loads[][2] = {{11.50, 12.60}, {12.00, 13.40}, {13.30, 13.60}, {13.50, 13.80}};  // LVD, LVR
+    const uint16_t icomps[] = {0, 1037, 5189};  // off, 0.02 ohm and 0.1 ohm
+    const uint16_t pairs[4][2] = {{A_EV_HVR, A_EV_HVD}, {A_EV_FLOAT, A_EV_REG}, {A_EV_FLOAT2, A_EV_REG2}, {A_EV_LVD, A_EV_LVR}};
+    std::map<uint16_t, uint16_t> base;
+    {
+      const SimSunSaver fresh;
+      for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
+        base[kPlanAddrs[i]] = reg(fresh, kPlanAddrs[i]);
+      }
+    }
+    const auto word = [](double volts) { return ss::rawFromCentivolts(ss::centivoltsOf(volts), ss::SCALE_100); };
+    long plans = 0;
+    long states = 0;
+    long raisedLate = 0;
+    long harmful = 0;
+    long disordered = 0;
+    std::string first;
+    for (const ss::Profile &wanted : profiles) {
+      CHECK_EQ(ss::validateProfile(wanted), 0);
+      for (const auto &bank : banks) {
+        for (const auto &bank2 : banks2) {
+          for (const auto &limit : limits) {
+            for (const double ceiling : ceilings) {
+              for (const auto &load : loads) {
+                for (const uint16_t icomp : icomps) {
+                  for (int extras = 0; extras < 2; ++extras) {
+                    std::map<uint16_t, uint16_t> regs = base;
+                    regs[A_EV_FLOAT] = word(bank[0]);
+                    regs[A_EV_REG] = word(bank[1]);
+                    regs[A_EV_FLOAT2] = word(bank2[0]);
+                    regs[A_EV_REG2] = word(bank2[1]);
+                    regs[A_EV_HVD] = word(limit[0]);
+                    regs[A_EV_HVR] = word(limit[1]);
+                    regs[A_EVB_REF_LIM] = word(ceiling);
+                    regs[A_EV_LVD] = word(load[0]);
+                    regs[A_EV_LVR] = word(load[1]);
+                    regs[A_ER_ICOMP] = icomp;
+                    regs[A_EV_EQ] = extras != 0 ? word(14.60) : 0;
+                    regs[A_EV_EQ2] = extras != 0 ? word(14.90) : 0;
+                    regs[A_EV_TEMPCOMP] = extras != 0 ? 20 : 0;
+                    ss::PlanEntry entries[ss::PLAN_ENTRIES];
+                    ss::buildPlan(snapshotOf(regs), wanted, ss::SCALE_100, entries);
+                    std::map<uint16_t, uint16_t> after = regs;
+                    for (const ss::PlanEntry &entry : entries) {
+                      after[ss::item(entry.item).addr] = entry.target;
+                    }
+                    bool inOrder[4];
+                    for (int p = 0; p < 4; ++p) {
+                      inOrder[p] = wordIn(regs, pairs[p][0]) < wordIn(regs, pairs[p][1]);
+                    }
+                    const Harm harmBefore = harmOf(regs);
+                    const Harm harmAfter = harmOf(after);
+                    bool bank2Seen = false;
+                    bool limitLate = false;
+                    for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
+                      const uint16_t addr = ss::item(entries[i].item).addr;
+                      bank2Seen = bank2Seen || addr == A_EV_REG2;
+                      limitLate = limitLate || (bank2Seen && (addr == A_EV_HVD || addr == A_EVB_REF_LIM));
+                      if (entries[i].status != ss::ENTRY_PENDING) {
+                        continue;
+                      }
+                      regs[addr] = entries[i].target;
+                      ++states;
+                      const std::string why = harmBeyond(harmOf(regs), harmBefore, harmAfter);
+                      bool disorder = false;
+                      for (int p = 0; p < 4; ++p) {
+                        disorder = disorder || (inOrder[p] && !(wordIn(regs, pairs[p][0]) < wordIn(regs, pairs[p][1])));
+                      }
+                      if ((!why.empty() || disorder) && harmful + disordered == 0) {
+                        char text[400];
+                        snprintf(text, sizeof(text),
+                                 "absorption %.2f/%.2f float %.2f/%.2f HVD %.2f HVR %.2f ceiling %.2f LVD %.2f LVR %.2f "
+                                 "icomp %u extras %d, asked %u/%u/%u: after write %u (%s): %s",
+                                 bank[1], bank2[1], bank[0], bank2[0], limit[0], limit[1], ceiling, load[0], load[1],
+                                 (unsigned)icomp, extras, (unsigned)wanted.absorbCv, (unsigned)wanted.hvdCv,
+                                 (unsigned)wanted.lvdCv, (unsigned)i, ss::item(entries[i].item).name,
+                                 disorder ? "a pair out of order" : why.c_str());
+                        first = text;
+                      }
+                      harmful += why.empty() ? 0 : 1;
+                      disordered += disorder ? 1 : 0;
+                    }
+                    raisedLate += limitLate ? 1 : 0;
+                    CHECK(regs == after);
+                    ++plans;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    CHECK_MSG(harmful == 0 && disordered == 0, "%ld of %ld states worse for the battery, %ld out of order; the first: %s",
+              harmful, states, disordered, first.c_str());
+    CHECK_EQ(plans, 3L * 4 * 3 * 5 * 4 * 4 * 3 * 2);
+    CHECK(raisedLate > 1000);  // plans in which a limit goes up, after the charge voltages
+    CHECK(states > 200000);
   }
 }
 
@@ -2621,6 +2892,151 @@ static void testSweeps() {
 }
 
 // ============================================================================
+// Limits on the charge voltage that go up
+// ============================================================================
+
+// The controller of the sixth review: a regulation ceiling holds both banks' absorption voltage
+// of 15.50 V down to 13.80 V under an HVD of 16.00 V, and the load current compensation is on
+// under an LVD of 13.50 V. The run is to lower the HVD and raise the ceiling, both to 15.00 V,
+// lower the absorption voltage to 14.60 V, switch the compensation off and lower the LVD to
+// 13.10 V.
+static const ss::Profile kRaiseProfile = {1460, 1350, 900, 1500, 1360, 1310, 1325};
+
+static void holdDownByCeiling(SimSunSaver &sim) {
+  sim.regs[A_EV_REG] = sim.setVolts(15.50);
+  sim.regs[A_EV_REG2] = sim.setVolts(15.50);
+  sim.regs[A_EV_HVD] = sim.setVolts(16.00);
+  sim.regs[A_EVB_REF_LIM] = sim.setVolts(13.80);
+  sim.regs[A_EV_LVD] = sim.setVolts(13.50);
+  sim.regs[A_EV_LVR] = sim.setVolts(13.80);
+  sim.regs[A_V_LVD] = sim.volts(13.50);
+  sim.regs[A_ER_ICOMP] = 1037;  // 0.02 ohm
+}
+
+// Has the bus judge the settings before every request, against what the station's controller
+// holds now and what the profile would leave it with.
+static void watchHarm(Station &station, const ss::Profile &profile) {
+  std::map<uint16_t, uint16_t> after = station.sim.regs;
+  for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
+    after[kPlanAddrs[i]] = wantedWord(station.sim, kPlanAddrs[i], profile);
+  }
+  station.bus.harmBefore = harmOf(station.sim.regs);
+  station.bus.harmAfter = harmOf(after);
+  station.bus.watchHarm = true;
+}
+
+// The registers in the order of their first write.
+static std::vector<uint16_t> writeOrder(const TestBus &bus) {
+  std::vector<uint16_t> order;
+  for (const Asked &asked : bus.log) {
+    if (asked.kind == 'w' && std::find(order.begin(), order.end(), asked.addr) == order.end()) {
+      order.push_back(asked.addr);
+    }
+  }
+  return order;
+}
+
+static void testLimitsLast() {
+  const ss::Profile profile = kRaiseProfile;
+  CHECK_EQ(ss::validateProfile(profile), 0);
+  SimSunSaver fresh;
+  holdDownByCeiling(fresh);
+
+  // The run goes well. The ceiling is written after both banks, the HVD (which comes down) before
+  // them, and the compensation before the LVD.
+  size_t length = 0;
+  {
+    Station station;
+    holdDownByCeiling(station.sim);
+    watchHarm(station, profile);
+    const ss::ProgramResult &result = station.run(profile);
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK(holdsProfile(station.sim, profile));
+    CHECK_MSG(station.bus.harmful == 0, "%s", station.bus.firstHarm.c_str());
+    const std::vector<uint16_t> want = {A_EV_EQ2,    A_EV_TEMPCOMP, A_EV_HVD,      A_EV_HVR,      A_EV_REG,
+                                        A_EV_FLOAT,  A_ET_FLOAT,    A_ET_FLOATLB,  A_EV_REG2,     A_EV_FLOAT2,
+                                        A_ET_FLOAT2, A_ET_FLOATLB2, A_EVB_REF_LIM, A_ER_ICOMP,    A_EV_LVD,
+                                        A_EV_LVR};
+    CHECK(writeOrder(station.bus) == want);
+    CHECK_EQ(station.bus.disorder, 0);
+    checkPauses(station);
+    length = station.bus.log.size();
+  }
+
+  // The case of the review: the absorption voltage does not take its word. The run stops there
+  // and restarts the controller, and the ceiling, not yet raised, still holds the charger to
+  // 13.80 V. Written first, it would let it charge to 15.00 V.
+  {
+    Station station;
+    holdDownByCeiling(station.sim);
+    watchHarm(station, profile);
+    station.bus.before = [&](size_t, char kind, uint16_t addr) {
+      if (kind == 'w' && addr == A_EV_REG) {
+        station.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+      }
+    };
+    const ss::ProgramResult &result = station.run(profile);
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(statusOf(result, A_EV_HVD), ss::ENTRY_WRITTEN);
+    CHECK_EQ(statusOf(result, A_EV_REG), ss::ENTRY_NOT_TAKEN);
+    CHECK_EQ(statusOf(result, A_EVB_REF_LIM), ss::ENTRY_PENDING);
+    CHECK_EQ(reg(station.sim, A_EV_HVD), station.sim.setVolts(15.00));
+    CHECK_EQ(reg(station.sim, A_EV_REG), station.sim.setVolts(15.50));
+    CHECK_EQ(reg(station.sim, A_EVB_REF_LIM), station.sim.setVolts(13.80));
+    CHECK(!editPending(station.sim));
+    const Harm now = harmOf(station.sim.regs);
+    CHECK(near(now.charge[0][0][1], 13.80, 0.002));  // bank 1, absorption, at 25 C
+    CHECK(harmBeyond(now, station.bus.harmBefore, station.bus.harmAfter).empty());
+    CHECK_MSG(station.bus.harmful == 0, "%s", station.bus.firstHarm.c_str());
+    checkLeftSafe(station, fresh, profile, "the absorption voltage not taken", 0);
+  }
+
+  // Every request lost twice in a row, and the controller's power lost for good from every
+  // request on until the run has ended: at no moment does the battery get worse than before and
+  // after, and the controller is left in order and not waiting.
+  CHECK(length > 40);
+  for (size_t at = 0; at < length; ++at) {
+    Station station;
+    holdDownByCeiling(station.sim);
+    watchHarm(station, profile);
+    failAt(station, at, SimSunSaver::FAULT_NO_REPLY, 2);
+    station.run(profile);
+    if (station.programmer.controllerUnknown()) {
+      CHECK(station.programmer.resume());
+      station.drive();
+    }
+    CHECK_MSG(station.bus.harmful == 0, "two lost requests at %u: %s", (unsigned)at, station.bus.firstHarm.c_str());
+    CHECK_MSG(harmBeyond(harmOf(station.sim.regs), station.bus.harmBefore, station.bus.harmAfter).empty(),
+              "two lost requests at %u: left worse", (unsigned)at);
+    CHECK_MSG(!editPending(station.sim), "two lost requests at %u: the controller waits for a restart", (unsigned)at);
+    checkLeftSafe(station, fresh, profile, "two lost requests, a limit raised", at);
+  }
+  for (size_t at = 0; at < length; ++at) {
+    Station station;
+    holdDownByCeiling(station.sim);
+    watchHarm(station, profile);
+    station.bus.before = [&station, at](size_t index, char, uint16_t) {
+      if (index >= at) {
+        station.sim.powered = false;
+      }
+    };
+    station.run(profile);
+    station.bus.before = nullptr;
+    station.sim.powered = true;
+    if (station.programmer.controllerUnknown()) {
+      CHECK(station.programmer.resume());
+      station.drive();
+    }
+    CHECK_MSG(station.bus.harmful == 0, "power lost at %u: %s", (unsigned)at, station.bus.firstHarm.c_str());
+    CHECK_MSG(harmBeyond(harmOf(station.sim.regs), station.bus.harmBefore, station.bus.harmAfter).empty(),
+              "power lost at %u: left worse", (unsigned)at);
+    CHECK_MSG(!editPending(station.sim), "power lost at %u: the controller waits for a restart", (unsigned)at);
+    checkLeftSafe(station, fresh, profile, "power lost, a limit raised", at);
+  }
+}
+
+// ============================================================================
 // A request in a config, and the client's journal
 // ============================================================================
 
@@ -3520,10 +3936,10 @@ static void testResultJson() {
     result.followUp = true;
     result.liveScale = ss::SCALE_UNKNOWN;
     result.notes = ss::NOTE_VERIFY_INCOMPLETE | ss::NOTE_SW3_ON;
-    result.entries[15].status = ss::ENTRY_LOST;  // EV_lvd
-    result.entries[15].found = result.entries[15].before;
-    result.entries[14].status = ss::ENTRY_ALTERED;  // EV_lvr
-    result.entries[14].found = quiet.sim.setVolts(12.00);
+    result.entries[16].status = ss::ENTRY_LOST;  // EV_lvd
+    result.entries[16].found = result.entries[16].before;
+    result.entries[15].status = ss::ENTRY_ALTERED;  // EV_lvr
+    result.entries[15].found = quiet.sim.setVolts(12.00);
     JsonDocument page;
     const std::string shown = describedAs(result, &page);
     CHECK(page["followUp"] == true);
@@ -6659,9 +7075,9 @@ static void testText() {
         "EV_float2: 13.70 V -> 13.50 V, written",
         "Et_float2: 9000 s (150 min) -> 900 s (15 min), written",
         "Et_floatlb2: 10800 s (180 min) -> 900 s (15 min), written",
+        "ER_icomp: 0 (off), already set",
         "EV_lvr: 12.60 V -> 13.25 V, written",
-        "EV_lvd: 11.50 V -> 13.10 V, written",
-        "ER_icomp: 0 (off), already set"};
+        "EV_lvd: 11.50 V -> 13.10 V, written"};
     for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
       CHECK_TEXT(textFrom([&](ss::Text *t) { ss::describeEntry(result.entries[i], result.scale, t); }), std::string(want[i]));
     }
@@ -6671,7 +7087,7 @@ static void testText() {
              std::string("LOAD output: LOAD_ON before the run, LOAD_ON while the charger waited for its restart, "
                          "LOAD_ON at the end."));
     // A register the run did not reach, and one that holds a word no state has.
-    ss::PlanEntry entry = result.entries[15];
+    ss::PlanEntry entry = result.entries[16];
     entry.status = ss::ENTRY_PENDING;
     CHECK_TEXT(textFrom([&](ss::Text *t) { ss::describeEntry(entry, ss::SCALE_100, t); }),
              std::string("EV_lvd: 11.50 V -> 13.10 V, not reached"));
@@ -6849,6 +7265,7 @@ int main() {
   testFinalRestart();
   testRecovery();
   testSweeps();
+  testLimitsLast();
   testText();
   testSmallThings();
   testRequestJson();

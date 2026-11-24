@@ -110,6 +110,40 @@ static void drainRS485Rx() {
   }
 }
 
+// The silence Modbus RTU wants on the line before a frame (Modbus over Serial Line V1.02,
+// 2.5.1.1): 3.5 characters of 11 bits, as the client sends them (8N2), and at least 1750 us,
+// the figure the standard sets above 19200 baud. In microseconds, rounded up: 4011 at 9600 baud.
+static uint32_t modbusFrameGapUs(uint32_t baud) {
+  if (baud == 0) {
+    baud = SOLAR_DEFAULT_BAUD_RATE;
+  }
+  const uint32_t gapUs = (38500000UL + baud - 1UL) / baud;
+  return gapUs < 1750UL ? 1750UL : gapUs;
+}
+
+// When the last request on the line ended: its reply was in, or the master gave up on it. Every
+// request notes it. ArduinoModbus keeps no silence between two frames, and the RS-485 pre-delay
+// is 0 (startModbusLink()), so a request sent at once after the one before could start inside
+// the silence that ends the reply. A request of charger programming waits for the gap first
+// (keepFrameGap()); the poll and the charger check send as they did.
+static uint32_t sSolarRequestEndMicros = 0;
+static bool     sSolarRequestEnded = false;
+
+static void noteRequestEnd() {
+  sSolarRequestEndMicros = (uint32_t)micros();
+  sSolarRequestEnded = true;
+}
+
+static void keepFrameGap(uint32_t gapUs) {
+  if (!sSolarRequestEnded) {
+    return;
+  }
+  const uint32_t quietUs = (uint32_t)micros() - sSolarRequestEndMicros;
+  if (quietUs < gapUs) {
+    delayMicroseconds((unsigned int)(gapUs - quietUs));
+  }
+}
+
 // Capture the reason for a low-level Modbus read failure (does NOT increment the failure
 // count -- that happens once per logical read in readRegistersWithFallback).
 static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
@@ -137,7 +171,9 @@ static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
 static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
   drainRS485Rx();
   unsigned long _t0 = millis();
-  if (!ModbusRTUClient.requestFrom(slaveId, HOLDING_REGISTERS, startAddress, count)) {
+  const int got = ModbusRTUClient.requestFrom(slaveId, HOLDING_REGISTERS, startAddress, count);
+  noteRequestEnd();
+  if (!got) {
     captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
@@ -163,7 +199,9 @@ static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t
 static bool readInputRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
   drainRS485Rx();
   unsigned long _t0 = millis();
-  if (!ModbusRTUClient.requestFrom(slaveId, INPUT_REGISTERS, startAddress, count)) {
+  const int got = ModbusRTUClient.requestFrom(slaveId, INPUT_REGISTERS, startAddress, count);
+  noteRequestEnd();
+  if (!got) {
     captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
@@ -1036,11 +1074,14 @@ class ChargerCheckBus : public sunsaver::Reader {
 // the restart coil with function 5, the rest between requests and the clock. A request without a
 // usable reply starts the line rest like any other, so the poll and the charger check leave the
 // line alone after the run as well. `functionCode` is the read function the controller answers,
-// or 0 when it is not known: the port finds it out then (sunsaver::FunctionChoice).
+// or 0 when it is not known: the port finds it out then (sunsaver::FunctionChoice). Before every
+// request it sends, the second request of a read that looks for its function too, it leaves the
+// line silent for the frame gap at `baud` (keepFrameGap()), since a run that goes well sends its
+// requests with no rest between them.
 class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionReader {
  public:
-  ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs)
-      : _function(functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs) {}
+  ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs, uint32_t baud)
+      : _function(functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs), _gapUs(modbusFrameGapUs(baud)) {}
 
   uint16_t timeoutMs() const override { return _timeoutMs; }
 
@@ -1061,9 +1102,12 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
   sunsaver::IoStatus writeRegister(uint16_t addr, uint16_t raw) override {
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
     KeptPollDiagnostics kept;
+    keepFrameGap(_gapUs);
     drainRS485Rx();
     const unsigned long t0 = millis();
-    if (ModbusRTUClient.holdingRegisterWrite(_slaveId, addr, raw) == 1) {
+    const int done = ModbusRTUClient.holdingRegisterWrite(_slaveId, addr, raw);
+    noteRequestEnd();
+    if (done == 1) {
       return sunsaver::SSIO_OK;
     }
     captureSolarModbusError(addr, (uint16_t)(millis() - t0));
@@ -1073,9 +1117,12 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
   sunsaver::IoStatus writeCoil(uint16_t addr) override {
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
     KeptPollDiagnostics kept;
+    keepFrameGap(_gapUs);
     drainRS485Rx();
     const unsigned long t0 = millis();
-    if (ModbusRTUClient.coilWrite(_slaveId, addr, 1) == 1) {
+    const int done = ModbusRTUClient.coilWrite(_slaveId, addr, 1);
+    noteRequestEnd();
+    if (done == 1) {
       return sunsaver::SSIO_OK;
     }
     captureSolarModbusError(addr, (uint16_t)(millis() - t0));
@@ -1105,12 +1152,14 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
 
  private:
   sunsaver::IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) override {
+    keepFrameGap(_gapUs);
     return ChargerCheckBus(_slaveId, function).readRegister(addr, raw);
   }
 
   sunsaver::FunctionChoice _function;
   uint8_t _slaveId;
   uint16_t _timeoutMs;
+  uint32_t _gapUs;
 };
 #endif  // TANKALARM_SUNSAVER_PROGRAMMING
 
@@ -1205,7 +1254,7 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   ChargerProgramPort port(_programming.controllerToUse(_config.modbusSlaveId),
                           _programming.readFunctionToUse(_config.modbusSlaveId,
                                                          line.pollAnswered ? _cachedHoldingFC : (uint8_t)0),
-                          _config.modbusTimeoutMs);
+                          _config.modbusTimeoutMs, _config.modbusBaudRate);
   // No poll runs, so the link is down (the charger is off in the config, or the link did not
   // start). It is started for a duty whose turn has come, on the settings the config holds, and
   // stopped again after it.
