@@ -256,9 +256,21 @@ to the voltage. The server looks it up from the National Weather Service
   temperature (after 3 hours of retrying); it is marked settled, and so are readings
   within 30 minutes of it. Each such reading is marked on its own, so an older reading
   that arrives later is still looked up; past 16 marks within NWS's seven days the oldest
-  becomes a cutoff before which nothing is looked up. NWS keeps about seven days of
+  becomes a cutoff (the end of its 30-minute window) before which nothing is looked up. NWS keeps about seven days of
   observations, so readings from before the feature was installed, or older than 6.5
   days when first seen, never get one. Nothing is interpolated or estimated.
+- **Moves.** When a client reports a location away from one it had reported before, the
+  readings before the move are not looked up any more (the old stations are gone and
+  the new ones are elsewhere). Its samples from before the move stay on the chart but
+  cover no reading after it, and a reading after the move is matched only to
+  observations after it. A client's first location starts no such period: its readings
+  from the last 6.5 days are still looked up.
+- **Saved.** The samples, stations, settled readings, the move time, the last location
+  request and an uncovered location's weekly retry are saved hourly, on reboot, and at
+  once when a client is removed, so a reboot neither asks again early nor brings a
+  removed client back. When the client metadata does not load at boot, the saved
+  temperatures of clients it does not list are kept (NWS cannot give them back); one
+  is dropped only when a known client needs its slot.
 - **Limits.** At most one api.weather.gov request every 30 s across all clients: finding
   the stations (`/points`, then the station list) and asking the second station take one
   request each, 30 s apart. A response counts only when its JSON and its HTTP framing
@@ -271,9 +283,14 @@ to the voltage. The server looks it up from the National Weather Service
   at most about 33 KB).
 - **API.** `/api/history` returns `temperature: [{client, status, stations, points: [[epoch, °F], ...]}]`
   for every client; `status` is `ok` (stations known), `finding`, `noLocation` or
-  `uncovered`, so the page can say why a client has no temperature. It lists each
-  client's VIN reading once (not once per sensor). `/api/location` also returns
-  `weatherStations`.
+  `uncovered`, so the page can say why a client has no temperature, and the VIN chart's
+  client picker lists every client. The temperature is written to the socket after the
+  rest of the response (it takes no room in the JSON document), and a response that runs
+  out of memory while being built is a 500, not a partial history. Snapshots of one
+  client at the same time list their VIN once; one voltage poll copied into readings
+  taken at different times (a daily report's sensors) is still listed at each reading's
+  time, because the snapshots do not keep the poll's own time. `/api/location` also
+  returns `weatherStations`.
 - **Retries.** When the second request of a step (the station list, or the second
   station) gets no answer, that step is kept and asked again after the network backoff.
   A location request counts toward the once-a-day limit only when it was sent; a failed

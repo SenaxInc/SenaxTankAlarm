@@ -1362,6 +1362,7 @@ static double gLastDailyEmailSentEpoch = 0.0;
 // Sensor registry & client metadata persistence state
 static bool gSensorRegistryDirty = false;         // True when sensor records need saving
 static bool gClientMetadataDirty = false;        // True when client metadata needs saving
+static bool gClientMetadataLoaded = false;       // The saved metadata was read and parsed at boot
 static unsigned long gLastRegistrySaveMillis = 0;
 static unsigned long gLastStaleCheckMillis = 0;
 
@@ -2353,8 +2354,8 @@ funct)HTML" R"HTML(ion populateFilters(){const siteSelect=document.getElementByI
 funct)HTML" R"HTML(ion getFilteredData(){const site=document.getElementById('siteFilter').value;const sensorIdx=document.getElementById('sensorFilter').value;const range=document.getElementById('rangeSelect').value;const now=Date.now()/1000;let cutoff=now-30*86400;let cutoffEnd=now;if(range==='24h')cutoff=now-86400;else if(range==='7d')cutoff=now-7*86400;else if(range==='90d')cutoff=now-90*86400;else if(range==='6mo')cutoff=now-180*86400;else if(range==='1yr')cutoff=now-365*86400;else if(range==='2yr')cutoff=now-730*86400;else if(range==='custom'){const sd=document.getElementById('startDate').value;const ed=document.getElementById('endDate').value;if(sd)cutoff=new Date(sd).getTime()/1000;if(ed)cutoffEnd=new Date(ed+'T23:59:59').getTime()/1000;}let sensors=historicalData.sensors;if(site!=='all')sensors=sensors.filter(t=>t.site===site);if(sensorIdx!=='all')sensors=[historicalData.sensors[parseInt(sensorIdx)]];return{sensors,cutoff,cutoffEnd};}
 funct)HTML" R"HTML(ion renderLevelChart(){const ctx=document.getElementById('levelChart').getContext('2d');const{sensors,cutoff,cutoffEnd}=getFilteredData();if(levelChart)levelChart.destroy();const datasets=sensors.slice(0,8).map((tank,i)=>{const data=tank.readings.filter(r=>r.timestamp>=cutoff&&r.timestamp<=cutoffEnd).map(r=>({x:new Date(r.timestamp*1000),y:r.level}));return{label:`${tank.site} - ${tank.label}`,data,borderColor:CHART_COLORS[i%CHART_COLORS.length],backgroundColor:CHART_COLORS[i%CHART_COLORS.length]+'20',fill:false,tension:0.3,pointRadius:0};});levelChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'index'},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a',displayFormats:{hour:'MMM d, HH:mm',day:'MMM d'}},grid:{color:'var(--chart-grid)'}},y:{title:{display:true,text:'Level (inches)'},grid:{color:'var(--chart-grid)'}}},plugins:{legend:{position:'bottom'}}}});}
 funct)HTML" R"HTML(ion renderAlarmChart(){const ctx=document.getElementById('alarmChart').getContext('2d');if(alarmChart)alarmChart.destroy();const sites=Object.keys(historicalData.sites);const highCounts=sites.map(s=>historicalData.alarms.filter(a=>a.site===s&&a.type==='HIGH').length);const lowCounts=sites.map(s=>historicalData.alarms.filter(a=>a.site===s&&a.type==='LOW').length);alarmChart=new Chart(ctx,{type:'bar',data:{labels:sites,datasets:[{label:'High Alarms',data:highCounts,backgroundColor:'#ef4444'},{label:'Low Alarms',data:lowCounts,backgroundColor:'#f59e0b'}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Alarm Count'}}},plugins:{legend:{position:'bottom'}}}});}
-funct)HTML" R"HTML(ion voltageClientList(){const names={};(historicalData.sensors||[]).forEach(s=>{if(s.client&&!names[s.client])names[s.client]=s.site||s.client;});const seen={};const ids=[];(historicalData.voltage||[]).concat((historicalData.temperature||[]).filter(t=>t.points&&t.points.length)).forEach(v=>{if(v.client&&!seen[v.client]){seen[v.client]=1;ids.push(v.client);}});const list=ids.map(id=>({id,name:names[id]||id}));const count={};list.forEach(c=>{count[c.name]=(count[c.name]||0)+1;});list.forEach(c=>{if(count[c.name]>1&&c.name!==c.id)c.name+=' (…'+c.id.slice(-6)+')';});return list.sort((a,b)=>a.name.localeCompare(b.name));}
-funct)HTML" R"HTML(ion populateVoltageClients(){const sel=document.getElementById('voltageClient');const prev=sel.value;const list=voltageClientList();sel.innerHTML='';list.forEach(c=>{const opt=document.createElement('option');opt.value=c.id;opt.textContent=c.name;opt.title=c.id;sel.appendChild(opt);});if(list.some(c=>c.id===prev))sel.value=prev;sel.style.display=list.length>1?'':'none';}
+funct)HTML" R"HTML(ion voltageClientList(){const names={};(historicalData.sensors||[]).forEach(s=>{if(s.client&&!names[s.client])names[s.client]=s.site||s.client;});const seen={};const ids=[];(historicalData.voltage||[]).concat(historicalData.temperature||[]).forEach(v=>{if(v.client&&!seen[v.client]){seen[v.client]=1;ids.push(v.client);}});const list=ids.map(id=>({id,name:names[id]||id}));const count={};list.forEach(c=>{count[c.name]=(count[c.name]||0)+1;});list.forEach(c=>{if(count[c.name]>1&&c.name!==c.id)c.name+=' (…'+c.id.slice(-6)+')';});return list.sort((a,b)=>a.name.localeCompare(b.name));}
+funct)HTML" R"HTML(ion populateVoltageClients(){const sel=document.getElementById('voltageClient');const prev=sel.value;const list=voltageClientList();sel.innerHTML='';list.forEach(c=>{const opt=document.createElement('option');opt.value=c.id;opt.textContent=c.name;opt.title=c.id;sel.appendChild(opt);});if(list.some(c=>c.id===prev))sel.value=prev;else{const withVin=list.find(c=>(historicalData.voltage||[]).some(v=>v.client===c.id));if(withVin)sel.value=withVin.id;}sel.style.display=list.length>1?'':'none';}
 funct)HTML" R"HTML(ion renderVoltageChart(){const ctx=document.getElementById('voltageChart').getContext('2d');if(voltageChart)voltageChart.destroy();voltageChart=null;const{cutoff,cutoffEnd}=getFilteredData();const client=document.getElementById('voltageClient').value;const inRange=t=>t>=cutoff&&t<=cutoffEnd;const data=(historicalData.voltage||[]).filter(v=>v.client===client&&inRange(v.timestamp)).sort((a,b)=>a.timestamp-b.timestamp).map(v=>({x:new Date(v.timestamp*1000),y:v.voltage}));const wx=(historicalData.temperature||[]).find(t=>t.client===client);const tdata=wx?(wx.points||[]).filter(p=>inRange(p[0])).sort((a,b)=>a[0]-b[0]).map(p=>({x:new Date(p[0]*1000),y:p[1]})):[];const cb=document.getElementById('showTemp');cb.disabled=!tdata.length;const showT=cb.checked&&tdata.length>0;const st=wx&&wx.stations&&wx.stations.length?wx.stations.join(' / '):'';const wxStatus=wx?wx.status:'';let note;if(tdata.length)note='Outdoor air temperature from the nearest National Weather Service station'+(st?' ('+st+')':'')+', observed within an hour of each reading.';else if(wxStatus==='uncovered')note='No outdoor temperature: the National Weather Service does not cover this client’s location (outside the US?).';else if(wxStatus==='noLocation')note='No outdoor temperature yet: the server is waiting for this client’s location from its Notecard.';else if(wx&&wx.points&&wx.points.length)note='No outdoor temperature in this range.';else if(st)note='No outdoor temperature yet. New readings are matched to National Weather Service station '+st+'.';else if(wx)note='No outdoor temperature yet: the server is finding the nearest National Weather Service station.';else note='No outdoor temperature recorded for this client yet.';if(client)note+=' Client '+client+'.';document.getElementById('tempNote').textContent=note;if(!data.length&&!tdata.length)return;let yMin,yMax;if(data.length){const vals=data.map(d=>d.y);const vMin=Math.min(...vals);const vMax=Math.max(...vals);if(vMax<=6){yMin=0;yMax=6;}else if(vMax<=15){yMin=10;yMax=15;}else{yMin=Math.floor(vMin-1);yMax=Math.ceil(vMax+1);}}const nearest=(arr,x)=>{let best=null;arr.forEach(p=>{const d=Math.abs(p.x-x);if(d<=3600000&&(!best||d<best.d))best={d,y:p.y};});return best;};const datasets=[{label:'VIN Voltage',data,yAxisID:'y',borderColor:'#10b981',backgroundColor:'#10b98120',fill:true,tension:0.3,pointRadius:0}];if(showT)datasets.push({label:'Outdoor temperature',data:tdata,yAxisID:'y1',borderColor:'#f59e0b',backgroundColor:'#f59e0b',borderDash:[6,4],fill:false,tension:0.3,pointRadius:tdata.length<60?2:0});voltageChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',axis:'x',intersect:false},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{min:yMin,max:yMax,title:{display:true,text:'Voltage (V)'},grid:{color:'var(--chart-grid)'}},y1:{display:showT,position:'right',title:{display:true,text:'Outdoor temperature (°F)'},grid:{drawOnChartArea:false}}},plugins:{legend:{display:showT,position:'bottom'},tooltip:{callbacks:{label:c=>{if(c.dataset.yAxisID==='y1'){const v=nearest(data,c.parsed.x);return ' Outdoor '+c.parsed.y.toFixed(1)+' °F'+(v?', VIN '+v.y.toFixed(2)+' V':'');}const t=showT?nearest(tdata,c.parsed.x):null;return ' VIN '+c.parsed.y.toFixed(2)+' V'+(t?', outdoor '+t.y.toFixed(1)+' °F':'');}}}}}});}
 funct)HTML" R"HTML(ion createSparkline(container,data){const width=container.clientWidth||100;const height=40;const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;container.appendChild(canvas);const ctx=canvas.getContext('2d');if(!data||data.length<2)return;const values=data.map(d=>d.level);const min=Math.min(...values);const max=Math.max(...values);const range=max-min||1;ctx.strokeStyle='#2563eb';ctx.lineWidth=1.5;ctx.beginPath();data.forEach((d,i)=>{const x=i/(data.length-1)*width;const y=height-(d.level-min)/range*height;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke();}
 funct)HTML" R"HTML(ion renderSites(){const container=document.getElementById('sitesContainer');container.innerHTML='';Object.keys(historicalData.sites).sort().forEach(siteName=>{const sensors=historicalData.sites[siteName];const alarmCount=historicalData.alarms.filter(a=>a.site===siteName).length;const siteCard=document.createElement('div');siteCard.className='site-card';siteCard.innerHTML=`<div class="site-header" onclick="this.nextElementSibling.classList.toggle('expanded')"><h3>${escapeHtml(siteName)}</h3><div class="site-stats"><span>${sensors.length} Tank${sensors.length!==1?'s':''}</span>${alarmCount>0?`<span class="alarm-badge">${alarmCount} Alarms</span>`:''}</div></div><div class="site-content"><div class="sensor-grid"></div></div>`;const grid=siteCard.querySelector('.sensor-grid');sensors.forEach(tank=>{const change=tank.change24h||0;const changeClass=change>=0?'positive':'negative';const changeSign=change>=0?'+':'';const tankCard=document.createElement('div');tankCard.className='sensor-card';tankCard.innerHTML=`<div class="tank-header"><div><div class="tank-name">${escapeHtml(tank.label)}</div><div class="sensor-level">${formatLevel(tank.currentLevel)}</div></div><div class="tank-change ${changeClass}">${changeSign}${change.toFixed(1)}" 24h</div></div><div class="sparkline"></div><div class="tank-footer"><span>Updated: ${formatEpoch(tank.readings[tank.readings.length-1]?.timestamp)}</span></div>`;grid.appendChild(tankCard);const sparklineEl=tankCard.querySelector('.sparkline');const last24h=tank.readings.slice(-24);setTimeout(()=>createSparkline(sparklineEl,last24h),0);});container.appendChild(siteCard);});}
@@ -2729,6 +2730,7 @@ static float getCachedTemperature(const char *clientUid);
 static void serviceOutdoorTemperature();
 static bool saveOutdoorTemperature();
 static void loadOutdoorTemperature();
+static NwsClientTemp *nwsWeatherSlot(const char *clientUid);
 
 static void handleRefreshPost(EthernetClient &client, const String &body) {
   char clientUid[64] = {0};
@@ -3181,15 +3183,27 @@ static void handleLocationResponse(JsonDocument &doc, double epoch) {
 
   ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
   if (meta) {
+    const bool hadLocation = (meta->latitude != 0.0f || meta->longitude != 0.0f);
     const bool moved = !(fabsf(meta->latitude - latitude) <= NWS_LOCATION_SAME_DEG &&
                          fabsf(meta->longitude - longitude) <= NWS_LOCATION_SAME_DEG);
     meta->latitude = latitude;
     meta->longitude = longitude;
     meta->locationEpoch = (epoch > 0.0) ? epoch : currentEpoch();
     gClientMetadataDirty = true;
-    // A new location: find the client's weather stations again, at once
-    NwsClientTemp *wx = nwsFindClient(gNwsTemp, clientUid);
-    if (moved && wx) nwsNoteLocationChanged(*wx);
+    // A new location: find the client's weather stations again, at once. After a move
+    // (not a first location), the readings before it get no outdoor temperature, and the
+    // samples before it cover none after it.
+    if (moved) {
+      NwsClientTemp *wx = nwsWeatherSlot(clientUid);
+      if (wx) {
+        if (hadLocation) {
+          nwsNoteMoved(*wx, currentEpoch());
+        } else {
+          nwsNoteLocationChanged(*wx);
+        }
+        gNwsTempDirty = true;
+      }
+    }
 
     Serial.print(F("Location received from "));
     Serial.print(clientUid);
@@ -4991,17 +5005,18 @@ void loop() {
     checkServerVoltage();
   }
   
-  // Periodic sensor registry save (when dirty, every 5 minutes)
-  if (gSensorRegistryDirty && (now - gLastRegistrySaveMillis > REGISTRY_SAVE_INTERVAL_MS)) {
+  // Periodic sensor registry and client metadata save (when dirty, every 5 minutes). One
+  // deadline for both: a registry save that reset it first would starve the metadata.
+  if ((gSensorRegistryDirty || gClientMetadataDirty) && (now - gLastRegistrySaveMillis > REGISTRY_SAVE_INTERVAL_MS)) {
     gLastRegistrySaveMillis = now;
-    saveSensorRegistry();
-    gSensorRegistryDirty = false;
-  }
-  
-  // Periodic client metadata save (when dirty, piggyback on same interval)
-  if (gClientMetadataDirty && (now - gLastRegistrySaveMillis > REGISTRY_SAVE_INTERVAL_MS)) {
-    saveClientMetadataCache();
-    gClientMetadataDirty = false;
+    if (gSensorRegistryDirty) {
+      saveSensorRegistry();
+      gSensorRegistryDirty = false;
+    }
+    if (gClientMetadataDirty) {
+      saveClientMetadataCache();
+      gClientMetadataDirty = false;
+    }
   }
   
   // Periodic stale client check (every hour)
@@ -6891,6 +6906,23 @@ static void nwsNoteClientFailure(NwsClientTemp &wx, double now, const char *what
   }
 }
 
+// The client's weather entry, added when missing. When the store is full, an entry
+// whose client has no metadata makes room (kept at boot because the metadata did not
+// load; see loadOutdoorTemperature).
+static NwsClientTemp *nwsWeatherSlot(const char *clientUid) {
+  NwsClientTemp *wx = nwsFindOrAddClient(gNwsTemp, clientUid);
+  if (wx || !nwsValidUid(clientUid) || gNwsTemp.count < NWS_TEMP_MAX_CLIENTS) return wx;
+  for (uint8_t i = 0; i < gNwsTemp.count; ++i) {
+    if (findClientMetadata(gNwsTemp.clients[i].uid)) continue;
+    nwsLog("info", "Dropping the saved temperatures of unknown client %.32s to make room",
+           gNwsTemp.clients[i].uid);
+    nwsForgetClient(gNwsTemp, gNwsTemp.clients[i].uid);
+    gNwsTempDirty = true;
+    return nwsFindOrAddClient(gNwsTemp, clientUid);
+  }
+  return nullptr;
+}
+
 // The oldest of the client's readings that still needs a temperature (0 = none). Oldest
 // first, so none ages out of NWS's seven days while newer ones wait. Entries an older
 // firmware saved (legacyCount) are skipped: their times may be receive times (S-D03).
@@ -6983,7 +7015,7 @@ static int nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat,
 // status (NWS_GET_NETWORK: no answer; 0: no request was made).
 static int nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t station, double now) {
   if (station >= nwsStationCount(wx)) return 0;  // the stations changed since: planned again
-  const double start = target - NWS_OBS_MATCH_SEC;
+  const double start = nwsObservationStart(wx, target);  // not before a move the reading is after
   double end = target + NWS_OBS_MATCH_SEC;
   if (end > now) end = now;
   char path[NWS_PATH_MAX];
@@ -7079,7 +7111,7 @@ static void serviceOutdoorTemperature() {
   for (uint8_t step = 0; step < gClientMetadataCount; ++step) {
     const uint8_t i = (uint8_t)((gNwsCursor + step) % gClientMetadataCount);
     const ClientMetadata &meta = gClientMetadata[i];
-    NwsClientTemp *wx = nwsFindOrAddClient(gNwsTemp, meta.clientUid);
+    NwsClientTemp *wx = nwsWeatherSlot(meta.clientUid);
     if (!wx) continue;
     const double target = nwsOldestReadingNeedingTemp(*wx, meta.clientUid, now);
     const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
@@ -7092,6 +7124,7 @@ static void serviceOutdoorTemperature() {
       // backs off like a failed lookup (10 min, doubling)
       if (sendLocationRequest(meta.clientUid)) {
         wx->lastLocationRequest = (uint32_t)now;
+        gNwsTempDirty = true;  // saved, so a reboot does not ask again the same day
         nwsLog("info", "Asked %.32s for its location (needed for outdoor temperature)", meta.clientUid);
       } else {
         nwsNoteFailure(*wx, now);
@@ -7164,6 +7197,15 @@ static void loadOutdoorTemperature() {
     return;
   }
   nwsLoadStore(gNwsTemp, doc.as<JsonArrayConst>(), currentEpoch());
+  // Clients the metadata does not list were removed. When the metadata did not load,
+  // that is unknown: they are kept (NWS cannot give their history back), and one
+  // makes room only when a known client needs it (nwsWeatherSlot).
+  if (!gClientMetadataLoaded) {
+    Serial.print(F("Weather: client metadata not loaded; keeping the outdoor temperature of all "));
+    Serial.print(gNwsTemp.count);
+    Serial.println(F(" saved clients"));
+    return;
+  }
   for (uint8_t i = 0; i < gNwsTemp.count;) {
     if (!findClientMetadata(gNwsTemp.clients[i].uid)) {
       nwsForgetClient(gNwsTemp, gNwsTemp.clients[i].uid);  // compacts: i stays
@@ -9441,6 +9483,7 @@ static void enableDfuMode() {
     gClientMetadataDirty = false;
   }
   saveHotTierSnapshot();
+  saveOutdoorTemperature();
   saveClientConfigSnapshots();
   saveHistorySettings();
 
@@ -16461,7 +16504,9 @@ static void loadSensorRegistry() {
 static void saveClientMetadataCache() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS || gClientMetadataCount == 0) {
+    // An empty table is written only after a change (the last client was removed), so
+    // a table that did not load is not overwritten by an empty one
+    if (!mbedFS || (gClientMetadataCount == 0 && !gClientMetadataDirty)) {
       return;
     }
     
@@ -16603,7 +16648,9 @@ static void loadClientMetadataCache() {
       meta.staleAlertSent = false;
       meta.staleDeletionPending = obj["sdp"] | false;
     }
-    
+    // Complete: the outdoor temperature store may drop clients this table does not list
+    gClientMetadataLoaded = !arr.isNull();
+
     Serial.print(F("Client metadata loaded: "));
     Serial.print(gClientMetadataCount);
     Serial.println(F(" entries"));
@@ -16806,6 +16853,7 @@ static void checkStaleClients() {
   if (removeCount > 0) {
     saveSensorRegistry();
     gSensorRegistryDirty = false;
+    saveOutdoorTemperature();
   }
   // Persist metadata when a stale-deletion flag was set or cleared above.
   if (gClientMetadataDirty) {
@@ -17354,12 +17402,14 @@ static void handleClientDeleteRequest(EthernetClient &client, const String &body
     Serial.print(F("Client removed: "));
     Serial.println(clientUid);
     
-    // Force immediate persistence save
+    // Force immediate persistence save (with the outdoor temperature, so a reboot
+    // before the hourly save does not bring the client's samples back)
     saveSensorRegistry();
     saveClientMetadataCache();
     gSensorRegistryDirty = false;
     gClientMetadataDirty = false;
-    
+    saveOutdoorTemperature();
+
     respondStatus(client, 200, F("Client removed"));
   } else {
     respondStatus(client, 404, F("Client not found"));
@@ -17699,7 +17749,93 @@ static bool cacheClientConfigFromBuffer(const char *clientUid, const char *buffe
 // Calibration Learning System Implementation
 // ============================================================================
 
+// Sends through a 512-byte buffer and holds back the last byte written, so a serialized
+// JSON object can be extended: drop its held closing '}', write more members, close it.
+class HistoryStreamPrint : public Print {
+ public:
+  explicit HistoryStreamPrint(Print &dst) : mDst(dst) {}
+  using Print::write;
+  size_t write(uint8_t c) override {
+    if (mHeld) put(mLast);
+    mLast = c;
+    mHeld = true;
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t n) override {
+    for (size_t i = 0; i < n; ++i) write(buf[i]);
+    return n;
+  }
+  void dropHeld() { mHeld = false; }
+  void finish() {
+    if (mHeld) put(mLast);
+    mHeld = false;
+    if (mLen > 0) mDst.write(mBuf, mLen);
+    mLen = 0;
+  }
 
+ private:
+  void put(uint8_t c) {
+    mBuf[mLen++] = c;
+    if (mLen == sizeof(mBuf)) {
+      mDst.write(mBuf, mLen);
+      mLen = 0;
+    }
+  }
+  Print &mDst;
+  uint8_t mBuf[512];
+  size_t mLen = 0;
+  bool mHeld = false;
+  uint8_t mLast = 0;
+};
+
+// The "temperature" member of /api/history, written straight to out (nullptr: only
+// measured), so the samples take no room in the JSON document. Returns its length.
+// NWS observations matched to each client's readings, at the observation's own time,
+// as [epoch, °F]; the VIN chart can draw them on a second axis. Every client is listed
+// with its lookup status, so the page can say why one has none: "uncovered" (NWS does
+// not cover its location), "noLocation" (still waiting for it), "finding" (looking up
+// its stations) or "ok" (stations known).
+static size_t writeHistoryTemperature(Print *out, double cutoffEpoch) {
+  size_t len = 0;
+  char buf[112];
+  auto put = [&](const char *s) {
+    const size_t n = strlen(s);
+    if (out) out->write((const uint8_t *)s, n);
+    len += n;
+  };
+  put("\"temperature\":[");
+  bool firstClient = true;
+  for (uint8_t c = 0; c < gClientMetadataCount; c++) {
+    const ClientMetadata &meta = gClientMetadata[c];
+    if (!nwsValidUid(meta.clientUid)) continue;  // its characters need no JSON escaping
+    const NwsClientTemp *wx = nwsFindClient(gNwsTemp, meta.clientUid);
+    const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
+    const uint8_t ns = wx ? nwsStationCount(*wx) : 0;
+    const char *status = (wx && wx->uncovered) ? "uncovered" : !hasLocation ? "noLocation" : ns > 0 ? "ok" : "finding";
+    snprintf(buf, sizeof(buf), "%s{\"client\":\"%s\",\"status\":\"%s\",\"stations\":[", firstClient ? "" : ",",
+             meta.clientUid, status);
+    put(buf);
+    firstClient = false;
+    for (uint8_t k = 0; k < ns; k++) {
+      snprintf(buf, sizeof(buf), "%s\"%s\"", k ? "," : "", wx->stations[k]);
+      put(buf);
+    }
+    put("],\"points\":[");
+    bool firstPoint = true;
+    for (uint16_t k = 0; wx && k < wx->count; k++) {
+      if (cutoffEpoch > 0.0 && (double)wx->sampleEpoch[k] < cutoffEpoch) continue;
+      const int tenths = wx->sampleTenthsF[k];
+      const int mag = tenths < 0 ? -tenths : tenths;
+      snprintf(buf, sizeof(buf), "%s[%lu,%s%d.%d]", firstPoint ? "" : ",", (unsigned long)wx->sampleEpoch[k],
+               tenths < 0 ? "-" : "", mag / 10, mag % 10);
+      put(buf);
+      firstPoint = false;
+    }
+    put("]}");
+  }
+  put("]");
+  return len;
+}
 
 static void sendHistoryJson(EthernetClient &client, const String &query) {
   // Build JSON response with historical sensor data for charting
@@ -17865,35 +18001,9 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
     }
   }
 
-  // Outdoor temperature per client (NWS observations matched to the client's readings,
-  // at the observation's own time). The VIN chart can draw it on a second axis. Every
-  // client is listed, with its lookup status, so the page can say why one has none:
-  // "uncovered" (NWS does not cover its location), "noLocation" (still waiting for it),
-  // "finding" (looking up its stations) or "ok" (stations known).
-  JsonArray temperatureArray = doc["temperature"].to<JsonArray>();
-  for (uint8_t c = 0; c < gClientMetadataCount; c++) {
-    const ClientMetadata &meta = gClientMetadata[c];
-    if (meta.clientUid[0] == '\0') continue;
-    const NwsClientTemp *wx = nwsFindClient(gNwsTemp, meta.clientUid);
-    const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
-    JsonObject tObj = temperatureArray.add<JsonObject>();
-    tObj["client"] = meta.clientUid;
-    tObj["status"] = (wx && wx->uncovered)                     ? "uncovered"
-                     : !hasLocation                            ? "noLocation"
-                     : (wx && nwsStationCount(*wx) > 0)        ? "ok"
-                                                               : "finding";
-    JsonArray st = tObj["stations"].to<JsonArray>();
-    JsonArray pts = tObj["points"].to<JsonArray>();
-    if (!wx) continue;
-    for (uint8_t k = 0; k < nwsStationCount(*wx); k++) st.add(wx->stations[k]);
-    for (uint16_t k = 0; k < wx->count; k++) {
-      if (cutoffEpoch > 0.0 && (double)wx->sampleEpoch[k] < cutoffEpoch) continue;
-      JsonArray p = pts.add<JsonArray>();
-      p.add(wx->sampleEpoch[k]);
-      p.add(roundTo(wx->sampleTenthsF[k] / 10.0f, 1));
-    }
-  }
-  
+  // The outdoor temperature ("temperature") is not in the document: it is written to the
+  // socket after it (writeHistoryTemperature), so its samples need no room here.
+
   // Add recent alarms from ring buffer
   for (uint8_t i = 0; i < alarmLogCount; i++) {
     int idx = (alarmLogWriteIndex - alarmLogCount + i + MAX_ALARM_LOG_ENTRIES) % MAX_ALARM_LOG_ENTRIES;
@@ -17949,19 +18059,32 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
     dataInfo["rangeNote"] = "Requested range exceeds hot tier. Daily summaries available for " +
                             String(gHistorySettings.warmTierRetentionMonths) + " months. Enable FTP for full archive.";
   }
-  
-  // Serialize and send
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-  
+
+  // Out of memory while building: an error, not a 200 with part of the history
+  if (doc.overflowed()) {
+    Serial.println(F("[ERROR] History JSON document overflowed - not enough memory"));
+    respondStatus(client, 500, F("History too large for available memory"));
+    return;
+  }
+
+  // Streamed to the socket (no String copy of the response): the document, then the
+  // outdoor temperature in place of its closing brace, then the brace
+  const size_t docLen = measureJson(doc);
+  const size_t tempLen = writeHistoryTemperature(nullptr, cutoffEpoch);
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: application/json"));
   client.println(F("Connection: close"));
   client.print(F("Content-Length: "));
-  client.println(jsonOut.length());
+  client.println((unsigned long)(docLen + 1 + tempLen));  // '}' out, ',' and '}' in
   client.println(F("Cache-Control: no-cache"));
   client.println();
-  client.print(jsonOut);
+  HistoryStreamPrint stream(client);
+  serializeJson(doc, stream);
+  stream.dropHeld();  // the document's closing '}'
+  stream.write(',');
+  writeHistoryTemperature(&stream, cutoffEpoch);
+  stream.write('}');
+  stream.finish();
 }
 
 // Helper to parse YYYYMM format into year and month

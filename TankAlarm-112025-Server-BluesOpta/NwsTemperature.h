@@ -644,15 +644,18 @@ struct NwsClientTemp {
   // sample could not be kept. Each mark settles the readings within
   // NWS_SETTLED_COVER_SEC of it, so a reading that arrives late (older than ones
   // already settled) is still looked up. When the marks are full the oldest one is
-  // folded into settledThrough, which settles every reading at or before it; that
-  // takes more than NWS_SETTLED_MARKS unmatched readings within NWS's seven days.
+  // folded into settledThrough, which settles every reading at or before the end of
+  // its window; that takes more than NWS_SETTLED_MARKS unmatched readings within
+  // NWS's seven days.
   uint32_t settled[NWS_SETTLED_MARKS];  // 0 = free
   uint32_t settledThrough;
-  // RAM only: scheduling
-  uint8_t failStreak;
-  bool uncovered;                      // /points answered 404: NWS does not cover the location
-  uint32_t retryAfter;                 // no request for this client before this epoch
-  uint32_t lastLocationRequest;
+  // When the client last reported a move from a location it had reported before (0 =
+  // never). Readings before it are settled, and samples before it cover no reading after it.
+  uint32_t movedAt;
+  uint32_t lastLocationRequest;  // when the client was last asked for its location
+  uint32_t retryAfter;           // no request for this client before this epoch
+  bool uncovered;                // /points answered 404: NWS does not cover the location
+  uint8_t failStreak;            // RAM only; the others are saved (retryAfter only while uncovered)
 };
 
 struct NwsTempStore {
@@ -759,6 +762,17 @@ static inline bool nwsSampleNear(const NwsClientTemp &c, double t, double within
   return false;
 }
 
+// A stored sample covers reading time t: one is within NWS_OBS_MATCH_SEC of it and from
+// the same location. Samples from before the client moved cover no reading after the move.
+static inline bool nwsSampleCovers(const NwsClientTemp &c, double t) {
+  const bool afterMove = c.movedAt != 0 && t >= (double)c.movedAt;
+  for (uint16_t i = 0; i < c.count; ++i) {
+    if (afterMove && c.sampleEpoch[i] < c.movedAt) continue;
+    if (fabs((double)c.sampleEpoch[i] - t) <= NWS_OBS_MATCH_SEC) return true;
+  }
+  return false;
+}
+
 static inline bool nwsIsSettled(const NwsClientTemp &c, double t) {
   if (t <= (double)c.settledThrough) return true;
   for (uint8_t i = 0; i < NWS_SETTLED_MARKS; ++i) {
@@ -768,22 +782,25 @@ static inline bool nwsIsSettled(const NwsClientTemp &c, double t) {
 }
 
 // Marks reading time t as needing no more lookups. A mark older than NWS keeps
-// observations is reused first; otherwise, when all are taken, the oldest mark is
-// folded into settledThrough.
+// observations, or whose whole window is under the watermark, is reused first;
+// otherwise, when all are taken, the oldest mark is folded into settledThrough,
+// which then covers that mark's whole window.
 static inline void nwsSettle(NwsClientTemp &c, double t, double now) {
   if (!(t >= NWS_MIN_VALID_EPOCH && t < NWS_MAX_VALID_EPOCH) || nwsIsSettled(c, t)) return;
   uint8_t slot = NWS_SETTLED_MARKS;
   uint8_t oldest = 0;
   for (uint8_t i = 0; i < NWS_SETTLED_MARKS; ++i) {
     const uint32_t m = c.settled[i];
-    if (m == 0 || (double)m <= (double)c.settledThrough || now - (double)m > NWS_OBS_MAX_AGE_SEC + NWS_SETTLED_COVER_SEC) {
+    if (m == 0 || (double)m + NWS_SETTLED_COVER_SEC <= (double)c.settledThrough ||
+        now - (double)m > NWS_OBS_MAX_AGE_SEC + NWS_SETTLED_COVER_SEC) {
       slot = i;  // free, already under the watermark, or too old to matter
       break;
     }
     if (m < c.settled[oldest]) oldest = i;
   }
   if (slot == NWS_SETTLED_MARKS) {
-    if (c.settled[oldest] > c.settledThrough) c.settledThrough = c.settled[oldest];
+    const double through = (double)c.settled[oldest] + NWS_SETTLED_COVER_SEC;
+    if (through > (double)c.settledThrough) c.settledThrough = (uint32_t)through;
     slot = oldest;
   }
   c.settled[slot] = (uint32_t)t;
@@ -795,7 +812,15 @@ static inline bool nwsReadingNeedsTemp(const NwsClientTemp &c, double t, double 
   if (!(t >= NWS_MIN_VALID_EPOCH && t < NWS_MAX_VALID_EPOCH) || !(now >= NWS_MIN_VALID_EPOCH)) return false;
   const double age = now - t;
   if (!(age >= NWS_OBS_SETTLE_SEC && age <= NWS_OBS_MAX_AGE_SEC)) return false;
-  return !nwsIsSettled(c, t) && !nwsSampleNear(c, t, NWS_OBS_MATCH_SEC);
+  return !nwsIsSettled(c, t) && !nwsSampleCovers(c, t);
+}
+
+// Where an observation request for reading time t starts: NWS_OBS_MATCH_SEC before it,
+// but not before the client's move when t is after it (those are the old location's).
+static inline double nwsObservationStart(const NwsClientTemp &c, double t) {
+  const double start = t - NWS_OBS_MATCH_SEC;
+  if (c.movedAt != 0 && t >= (double)c.movedAt && start < (double)c.movedAt) return (double)c.movedAt;
+  return start;
 }
 
 // ============================================================================
@@ -814,7 +839,9 @@ static inline NwsAction nwsPlan(const NwsClientTemp &c, bool hasLocation, float 
   if (!readingWaiting || !(now >= NWS_MIN_VALID_EPOCH)) return NWS_ACT_NONE;
   if (now < (double)c.retryAfter) return NWS_ACT_NONE;
   if (!hasLocation) {
-    const bool due = c.lastLocationRequest == 0 || now - (double)c.lastLocationRequest >= NWS_LOCATION_REQUEST_SEC;
+    // Once a day; a request time more than an hour ahead means the clock was wrong then
+    const double since = now - (double)c.lastLocationRequest;
+    const bool due = c.lastLocationRequest == 0 || since >= NWS_LOCATION_REQUEST_SEC || since < -3600.0;
     return due ? NWS_ACT_REQUEST_LOCATION : NWS_ACT_NONE;
   }
   if (!nwsStationsCurrent(c, lat, lon, now)) return NWS_ACT_FIND_STATIONS;
@@ -844,7 +871,7 @@ static inline void nwsNoteUncovered(NwsClientTemp &c, double now) {
   c.retryAfter = (uint32_t)(now + NWS_UNCOVERED_RETRY_SEC);
 }
 
-// The client reported a new location: find its stations again, at once
+// The client reported a new location (or its first): find its stations again, at once
 static inline void nwsNoteLocationChanged(NwsClientTemp &c) {
   nwsClearStations(c);
   c.uncovered = false;
@@ -852,14 +879,27 @@ static inline void nwsNoteLocationChanged(NwsClientTemp &c) {
   c.retryAfter = 0;
 }
 
+// The client moved, at now, from a location it had reported before. Its stations are
+// found again; the readings before the move are settled (the old stations are gone and
+// the new ones are elsewhere), and its samples from before the move, which stay on the
+// chart, cover no reading after it.
+static inline void nwsNoteMoved(NwsClientTemp &c, double now) {
+  nwsNoteLocationChanged(c);
+  if (!(now >= NWS_MIN_VALID_EPOCH && now < NWS_MAX_VALID_EPOCH)) return;
+  c.movedAt = (uint32_t)now;
+  if (c.movedAt > c.settledThrough) c.settledThrough = c.movedAt;
+  memset(c.settled, 0, sizeof(c.settled));  // a mark's window may reach past the move
+}
+
 // The observation at obsEpoch matched reading time t. Returns true when the store
-// changed. A sample the store cannot keep (full of newer ones) settles t instead,
-// so the reading is not asked about again.
+// changed. A sample the store cannot keep (full of newer ones, or from before the
+// client moved while t is after) settles t instead, so it is not asked about again.
 static inline bool nwsNoteMatched(NwsClientTemp &c, double t, uint32_t obsEpoch, float tempF, double now) {
   c.failStreak = 0;
   c.retryAfter = 0;
-  bool changed = nwsAddSample(c, obsEpoch, tempF);
-  if (!nwsSampleNear(c, t, NWS_OBS_MATCH_SEC)) {
+  const bool oldLocation = c.movedAt != 0 && obsEpoch < c.movedAt && t >= (double)c.movedAt;
+  bool changed = !oldLocation && nwsAddSample(c, obsEpoch, tempF);
+  if (!nwsSampleCovers(c, t) && !nwsIsSettled(c, t)) {
     nwsSettle(c, t, now);
     changed = true;
   }
@@ -883,9 +923,10 @@ static inline bool nwsNoteNoMatch(NwsClientTemp &c, double t, double now) {
 // ============================================================================
 // Saved file:
 //   [{"c":uid,"st":["KDCA","KCGS"],"sl":[lat,lon],"se":epoch,"sb":epoch,"sd":[epoch,...],
-//     "t":[[epoch,tenthsF],...]},...]
+//     "mv":epoch,"lr":epoch,"ux":epoch,"t":[[epoch,tenthsF],...]},...]
 // st/sl/se: the stations, the location they were found for and when; sb: settledThrough;
-// sd: the settled marks; t: the samples, oldest first.
+// sd: the settled marks; mv: movedAt; lr: lastLocationRequest; ux: present while NWS does
+// not cover the location, when to ask again; t: the samples, oldest first.
 // ============================================================================
 
 struct NwsOut {
@@ -904,7 +945,8 @@ struct NwsOut {
 
 // Writes the store as JSON into out (NUL-terminated when cap > 0) and returns the
 // full length, as snprintf does; call with out = nullptr to measure. Clients with
-// nothing to keep (no stations, samples or settled readings) are left out.
+// nothing to keep (no stations, samples, settled readings, move, location request or
+// uncovered status) are left out.
 static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t cap) {
   NwsOut o = {out, cap, 0};
   if (out && cap > 0) out[0] = '\0';
@@ -915,7 +957,11 @@ static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t 
     const uint8_t ns = nwsStationCount(c);
     uint8_t marks = 0;
     for (uint8_t k = 0; k < NWS_SETTLED_MARKS; ++k) marks += (c.settled[k] != 0) ? 1 : 0;
-    if (!nwsValidUid(c.uid) || (ns == 0 && c.count == 0 && c.settledThrough == 0 && marks == 0)) continue;
+    const bool uncovered = c.uncovered && c.retryAfter != 0;
+    if (!nwsValidUid(c.uid) || (ns == 0 && c.count == 0 && c.settledThrough == 0 && marks == 0 && c.movedAt == 0 &&
+                                c.lastLocationRequest == 0 && !uncovered)) {
+      continue;
+    }
     o.putf("%s{\"c\":\"%s\"", first ? "" : ",", c.uid);
     first = false;
     if (ns > 0) {
@@ -935,6 +981,9 @@ static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t 
       }
       o.putf("]");
     }
+    if (c.movedAt != 0) o.putf(",\"mv\":%lu", (unsigned long)c.movedAt);
+    if (c.lastLocationRequest != 0) o.putf(",\"lr\":%lu", (unsigned long)c.lastLocationRequest);
+    if (uncovered) o.putf(",\"ux\":%lu", (unsigned long)c.retryAfter);
     o.putf(",\"t\":[");
     for (uint16_t k = 0; k < c.count; ++k) {
       o.putf("%s[%lu,%d]", k ? "," : "", (unsigned long)c.sampleEpoch[k], (int)c.sampleTenthsF[k]);
@@ -945,8 +994,14 @@ static inline size_t nwsSerializeStore(const NwsTempStore &s, char *out, size_t 
   return o.len;
 }
 
+// A saved epoch is usable: in range, and at most `ahead` seconds after now (now <= 0: no check)
+static inline bool nwsSavedEpochOk(double v, double now, double ahead) {
+  return v >= NWS_MIN_VALID_EPOCH && v < NWS_MAX_VALID_EPOCH && !(now > 0.0 && v > now + ahead);
+}
+
 // Replaces the store with the clients in arr. Bad entries and values are
-// skipped; samples later than now + 1 h are dropped (now <= 0: no check).
+// skipped; times later than now + 1 h are dropped (now <= 0: no check), and an
+// uncovered client's next request no later than now + NWS_UNCOVERED_RETRY_SEC.
 static inline uint8_t nwsLoadStore(NwsTempStore &s, JsonArrayConst arr, double now) {
   memset(&s, 0, sizeof(s));
   for (JsonVariantConst e : arr) {
@@ -968,8 +1023,15 @@ static inline uint8_t nwsLoadStore(NwsTempStore &s, JsonArrayConst arr, double n
       nwsSetStations(*c, ids, n, lat, lon, se);
     }
     const double sb = e["sb"] | 0.0;
-    if (sb >= NWS_MIN_VALID_EPOCH && sb < NWS_MAX_VALID_EPOCH && !(now > 0.0 && sb > now + 3600.0)) {
-      c->settledThrough = (uint32_t)sb;
+    if (nwsSavedEpochOk(sb, now, 3600.0)) c->settledThrough = (uint32_t)sb;
+    const double mv = e["mv"] | 0.0;
+    if (nwsSavedEpochOk(mv, now, 3600.0)) c->movedAt = (uint32_t)mv;
+    const double lr = e["lr"] | 0.0;
+    if (nwsSavedEpochOk(lr, now, 3600.0)) c->lastLocationRequest = (uint32_t)lr;
+    const double ux = e["ux"] | 0.0;
+    if (nwsSavedEpochOk(ux, now, NWS_UNCOVERED_RETRY_SEC)) {
+      c->uncovered = true;
+      c->retryAfter = (uint32_t)ux;
     }
     uint8_t marks = 0;
     for (JsonVariantConst m : e["sd"].as<JsonArrayConst>()) {

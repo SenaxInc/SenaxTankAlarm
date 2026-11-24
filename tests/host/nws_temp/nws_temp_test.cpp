@@ -704,10 +704,29 @@ static void testStore() {
   memset(&o, 0, sizeof(o));
   const double first = now - 500000.0;
   for (int i = 0; i < NWS_SETTLED_MARKS + 3; ++i) nwsSettle(o, first + i * 10000.0, now);
-  CHECK(o.settledThrough == (uint32_t)(first + 2 * 10000.0));
+  CHECK(o.settledThrough == (uint32_t)(first + 2 * 10000.0 + NWS_SETTLED_COVER_SEC));  // the folded mark's whole window
   for (int i = 0; i < NWS_SETTLED_MARKS + 3; ++i) CHECK(nwsIsSettled(o, first + i * 10000.0));
   CHECK(!nwsIsSettled(o, first + (NWS_SETTLED_MARKS + 3) * 10000.0));
   CHECK(nwsIsSettled(o, first - 50000.0));                                     // under the watermark
+  // Readings just after a folded mark stay settled (they were in its window)
+  CHECK(nwsIsSettled(o, first + 2 * 10000.0 + 1.0) && nwsIsSettled(o, first + 2 * 10000.0 + NWS_SETTLED_COVER_SEC));
+  CHECK(!nwsReadingNeedsTemp(o, first + 2 * 10000.0 + 600.0, now));
+  CHECK(!nwsIsSettled(o, first + 2 * 10000.0 + NWS_SETTLED_COVER_SEC + 1.0));
+  // A mark only partly under the watermark is not reused: its window past the watermark stays settled
+  NwsClientTemp q;
+  memset(&q, 0, sizeof(q));
+  const double wm = now - 300000.0;
+  q.settledThrough = (uint32_t)wm;
+  q.settled[0] = (uint32_t)(wm - 1000.0);  // covers up to wm + 800
+  for (int i = 1; i < NWS_SETTLED_MARKS; ++i) q.settled[i] = (uint32_t)(wm + 50000.0 + i * 4000.0);
+  nwsSettle(q, now - 30000.0, now);
+  CHECK(nwsIsSettled(q, wm + 800.0) && nwsIsSettled(q, now - 30000.0));
+  CHECK(q.settledThrough == (uint32_t)(wm + 800.0));  // it was the oldest, so it was folded
+  // ...and one wholly under the watermark is reused without folding anything
+  q.settled[3] = (uint32_t)(wm - NWS_SETTLED_COVER_SEC - 5000.0);
+  const uint32_t before = q.settledThrough;
+  nwsSettle(q, now - 20000.0, now);
+  CHECK(q.settledThrough == before && q.settled[3] == (uint32_t)(now - 20000.0));
   // Marks older than NWS keeps observations are reused before anything is folded
   NwsClientTemp p;
   memset(&p, 0, sizeof(p));
@@ -718,6 +737,39 @@ static void testStore() {
   nwsSettle(p, 0.0, now);
   nwsSettle(p, NAN, now);
   CHECK(p.settledThrough == 0);
+
+  // A move: readings before it are settled; samples before it cover none after it
+  NwsClientTemp v;
+  memset(&v, 0, sizeof(v));
+  const double moved = now - 100000.0;
+  nwsAddSample(v, (uint32_t)(moved - 600.0), 55.0f);    // old location, 10 min before the move
+  nwsAddSample(v, (uint32_t)(moved - 50000.0), 50.0f);
+  nwsSettle(v, moved - 1000.0, now);                     // its window reaches past the move
+  CHECK(!nwsReadingNeedsTemp(v, moved + 600.0, now));    // before the fix: covered by both
+  char vids[NWS_STATIONS][NWS_STATION_ID_MAX] = {"KDCA", "KCGS"};
+  nwsSetStations(v, vids, 2, 38.9f, -77.0f, now - 200000.0);
+  nwsNoteMoved(v, moved);
+  CHECK(v.movedAt == (uint32_t)moved && v.settledThrough == (uint32_t)moved && nwsStationCount(v) == 0);
+  CHECK(v.count == 2);                                   // the old location's samples stay on the chart
+  CHECK(nwsReadingNeedsTemp(v, moved + 600.0, now));     // the old sample and mark no longer cover it
+  CHECK(nwsReadingNeedsTemp(v, moved + 1.0, now));
+  CHECK(!nwsReadingNeedsTemp(v, moved - 30000.0, now));  // before the move: settled
+  CHECK(!nwsSampleCovers(v, moved + 600.0) && nwsSampleCovers(v, moved - 1200.0));
+  // Requests for readings after the move ask only for observations after it
+  CHECK(nwsObservationStart(v, moved + 600.0) == moved);
+  CHECK(nwsObservationStart(v, moved + 5000.0) == moved + 5000.0 - NWS_OBS_MATCH_SEC);
+  // A new-location observation covers the reading; one from before the move is not kept
+  CHECK(nwsNoteMatched(v, moved + 600.0, (uint32_t)(moved + 900.0), 61.0f, now));
+  CHECK(!nwsReadingNeedsTemp(v, moved + 600.0, now) && v.count == 3 && !nwsIsSettled(v, moved + 600.0));
+  CHECK(nwsNoteMatched(v, moved + 9000.0, (uint32_t)(moved - 60.0), 62.0f, now));  // changed: settled
+  CHECK(v.count == 3 && nwsIsSettled(v, moved + 9000.0) && !nwsReadingNeedsTemp(v, moved + 9000.0, now));
+  // Moving without a valid clock only finds the stations again
+  NwsClientTemp w;
+  memset(&w, 0, sizeof(w));
+  nwsNoteMoved(w, 0.0);
+  CHECK(w.movedAt == 0 && w.settledThrough == 0);
+  // Without a move, samples cover readings on both sides as before
+  CHECK(nwsSampleCovers(*a, base + 300.0 + NWS_OBS_MATCH_SEC) && !nwsSampleCovers(*a, base + 301.0 + NWS_OBS_MATCH_SEC));
 
   // Forget compacts the table
   NwsClientTemp *c = nwsFindOrAddClient(gStore, "dev:3");
@@ -741,6 +793,8 @@ static void testScheduling() {
   c.lastLocationRequest = (uint32_t)now;
   CHECK(nwsPlan(c, false, 0, 0, true, now + NWS_LOCATION_REQUEST_SEC - 1) == NWS_ACT_NONE);
   CHECK(nwsPlan(c, false, 0, 0, true, now + NWS_LOCATION_REQUEST_SEC) == NWS_ACT_REQUEST_LOCATION);
+  CHECK(nwsPlan(c, false, 0, 0, true, now - 3600.0) == NWS_ACT_NONE);          // an hour of clock slack
+  CHECK(nwsPlan(c, false, 0, 0, true, now - 3601.0) == NWS_ACT_REQUEST_LOCATION);  // clock was wrong then
   CHECK(nwsPlan(c, true, lat, lon, true, now) == NWS_ACT_FIND_STATIONS);
 
   char ids[NWS_STATIONS][NWS_STATION_ID_MAX] = {"KDCA", "KCGS"};
@@ -794,18 +848,28 @@ static void testSaveLoad() {
   nwsSettle(*a, now - 9000.0, now);
   nwsSettle(*a, now - 90000.0, now);
   a->settledThrough = (uint32_t)(now - 400000.0);
+  a->movedAt = (uint32_t)(now - 500000.0);
   NwsClientTemp *b = nwsFindOrAddClient(gStore, "dev:2");
   nwsAddSample(*b, (uint32_t)now - 100, 70.0f);
   nwsFindOrAddClient(gStore, "dev:empty");  // nothing to save
+  // Saved although they have nothing else: a location request, and an uncovered location
+  NwsClientTemp *lr = nwsFindOrAddClient(gStore, "dev:asked");
+  lr->lastLocationRequest = (uint32_t)(now - 5000.0);
+  NwsClientTemp *ux = nwsFindOrAddClient(gStore, "dev:abroad");
+  nwsNoteUncovered(*ux, now - 86400.0);
+  NwsClientTemp *failed = nwsFindOrAddClient(gStore, "dev:failed");
+  nwsNoteFailure(*failed, now);  // a failure backoff is RAM only
 
   const size_t need = nwsSerializeStore(gStore, nullptr, 0);
   std::vector<char> buf(need + 1);
   CHECK(nwsSerializeStore(gStore, buf.data(), buf.size()) == need && strlen(buf.data()) == need);
-  CHECK(strstr(buf.data(), "\"dev:empty\"") == nullptr);
+  CHECK(strstr(buf.data(), "\"dev:empty\"") == nullptr && strstr(buf.data(), "\"dev:failed\"") == nullptr);
   CHECK(strstr(buf.data(), "\"st\":[\"KDCA\",\"KCGS\"],\"sl\":[38.8894,-77.0352],\"se\":1762913600,"
-                           "\"sb\":1762600000,\"sd\":[1762991000,1762910000],") != nullptr);
+                           "\"sb\":1762600000,\"sd\":[1762991000,1762910000],\"mv\":1762500000,") != nullptr);
   CHECK(strstr(buf.data(), "\"t\":[[1762992800,453],[1762996400,-37]]") != nullptr);
   CHECK(strstr(buf.data(), "{\"c\":\"dev:2\",\"t\":[[1762999900,700]]}") != nullptr);
+  CHECK(strstr(buf.data(), "{\"c\":\"dev:asked\",\"lr\":1762995000,\"t\":[]}") != nullptr);
+  CHECK(strstr(buf.data(), "{\"c\":\"dev:abroad\",\"ux\":1763518400,\"t\":[]}") != nullptr);
 
   // A too-small buffer still reports the full length and stays terminated
   char small[16];
@@ -814,13 +878,24 @@ static void testSaveLoad() {
   JsonDocument doc;
   CHECK(deserializeJson(doc, buf.data()) == DeserializationError::Ok);
   static NwsTempStore loaded;
-  CHECK(nwsLoadStore(loaded, doc.as<JsonArrayConst>(), now) == 2);
+  CHECK(nwsLoadStore(loaded, doc.as<JsonArrayConst>(), now) == 4);
   const NwsClientTemp *la = nwsFindClient(loaded, "dev:864475044012345");
   CHECK(la && la->count == 2 && la->sampleTenthsF[0] == 453 && la->sampleTenthsF[1] == -37);
   CHECK(la && nwsStationCount(*la) == 2 && la->stationsEpoch == (uint32_t)(now - 86400.0));
   CHECK(la && nwsStationsCurrent(*la, 38.8894f, -77.0352f, now));
   CHECK(la && la->failStreak == 0 && la->settledThrough == (uint32_t)(now - 400000.0));
   CHECK(la && nwsIsSettled(*la, now - 9000.0) && nwsIsSettled(*la, now - 90000.0) && !nwsIsSettled(*la, now - 50000.0));
+  CHECK(la && la->movedAt == (uint32_t)(now - 500000.0) && !la->uncovered && la->lastLocationRequest == 0);
+  // After a reboot the daily location allowance and the weekly uncovered retry still hold
+  const NwsClientTemp *lla = nwsFindClient(loaded, "dev:asked");
+  CHECK(lla && lla->lastLocationRequest == (uint32_t)(now - 5000.0));
+  CHECK(lla && nwsPlan(*lla, false, 0, 0, true, now) == NWS_ACT_NONE);
+  CHECK(lla && nwsPlan(*lla, false, 0, 0, true, now - 5000.0 + NWS_LOCATION_REQUEST_SEC) == NWS_ACT_REQUEST_LOCATION);
+  const NwsClientTemp *lux = nwsFindClient(loaded, "dev:abroad");
+  CHECK(lux && lux->uncovered && lux->retryAfter == (uint32_t)(now - 86400.0 + NWS_UNCOVERED_RETRY_SEC));
+  CHECK(lux && nwsPlan(*lux, true, 46.0f, 2.0f, true, now) == NWS_ACT_NONE);
+  CHECK(lux && nwsPlan(*lux, true, 46.0f, 2.0f, true, now - 86400.0 + NWS_UNCOVERED_RETRY_SEC) == NWS_ACT_FIND_STATIONS);
+  CHECK(nwsFindClient(loaded, "dev:failed") == nullptr);
   const size_t again = nwsSerializeStore(loaded, nullptr, 0);
   std::vector<char> buf2(again + 1);
   nwsSerializeStore(loaded, buf2.data(), buf2.size());
@@ -834,9 +909,11 @@ static void testSaveLoad() {
                   "\"sd\":[1762950000,\"x\",1000,1763090000,1762960000],"
                   "\"t\":[[1763000000,453],[\"x\",1],[1000,2],[1762999000,\"y\"],[1763090000,9],[1762990000,-1500],[1762980000,100]]},"
                   "{\"c\":\"dev:a\",\"t\":[[1763000000,1]]},"
-                  "{\"c\":\"dev:b\",\"st\":[\"KDCA\"],\"se\":1762000000,\"sb\":1763090000,\"t\":[]},"
+                  "{\"c\":\"dev:b\",\"st\":[\"KDCA\"],\"se\":1762000000,\"sb\":1763090000,\"mv\":1763090000,"
+                  "\"lr\":1763090000,\"ux\":1763700000,\"t\":[]},"
+                  "{\"c\":\"dev:c\",\"mv\":\"x\",\"lr\":1000,\"ux\":1763600000,\"t\":[]},"
                   "{\"t\":[]},5]");
-  CHECK(nwsLoadStore(loaded, messy.as<JsonArrayConst>(), now) == 2);
+  CHECK(nwsLoadStore(loaded, messy.as<JsonArrayConst>(), now) == 3);
   const NwsClientTemp *ma = nwsFindClient(loaded, "dev:a");
   CHECK(ma && ma->count == 2 && ma->sampleEpoch[0] == 1762980000u && ma->sampleEpoch[1] == 1763000000u);
   CHECK(ma && nwsStationCount(*ma) == 2 && strcmp(ma->stations[0], "KDCA") == 0 && strcmp(ma->stations[1], "KCGS") == 0);
@@ -845,6 +922,11 @@ static void testSaveLoad() {
   CHECK(ma && ma->settledThrough == 1762990000u);
   CHECK(ma && ma->settled[0] == 1762950000u && ma->settled[1] == 1762960000u && ma->settled[2] == 0);  // bad marks skipped
   CHECK(mb && mb->settledThrough == 0);    // later than now + 1 h
+  CHECK(mb && mb->movedAt == 0 && mb->lastLocationRequest == 0);              // later than now + 1 h
+  CHECK(mb && !mb->uncovered && mb->retryAfter == 0);                         // later than now + a week
+  const NwsClientTemp *mc = nwsFindClient(loaded, "dev:c");
+  CHECK(mc && mc->movedAt == 0 && mc->lastLocationRequest == 0);              // not a time / too early
+  CHECK(mc && mc->uncovered && mc->retryAfter == 1763600000u);
   JsonDocument notArray;
   deserializeJson(notArray, "{\"c\":\"dev:a\"}");
   CHECK(nwsLoadStore(loaded, notArray.as<JsonArrayConst>(), now) == 0);
