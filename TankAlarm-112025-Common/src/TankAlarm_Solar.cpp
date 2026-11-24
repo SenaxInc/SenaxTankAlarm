@@ -89,9 +89,13 @@ static void incrementSolarErrorBucket() {
 // that silence would take the stray reply for its own. After such a request everything that
 // sends on this link (the poll, the charger check, the startup probe) therefore leaves the line
 // alone for one Modbus timeout: SolarManager::lineResting(). A request the controller refused
-// with a Modbus exception has had its answer and needs no rest.
+// with a Modbus exception has had its answer and needs no rest. The rest is the timeout of the
+// request that missed: a config update that shortens the timeout restarts the link at once, and
+// a reply to the request before it can still be on its way.
 static unsigned long sSolarLastMissMillis = 0;
+static unsigned long sSolarMissRestMs = 0;     // how long the line rests after that miss
 static bool          sSolarMissSeen = false;
+static unsigned long sSolarTimeoutMs = 0;      // the timeout ModbusRTUClient was last given
 
 // True for the text of a Modbus exception a SunSaver answers with: the controller is there and
 // said no. Anything else that ModbusRTUClient.lastError() gives means that no usable reply came.
@@ -130,6 +134,7 @@ static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
   classifyModbusErrorTag(sSolarLastModbusError);
   if (!solarErrorIsRefusal(sSolarLastModbusError)) {
     sSolarLastMissMillis = millis();  // the line rests from now (see lineResting())
+    sSolarMissRestMs = sSolarTimeoutMs;
     sSolarMissSeen = true;
   }
 }
@@ -317,6 +322,7 @@ bool SolarManager::begin(const SolarConfig& config) {
     _config.modbusTimeoutMs = 500;
   }
   ModbusRTUClient.setTimeout(_config.modbusTimeoutMs);
+  sSolarTimeoutMs = _config.modbusTimeoutMs;
 
   // RS-485 timing fix per Arduino forum thread #1421875 post #18:
   // The Opta needs a post-TX delay of one full character time before DE drops,
@@ -356,7 +362,7 @@ bool SolarManager::begin(const SolarConfig& config) {
   
   // A request of the link as it was may have gone unanswered a moment ago (a config update
   // restarts the link at any time): the probe waits like every other request. At most one
-  // Modbus timeout, and not at all at boot.
+  // Modbus timeout of that link, and not at all at boot.
   while (lineResting()) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
@@ -430,7 +436,7 @@ bool SolarManager::lineResting() const {
   if (!sSolarMissSeen) {
     return false;
   }
-  if ((unsigned long)(millis() - sSolarLastMissMillis) < (unsigned long)_config.modbusTimeoutMs) {
+  if ((unsigned long)(millis() - sSolarLastMissMillis) < sSolarMissRestMs) {
     return true;
   }
   sSolarMissSeen = false;  // over: millis() may wrap before the next miss

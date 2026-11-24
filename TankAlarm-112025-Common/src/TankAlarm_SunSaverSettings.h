@@ -44,6 +44,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "TankAlarm_Battery.h"
+
 namespace sunsaver {
 
 // ---------------------------------------------------------------------------------------------
@@ -516,13 +518,8 @@ enum LiveSource : uint8_t {
   LIVE_SOURCE_STORED_LVD   // DIP switch 2 ON: V_lvd reads the stored EV_lvd
 };
 
-// 12 or 24, from the battery voltage. 0 when it was not read or makes no sense. The two scales
-// are 3.3 % apart and the two systems a factor of two, so either scale decides this.
-inline uint8_t systemVolts(const Snapshot &snapshot) {
-  if (!have(snapshot, I_ADC_VB_F)) {
-    return 0;
-  }
-  const double volts = voltsFromRaw(snapshot.raw[I_ADC_VB_F], SCALE_100);
+// The system that one reading of the battery voltage fits: 12, 24, or 0 for neither.
+inline uint8_t systemVoltsFor(double volts) {
   if (volts >= 8.0 && volts <= 17.0) {
     return 12;
   }
@@ -530,6 +527,20 @@ inline uint8_t systemVolts(const Snapshot &snapshot) {
     return 24;
   }
   return 0;
+}
+
+// 12 or 24, from the battery voltage. 0 when it was not read, makes no sense, or fits another
+// system with each scale. The scale of the live readings is not known here, and the two scales
+// are 3.3 % apart: near a limit one battery voltage can fit both systems (raw 5627 is 16.60 V
+// with x96.667 and 17.17 V with x100). So both scales have to give the same system, which they
+// do from 8.28 to 17.00 V and from 17.59 to 34.00 V read with x100.
+inline uint8_t systemVolts(const Snapshot &snapshot) {
+  if (!have(snapshot, I_ADC_VB_F)) {
+    return 0;
+  }
+  const uint8_t with100 = systemVoltsFor(voltsFromRaw(snapshot.raw[I_ADC_VB_F], SCALE_100));
+  const uint8_t with96667 = systemVoltsFor(voltsFromRaw(snapshot.raw[I_ADC_VB_F], SCALE_96667));
+  return with100 == with96667 ? with100 : (uint8_t)0;
 }
 
 // The LVD in effect is the wanted LVD less the load-current compensation, which the built-in
@@ -622,6 +633,26 @@ inline const char *chemistryName(uint8_t chemistry) {
 
 inline bool chemistryIsLithium(uint8_t chemistry) {
   return chemistry == CHEMISTRY_LIFEPO4 || chemistry == CHEMISTRY_LI_ION;
+}
+
+// The chemistry that a battery type of the client config (BatteryType, TankAlarm_Battery.h) is
+// judged as. The client judges its charger against it, and the server tells from it whether the
+// report it keeps was judged against the battery that the config names now.
+inline uint8_t chemistryForBatteryType(int batteryType) {
+  switch (batteryType) {
+    case BATTERY_TYPE_AGM:
+    case BATTERY_TYPE_GEL:
+    case BATTERY_TYPE_SLA:
+      return CHEMISTRY_LEAD_SEALED;
+    case BATTERY_TYPE_FLOODED:
+      return CHEMISTRY_LEAD_FLOODED;
+    case BATTERY_TYPE_LIFEPO4:
+      return CHEMISTRY_LIFEPO4;
+    case BATTERY_TYPE_LI_ION:
+      return CHEMISTRY_LI_ION;
+    default:
+      return CHEMISTRY_NOT_JUDGED;  // no battery, custom thresholds, or the LiPo cell
+  }
 }
 
 enum Finding : uint32_t {

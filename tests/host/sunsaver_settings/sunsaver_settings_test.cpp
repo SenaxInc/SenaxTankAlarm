@@ -539,6 +539,22 @@ static void testText() {
   CHECK(ss::chemistryIsLithium(ss::CHEMISTRY_LIFEPO4) && ss::chemistryIsLithium(ss::CHEMISTRY_LI_ION));
   CHECK(!ss::chemistryIsLithium(ss::CHEMISTRY_LEAD_SEALED) && !ss::chemistryIsLithium(ss::CHEMISTRY_LEAD_FLOODED) &&
         !ss::chemistryIsLithium(ss::CHEMISTRY_NOT_JUDGED));
+  // The battery types of the client config, as the client judges them and the server compares
+  // them with a kept report. The numbers are those the config carries (batteryConfig.batteryType).
+  {
+    const int types[] = {BATTERY_TYPE_NONE, BATTERY_TYPE_AGM,     BATTERY_TYPE_FLOODED, BATTERY_TYPE_GEL,
+                         BATTERY_TYPE_SLA,  BATTERY_TYPE_LIFEPO4, BATTERY_TYPE_LI_ION,  BATTERY_TYPE_LIPO,
+                         BATTERY_TYPE_CUSTOM, 9, 255, -1};
+    const int numbers[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, -1};
+    const uint8_t want[] = {ss::CHEMISTRY_NOT_JUDGED, ss::CHEMISTRY_LEAD_SEALED, ss::CHEMISTRY_LEAD_FLOODED,
+                            ss::CHEMISTRY_LEAD_SEALED, ss::CHEMISTRY_LEAD_SEALED, ss::CHEMISTRY_LIFEPO4,
+                            ss::CHEMISTRY_LI_ION,      ss::CHEMISTRY_NOT_JUDGED,  ss::CHEMISTRY_NOT_JUDGED,
+                            ss::CHEMISTRY_NOT_JUDGED,  ss::CHEMISTRY_NOT_JUDGED,  ss::CHEMISTRY_NOT_JUDGED};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+      CHECK_EQ(types[i], numbers[i]);
+      CHECK_MSG(ss::chemistryForBatteryType(types[i]) == want[i], "battery type %d", types[i]);
+    }
+  }
 
   // Every finding has a sentence of its own.
   CHECK_EQ(ss::FINDING_BITS, 15);
@@ -1115,21 +1131,40 @@ static void testLiveScale() {
   uint8_t scale = 99;
   uint8_t source = 99;
 
-  // 12 or 24 V.
+  // 12 or 24 V. Both scales have to give the same system, since the live scale is not known yet.
   {
     SimSunSaver sim;
-    const double volts[] = {0.0, 7.95, 8.05, 12.80, 16.95, 17.05, 26.40, 33.95, 34.05, 199.0};
-    const int want[] = {0, 0, 12, 12, 12, 24, 24, 24, 0, 0};
+    const double volts[] = {0.0, 7.95, 8.05, 8.30, 12.80, 16.95, 17.05, 17.30, 17.60, 26.40, 33.95, 34.05, 199.0};
+    const int want[] = {0, 0, 0, 12, 12, 12, 0, 0, 24, 24, 24, 0, 0};
     for (size_t i = 0; i < sizeof(volts) / sizeof(volts[0]); ++i) {
       sim.regs[0x0008] = sim.volts(volts[i]);
       CHECK_MSG(ss::systemVolts(snapshotOf(sim)) == want[i], "%.2f V", volts[i]);
     }
-    // The other scale puts a battery 3.3 % lower. That moves no battery across a limit.
+    // The words at the ends: 2712 is 8.00 V with x96.667, 5570 is 17.00 V with x100, 5763 is
+    // 17.00 V with x96.667 and 11141 is 34.00 V with x100. In between, each scale gives another
+    // system.
+    const uint16_t words[] = {2711, 2712, 5570, 5571, 5627, 5762, 5763, 11141, 11142};
+    const int wantWord[] = {0, 12, 12, 0, 0, 0, 24, 24, 0};
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i) {
+      sim.regs[0x0008] = words[i];
+      CHECK_MSG(ss::systemVolts(snapshotOf(sim)) == wantWord[i], "word %u", (unsigned)words[i]);
+    }
+    CHECK_EQ(ss::systemVoltsFor(8.00), 12);
+    CHECK_EQ(ss::systemVoltsFor(7.99), 0);
+    CHECK_EQ(ss::systemVoltsFor(17.00), 12);
+    CHECK_EQ(ss::systemVoltsFor(17.01), 24);
+    CHECK_EQ(ss::systemVoltsFor(34.00), 24);
+    CHECK_EQ(ss::systemVoltsFor(34.01), 0);
+    // The other scale puts a battery 3.3 % lower. Away from the ends that changes nothing.
     SimSunSaver other(96.667);
     other.regs[0x0008] = other.volts(12.80);
     CHECK_EQ(ss::systemVolts(snapshotOf(other)), 12);
     other.regs[0x0008] = other.volts(25.60);
     CHECK_EQ(ss::systemVolts(snapshotOf(other)), 24);
+    // A 12 V battery at 16.60 V, as an x96.667 controller reports it: 17.17 V with x100.
+    other.regs[0x0008] = other.volts(16.60);
+    CHECK_EQ(other.regs[0x0008], 5627);
+    CHECK_EQ(ss::systemVolts(snapshotOf(other)), 0);
     sim.regs.erase(0x0008);
     CHECK_EQ(ss::systemVolts(snapshotOf(sim)), 0);
   }
@@ -1696,8 +1731,9 @@ static void testEvaluate() {
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
   }
   {
-    // A battery voltage that fits neither system: the same, under its own name.
-    const double odd[] = {0.0, 5.00, 7.99, 34.02, 60.00};
+    // A battery voltage that fits neither system, or each scale another: the same, under its own
+    // name.
+    const double odd[] = {0.0, 5.00, 7.99, 8.10, 17.05, 17.40, 34.02, 60.00};
     for (size_t i = 0; i < sizeof(odd) / sizeof(odd[0]); ++i) {
       SimSunSaver sim;
       makeLiFePO4(sim);
@@ -1719,7 +1755,7 @@ static void testEvaluate() {
       CHECK_EQ(judge(sim, ss::CHEMISTRY_NOT_JUDGED).findings, kNone);
     }
     // Just inside the ends of the two systems.
-    const double fits[] = {8.01, 13.30, 16.99, 17.02, 26.60, 33.99};
+    const double fits[] = {8.30, 13.30, 16.99, 17.60, 26.60, 33.99};
     for (size_t i = 0; i < sizeof(fits) / sizeof(fits[0]); ++i) {
       SimSunSaver sim;
       makeLiFePO4(sim);
@@ -2029,6 +2065,13 @@ static void testFloatReference() {
     sim.regs[0x0008] = sim.volts(27.00);
     sim.regs[0x001C] = sim.volts(26.20);
     CHECK(near(Rigged::reference(sim), 27.00, 0.02));
+    // A 12 V battery at 16.60 V reads 17.17 V with x100. It is not taken for a 24 V system, which
+    // would double the reference: no reference until the battery voltage tells.
+    sim.regs[0x0008] = sim.volts(16.60);
+    sim.regs[0x001C] = sim.volts(13.00);
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    sim.regs[0x0008] = sim.volts(13.30);
+    CHECK(near(Rigged::reference(sim), 13.50, 0.01));
   }
   {
     // Not known: a built-in profile, temperature compensation, an unproven scale, a missing
