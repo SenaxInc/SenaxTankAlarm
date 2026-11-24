@@ -446,10 +446,12 @@ public:
 
   // Call from every pass of loop(), whether the charger is enabled or not: a request that waits
   // runs out of time here too. `allowed` is false while the client must not talk to the
-  // controller (a firmware update is being staged, or a poll has just talked to it). The
-  // controller is talked to only once a poll has succeeded and the line is not resting. A duty
-  // left by a run that was cut short goes to the controller that run talked to, whatever the
-  // config names now. Returns true when a run talked to it: that held loop() for the whole run
+  // controller (a firmware update is being staged, or a poll has just talked to it). Nothing is
+  // sent while the line rests. A request runs only once a poll has succeeded. A duty left by a
+  // run that was cut short goes to the controller that run talked to, whatever the config names
+  // now, and is made on its own timetable when no poll speaks for that controller: with the
+  // charger off in the config, the link is started for it and stopped after it (see
+  // sunsaver::Supervisor::mayTalk()). Returns true when a run talked to it: that held loop() for the whole run
   // (about 10 seconds, never more than a minute: see sunsaver::RUN_LIMIT_MS; with the watchdog
   // fed), and the controller may hold other settings now. A charger check under way is dropped
   // then, and the next poll is due at once.
@@ -492,6 +494,7 @@ private:
   JournalFile _journalFile;
   
   // Modbus communication
+  bool startModbusLink();  // ModbusRTUClient on the RS-485 port, as _config says: false when it does not start
   bool readRegisters();
   float scaleVoltage(uint16_t raw) const;
   float scaleCurrent(uint16_t raw) const;

@@ -284,6 +284,52 @@ SolarManager::SolarManager()
   _config.includeInDailyReport = true;
 }
 
+// RS-485 timing fix per Arduino forum thread #1421875 post #18:
+// The Opta needs a post-TX delay of one full character time before DE drops,
+// otherwise the last byte of the Modbus query is corrupted on the wire and
+// the slave silently rejects it. setDelays(pre, post) is in microseconds.
+//
+// Fix S1 (v2.0.49): the post-delay must SCALE WITH BAUD RATE. The previous
+// hardcoded 1200 us was safe at 9600 baud (1 char time = 1146 us) but at the higher
+// baud rates the sanitizer also permits (19200..115200) it held DE active past the
+// Modbus 3.5-char inter-frame gap and caused bus contention with a fast slave's
+// response. One 11-bit character time (8N2) = 11,000,000 / baud microseconds, clamped
+// to a safe floor (150 us protects 115200 from underrunning the DE FET) and ceiling
+// (1500 us is more than enough for the slowest supported baud).
+//
+// Note on truncation margin: we add 50 microseconds of safety margin to the raw quotient
+// (11,000,000 / 9600 = 1145 us) to ensure integer truncation doesn't drop the DE pin
+// 0.83 microseconds BEFORE the stop bits have fully completed transmitting. This scales
+// 9600 to 1195 us (matching the stable 1200 us baseline).
+static uint32_t modbusPostDelayUs(uint16_t baud) {
+  uint32_t postDelayUs = (11000000UL / baud) + 50UL;
+  if (postDelayUs < 150)  postDelayUs = 150;
+  if (postDelayUs > 1500) postDelayUs = 1500;
+  return postDelayUs;
+}
+
+bool SolarManager::startModbusLink() {
+  // Arduino Opta RS485 uses the built-in RS485 interface.
+  // Modbus RTU spec requires 8N2 when no parity is used; SunSaver MPPT
+  // (and Morningstar MRC-1 adapter) expect 8N2. ArduinoModbus default is
+  // 8N1, which often appears to work but produces intermittent CRC errors.
+  if (!ModbusRTUClient.begin(TANKALARM_SOLAR_RS485, _config.modbusBaudRate, SERIAL_8N2)) {
+    return false;
+  }
+
+  // Set read timeout. Clamp to >=500 ms because SunSaver MPPT can take several
+  // hundred ms to assemble a reply over the MRC-1 MeterBus->RS-485 bridge,
+  // and the default 200 ms in older saved configs causes the client to
+  // give up before the reply arrives.
+  if (_config.modbusTimeoutMs < 500) {
+    _config.modbusTimeoutMs = 500;
+  }
+  ModbusRTUClient.setTimeout(_config.modbusTimeoutMs);
+
+  TANKALARM_SOLAR_RS485.setDelays(0, modbusPostDelayUs(_config.modbusBaudRate));
+  return true;
+}
+
 bool SolarManager::begin(const SolarConfig& config) {
   // A charger check that was under way belongs to the link as it was, and so does what the
   // last one found: another charger may be on the line now, or none.
@@ -298,47 +344,11 @@ bool SolarManager::begin(const SolarConfig& config) {
   
   setConfig(config);
   
-  // Initialize Modbus RTU Client
-  // Arduino Opta RS485 uses the built-in RS485 interface.
-  // Modbus RTU spec requires 8N2 when no parity is used; SunSaver MPPT
-  // (and Morningstar MRC-1 adapter) expect 8N2. ArduinoModbus default is
-  // 8N1, which often appears to work but produces intermittent CRC errors.
-  if (!ModbusRTUClient.begin(TANKALARM_SOLAR_RS485, _config.modbusBaudRate, SERIAL_8N2)) {
+  if (!startModbusLink()) {
     Serial.println(F("Solar: Failed to initialize Modbus RTU Client"));
     _initialized = false;
     return false;
   }
-  
-  // Set read timeout. Clamp to >=500 ms because SunSaver MPPT can take several
-  // hundred ms to assemble a reply over the MRC-1 MeterBus->RS-485 bridge,
-  // and the default 200 ms in older saved configs causes the client to
-  // give up before the reply arrives.
-  if (_config.modbusTimeoutMs < 500) {
-    _config.modbusTimeoutMs = 500;
-  }
-  ModbusRTUClient.setTimeout(_config.modbusTimeoutMs);
-
-  // RS-485 timing fix per Arduino forum thread #1421875 post #18:
-  // The Opta needs a post-TX delay of one full character time before DE drops,
-  // otherwise the last byte of the Modbus query is corrupted on the wire and
-  // the slave silently rejects it. setDelays(pre, post) is in microseconds.
-  //
-  // Fix S1 (v2.0.49): the post-delay must SCALE WITH BAUD RATE. The previous
-  // hardcoded 1200 us was safe at 9600 baud (1 char time = 1146 us) but at the higher
-  // baud rates the sanitizer also permits (19200..115200) it held DE active past the
-  // Modbus 3.5-char inter-frame gap and caused bus contention with a fast slave's
-  // response. One 11-bit character time (8N2) = 11,000,000 / baud microseconds, clamped
-  // to a safe floor (150 us protects 115200 from underrunning the DE FET) and ceiling
-  // (1500 us is more than enough for the slowest supported baud).
-  //
-  // Note on truncation margin: we add 50 microseconds of safety margin to the raw quotient
-  // (11,000,000 / 9600 = 1145 us) to ensure integer truncation doesn't drop the DE pin
-  // 0.83 microseconds BEFORE the stop bits have fully completed transmitting. This scales
-  // 9600 to 1195 us (matching the stable 1200 us baseline).
-  uint32_t postDelayUs = (11000000UL / _config.modbusBaudRate) + 50UL;
-  if (postDelayUs < 150)  postDelayUs = 150;
-  if (postDelayUs > 1500) postDelayUs = 1500;
-  TANKALARM_SOLAR_RS485.setDelays(0, postDelayUs);
   
   Serial.print(F("Solar: Modbus RTU initialized at "));
   Serial.print(_config.modbusBaudRate);
@@ -347,7 +357,7 @@ bool SolarManager::begin(const SolarConfig& config) {
   Serial.print(F(", timeout "));
   Serial.print(_config.modbusTimeoutMs);
   Serial.print(F(" ms, postDelay "));
-  Serial.print(postDelayUs);
+  Serial.print(modbusPostDelayUs(_config.modbusBaudRate));
   Serial.println(F(" us"));
   
   _initialized = true;
@@ -1168,13 +1178,29 @@ void SolarManager::chargerProgramReportTaken() {
 
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
 #if TANKALARM_SUNSAVER_PROGRAMMING
-  // The poll comes first here too: it finds the function code and shows that the link works.
+  // The poll comes first here too: it finds the function code and shows that the link works, for
+  // the controller the config names.
   const bool linkKnown = _cachedHoldingFC == 3 || _cachedHoldingFC == 4;
-  const bool ready = allowed && _config.enabled && _initialized && _data.lastPollOk && linkKnown && !lineResting();
+  sunsaver::Line line;
+  line.free = allowed && !lineResting();
+  line.polling = _config.enabled && _initialized;
+  line.pollAnswered = line.polling && _data.lastPollOk && linkKnown;
+  line.configured = _config.modbusSlaveId;
   // A duty goes to the controller its run talked to, should the config name another one now.
   ChargerProgramPort port(_programming.controllerToUse(_config.modbusSlaveId),
                           linkKnown ? _cachedHoldingFC : (uint8_t)3, _config.modbusTimeoutMs);
-  const bool talked = _programming.service(port, epochNow, ready);
+  // No poll runs, so the link is down (the charger is off in the config, or the link did not
+  // start). It is started for a duty whose turn has come, on the settings the config holds, and
+  // stopped again after it.
+  const bool linkForDuty = !line.polling && _programming.mayTalk(port, line) &&
+                           _programming.wantsLine(epochNow, (uint32_t)millis());
+  if (linkForDuty && !startModbusLink()) {
+    line.free = false;  // nothing talks: the duty waits, and the next pass tries again
+  }
+  const bool talked = _programming.service(port, epochNow, line);
+  if (linkForDuty && line.free) {
+    ModbusRTUClient.end();
+  }
   if (talked) {
     _chargerCheck.cancel();  // it read the controller as it was before
     _lastPollMillis = 0;     // and the poll reads it as it is now

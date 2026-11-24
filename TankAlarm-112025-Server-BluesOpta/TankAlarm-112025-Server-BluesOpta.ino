@@ -12318,12 +12318,14 @@ static uint8_t purgePendingConfigNotes(const char *clientUid) {
 
 // The time a config is sent with, as "_ts". A client reads it in whole seconds and sets aside a
 // config whose second is not later than that of the config it holds. So for one client the
-// second always moves on, even when the server's clock went back or two configs leave within one
-// second: the config is then sent a second after the one before. A request to program the
-// charger in a config (stampChargerProgramRequest()) is only acted on when the config is.
+// second always moves on, even when the server's clock went back, is not set (as after a restart
+// of the server), or two configs leave within one second: the config is then sent a second after
+// the one before. While the clock is not set, a config for a client with no earlier dispatch time
+// goes out without a time, and the client applies it. A request to program the charger in a config
+// (stampChargerProgramRequest()) is only acted on when the config is.
 static double nextConfigDispatchEpoch(double previous) {
   const double now = currentEpoch();
-  if (now > 0.0 && previous > 0.0 && floor(now) <= floor(previous)) {
+  if (previous > 0.0 && !(floor(now) > floor(previous))) {
     return floor(previous) + 1.0;
   }
   return now;

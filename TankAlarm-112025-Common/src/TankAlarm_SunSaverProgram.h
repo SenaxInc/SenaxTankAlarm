@@ -567,10 +567,11 @@ enum Note : uint16_t {
   NOTE_VERIFY_INCOMPLETE = 1u << 5,    // registers could not be read again after the restart
   NOTE_NOTHING_WRITTEN = 1u << 6,      // an interrupted run that had not begun to write
   NOTE_AT_FIRST_RESTART = 1u << 7,     // the client restarted while the charger restarted for the first time
-  NOTE_TIME_LIMIT = 1u << 8            // the run reached its time limit and was cut short
+  NOTE_TIME_LIMIT = 1u << 8,           // the run reached its time limit and was cut short
+  NOTE_NOT_ANSWERED = 1u << 9          // a look after a run that was cut short could not read the controller
 };
 
-static const uint8_t NOTE_BITS = 9;
+static const uint8_t NOTE_BITS = 10;
 
 inline const char *noteText(uint16_t note) {
   switch (note) {
@@ -595,6 +596,9 @@ inline const char *noteText(uint16_t note) {
     case NOTE_TIME_LIMIT:
       return "The charger answered so slowly that the run reached its time limit and was cut short. Past it "
              "nothing more is written, and a charger that was written to is still sent its restart.";
+    case NOTE_NOT_ANSWERED:
+      return "The charger did not answer when the client looked at it after its own restart, so it is not "
+             "known whether the charger waits for a restart.";
     default: return "A note this firmware has no text for.";
   }
 }
@@ -740,8 +744,9 @@ class Programmer {
   // Starts a run that writes nothing, for a client that restarted during a run. It makes sure
   // the controller is not left waiting for a restart: it asks, and sends the restart command if
   // it is. beforeWrites says that the run had not been released to write (it stopped between
-  // COMMIT_RESTART and COMMIT_WRITE). The outcome is OUTCOME_INTERRUPTED, or OUTCOME_NO_LINK
-  // when the controller's fault registers could not be read.
+  // COMMIT_RESTART and COMMIT_WRITE). The outcome is OUTCOME_INTERRUPTED, which speaks for the
+  // run that was cut short. It holds NOTE_NOT_ANSWERED, and a follow-up, when the controller's
+  // fault registers could not be read: that run may have written, so this is no OUTCOME_NO_LINK.
   void startRecovery(bool beforeWrites) {
     reset();
     recovery_ = true;
@@ -947,7 +952,8 @@ class Programmer {
     // settle exactly this.
     const bool restartOpen =
         result_.restart == RESTART_NO_ANSWER || result_.restart == RESTART_UNCONFIRMED || restartCut_;
-    result_.followUp = recovery_ ? (restartOpen || outcome == OUTCOME_NO_LINK) : (restartOpen && result_.wroteAny);
+    result_.followUp =
+        recovery_ ? (restartOpen || (result_.notes & NOTE_NOT_ANSWERED) != 0) : (restartOpen && result_.wroteAny);
     phase_ = PHASE_ENDED;
   }
 
@@ -1084,7 +1090,7 @@ class Programmer {
   bool stepRecover(Bus &bus) {
     if (overdue_) {
       if (recovery_) {
-        finish(OUTCOME_NO_LINK);
+        notAnswered();
       } else {
         conclude();  // it still does not know
       }
@@ -1097,7 +1103,7 @@ class Programmer {
     }
     if (got == FETCH_NONE) {
       if (recovery_) {
-        finish(OUTCOME_NO_LINK);
+        notAnswered();
       } else {
         conclude();  // it still does not know
       }
@@ -1126,6 +1132,13 @@ class Programmer {
       beginVerify();
     }
     return true;
+  }
+
+  // A recovery that could not read the controller: it is owed again. The run it is about may
+  // have written, so its result does not say that nothing was.
+  void notAnswered() {
+    result_.notes |= NOTE_NOT_ANSWERED;
+    finish(OUTCOME_INTERRUPTED);
   }
 
   // A restart command is to go out. `first`: the one before the writes. `pending`: the
@@ -1511,6 +1524,15 @@ class Port : public Bus {
   virtual uint8_t controller() const = 0;
 };
 
+// What the client knows of the line at a pass of its loop: see Supervisor::mayTalk().
+struct Line {
+  bool free;           // nothing keeps the client off the line in this pass: no firmware update is
+                       // being staged, no poll took the pass, and the line does not rest after a miss
+  bool polling;        // the client polls the charger: it is on in the config, and its link started
+  bool pollAnswered;   // and the controller the config names answered the last poll
+  uint8_t configured;  // the Modbus id the config names
+};
+
 static const uint32_t REQUEST_WAIT_MS = 3600000ul;        // a request waits this long for the clock and the charger
 static const double REQUEST_MAX_AGE_SECONDS = 86400.0;    // and may be this old when it runs
 static const double REQUEST_MAX_AHEAD_SECONDS = 3600.0;   // or this far ahead of the client's clock
@@ -1607,10 +1629,13 @@ class Supervisor {
     return true;
   }
 
-  // Once per pass of the client's loop. `epochNow` is the client's clock, or anything below
-  // CLOCK_SET_EPOCH while it is not set. `ready` says that the controller can be talked to now:
-  // it answered its last poll, and nothing forbids it (a firmware update that is being staged).
-  // Returns true when it talked to the controller: that held the caller for a whole run.
+  // Once per pass of the client's loop, with what the client knows of the line (see mayTalk()).
+  // `port` talks to controllerToUse(line.configured). Returns true when it talked to the
+  // controller: that held the caller for a whole run.
+  bool service(Port &port, double epochNow, const Line &line) { return service(port, epochNow, mayTalk(port, line)); }
+
+  // The same, with `ready` decided by the caller: the controller may be talked to now.
+  // `epochNow` is the client's clock, or anything below CLOCK_SET_EPOCH while it is not set.
   bool service(Port &port, double epochNow, bool ready) {
     const uint32_t nowMs = port.millisNow();
     if (journalUnsaved_ && (uint32_t)(nowMs - journalTryMs_) >= JOURNAL_RETRY_MS) {
@@ -1706,6 +1731,22 @@ class Supervisor {
   }
   // The controller may wait for a restart, and the client has yet to settle that.
   bool dutyOwed() const { return journal_.phase == JOURNAL_RESTARTING || journal_.phase == JOURNAL_WRITING; }
+  // Whether service() may talk to the controller of `port` in a pass with this line. A request
+  // waits for a poll that shows the link works, since its run talks to the controller the config
+  // names. So does a duty owed to that controller while the client polls: a dead link costs it no
+  // try. A duty owed to another controller (the config names a new id now), or one that is owed
+  // while no poll runs (the charger is off in the config), does without: the poll says nothing of
+  // its controller, and a controller that waits for its restart may not charge. Its first request
+  // asks the controller, and a miss leaves the duty owed until its next turn (dutyTurn()).
+  bool mayTalk(const Port &port, const Line &line) const {
+    if (!line.free) {
+      return false;
+    }
+    if (line.polling && line.pollAnswered) {
+      return true;
+    }
+    return dutyOwed() && (!line.polling || port.controller() != line.configured);
+  }
   // The Modbus id to talk to: the controller a duty is owed to, when the journal knows which
   // one that is, and otherwise `configured`, the one the client's config names.
   uint8_t controllerToUse(uint8_t configured) const {

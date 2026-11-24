@@ -2330,14 +2330,17 @@ static void testRecovery() {
     CHECK(!ignored.programmer.controllerUnknown());
   }
 
-  // The controller does not answer: the recovery is owed again.
+  // The controller does not answer: the recovery is owed again. Its result speaks for the run
+  // that was cut short, which may have written: it is no "no link", which says nothing was.
   {
     Station station;
     station.sim.powered = false;
     station.programmer.startRecovery(true);
     station.drive();
     const ss::ProgramResult &result = station.programmer.result();
-    CHECK_EQ(result.outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(result.notes, ss::NOTE_NOTHING_WRITTEN | ss::NOTE_AT_FIRST_RESTART | ss::NOTE_NOT_ANSWERED);
+    CHECK(result.followUp);
     CHECK_EQ(result.seen, 0);
     CHECK_EQ(station.bus.log.size(), ss::READ_ATTEMPTS);
     CHECK(station.programmer.controllerUnknown());
@@ -2348,7 +2351,9 @@ static void testRecovery() {
     second.sim.regs.erase(A_LOAD_FAULT);
     second.programmer.startRecovery(false);
     second.drive();
-    CHECK_EQ(second.programmer.result().outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(second.programmer.result().outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(second.programmer.result().notes, ss::NOTE_NOT_ANSWERED);
+    CHECK(second.programmer.result().followUp);
     CHECK_EQ(second.programmer.result().seen, 0);
     CHECK_EQ(second.bus.count('c'), 0);
     CHECK(second.programmer.controllerUnknown());
@@ -3442,6 +3447,29 @@ static void testResultJson() {
     CHECK_EQ(page["registers"].size(), 0);
     CHECK(page["restart"].isNull());
   }
+  // A look after a run that was cut short, which the charger did not answer: the run may have
+  // written, and nothing on the page says that nothing was. A run that could not begin says so.
+  {
+    Station looking;
+    looking.sim.powered = false;
+    looking.programmer.startRecovery(false);
+    looking.drive();
+    JsonDocument page;
+    const std::string shown = describedAs(looking.programmer.result(), &page);
+    CHECK(page["outcome"] == "interrupted");
+    CHECK(page["followUp"] == true);
+    CHECK_EQ(page["notes"].size(), 1);
+    CHECK(page["notes"][0] == ss::noteText(ss::NOTE_NOT_ANSWERED));
+    CHECK(has(page["notes"][0].as<const char *>(), "waits for a restart"));
+    CHECK(!has(shown.c_str(), "othing was written") && !has(shown.c_str(), "othing had been written"));
+    Station gone;
+    gone.sim.powered = false;
+    JsonDocument before;
+    describedAs(gone.run(), &before);
+    CHECK(before["outcome"] == "no link");
+    CHECK(has(before["text"].as<const char *>(), "Nothing was written."));
+    CHECK(before["followUp"].isNull());
+  }
   // The restart is not confirmed, a register lost its word, another was altered, and the
   // battery reading has no proven scale.
   {
@@ -3587,7 +3615,10 @@ struct Desk : ss::Port, ss::JournalStore {
   uint32_t millisAtBoot;            // what millis() reads at that moment: to cross its wrap
   bool clockSet;
   double epochBase;                 // the wall clock when the simulator's clock read 0
-  bool ready;
+  bool ready;                       // the controller the config names answered its last poll
+  bool polling;                     // the client polls: the charger is on in its config
+  bool held;                        // a firmware update is being staged: nobody talks to the charger
+  int configured;                   // the Modbus id the config names: -1 for the one this desk talks to
   std::vector<Report> reports;
 
   Desk()
@@ -3604,7 +3635,10 @@ struct Desk : ss::Port, ss::JournalStore {
         millisAtBoot(0),
         clockSet(true),
         epochBase(kClientNow),
-        ready(true) {
+        ready(true),
+        polling(true),
+        held(false),
+        configured(-1) {
     sim.configure(9600, MB_8N2);
     flash = ss::emptyJournal();
   }
@@ -3684,7 +3718,7 @@ struct Desk : ss::Port, ss::JournalStore {
   }
 
   // The client's line rest: nothing is sent for one Modbus timeout after a request that got no
-  // reply (SolarManager::lineResting()), and the client tells service() that it is not ready.
+  // reply (SolarManager::lineResting()), and the client tells service() that the line is not free.
   bool lineResting() const {
     if (bus.log.empty() || bus.log.back().status != ss::SSIO_NO_REPLY) {
       return false;
@@ -3692,17 +3726,29 @@ struct Desk : ss::Port, ss::JournalStore {
     return sim.elapsedMs() - bus.log.back().end < master.responseTimeoutMs;
   }
 
+  // What the client knows of the line in this pass (SolarManager::serviceChargerProgramming()).
+  ss::Line line() const {
+    ss::Line line;
+    line.free = !held && !lineResting();
+    line.polling = polling;
+    line.pollAnswered = polling && ready;
+    line.configured = configured >= 0 ? (uint8_t)configured : bus.slave;
+    return line;
+  }
+
   // One pass of the client's loop. True when it talked to the controller.
   //
-  // The client lets programming have a pass that a poll would take when wantsLine() says yes. So
-  // with a line that is ready it must say yes exactly where service() talks to the controller.
-  // Every test checks that here, in every pass.
+  // The client lets programming have a pass that a poll would take when wantsLine() says yes, and
+  // starts the link for a duty while no poll runs when mayTalk() and wantsLine() say yes. So where
+  // it may talk, wantsLine() must say yes exactly where service() talks to the controller. Every
+  // test checks that here, in every pass.
   bool pass(ss::Supervisor &supervisor) {
     const bool wanted = supervisor.wantsLine(clock(), millisNow());
-    const bool lineReady = ready && !lineResting();
-    const bool ran = supervisor.service(*this, clock(), lineReady);
-    CHECK_MSG(ran == (wanted && lineReady), "wantsLine() said %s, the line was %sready, and service() %s",
-              wanted ? "yes" : "no", lineReady ? "" : "not ", ran ? "ran" : "did not run");
+    const ss::Line now = line();
+    const bool mayTalk = supervisor.mayTalk(*this, now);
+    const bool ran = supervisor.service(*this, clock(), now);
+    CHECK_MSG(ran == (wanted && mayTalk), "wantsLine() said %s, mayTalk() said %s, and service() %s",
+              wanted ? "yes" : "no", mayTalk ? "yes" : "no", ran ? "ran" : "did not run");
     collect(supervisor);
     return ran;
   }
@@ -4598,7 +4644,8 @@ static void testSupervisor() {
     desk.boot(supervisor);
     CHECK(desk.pass(supervisor));
     CHECK_EQ(desk.reports.size(), 1);
-    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK((desk.reports.back().result.notes & ss::NOTE_NOT_ANSWERED) != 0);
     CHECK(desk.reports.back().result.followUp);
     CHECK(supervisor.dutyOwed());
     CHECK_EQ(desk.saves.size(), 2);
@@ -5079,13 +5126,15 @@ static void testJournalKeeps() {
     CHECK(supervisor.service(desk, desk.clock(), true));  // no answer: still owed
     CHECK(supervisor.dutyOwed());
     CHECK(supervisor.reportDue() && supervisor.reportRequestId() == kRequestId);
-    CHECK_EQ(supervisor.report().outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(supervisor.report().outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(supervisor.report().notes, ss::NOTE_NOT_ANSWERED);
     desk.sim.powered = true;
     desk.advance(ss::DUTY_RETRY_MS);
     CHECK(supervisor.service(desk, desk.clock(), true));
     CHECK(!supervisor.dutyOwed());
     CHECK_EQ(supervisor.reportRequestId(), kRequestId);
     CHECK_EQ(supervisor.report().outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(supervisor.report().notes & ss::NOTE_NOT_ANSWERED, 0);
     CHECK(supervisor.request(kRequestId + 1, profile, ss::PROFILE_HVD, 0, true, desk.clock(), desk.millisNow()));
     CHECK_EQ(supervisor.reportRequestId(), kRequestId + 1);
     CHECK_EQ(supervisor.report().refusals, ss::REFUSE_PROFILE);
@@ -5176,6 +5225,134 @@ static void testJournalKeeps() {
     CHECK_EQ(supervisor.report().refusals, ss::REFUSE_JOURNAL);
     CHECK(!supervisor.service(desk, desk.clock(), true));
     CHECK(desk.bus.log.empty());
+  }
+}
+
+// What the client knows of the line decides whether programming talks (Supervisor::mayTalk()). A
+// request waits for a poll that answers. A duty owed to the controller the config names does too,
+// while the client polls. A duty owed to another controller, or owed while no poll runs, is made
+// on its own timetable: a controller that waits for its restart may not charge.
+static void testLineForDuty() {
+  // The config names controller 1 now, and it answers no poll. The duty is owed to controller 7,
+  // which waits for its restart: it is made at once.
+  {
+    Desk desk;
+    desk.bus.slave = 7;
+    desk.sim.slaveId = 7;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.flash.controller = 7;
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK_EQ(supervisor.controllerToUse(1), 7);
+    desk.configured = 1;
+    desk.ready = false;
+    CHECK(supervisor.mayTalk(desk, desk.line()));
+    CHECK(desk.pass(supervisor));
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.sim.resets, 1);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(!desk.reports.back().result.followUp);
+    // Settled: a request goes to the controller the config names, and waits for its poll.
+    CHECK(desk.ask(supervisor, kRequestId + 1));
+    CHECK(!supervisor.mayTalk(desk, desk.line()));
+    CHECK_EQ(desk.loopFor(supervisor, 600000), 0);
+    CHECK(supervisor.requestWaiting());
+  }
+  // The same duty, owed to the controller the config names: a poll that gets no answer shows a
+  // dead link, and the duty waits for one that answers, however long. No try is spent on it.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.ready = false;
+    CHECK(!supervisor.mayTalk(desk, desk.line()));
+    CHECK_EQ(desk.loopFor(supervisor, 2 * 86400000ull, 60000), 0);
+    CHECK(desk.bus.log.empty());
+    CHECK(supervisor.dutyOwed());
+    desk.ready = true;
+    CHECK(desk.pass(supervisor));  // at the first pass with a poll that answered
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+  }
+  // No poll runs: the charger is off in the config. A duty is made all the same, at once and
+  // then on its timetable while the controller does not answer: DUTY_FAST_TRIES tries
+  // DUTY_RETRY_MS apart, then one every DUTY_SLOW_RETRY_MS.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.powered = false;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.polling = false;
+    desk.ready = false;
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK((desk.reports.back().result.notes & ss::NOTE_NOT_ANSWERED) != 0);
+    CHECK(desk.reports.back().result.followUp);
+    CHECK_EQ(desk.loopFor(supervisor, 2 * ss::DUTY_RETRY_MS + 30000, 1000), ss::DUTY_FAST_TRIES - 1);
+    // The last fast try was half a minute ago: the next is due a day after it.
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_SLOW_RETRY_MS - ss::DUTY_RETRY_MS, 60000), 0);
+    CHECK_EQ(desk.loopFor(supervisor, 2 * ss::DUTY_RETRY_MS, 60000), 1);
+    CHECK(supervisor.dutyOwed());
+    // The controller answers again, and waits for its restart: the next try settles it.
+    desk.sim.powered = true;
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_SLOW_RETRY_MS, 60000), 1);
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(desk.reports.back().result.notes & ss::NOTE_NOT_ANSWERED, 0);
+    CHECK(!desk.reports.back().result.followUp);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId);
+  }
+  // While no poll runs a request never runs: after its hour it is refused, and nothing is sent.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.polling = false;
+    CHECK(desk.ask(supervisor, kRequestId));
+    CHECK(!supervisor.mayTalk(desk, desk.line()));
+    CHECK_EQ(desk.loopFor(supervisor, ss::REQUEST_WAIT_MS + 60000, 60000), 0);
+    CHECK(!supervisor.requestWaiting());
+    CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_NO_CHARGER);
+    CHECK(desk.bus.log.empty());
+  }
+  // Nobody talks to the charger while a firmware update is being staged, a duty or not, and none
+  // while the line rests after a request that got no reply.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_RESTARTING);
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.held = true;
+    for (int polling = 0; polling < 2; ++polling) {
+      desk.polling = polling != 0;
+      for (int configured = 0; configured < 3; ++configured) {
+        desk.configured = configured;  // 1 is the controller of the duty: journalOf()
+        CHECK(!supervisor.mayTalk(desk, desk.line()));
+      }
+    }
+    CHECK_EQ(desk.loopFor(supervisor, 600000), 0);
+    desk.held = false;
+    desk.polling = false;
+    const Asked miss = {'r', 0x0022, 0, ss::SSIO_NO_REPLY, desk.sim.elapsedMs(), desk.sim.elapsedMs()};
+    desk.bus.log.push_back(miss);  // a request of a poll, a moment ago
+    CHECK(desk.lineResting());
+    CHECK(!supervisor.mayTalk(desk, desk.line()));
+    desk.bus.log.clear();
+    CHECK(supervisor.mayTalk(desk, desk.line()));
+    CHECK(desk.pass(supervisor));
+    CHECK(!supervisor.dutyOwed());
   }
 }
 
@@ -5468,7 +5645,8 @@ static void testTimeLimit() {
     looking.master.responseTimeoutMs = 9000;
     looking.programmer.startRecovery(false);
     looking.drive();
-    CHECK_EQ(looking.programmer.result().outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(looking.programmer.result().outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK((looking.programmer.result().notes & ss::NOTE_NOT_ANSWERED) != 0);
     CHECK(looking.programmer.result().followUp);
     CHECK(looking.bus.log.empty());
   }
@@ -5879,6 +6057,7 @@ int main() {
   testWantsLine();
   testWithdraw();
   testJournalKeeps();
+  testLineForDuty();
   testSupervisorSweeps();
   testTimeLimit();
   CHECK_EQ(gAllocLive, 0);

@@ -1899,10 +1899,15 @@ void setup() {
       Serial.println(F("Warning: Solar charger initialization failed"));
       addSerialLog("Solar charger init failed");
     }
+  } else {
+    // No poll runs. The link's settings are kept all the same: a look at the charger that a run
+    // cut short left owed is made on them (see SolarManager::serviceChargerProgramming()).
+    gSolarManager.setConfig(gConfig.solarCharger);
   }
 
   // Charger programming: whether a run that a restart of this client cut short left the charger
-  // owed a look. That is settled, and a request is run, only once a poll in loop() has worked.
+  // owed a look. A request is run only once a poll in loop() has worked. The look goes to the
+  // charger that run talked to, and needs no poll when none speaks for that charger.
   gSolarManager.beginChargerProgramming(loadChargerJournal(), saveChargerJournal);
 
   // Initialize battery voltage monitoring
@@ -2411,7 +2416,8 @@ void loop() {
 
   // Charger programming: a request from a config, or a look that a run cut short by a restart
   // of this client left owed. It comes before the check, and runs in every pass whether the
-  // charger is enabled or not, so that a request that waits runs out of time.
+  // charger is enabled or not, so that a request that waits runs out of time and a look that is
+  // owed is made all the same.
   const bool programmed = serviceChargerProgramming(now, !solarPolled);
 
   if (gSolarManager.isEnabled()) {
@@ -5146,8 +5152,11 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       }
     } else if (!gConfig.solarCharger.enabled && prevEnabled) {
       gSolarManager.end();
+      gSolarManager.setConfig(gConfig.solarCharger);  // for a look at the charger that is owed: see setup()
       Serial.println(F("Solar charger disabled via config update"));
       addSerialLog("Solar charger disabled via config update");
+    } else if (!gConfig.solarCharger.enabled) {
+      gSolarManager.setConfig(gConfig.solarCharger);  // as above: the link's settings may have changed
     } else if (gConfig.solarCharger.enabled && prevEnabled && !transportChanged) {
       // Non-transport change: refresh thresholds/flags directly (Task 1.1)
       uint16_t prevPoll = gSolarManager.getConfig().pollIntervalSec;
@@ -7717,10 +7726,13 @@ static bool saveChargerJournal(const sunsaver::Journal &journal) {
 }
 
 // What keeps this client from taking a request on, as far as it can tell without the
-// controller: Refusal bits, 0 when nothing does.
+// controller: Refusal bits, 0 when nothing does. The battery counts as the server's
+// configSuitsChargerProgram() counts it: on, LiFePO4, 12 V. A config may switch the battery off
+// and leave its type as it was.
 static uint32_t chargerProgramClientRefusals() {
   uint32_t refusals = 0;
-  if (chargerCheckChemistry() != sunsaver::CHEMISTRY_LIFEPO4 || gConfig.batteryMonitor.nominalVoltage != 12) {
+  if (!gConfig.batteryMonitor.enabled || chargerCheckChemistry() != sunsaver::CHEMISTRY_LIFEPO4 ||
+      gConfig.batteryMonitor.nominalVoltage != 12) {
     refusals |= sunsaver::REFUSE_NOT_LIFEPO4;
   }
   if (!gConfig.solarCharger.enabled || !gSolarManager.isInitialized()) {
@@ -7771,8 +7783,8 @@ static void handleChargerProgramRequest(JsonObjectConst program) {
 }
 
 // After each config: a request that waits is withdrawn once the client could no longer take it
-// on (the battery is no longer 12 V LiFePO4, or the charger is off). A config that carries the
-// request again does not change that.
+// on (the battery is off, or no longer 12 V LiFePO4, or the charger is off). A config that
+// carries the request again does not change that.
 static void withdrawUnsuitedChargerProgram() {
   const uint32_t refusals = chargerProgramClientRefusals();
   const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
