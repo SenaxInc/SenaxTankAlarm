@@ -31,6 +31,7 @@
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include "WarmTierStore.h"  // S-D03: warm-tier daily summary storage (host-tested in tests/host/warm_store)
+#include "NwsTemperature.h"  // outdoor temperature for the VIN chart (host-tested in tests/host/nws_temp)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4)
   #include <PortentaEthernet.h>
   #include <Ethernet.h>
@@ -59,6 +60,7 @@
   #include "netsocket/TLSSocketWrapper.h"
   #include "mbedtls/ssl.h"
   #include "mbedtls/sha256.h"
+  #include <new>  // std::nothrow (outdoor temperature HTTPS sockets)
 #endif
 
 // POSIX file I/O types (for platforms that support it)
@@ -370,26 +372,44 @@
 #define MAX_CALIBRATION_SENSORS 20  // Max sensors to track calibration for
 #endif
 
-// National Weather Service API constants (for weather data during calibration)
-#ifndef NWS_API_HOST
-#define NWS_API_HOST "api.weather.gov"
+// Outdoor temperature for the History page's VIN chart (NwsTemperature.h): the server asks
+// api.weather.gov over HTTPS for the observation nearest each client reading.
+#ifndef NWS_TEMP_ENABLED
+#define NWS_TEMP_ENABLED 1
 #endif
 
-#ifndef NWS_API_PORT
-#define NWS_API_PORT 80  // Use HTTP for Arduino compatibility (HTTPS not easily supported)
+// A request blocks loop() (web pages, Notecard polling) while it runs: about 1-2 s
+// normally. These bound the worst case; failures then back off for 5 min or more.
+#ifndef NWS_SOCKET_TIMEOUT_MS
+#define NWS_SOCKET_TIMEOUT_MS 3000  // per socket operation; the watchdog is fed between operations
 #endif
 
-#ifndef NWS_API_TIMEOUT_MS
-#define NWS_API_TIMEOUT_MS 10000UL  // 10 second timeout for NWS API calls
+#ifndef NWS_REQUEST_BUDGET_MS
+#define NWS_REQUEST_BUDGET_MS 10000UL  // a response must arrive within this of the request starting
 #endif
 
-#ifndef NWS_AVG_HOURS
-#define NWS_AVG_HOURS 6  // Average temperature over this many hours for calibration
+#ifndef NWS_SERVICE_INTERVAL_MS
+#define NWS_SERVICE_INTERVAL_MS 30000UL  // at most one api.weather.gov request per 30 s
 #endif
 
-// Temperature cache TTL for real-time compensation (30 minutes)
-#ifndef TEMP_CACHE_TTL_SECONDS
-#define TEMP_CACHE_TTL_SECONDS 1800
+// A request starts only at a quiet moment: within NWS_QUIET_AFTER_POLL_MS of a Notecard
+// poll finishing (incoming alarms were just handled) and with no web connection for
+// NWS_QUIET_WEB_MS. Temperatures can wait (NWS keeps 7 days), but once a request has
+// waited NWS_QUIET_MAX_WAIT_MS, web traffic no longer holds it up.
+#ifndef NWS_QUIET_AFTER_POLL_MS
+#define NWS_QUIET_AFTER_POLL_MS 3000UL
+#endif
+
+#ifndef NWS_QUIET_WEB_MS
+#define NWS_QUIET_WEB_MS 10000UL
+#endif
+
+#ifndef NWS_QUIET_MAX_WAIT_MS
+#define NWS_QUIET_MAX_WAIT_MS 600000UL
+#endif
+
+#ifndef NWS_NET_RETRY_BASE_SEC
+#define NWS_NET_RETRY_BASE_SEC 300.0  // after DNS/connect/TLS fails, no request for 5 min, doubling to 6 h
 #endif
 
 // Temperature sentinel value (indicates no weather data available)
@@ -509,18 +529,11 @@ struct ClientMetadata {
   char clientUid[48];
   float vinVoltage;          // Blues Notecard VIN voltage from daily report
   double vinVoltageEpoch;    // When the VIN voltage was last updated
-  // GPS location from Blues Notecard (for NWS weather lookup)
+  // Location from the client's Notecard (card.location: its cell-tower fix while GPS is off),
+  // used to find the client's NWS weather stations (gNwsTemp)
   float latitude;            // Latitude in decimal degrees (e.g., 38.8894)
   float longitude;           // Longitude in decimal degrees (e.g., -77.0352)
   double locationEpoch;      // When the location was last updated
-  // NWS API grid point cache (to avoid repeated lookups)
-  char nwsGridOffice[4];     // NWS office ID (e.g., "LWX")
-  uint16_t nwsGridX;         // Grid X coordinate
-  uint16_t nwsGridY;         // Grid Y coordinate
-  bool nwsGridValid;         // True if grid data is cached
-  // Current temperature cache for real-time compensation
-  float cachedTemperatureF;  // Cached current temperature in °F
-  double tempCacheEpoch;     // When temperature was last fetched
   // Client firmware version tracking
   char firmwareVersion[16];  // Firmware version string from client telemetry/daily
   // OTA update management (expected-vs-reported reconciliation for operator visibility)
@@ -782,6 +795,15 @@ struct SensorHourlyHistory {
 
 static SensorHourlyHistory gSensorHistory[MAX_HISTORY_SENSORS];
 static uint8_t gSensorHistoryCount = 0;
+
+// Outdoor temperature per client for the VIN Voltage History chart (NwsTemperature.h):
+// NWS observations matched to the client's readings, saved to NWS_TEMP_FILE.
+#define NWS_TEMP_FILE "/fs/history/outdoor_temp.json"
+static NwsTempStore gNwsTemp;
+static bool gNwsTempDirty = false;
+static uint32_t gNwsTempLastHash = 0;
+static_assert(NWS_TEMP_MAX_CLIENTS >= MAX_CLIENT_METADATA, "every client with metadata needs a weather slot");
+static_assert(NWS_UID_MAX >= sizeof(((SensorRecord *)nullptr)->clientUid), "client UIDs must fit the weather store");
 
 // History storage settings
 struct HistorySettings {
@@ -1190,7 +1212,9 @@ static double gNextDailyEmailEpoch = 0.0;
 static double gNextViewerSummaryEpoch = 0.0;
 static double gLastViewerSummaryEpoch = 0.0;
 
-static unsigned long gLastPollMillis = 0;
+static unsigned long gLastPollMillis = 0;      // when the last Notecard poll started (sets the 5 s cadence)
+static unsigned long gLastPollDoneMs = 0;      // when the last Notecard poll finished (0 = none yet)
+static unsigned long gLastWebRequestMs = 0;  // when the web server last accepted a connection (0 = none yet)
 static unsigned long gLastLinkCheckMillis = 0;
 static bool gLastLinkState = false;
 // v1.9.22 autonomous Ethernet recovery (the Opta LAN8742 PHY often fails to relink after a
@@ -1338,6 +1362,7 @@ static double gLastDailyEmailSentEpoch = 0.0;
 // Sensor registry & client metadata persistence state
 static bool gSensorRegistryDirty = false;         // True when sensor records need saving
 static bool gClientMetadataDirty = false;        // True when client metadata needs saving
+static bool gClientMetadataLoaded = false;       // The saved metadata was read and parsed at boot
 static unsigned long gLastRegistrySaveMillis = 0;
 static unsigned long gLastStaleCheckMillis = 0;
 
@@ -2316,24 +2341,26 @@ function updateCalibrationTable(){const tbody = document.getElementById('calibra
 funct)HTML" R"HTML(ion updateCalibrationLog(){const tbody = document.getElementById('logTableBody');const filter = document.getElementById('logSensorFilter').value;tbody.innerHTML = '';let filtered = calibrationLogs;if(filter){const sk=parseSensorKey(filter);filtered = sk?calibrationLogs.filter(log => log.clientUid === sk.clientUid && log.sensorIndex === sk.sensorIndex):[];}if(filtered.length === 0){tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No calibration entries found.</td></tr>';return;}filtered.sort((a,b)=> b.timestamp - a.timestamp);filtered.forEach(log =>{const tr = document.createElement('tr');const sensorInfo = sensors.find(t => t.client === log.clientUid && t.sensorIndex === log.sensorIndex);const sensorName = sensorInfo ? `${sensorInfo.site} - ${sensorInfo.label || 'Sensor ' + log.sensorIndex}${sensorInfo.userNumber?' #'+sensorInfo.userNumber:''}`:`Sensor ${log.sensorIndex}`;const isValidReading = log.sensorReading >= 4 && log.sensorReading <= 20;const sensorDisplay = isValidReading ? log.sensorReading.toFixed(2)+ ' mA':(log.sensorReading ? `${log.sensorReading.toFixed(2)} mA (out of range)`:'-- (out of range)');const tempDisplay = log.temperatureF !== undefined && log.temperatureF !== null ? log.temperatureF.toFixed(1)+ '°F':'--';tr.innerHTML = ` <td>${formatEpoch(log.timestamp)}</td><td>${escapeHtml(sensorName)}</td><td title="${isValidReading ? '':'Not used for calibration(outside 4-20mA range)'}">${sensorDisplay}</td><td>${formatLevel(log.verifiedLevelInches,getSensorUnit(log.clientUid,log.sensorIndex))}</td><td>${tempDisplay}</td><td>${escapeHtml(log.notes || '--')}</td> `;if(!isValidReading){tr.style.opacity = '0.6';}tbody.appendChild(tr);});}document.getElementById('calibrationForm').addEventListener('submit',async(e)=>{e.preventDefault();const sensorKey = document.getElementById('sensorSelect').value;if(!sensorKey){showToast('Please select a sensor',true);return;}const sk=parseSensorKey(sensorKey);if(!sk){showToast('Invalid sensor selection',true);return;}const clientUid=sk.clientUid;const sensorIndex=sk.sensorIndex;const tank = sensors.find(t => t.client===clientUid && t.sensorIndex===sensorIndex);const isTankMode=document.getElementById('levelInputTank').style.display!=='none';const numField=id=>{const s=document.getElementById(id).value.trim();if(s==='')return null;const v=Number(s);return Number.isFinite(v)?v:NaN;};let totalValue;if(isTankMode){const ft=numField('levelFeet'),inch=numField('levelInches');if(ft===null&&inch===null){showToast('Enter the verified level in feet and/or inches (0 is a valid level)',true);return;}if(Number.isNaN(ft)||Number.isNaN(inch)){showToast('The verified level must be a number',true);return;}totalValue=(ft||0)*12+(inch||0);}else{const v=numField('levelValue');if(v===null||Number.isNaN(v)){showToast('Enter the verified value (0 is a valid value)',true);return;}totalValue=v;}const timestampInput = document.getElementById('readingTimestamp').value;const note)HTML" R"HTML(s = document.getElementById('notes').value.trim();if(totalValue < 0){showToast('Invalid level value',true);return;}const payload ={clientUid:clientUid,sensorIndex:sensorIndex,verifiedLevelInches:totalValue,notes:notes};if(tank && tank.sensorMa && tank.sensorMa >= 4 && tank.sensorMa <= 20){payload.sensorReading = tank.sensorMa;}if(timestampInput){payload.timestamp = Math.floor(new Date(timestampInput).getTime()/ 1000);}try{const response = await fetch('/api/calibration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!response.ok){const text = await response.text();throw new Error(text || 'Failed to submit calibration');}showToast('Calibration reading submitted successfully');document.getElementById('calibrationForm').reset();loadCalibrationData();}catch(err){console.error('Error submitting calibration:',err);showToast(err.message || 'Failed to submit calibration',true);}});document.getElementById('logSensorFilter').addEventListener('change',updateCalibrationLog);const now = new Date();now.setMinutes(now.getMinutes()- now.getTimezoneOffset());document.getElementById('readingTimestamp').value = now.toISOString().slice(0,16);await loadSensors();await loadCalibrationData();setInterval(loadCalibrationData,30000);funct)HTML" R"HTML(ion viewTankPoints(sensorKey){document.getElementById('logSensorFilter').value = sensorKey;updateCalibrationLog();document.getElementById('logTableBody').closest('.card').scrollIntoView({behavior:'smooth',block:'start'});showToast('Showing data points for selected tank');}async funct)HTML" R"HTML(ion resetCalibration(clientUid,sensorIndex){if(!confirm(`Reset calibration for sensor ${sensorIndex}? This will delete all calibration data for this sensor.`)){return;}try{const response = await fetch('/api/calibration',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientUid:clientUid,sensorIndex:sensorIndex})});if(!response.ok){const text = await response.text();throw new Error(text || 'Failed to reset calibration');}showToast('Calibration reset successfully');loadCalibrationData();}catch(err){console.error('Error resetting calibration:',err);showToast(err.message || 'Failed to reset calibration',true);}}})();})();
 </script></body></html>)HTML";
 
-static const char HISTORICAL_DATA_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>History - TankAlarm</title><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Fleet Summary</h2><div class="stats-grid"><div class="stat-box"><div class="stat-value" id="statTotalTanks">0</div><div class="stat-label">Total Sensors</div></div><div class="stat-box"><div class="stat-value" id="statAlarmsToday">0</div><div class="stat-label">Alarms Today</div></div><div class="stat-box"><div class="stat-value" id="statAlarmsWeek">0</div><div class="stat-label">Alarms This Week</div></div></div><div id="dataSourceBanner" style="display:none;margin-top:12px;padding:8px 14px;border-radius:6px;font-size:0.85rem;background:#dbeafe;color:#1e40af;"></div></div><div class="card"><h2>Level Trends</h2><div class="controls"><select id="siteFilter"><option value="all")HTML" R"HTML(>All Sites</option></select><select id="sensorFilter"><option value="all">All Sensors</option></select><select id="rangeSelect"><option value="24h">Last 24 Hours</option><option value="7d">Last 7 Days</option><option value="30d" selected>Last 30 Days</option><option value="90d">Last 90 Days</option><option value="6mo">Last 6 Months</option><option value="1yr">Last Year</option><option value="2yr">Last 2 Years</option><option value="custom">Custom Range</option></select><input type="date" id="startDate" style="display:none;"><input type="date" id="endDate" style="display:none;"><button onclick="refreshData()">Refresh</button><button class="secondary" onclick="exportData()">Export CSV</button></div><div class="chart-container"><canvas id="levelChart"></canvas></div></div><div class="card"><h2>Alarm Frequency</h2><div class="chart-container"><canvas id="alarmChart"></canvas></div></div><div class="card"><h2>Sites &amp; Sensors</h2><p style="color:var(--muted);margin-bottom:16px;">Click on a site to expand and view individual tank details with mini sparklines.</p><div id="sitesContainer"></div></div><div class="card"><h2>VIN Voltage History</h2><p style="color:var(--muted);margin-bottom:16px;">Track power supply voltage trends to detect battery degradation or power issues early.</p><div class="chart-container"><canvas id="voltageChart"></canvas></div></div><div class="card" id="archivedCard" style="display:none"><h2>Archived Clients</h2><p style="color:var(--muted);margin-bottom:16px;">Previously removed clients archived to FTP. Click to load and view historical data.</p><div id="archivedList"></div><div class="chart-container" id="archivedChartWrap" style="display:none"><canvas id="archivedChart"></canvas></div></div></main><div id="toast"></div><script>(async () => {const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);/* PAUSE LOGIC */const pause_els={btn:document.getElementById('pauseBtn'),toast:document.getElementById('toast')};
+static const char HISTORICAL_DATA_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>History - TankAlarm</title><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Fleet Summary</h2><div class="stats-grid"><div class="stat-box"><div class="stat-value" id="statTotalTanks">0</div><div class="stat-label">Total Sensors</div></div><div class="stat-box"><div class="stat-value" id="statAlarmsToday">0</div><div class="stat-label">Alarms Today</div></div><div class="stat-box"><div class="stat-value" id="statAlarmsWeek">0</div><div class="stat-label">Alarms This Week</div></div></div><div id="dataSourceBanner" style="display:none;margin-top:12px;padding:8px 14px;border-radius:6px;font-size:0.85rem;background:#dbeafe;color:#1e40af;"></div></div><div class="card"><h2>Level Trends</h2><div class="controls"><select id="siteFilter"><option value="all")HTML" R"HTML(>All Sites</option></select><select id="sensorFilter"><option value="all">All Sensors</option></select><select id="rangeSelect"><option value="24h">Last 24 Hours</option><option value="7d">Last 7 Days</option><option value="30d" selected>Last 30 Days</option><option value="90d">Last 90 Days</option><option value="6mo">Last 6 Months</option><option value="1yr">Last Year</option><option value="2yr">Last 2 Years</option><option value="custom">Custom Range</option></select><input type="date" id="startDate" style="display:none;"><input type="date" id="endDate" style="display:none;"><button onclick="refreshData()">Refresh</button><button class="secondary" onclick="exportData()">Export CSV</button></div><div class="chart-container"><canvas id="levelChart"></canvas></div></div><div class="card"><h2>Alarm Frequency</h2><div class="chart-container"><canvas id="alarmChart"></canvas></div></div><div class="card"><h2>Sites &amp; Sensors</h2><p style="color:var(--muted);margin-bottom:16px;">Click on a site to expand and view individual tank details with mini sparklines.</p><div id="sitesContainer"></div></div><div class="card"><h2>VIN Voltage History</h2><p style="color:var(--muted);margin-bottom:16px;">Track power supply voltage trends to detect battery degradation or power issues early.</p><div class="controls"><select id="voltageClient" aria-label="Client"></select><label class="toggle" for="showTemp"><input type="checkbox" id="showTemp" checked> Show outdoor temperature</label></div><div class="chart-container"><canvas id="voltageChart"></canvas></div><p id="tempNote" style="color:var(--muted);font-size:0.85rem;margin-top:8px;"></p></div><div class="card" id="archivedCard" style="display:none"><h2>Archived Clients</h2><p style="color:var(--muted);margin-bottom:16px;">Previously removed clients archived to FTP. Click to load and view historical data.</p><div id="archivedList"></div><div class="chart-container" id="archivedChartWrap" style="display:none"><canvas id="archivedChart"></canvas></div></div></main><div id="toast"></div><script>(async () => {const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);/* PAUSE LOGIC */const pause_els={btn:document.getElementById('pauseBtn'),toast:document.getElementById('toast')};
 const pause_state={paused:false};if(pause_els.btn)pause_els.btn.addEventListener('click',togglePauseFlow);if(pause_els.btn)pause_els.btn.addEventListener('mouseenter',()=>{if(pause_state.paused)pause_els.btn.textContent='Resume';});if(pause_els.btn)pause_els.btn.addEventListener('mouseleave',()=>{renderPauseBtn();});await fetch('/api/clients?summary=1').then(r=>r.json()).then(d=>{if(d&&d.srv){pause_state.paused=!!d.srv.ps;renderPauseBtn();}}).catch(e=>console.error('Failed to load pause state',e));
 funct)HTML" R"HTML(ion showPauseToast(message,isError){if(!pause_els.toast)return;const t=pause_els.toast;t.textContent=message;t.style.background=isError?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}
 funct)HTML" R"HTML(ion renderPauseBtn(){const btn=pause_els.btn;if(!btn)return;if(pause_state.paused){btn.classList.add('paused');btn.style.display='';btn.textContent='Unpause';btn.title='Resume data flow';}else{btn.classList.remove('paused');btn.style.display='none';}}
 async funct)HTML" R"HTML(ion togglePauseFlow(){const targetPaused=!pause_state.paused;try{const res=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:targetPaused})});if(!res.ok){const text=await res.text();throw new Error(text||'Pause toggle failed');}const data=await res.json();pause_state.paused=!!data.paused;renderPauseBtn();showPauseToast(pause_state.paused?'Paused for maintenance':'Resumed');}catch(err){showPauseToast(err.message||'Pause toggle failed',true);}}(async ()=>{const CHART_COLORS=['#2563eb','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16'];function escapeHtml(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}function escapeCsv(s){if(!s)return'';return String(s).replace(/"/g,'""');}let levelChart=null;let alarmChart=null;let voltageChart=null;let historicalData={sites:{},sensors:[],alarms:[],voltage:[]};funct)HTML" R"HTML(ion showToast(message,isError){const toast=document.getElementById('toast');toast.textContent=message;toast.style.background=isError?'#dc2626':'#0284c7';toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2500);}
 funct)HTML" R"HTML(ion formatLevel(inches){if(typeof inches!=='number'||!isFinite(inches))return'--';const feet=Math.floor(inches/12);const rem=inches%12;return feet>0?`${feet}' ${rem.toFixed(1)}"`:`${rem.toFixed(1)}"`;}
 funct)HTML" R"HTML(ion formatEpoch(epoch){if(!epoch)return'--';const d=new Date(epoch*1000);return d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}
-funct)HTML" R"HTML(ion initEmptyData(){historicalData={sites:{},sensors:[],alarms:[],voltage:[]};}
+funct)HTML" R"HTML(ion initEmptyData(){historicalData={sites:{},sensors:[],alarms:[],voltage:[],temperature:[]};}
 funct)HTML" R"HTML(ion updateStats(){const totalSensors=historicalData.sensors.length;const now=Date.now()/1000;const today=now-86400;const week=now-7*86400;const alarmsToday=historicalData.alarms.filter(a=>a.timestamp>today).length;const alarmsWeek=historicalData.alarms.filter(a=>a.timestamp>week).length;document.getElementById('statTotalTanks').textContent=totalSensors;document.getElementById('statAlarmsToday').textContent=alarmsToday;document.getElementById('statAlarmsWeek').textContent=alarmsWeek;}
 funct)HTML" R"HTML(ion populateFilters(){const siteSelect=document.getElementById('siteFilter');const sensorSelect=document.getElementById('sensorFilter');siteSelect.innerHTML='<option value="all">All Sites</option>';Object.keys(historicalData.sites).sort().forEach(site=>{const opt=document.createElement('option');opt.value=site;opt.textContent=site;siteSelect.appendChild(opt);});sensorSelect.innerHTML='<option value="all">All Sensors</option>';historicalData.sensors.forEach((t,i)=>{const opt=document.createElement('option');opt.value=i;opt.textContent=`${t.site} - ${t.label}`;sensorSelect.appendChild(opt);});}
 funct)HTML" R"HTML(ion getFilteredData(){const site=document.getElementById('siteFilter').value;const sensorIdx=document.getElementById('sensorFilter').value;const range=document.getElementById('rangeSelect').value;const now=Date.now()/1000;let cutoff=now-30*86400;let cutoffEnd=now;if(range==='24h')cutoff=now-86400;else if(range==='7d')cutoff=now-7*86400;else if(range==='90d')cutoff=now-90*86400;else if(range==='6mo')cutoff=now-180*86400;else if(range==='1yr')cutoff=now-365*86400;else if(range==='2yr')cutoff=now-730*86400;else if(range==='custom'){const sd=document.getElementById('startDate').value;const ed=document.getElementById('endDate').value;if(sd)cutoff=new Date(sd).getTime()/1000;if(ed)cutoffEnd=new Date(ed+'T23:59:59').getTime()/1000;}let sensors=historicalData.sensors;if(site!=='all')sensors=sensors.filter(t=>t.site===site);if(sensorIdx!=='all')sensors=[historicalData.sensors[parseInt(sensorIdx)]];return{sensors,cutoff,cutoffEnd};}
 funct)HTML" R"HTML(ion renderLevelChart(){const ctx=document.getElementById('levelChart').getContext('2d');const{sensors,cutoff,cutoffEnd}=getFilteredData();if(levelChart)levelChart.destroy();const datasets=sensors.slice(0,8).map((tank,i)=>{const data=tank.readings.filter(r=>r.timestamp>=cutoff&&r.timestamp<=cutoffEnd).map(r=>({x:new Date(r.timestamp*1000),y:r.level}));return{label:`${tank.site} - ${tank.label}`,data,borderColor:CHART_COLORS[i%CHART_COLORS.length],backgroundColor:CHART_COLORS[i%CHART_COLORS.length]+'20',fill:false,tension:0.3,pointRadius:0};});levelChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'index'},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a',displayFormats:{hour:'MMM d, HH:mm',day:'MMM d'}},grid:{color:'var(--chart-grid)'}},y:{title:{display:true,text:'Level (inches)'},grid:{color:'var(--chart-grid)'}}},plugins:{legend:{position:'bottom'}}}});}
 funct)HTML" R"HTML(ion renderAlarmChart(){const ctx=document.getElementById('alarmChart').getContext('2d');if(alarmChart)alarmChart.destroy();const sites=Object.keys(historicalData.sites);const highCounts=sites.map(s=>historicalData.alarms.filter(a=>a.site===s&&a.type==='HIGH').length);const lowCounts=sites.map(s=>historicalData.alarms.filter(a=>a.site===s&&a.type==='LOW').length);alarmChart=new Chart(ctx,{type:'bar',data:{labels:sites,datasets:[{label:'High Alarms',data:highCounts,backgroundColor:'#ef4444'},{label:'Low Alarms',data:lowCounts,backgroundColor:'#f59e0b'}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Alarm Count'}}},plugins:{legend:{position:'bottom'}}}});}
-funct)HTML" R"HTML(ion renderVoltageChart(){const ctx=document.getElementById('voltageChart').getContext('2d');if(voltageChart)voltageChart.destroy();const data=historicalData.voltage.map(v=>({x:new Date(v.timestamp*1000),y:v.voltage}));if(!data.length){voltageChart=null;return;}var vals=data.map(d=>d.y);var vMin=Math.min(...vals);var vMax=Math.max(...vals);var yMin,yMax;if(vMax<=6){yMin=0;yMax=6;}else if(vMax<=15){yMin=10;yMax=15;}else{yMin=Math.floor(vMin-1);yMax=Math.ceil(vMax+1);}voltageChart=new Chart(ctx,{type:'line',data:{datasets:[{label:'VIN Voltage',data,borderColor:'#10b981',backgroundColor:'#10b98120',fill:true,tension:0.3,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{min:yMin,max:yMax,title:{display:true,text:'Voltage (V)'},grid:{color:'var(--chart-grid)'}}},plugins:{legend:{display:false}}}});}
+funct)HTML" R"HTML(ion voltageClientList(){const names={};(historicalData.sensors||[]).forEach(s=>{if(s.client&&!names[s.client])names[s.client]=s.site||s.client;});const seen={};const ids=[];(historicalData.voltage||[]).concat(historicalData.temperature||[]).forEach(v=>{if(v.client&&!seen[v.client]){seen[v.client]=1;ids.push(v.client);}});const list=ids.map(id=>({id,name:names[id]||id}));const count={};list.forEach(c=>{count[c.name]=(count[c.name]||0)+1;});list.forEach(c=>{if(count[c.name]>1&&c.name!==c.id)c.name+=' (…'+c.id.slice(-6)+')';});return list.sort((a,b)=>a.name.localeCompare(b.name));}
+funct)HTML" R"HTML(ion populateVoltageClients(){const sel=document.getElementById('voltageClient');const prev=sel.value;const list=voltageClientList();sel.innerHTML='';list.forEach(c=>{const opt=document.createElement('option');opt.value=c.id;opt.textContent=c.name;opt.title=c.id;sel.appendChild(opt);});if(list.some(c=>c.id===prev))sel.value=prev;else{const withVin=list.find(c=>(historicalData.voltage||[]).some(v=>v.client===c.id));if(withVin)sel.value=withVin.id;}sel.style.display=list.length>1?'':'none';}
+funct)HTML" R"HTML(ion renderVoltageChart(){const ctx=document.getElementById('voltageChart').getContext('2d');if(voltageChart)voltageChart.destroy();voltageChart=null;const{cutoff,cutoffEnd}=getFilteredData();const client=document.getElementById('voltageClient').value;const inRange=t=>t>=cutoff&&t<=cutoffEnd;const data=(historicalData.voltage||[]).filter(v=>v.client===client&&inRange(v.timestamp)).sort((a,b)=>a.timestamp-b.timestamp).map(v=>({x:new Date(v.timestamp*1000),y:v.voltage}));const wx=(historicalData.temperature||[]).find(t=>t.client===client);const tdata=wx?(wx.points||[]).filter(p=>inRange(p[0])).sort((a,b)=>a[0]-b[0]).map(p=>({x:new Date(p[0]*1000),y:p[1]})):[];const cb=document.getElementById('showTemp');cb.disabled=!tdata.length;const showT=cb.checked&&tdata.length>0;const st=wx&&wx.stations&&wx.stations.length?wx.stations.join(' / '):'';const wxStatus=wx?wx.status:'';let note;if(tdata.length)note='Outdoor air temperature from the nearest National Weather Service station'+(st?' ('+st+')':'')+', observed within an hour of each reading.';else if(wxStatus==='uncovered')note='No outdoor temperature: the National Weather Service does not cover this client’s location (outside the US?).';else if(wxStatus==='noLocation')note='No outdoor temperature yet: the server is waiting for this client’s location from its Notecard.';else if(wx&&wx.points&&wx.points.length)note='No outdoor temperature in this range.';else if(st)note='No outdoor temperature yet. New readings are matched to National Weather Service station '+st+'.';else if(wx)note='No outdoor temperature yet: the server is finding the nearest National Weather Service station.';else note='No outdoor temperature recorded for this client yet.';if(client)note+=' Client '+client+'.';document.getElementById('tempNote').textContent=note;if(!data.length&&!tdata.length)return;let yMin,yMax;if(data.length){const vals=data.map(d=>d.y);const vMin=Math.min(...vals);const vMax=Math.max(...vals);if(vMax<=6){yMin=0;yMax=6;}else if(vMax<=15){yMin=10;yMax=15;}else{yMin=Math.floor(vMin-1);yMax=Math.ceil(vMax+1);}}const nearest=(arr,x)=>{let best=null;arr.forEach(p=>{const d=Math.abs(p.x-x);if(d<=3600000&&(!best||d<best.d))best={d,y:p.y};});return best;};const datasets=[{label:'VIN Voltage',data,yAxisID:'y',borderColor:'#10b981',backgroundColor:'#10b98120',fill:true,tension:0.3,pointRadius:0}];if(showT)datasets.push({label:'Outdoor temperature',data:tdata,yAxisID:'y1',borderColor:'#f59e0b',backgroundColor:'#f59e0b',borderDash:[6,4],fill:false,tension:0.3,pointRadius:tdata.length<60?2:0});voltageChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',axis:'x',intersect:false},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{min:yMin,max:yMax,title:{display:true,text:'Voltage (V)'},grid:{color:'var(--chart-grid)'}},y1:{display:showT,position:'right',title:{display:true,text:'Outdoor temperature (°F)'},grid:{drawOnChartArea:false}}},plugins:{legend:{display:showT,position:'bottom'},tooltip:{callbacks:{label:c=>{if(c.dataset.yAxisID==='y1'){const v=nearest(data,c.parsed.x);return ' Outdoor '+c.parsed.y.toFixed(1)+' °F'+(v?', VIN '+v.y.toFixed(2)+' V':'');}const t=showT?nearest(tdata,c.parsed.x):null;return ' VIN '+c.parsed.y.toFixed(2)+' V'+(t?', outdoor '+t.y.toFixed(1)+' °F':'');}}}}}});}
 funct)HTML" R"HTML(ion createSparkline(container,data){const width=container.clientWidth||100;const height=40;const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;container.appendChild(canvas);const ctx=canvas.getContext('2d');if(!data||data.length<2)return;const values=data.map(d=>d.level);const min=Math.min(...values);const max=Math.max(...values);const range=max-min||1;ctx.strokeStyle='#2563eb';ctx.lineWidth=1.5;ctx.beginPath();data.forEach((d,i)=>{const x=i/(data.length-1)*width;const y=height-(d.level-min)/range*height;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke();}
 funct)HTML" R"HTML(ion renderSites(){const container=document.getElementById('sitesContainer');container.innerHTML='';Object.keys(historicalData.sites).sort().forEach(siteName=>{const sensors=historicalData.sites[siteName];const alarmCount=historicalData.alarms.filter(a=>a.site===siteName).length;const siteCard=document.createElement('div');siteCard.className='site-card';siteCard.innerHTML=`<div class="site-header" onclick="this.nextElementSibling.classList.toggle('expanded')"><h3>${escapeHtml(siteName)}</h3><div class="site-stats"><span>${sensors.length} Tank${sensors.length!==1?'s':''}</span>${alarmCount>0?`<span class="alarm-badge">${alarmCount} Alarms</span>`:''}</div></div><div class="site-content"><div class="sensor-grid"></div></div>`;const grid=siteCard.querySelector('.sensor-grid');sensors.forEach(tank=>{const change=tank.change24h||0;const changeClass=change>=0?'positive':'negative';const changeSign=change>=0?'+':'';const tankCard=document.createElement('div');tankCard.className='sensor-card';tankCard.innerHTML=`<div class="tank-header"><div><div class="tank-name">${escapeHtml(tank.label)}</div><div class="sensor-level">${formatLevel(tank.currentLevel)}</div></div><div class="tank-change ${changeClass}">${changeSign}${change.toFixed(1)}" 24h</div></div><div class="sparkline"></div><div class="tank-footer"><span>Updated: ${formatEpoch(tank.readings[tank.readings.length-1]?.timestamp)}</span></div>`;grid.appendChild(tankCard);const sparklineEl=tankCard.querySelector('.sparkline');const last24h=tank.readings.slice(-24);setTimeout(()=>createSparkline(sparklineEl,last24h),0);});container.appendChild(siteCard);});}
-async funct)HTML" R"HTML(ion loadHistoricalData(){const sensorIdx=document.getElementById('sensorFilter').value;const range=document.getElementById('rangeSelect').value;let apiDays=90;if(sensorIdx!=='all'){apiDays=0;}else{const rangeDays={'24h':7,'7d':7,'30d':30,'90d':90,'6mo':180,'1yr':365,'2yr':730};apiDays=rangeDays[range]||90;}const url=apiDays>0?'/api/history?days='+apiDays:'/api/history';try{const res=await fetch(url);if(!res.ok)throw new Error('Failed to load historical data');const data=await res.json();if(data.sensors&&data.sensors.length>0){historicalData=data;historicalData.sites={};historicalData.sensors.forEach(s=>{const site=s.site||'Unknown Site';(historicalData.sites[site]=historicalData.sites[site]||[]).push(s);});if(!historicalData.alarms)historicalData.alarms=[];if(!historicalData.voltage)historicalData.voltage=[];}else{initEmptyData();}if(data.dataInfo){const banner=document.getElementById('dataSourceBanner');if(banner){let msg='Data: RAM ('+data.settings.hotTierDays+'d)';if(data.dataInfo.warmTierAvailable)msg+=' + Flash ('+data.settings.warmTierMonths+'mo)';if(data.dataInfo.coldTierAvailable){msg+=' + FTP Archive'+(data.settings&&data.settings.lastFtpSync>0?'':' (first sync pending)');}else if(data.dataInfo.ftpConfigured){msg+=' | FTP connected but history archive is OFF (enable in Server Settings)';}else{msg+=' | Enable FTP for full archive';}if(data.dataInfo.rangeNote)msg+=' — '+data.dataInfo.rangeNote;banner.textContent=msg;banner.style.display='';banner.style.background=data.dataInfo.coldTierAvailable?'#d1fae5':'#fef3c7';banner.style.color=data.dataInfo.coldTierAvailable?'#065f46':'#92400e';}}updateStats();populateFilters();renderLevelChart();renderAlarmChart();renderVoltageChart();renderSites();}catch(err){console.warn('No historical data available:',err.message);initEmptyData();updateStats();populateFilters();renderLevelChart();renderAlarmChart();renderVoltageChart();renderSites();}}
-window.refreshData=funct)HTML" R"HTML(ion(){loadHistoricalData();showToast('Data refreshed');};window.exportData=funct)HTML" R"HTML(ion(){const{sensors,cutoff,cutoffEnd}=getFilteredData();let csv='Site,Tank,Timestamp,Level (inches)\n';sensors.forEach(tank=>{tank.readings.filter(r=>r.timestamp>=cutoff&&r.timestamp<=cutoffEnd).forEach(r=>{csv+=`"${escapeCsv(tank.site)}","${escapeCsv(tank.label)}",${new Date(r.timestamp*1000).toISOString()},${r.level.toFixed(2)}\n`;});});const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='tank_history.csv';a.click();URL.revokeObjectURL(url);showToast('CSV exported');};document.getElementById('siteFilter').addEventListener('change',renderLevelChart);document.getElementById('startDate').addEventListener('change',renderLevelChart);document.getElementById('endDate').addEventListener('change',renderLevelChart);document.getElementById('sensorFilter').addEventListener('change',function(){loadHistoricalData();});document.getElementById('rangeSelect').addEventListener('change',function(){const sd=document.getElementById('startDate');const ed=document.getElementById('endDate');if(this.value==='custom'){sd.style.display='';ed.style.display='';if(!sd.value){const d=new Date();d.setDate(d.getDate()-7);sd.value=d.toISOString().split('T')[0];}if(!ed.value){ed.value=new Date().toISOString().split('T')[0];}}else{sd.style.display='none';ed.style.display='none';}loadHistoricalData();});loadHistoricalData();/* ARCHIVED CLIENTS */let archivedChart=null;async function loadArchivedClients(){try{const res=await fetch('/api/history/archived');if(!res.ok)return;const data=await res.json();const archives=data.archives||[];if(!archives.length)return;const card=document.getElementById('archivedCard');card.style.display='';const list=document.getElementById('archivedList');list.innerHTML='';archives.forEach((a,idx)=>{const div=document.createElement('div');div.className='site-card';div.style.cursor='pointer';div.style.padding='12px 16px';div.style.marginBottom='8px';const d1=a.firstSeenEpoch?new Date(a.firstSeenEpoch*1000).toLocaleDateString(undefined,{month:'short',year:'numeric'}):'?';const d2=a.lastUpdateEpoch?new Date(a.lastUpdateEpoch*1000).toLocaleDateString(undefined,{month:'short',year:'numeric'}):'?';div.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong>'+escHtml(a.displayLabel||a.site||a.clientUid)+'</strong><div style="font-size:0.85rem;color:var(--muted);margin-top:4px">'+a.sensorCount+' sensor'+(a.sensorCount!==1?'s':'')+' &bull; '+d1+' &mdash; '+d2+'</div></div><button class="pill secondary" style="font-size:0.8rem" data-idx="'+idx+'">Load Data</button></div>';div.querySelector('button').addEventListener('click',function(e){e.stopPropagation();loadArchivedData(a.ftpFile,a.displayLabel||a.site);});list.appendChild(div);});}catch(e){console.warn('Archived clients:',e.message);}}function escHtml(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}async function loadArchivedData(ftpFile,label){try{showToast('Loading archived data from FTP...');const res=await fetch('/api/history/archived?file='+encodeURIComponent(ftpFile));if(!res.ok)throw new Error('Failed to load archive');const data=await res.json();const wrap=document.getElementById('archivedChartWrap');wrap.style.display='';const ctx=document.getElementById('archivedChart').getContext('2d');if(archivedChart)archivedChart.destroy();const datasets=[];const COLORS=['#2563eb','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899'];if(data.history&&data.history.length){data.history.forEach((h,i)=>{const pts=(h.readings||[]).map(r=>({x:new Date(r[0]*1000),y:r[1]}));if(pts.length)datasets.push({label:(data.site||'')+' Sensor '+h.sensorIndex,data:pts,borderColor:COLORS[i%COLORS.length],backgroundColor:COLORS[i%COLORS.length]+'20',fill:false,tension:0.3,pointRadius:0});});}if(!datasets.length){wrap.style.display='none';showToast('No chart data in archive',true);return;}archivedChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'index'},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{title:{display:true,text:'Level (inches)'},grid:{color:'var(--chart-grid)'}}},plugins:{legend:{position:'bottom'}}}});showToast('Loaded: '+label);}catch(e){showToast(e.message||'Archive load failed',true);}}loadArchivedClients();})();})();
+async funct)HTML" R"HTML(ion loadHistoricalData(){const sensorIdx=document.getElementById('sensorFilter').value;const range=document.getElementById('rangeSelect').value;let apiDays=90;if(sensorIdx!=='all'){apiDays=0;}else{const rangeDays={'24h':7,'7d':7,'30d':30,'90d':90,'6mo':180,'1yr':365,'2yr':730};apiDays=rangeDays[range]||90;}const url=apiDays>0?'/api/history?days='+apiDays:'/api/history';try{const res=await fetch(url);if(!res.ok)throw new Error('Failed to load historical data');const data=await res.json();if(data.sensors&&data.sensors.length>0){historicalData=data;historicalData.sites={};historicalData.sensors.forEach(s=>{const site=s.site||'Unknown Site';(historicalData.sites[site]=historicalData.sites[site]||[]).push(s);});if(!historicalData.alarms)historicalData.alarms=[];if(!historicalData.voltage)historicalData.voltage=[];if(!historicalData.temperature)historicalData.temperature=[];}else{initEmptyData();}if(data.dataInfo){const banner=document.getElementById('dataSourceBanner');if(banner){let msg='Data: RAM ('+data.settings.hotTierDays+'d)';if(data.dataInfo.warmTierAvailable)msg+=' + Flash ('+data.settings.warmTierMonths+'mo)';if(data.dataInfo.coldTierAvailable){msg+=' + FTP Archive'+(data.settings&&data.settings.lastFtpSync>0?'':' (first sync pending)');}else if(data.dataInfo.ftpConfigured){msg+=' | FTP connected but history archive is OFF (enable in Server Settings)';}else{msg+=' | Enable FTP for full archive';}if(data.dataInfo.rangeNote)msg+=' — '+data.dataInfo.rangeNote;banner.textContent=msg;banner.style.display='';banner.style.background=data.dataInfo.coldTierAvailable?'#d1fae5':'#fef3c7';banner.style.color=data.dataInfo.coldTierAvailable?'#065f46':'#92400e';}}updateStats();populateFilters();renderLevelChart();renderAlarmChart();populateVoltageClients();renderVoltageChart();renderSites();}catch(err){console.warn('No historical data available:',err.message);initEmptyData();updateStats();populateFilters();renderLevelChart();renderAlarmChart();populateVoltageClients();renderVoltageChart();renderSites();}}
+window.refreshData=funct)HTML" R"HTML(ion(){loadHistoricalData();showToast('Data refreshed');};window.exportData=funct)HTML" R"HTML(ion(){const{sensors,cutoff,cutoffEnd}=getFilteredData();let csv='Site,Tank,Timestamp,Level (inches)\n';sensors.forEach(tank=>{tank.readings.filter(r=>r.timestamp>=cutoff&&r.timestamp<=cutoffEnd).forEach(r=>{csv+=`"${escapeCsv(tank.site)}","${escapeCsv(tank.label)}",${new Date(r.timestamp*1000).toISOString()},${r.level.toFixed(2)}\n`;});});const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='tank_history.csv';a.click();URL.revokeObjectURL(url);showToast('CSV exported');};document.getElementById('siteFilter').addEventListener('change',renderLevelChart);document.getElementById('startDate').addEventListener('change',renderLevelChart);document.getElementById('endDate').addEventListener('change',renderLevelChart);document.getElementById('startDate').addEventListener('change',renderVoltageChart);document.getElementById('endDate').addEventListener('change',renderVoltageChart);document.getElementById('voltageClient').addEventListener('change',renderVoltageChart);document.getElementById('siteFilter').addEventListener('change',function(){const site=this.value;if(site==='all')return;const sensor=historicalData.sensors.find(s=>s.site===site&&s.client);const sel=document.getElementById('voltageClient');if(sensor&&Array.from(sel.options).some(o=>o.value===sensor.client)){sel.value=sensor.client;renderVoltageChart();}});{const cb=document.getElementById('showTemp');try{if(localStorage.getItem('tankalarm_vin_temp')==='0')cb.checked=false;}catch(e){}cb.addEventListener('change',function(){try{localStorage.setItem('tankalarm_vin_temp',this.checked?'1':'0');}catch(e){}renderVoltageChart();});}document.getElementById('sensorFilter').addEventListener('change',function(){loadHistoricalData();});document.getElementById('rangeSelect').addEventListener('change',function(){const sd=document.getElementById('startDate');const ed=document.getElementById('endDate');if(this.value==='custom'){sd.style.display='';ed.style.display='';if(!sd.value){const d=new Date();d.setDate(d.getDate()-7);sd.value=d.toISOString().split('T')[0];}if(!ed.value){ed.value=new Date().toISOString().split('T')[0];}}else{sd.style.display='none';ed.style.display='none';}loadHistoricalData();});loadHistoricalData();/* ARCHIVED CLIENTS */let archivedChart=null;async function loadArchivedClients(){try{const res=await fetch('/api/history/archived');if(!res.ok)return;const data=await res.json();const archives=data.archives||[];if(!archives.length)return;const card=document.getElementById('archivedCard');card.style.display='';const list=document.getElementById('archivedList');list.innerHTML='';archives.forEach((a,idx)=>{const div=document.createElement('div');div.className='site-card';div.style.cursor='pointer';div.style.padding='12px 16px';div.style.marginBottom='8px';const d1=a.firstSeenEpoch?new Date(a.firstSeenEpoch*1000).toLocaleDateString(undefined,{month:'short',year:'numeric'}):'?';const d2=a.lastUpdateEpoch?new Date(a.lastUpdateEpoch*1000).toLocaleDateString(undefined,{month:'short',year:'numeric'}):'?';div.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong>'+escHtml(a.displayLabel||a.site||a.clientUid)+'</strong><div style="font-size:0.85rem;color:var(--muted);margin-top:4px">'+a.sensorCount+' sensor'+(a.sensorCount!==1?'s':'')+' &bull; '+d1+' &mdash; '+d2+'</div></div><button class="pill secondary" style="font-size:0.8rem" data-idx="'+idx+'">Load Data</button></div>';div.querySelector('button').addEventListener('click',function(e){e.stopPropagation();loadArchivedData(a.ftpFile,a.displayLabel||a.site);});list.appendChild(div);});}catch(e){console.warn('Archived clients:',e.message);}}function escHtml(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}async function loadArchivedData(ftpFile,label){try{showToast('Loading archived data from FTP...');const res=await fetch('/api/history/archived?file='+encodeURIComponent(ftpFile));if(!res.ok)throw new Error('Failed to load archive');const data=await res.json();const wrap=document.getElementById('archivedChartWrap');wrap.style.display='';const ctx=document.getElementById('archivedChart').getContext('2d');if(archivedChart)archivedChart.destroy();const datasets=[];const COLORS=['#2563eb','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899'];if(data.history&&data.history.length){data.history.forEach((h,i)=>{const pts=(h.readings||[]).map(r=>({x:new Date(r[0]*1000),y:r[1]}));if(pts.length)datasets.push({label:(data.site||'')+' Sensor '+h.sensorIndex,data:pts,borderColor:COLORS[i%COLORS.length],backgroundColor:COLORS[i%COLORS.length]+'20',fill:false,tension:0.3,pointRadius:0});});}if(!datasets.length){wrap.style.display='none';showToast('No chart data in archive',true);return;}archivedChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'index'},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{title:{display:true,text:'Level (inches)'},grid:{color:'var(--chart-grid)'}}},plugins:{legend:{position:'bottom'}}}});showToast('Loaded: '+label);}catch(e){showToast(e.message||'Archive load failed',true);}}loadArchivedClients();})();})();
 </script></body></html>)HTML";
 
 static const char TRANSMISSION_LOG_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Transmission Log - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><h2>Outbound Transmission Log</h2><p style="color:var(--muted);margin-bottom:16px;">Log of messages sent from the server to clients and external services via Notehub. Shows the most recent 100 transmissions.</p><div class="controls"><button id="refreshBtn">Refresh</button><select id="typeFilter"><option value="all">All Types</option></select><select id="statusFilter"><option value="all">All Statuses</option></select><input type="text" id="searchInput" placeholder="Filter by site or client..." style="max-width:250px;"><button class="secondary" id="exportBtn">Export CSV</button><button class="secondary" id="cancelAllBtn" style="display:none;background:#fee2e2;color:#991b1b;border-color:#fca5a5;">Cancel All Pending</button></div><table><thead><tr><th>Date/Time</th><th>Site</th><th>Client ID</th><th>Type</th><th>Status</th><th>Detail</th><th style="width:80px;">Actions</th></tr></thead><tbody id="logBody"><tr><td colspan="7" class="empty-state">Loading...</td></tr></tbody></table></div></main><div id="toast"></div><script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);)HTML"
@@ -2697,11 +2724,13 @@ static void handleClientDeleteRequest(EthernetClient &client, const String &body
 static String getQueryParam(const String &query, const char *key);
 static bool requireValidPin(EthernetClient &client, const char *pinValue);
 
-// NWS Weather API functions (for calibration temperature data)
-static bool nwsLookupGridPoint(ClientMetadata *meta);
-static float nwsFetchAverageTemperature(ClientMetadata *meta, double timestamp);
+// Outdoor temperature (NWS) for the VIN chart; calibration does not use it yet (S-D05)
 static float nwsGetCalibrationTemperature(const char *clientUid, double timestamp);
 static float getCachedTemperature(const char *clientUid);
+static void serviceOutdoorTemperature();
+static bool saveOutdoorTemperature();
+static void loadOutdoorTemperature();
+static NwsClientTemp *nwsWeatherSlot(const char *clientUid);
 
 static void handleRefreshPost(EthernetClient &client, const String &body) {
   char clientUid[64] = {0};
@@ -3154,12 +3183,28 @@ static void handleLocationResponse(JsonDocument &doc, double epoch) {
 
   ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
   if (meta) {
+    const bool hadLocation = (meta->latitude != 0.0f || meta->longitude != 0.0f);
+    const bool moved = !(fabsf(meta->latitude - latitude) <= NWS_LOCATION_SAME_DEG &&
+                         fabsf(meta->longitude - longitude) <= NWS_LOCATION_SAME_DEG);
     meta->latitude = latitude;
     meta->longitude = longitude;
     meta->locationEpoch = (epoch > 0.0) ? epoch : currentEpoch();
-    // Invalidate cached NWS grid point if location changed
-    meta->nwsGridValid = false;
-    
+    gClientMetadataDirty = true;
+    // A new location: find the client's weather stations again, at once. After a move
+    // (not a first location), the readings before it get no outdoor temperature, and the
+    // samples before it cover none after it.
+    if (moved) {
+      NwsClientTemp *wx = nwsWeatherSlot(clientUid);
+      if (wx) {
+        if (hadLocation) {
+          nwsNoteMoved(*wx, currentEpoch());
+        } else {
+          nwsNoteLocationChanged(*wx);
+        }
+        gNwsTempDirty = true;
+      }
+    }
+
     Serial.print(F("Location received from "));
     Serial.print(clientUid);
     Serial.print(F(": "));
@@ -4516,6 +4561,7 @@ void setup() {
       "/fs/client_config_cache.txt",
       "/fs/history_settings.json",
       "/fs/history/hot_tier.json",
+      NWS_TEMP_FILE,
       "/fs/contacts_config.json",
       "/fs/email_format.json",
       "/fs/calibration_data.txt",
@@ -4537,6 +4583,7 @@ void setup() {
 #endif
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
+  loadOutdoorTemperature();   // Restore outdoor temperature samples (after the metadata it is checked against)
   printHardwareRequirements();
 
   Wire.begin();
@@ -4801,6 +4848,8 @@ void loop() {
     gLastPollMillis = now;
     if (!gPaused) {
       pollNotecard();
+      gLastPollDoneMs = millis();
+      if (gLastPollDoneMs == 0) gLastPollDoneMs = 1;
     }
   }
 
@@ -4893,7 +4942,8 @@ void loop() {
     
     // Persist hot tier ring buffer to flash (survive reboot)
     saveHotTierSnapshot();
-    
+    saveOutdoorTemperature();  // outdoor temperature samples for the VIN chart (when changed)
+
     // Check if we need to archive last month to FTP (cold tier)
     if (gHistorySettings.ftpArchiveEnabled && gConfig.ftpEnabled) {
       time_t nowTime = (time_t)epoch;
@@ -4946,23 +4996,27 @@ void loop() {
     }
   }
 
+  // Outdoor temperature for the VIN chart: at most one api.weather.gov lookup per 30 s
+  serviceOutdoorTemperature();
+
   // Periodic voltage check (Notecard supply + optional analog Vin)
   if (now - gLastVoltageCheckMillis > VOLTAGE_CHECK_INTERVAL_MS) {
     gLastVoltageCheckMillis = now;
     checkServerVoltage();
   }
   
-  // Periodic sensor registry save (when dirty, every 5 minutes)
-  if (gSensorRegistryDirty && (now - gLastRegistrySaveMillis > REGISTRY_SAVE_INTERVAL_MS)) {
+  // Periodic sensor registry and client metadata save (when dirty, every 5 minutes). One
+  // deadline for both: a registry save that reset it first would starve the metadata.
+  if ((gSensorRegistryDirty || gClientMetadataDirty) && (now - gLastRegistrySaveMillis > REGISTRY_SAVE_INTERVAL_MS)) {
     gLastRegistrySaveMillis = now;
-    saveSensorRegistry();
-    gSensorRegistryDirty = false;
-  }
-  
-  // Periodic client metadata save (when dirty, piggyback on same interval)
-  if (gClientMetadataDirty && (now - gLastRegistrySaveMillis > REGISTRY_SAVE_INTERVAL_MS)) {
-    saveClientMetadataCache();
-    gClientMetadataDirty = false;
+    if (gSensorRegistryDirty) {
+      saveSensorRegistry();
+      gSensorRegistryDirty = false;
+    }
+    if (gClientMetadataDirty) {
+      saveClientMetadataCache();
+      gClientMetadataDirty = false;
+    }
   }
   
   // Periodic stale client check (every hour)
@@ -5042,6 +5096,7 @@ static void recoverOrphanedTmpFiles() {
     "/fs/history_settings.json",
     "/fs/server_heartbeat.json",
     "/fs/history/hot_tier.json",
+    NWS_TEMP_FILE,
     "/fs/archived_clients.json",
     nullptr
   };
@@ -6596,315 +6651,574 @@ static void ftpsQuit() {
 }
 
 // ============================================================================
-// National Weather Service API Integration
+// Outdoor temperature (National Weather Service) for the VIN Voltage History chart
 // ============================================================================
-// Fetches weather data for calibration temperature compensation.
-// Uses the NWS public API: https://api.weather.gov
-// Flow: /points/{lat},{lon} -> get grid office/X/Y -> /gridpoints/{office}/{X},{Y} -> get temperature
+// NwsTemperature.h holds the request paths, the HTTP reader, the response parsing, the
+// per-client store and the scheduling rules (host-tested in tests/host/nws_temp). This
+// part makes the HTTPS requests to api.weather.gov and walks the clients, one lookup per
+// NWS_SERVICE_INTERVAL_MS at most.
+//
+// Calibration does not use these temperatures (S-D05). getCachedTemperature() and
+// nwsGetCalibrationTemperature() return TEMPERATURE_UNAVAILABLE, which is what the old
+// lookup returned in practice: it asked api.weather.gov over HTTP port 80, which answers
+// with a 301 to HTTPS and an empty body. So no level calculation changes here.
 
-// Look up NWS grid point for a client's location and cache it
-static bool nwsLookupGridPoint(ClientMetadata *meta) {
-  if (!meta || meta->latitude == 0.0f || meta->longitude == 0.0f) {
-    return false;
-  }
-  
-  // If already cached, don't re-fetch
-  if (meta->nwsGridValid && meta->nwsGridOffice[0] != '\0') {
-    return true;
-  }
-  
-  EthernetClient client;
-  if (!client.connect(NWS_API_HOST, NWS_API_PORT)) {
-    Serial.println(F("NWS: Failed to connect to api.weather.gov"));
-    return false;
-  }
-  
-  // Build request URL: /points/{lat},{lon}
-  char path[64];
-  // Format with 4 decimal places (NWS max precision)
-  snprintf(path, sizeof(path), "/points/%.4f,%.4f", meta->latitude, meta->longitude);
-  
-  // Send HTTP GET request with required User-Agent header
-  client.print(F("GET "));
-  client.print(path);
-  client.println(F(" HTTP/1.1"));
-  client.print(F("Host: "));
-  client.println(F(NWS_API_HOST));
-  client.println(F("User-Agent: TankAlarm/1.0 (sensor monitoring system)"));
-  client.println(F("Accept: application/json"));
-  client.println(F("Connection: close"));
-  client.println();
-  
-  // Wait for response
-  unsigned long start = millis();
-  while (!client.available() && millis() - start < NWS_API_TIMEOUT_MS) {
-    safeSleep(10);
-  }
-  
-  if (!client.available()) {
-    Serial.println(F("NWS: Timeout waiting for /points response"));
-    client.stop();
-    return false;
-  }
-  
-  // Read response and parse JSON to find grid office, X, Y
-  // Skip HTTP headers
-  bool headersComplete = false;
-  while (client.available() && !headersComplete) {
-    String line = client.readStringUntil('\n');
-    if (line == "\r" || line.length() == 0) {
-      headersComplete = true;
-    }
-  }
-  
-  // Read JSON body (limited to 4KB for safety)
-  char buffer[4096];
-  size_t len = 0;
-  while (client.available() && len < sizeof(buffer) - 1 && millis() - start < NWS_API_TIMEOUT_MS) {
-    buffer[len++] = client.read();
-  }
-  buffer[len] = '\0';
-  client.stop();
-  
-  // Parse JSON response
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, buffer);
-  if (error) {
-    Serial.print(F("NWS: JSON parse error: "));
-    Serial.println(error.c_str());
-    return false;
-  }
-  
-  // Extract grid office and coordinates from properties
-  // Response format: { "properties": { "gridId": "LWX", "gridX": 96, "gridY": 70 } }
-  const char *gridId = doc["properties"]["gridId"];
-  int gridX = doc["properties"]["gridX"] | -1;
-  int gridY = doc["properties"]["gridY"] | -1;
-  
-  if (!gridId || gridX < 0 || gridY < 0) {
-    Serial.println(F("NWS: Missing grid data in response"));
-    return false;
-  }
-  
-  // Cache the grid point
-  strlcpy(meta->nwsGridOffice, gridId, sizeof(meta->nwsGridOffice));
-  meta->nwsGridX = (uint16_t)gridX;
-  meta->nwsGridY = (uint16_t)gridY;
-  meta->nwsGridValid = true;
-  
-  Serial.print(F("NWS: Grid point cached: "));
-  Serial.print(gridId);
-  Serial.print(F(" ("));
-  Serial.print(gridX);
-  Serial.print(F(","));
-  Serial.print(gridY);
-  Serial.println(F(")"));
-  
-  return true;
-}
-
-// Fetch hourly temperature observations and calculate average for past N hours
-static float nwsFetchAverageTemperature(ClientMetadata *meta, double timestamp) {
-  if (!meta || !meta->nwsGridValid) {
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  EthernetClient client;
-  if (!client.connect(NWS_API_HOST, NWS_API_PORT)) {
-    Serial.println(F("NWS: Failed to connect for gridpoints"));
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  // Build request URL: /gridpoints/{office}/{X},{Y}
-  char path[64];
-  snprintf(path, sizeof(path), "/gridpoints/%s/%u,%u", 
-           meta->nwsGridOffice, meta->nwsGridX, meta->nwsGridY);
-  
-  // Send HTTP GET request
-  client.print(F("GET "));
-  client.print(path);
-  client.println(F(" HTTP/1.1"));
-  client.print(F("Host: "));
-  client.println(F(NWS_API_HOST));
-  client.println(F("User-Agent: TankAlarm/1.0 (sensor monitoring system)"));
-  client.println(F("Accept: application/json"));
-  client.println(F("Connection: close"));
-  client.println();
-  
-  // Wait for response
-  unsigned long start = millis();
-  while (!client.available() && millis() - start < NWS_API_TIMEOUT_MS) {
-    safeSleep(10);
-  }
-  
-  if (!client.available()) {
-    Serial.println(F("NWS: Timeout waiting for gridpoints response"));
-    client.stop();
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  // Skip HTTP headers
-  bool headersComplete = false;
-  while (client.available() && !headersComplete) {
-    String line = client.readStringUntil('\n');
-    if (line == "\r" || line.length() == 0) {
-      headersComplete = true;
-    }
-  }
-  
-  // Read JSON body (this can be large, limit to 16KB)
-  char *buffer = (char *)malloc(16384);
-  if (!buffer) {
-    Serial.println(F("NWS: Failed to allocate buffer"));
-    client.stop();
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  size_t len = 0;
-  while (client.available() && len < 16383 && millis() - start < NWS_API_TIMEOUT_MS) {
-    buffer[len++] = client.read();
-  }
-  buffer[len] = '\0';
-  client.stop();
-  
-  // Parse JSON response
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, buffer);
-  free(buffer);
-  
-  if (error) {
-    Serial.print(F("NWS: JSON parse error: "));
-    Serial.println(error.c_str());
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  // Extract temperature time series from properties.temperature.values
-  // Format: { "properties": { "temperature": { "uom": "wmoUnit:degC", "values": [ { "validTime": "...", "value": 25.0 }, ... ] } } }
-  JsonArray tempValues = doc["properties"]["temperature"]["values"];
-  const char *tempUom = doc["properties"]["temperature"]["uom"];
-  
-  if (tempValues.isNull() || tempValues.size() == 0) {
-    Serial.println(F("NWS: No temperature data in response"));
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  // Determine if temperatures are in Celsius (they usually are from NWS)
-  bool isCelsius = (tempUom && strstr(tempUom, "degC") != nullptr);
-  
-  // Average the first NWS_AVG_HOURS temperature values (recent near-term conditions)
-  float tempSum = 0.0f;
-  int tempCount = 0;
-  
-  // The NWS data is forecast data, but recent values are essentially observations
-  // We'll use any values that overlap with our window
-  for (JsonObject entry : tempValues) {
-    float tempValue = entry["value"] | TEMPERATURE_UNAVAILABLE;
-    if (tempValue == TEMPERATURE_UNAVAILABLE) continue;
-    
-    // For simplicity, use the first several hourly values
-    // (NWS gridpoint data represents recent/near-term conditions)
-    if (tempCount < NWS_AVG_HOURS) {
-      // Convert to Fahrenheit if needed
-      float tempF = isCelsius ? (tempValue * 9.0f / 5.0f + 32.0f) : tempValue;
-      tempSum += tempF;
-      tempCount++;
-    }
-  }
-  
-  if (tempCount == 0) {
-    Serial.println(F("NWS: No valid temperature values found"));
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  float avgTempF = tempSum / tempCount;
-  
-  Serial.print(F("NWS: Average temperature ("));
-  Serial.print(tempCount);
-  Serial.print(F(" readings): "));
-  Serial.print(avgTempF, 1);
-  Serial.println(F("°F"));
-  
-  return avgTempF;
-}
-
-// Main entry point: get calibration temperature for a client at a given time
 static float nwsGetCalibrationTemperature(const char *clientUid, double timestamp) {
-  if (!clientUid || strlen(clientUid) == 0) {
+  (void)timestamp;
+  if (!clientUid || clientUid[0] == '\0') {
     return TEMPERATURE_UNAVAILABLE;
   }
-  
-  // Find client metadata with location
   ClientMetadata *meta = findClientMetadata(clientUid);
   if (!meta || meta->latitude == 0.0f || meta->longitude == 0.0f) {
+    // No location yet: ask the client for it, so its weather stations can be found
     Serial.print(F("NWS: No location data for client "));
     Serial.print(clientUid);
     Serial.println(F(" - requesting location from device"));
-    
-    // Request location from the client - it will respond asynchronously
-    // Temperature will be available for future calibration entries
     sendLocationRequest(clientUid);
-    
-    return TEMPERATURE_UNAVAILABLE;
   }
-  
-  // Look up grid point (caches result)
-  if (!nwsLookupGridPoint(meta)) {
-    return TEMPERATURE_UNAVAILABLE;
-  }
-  
-  // Fetch average temperature
-  return nwsFetchAverageTemperature(meta, timestamp);
+  return TEMPERATURE_UNAVAILABLE;
 }
 
-// Get current temperature for real-time telemetry compensation
-// Uses cached value if fresh (< TEMP_CACHE_TTL_SECONDS old), otherwise fetches from NWS
 static float getCachedTemperature(const char *clientUid) {
-  if (!clientUid || strlen(clientUid) == 0) {
-    return TEMPERATURE_UNAVAILABLE;
+  (void)clientUid;
+  return TEMPERATURE_UNAVAILABLE;  // see above: calibration does not use outdoor temperature yet
+}
+
+static void nwsLog(const char *level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void nwsLog(const char *level, const char *fmt, ...) {
+  char msg[160];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  Serial.print(F("Weather: "));
+  Serial.println(msg);
+  addServerSerialLog(msg, level, "weather");
+}
+
+enum : int {
+  NWS_GET_NETWORK = -1,       // DNS, connect, TLS, send, or no answer at all
+  NWS_GET_BAD_RESPONSE = -2,  // an answer that is not an HTTP response
+  NWS_GET_THROTTLED = -3      // not sent: the previous request started less than NWS_SERVICE_INTERVAL_MS ago
+};
+
+static unsigned long gNwsLastRequestMs = 0;  // when the last api.weather.gov request started (0 = none yet)
+
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+// Tears the TLS+TCP pair down without waiting for the peer, the same steps the FTPS
+// library takes (ftpsReleaseSocketPair): a graceful close on this core can block for a
+// minute. linger=0 turns close() into a reset; the deletes release the LWIP socket,
+// which the pool (only a few deep) needs back.
+static void nwsReleaseSockets(TLSSocketWrapper *&tls, TCPSocket *&tcp) {
+  if (tcp) {
+    struct { int l_onoff; int l_linger; } linger = {1, 0};
+    (void)tcp->setsockopt(NSAPI_SOCKET, NSAPI_LINGER, &linger, sizeof(linger));
+    tcp->set_blocking(false);
+    tcp->set_timeout(0);
   }
-  
-  // Find client metadata
-  ClientMetadata *meta = findClientMetadata(clientUid);
-  if (!meta) {
-    return TEMPERATURE_UNAVAILABLE;
+  if (tls) {
+    mbedtls_ssl_context *ssl = tls->get_ssl_context();
+    if (ssl) (void)mbedtls_ssl_close_notify(ssl);
   }
-  
-  // Check if we have a valid cached temperature
-  double now = currentEpoch();
-  if (meta->cachedTemperatureF > TEMPERATURE_UNAVAILABLE + 1.0f &&
-      meta->tempCacheEpoch > 0.0 &&
-      (now - meta->tempCacheEpoch) < TEMP_CACHE_TTL_SECONDS) {
-    // Cached temperature is still fresh
-    return meta->cachedTemperatureF;
+  if (tcp) (void)tcp->close();
+  if (tls) {
+    delete tls;
+    tls = nullptr;
   }
-  
-  // Need to fetch fresh temperature - check if we have location
-  if (meta->latitude == 0.0f || meta->longitude == 0.0f) {
-    // No location - can't fetch temperature
-    // Don't spam location requests here since telemetry comes frequently
-    return TEMPERATURE_UNAVAILABLE;
+  if (tcp) {
+    delete tcp;
+    tcp = nullptr;
   }
-  
-  // Look up grid point if needed
-  if (!nwsLookupGridPoint(meta)) {
-    return TEMPERATURE_UNAVAILABLE;
+}
+
+struct NwsTlsRead {
+  TLSSocketWrapper *tls;
+  unsigned long startMs;
+};
+
+// NwsHttpReader's byte source. Feeds the watchdog on every read; each recv waits at most
+// NWS_SOCKET_TIMEOUT_MS, and reading stops NWS_REQUEST_BUDGET_MS after the request began.
+static int nwsTlsRead(void *ctx, uint8_t *buf, size_t len) {
+  NwsTlsRead *r = static_cast<NwsTlsRead *>(ctx);
+  serviceTransferWatchdog();
+  if (millis() - r->startMs > NWS_REQUEST_BUDGET_MS) return -1;
+  const nsapi_size_or_error_t n = r->tls->recv(buf, len);
+  if (n > 0) return (int)n;
+  return (n == 0) ? 0 : -1;
+}
+#endif
+
+// GET https://api.weather.gov<path>. Returns the HTTP status, NWS_GET_NETWORK,
+// NWS_GET_BAD_RESPONSE or NWS_GET_THROTTLED. On 200 the body is parsed into doc through
+// filter, and jsonErr is Ok only when the whole JSON value arrived and the body ended as
+// its framing says. At most one request per NWS_SERVICE_INTERVAL_MS is sent, whoever asks.
+// Callers use nwsHttpsGetJson(), which also logs it.
+static int nwsHttpsRequest(const char *path, JsonDocument &filter, JsonDocument &doc, DeserializationError &jsonErr) {
+  jsonErr = DeserializationError::EmptyInput;
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  const unsigned long startMs = millis();
+  if (gNwsLastRequestMs != 0 && startMs - gNwsLastRequestMs < NWS_SERVICE_INTERVAL_MS) return NWS_GET_THROTTLED;
+  NetworkInterface *network = Ethernet.getNetwork();
+  if (!network || Ethernet.linkStatus() != LinkON) return NWS_GET_NETWORK;
+  gNwsLastRequestMs = startMs ? startMs : 1;
+
+  char userAgent[40];
+  snprintf(userAgent, sizeof(userAgent), "TankAlarm-Server/%s", FIRMWARE_VERSION);
+  char request[320];
+  const size_t requestLen = nwsBuildGet(request, sizeof(request), path, userAgent);
+  if (requestLen == 0) return NWS_GET_BAD_RESPONSE;
+
+  // The address is kept for an hour, so DNS (up to ~15 s on this core when the resolver
+  // does not answer) runs rarely; a failed connect drops it.
+  static SocketAddress cachedAddress;
+  static unsigned long cachedAtMs = 0;
+  static bool cachedValid = false;
+  if (!cachedValid || millis() - cachedAtMs > 3600000UL) {
+    serviceTransferWatchdog();
+    SocketAddress resolved;
+    if (network->gethostbyname(NWS_HOST, &resolved) != NSAPI_ERROR_OK) {
+      cachedValid = false;
+      return NWS_GET_NETWORK;
+    }
+    resolved.set_port(NWS_PORT);
+    cachedAddress = resolved;
+    cachedAtMs = millis();
+    cachedValid = true;
   }
-  
-  // Fetch current temperature (use current time)
-  float temp = nwsFetchAverageTemperature(meta, now);
-  
-  // Cache the result
-  if (temp > TEMPERATURE_UNAVAILABLE + 1.0f) {
-    meta->cachedTemperatureF = temp;
-    meta->tempCacheEpoch = now;
-    Serial.print(F("Temperature cached for "));
-    Serial.print(clientUid);
-    Serial.print(F(": "));
-    Serial.print(temp, 1);
-    Serial.println(F("°F"));
+  serviceTransferWatchdog();
+
+  TLSSocketWrapper *tls = nullptr;
+  TCPSocket *tcp = new (std::nothrow) TCPSocket();
+  if (!tcp) return NWS_GET_NETWORK;
+  if (tcp->open(network) != NSAPI_ERROR_OK) {
+    delete tcp;
+    return NWS_GET_NETWORK;
   }
-  
-  return temp;
+  tcp->set_timeout(NWS_SOCKET_TIMEOUT_MS);
+  if (tcp->connect(cachedAddress) != NSAPI_ERROR_OK) {
+    cachedValid = false;
+    nwsReleaseSockets(tls, tcp);
+    return NWS_GET_NETWORK;
+  }
+  serviceTransferWatchdog();
+
+  tls = new (std::nothrow) TLSSocketWrapper(tcp, NWS_HOST, TLSSocketWrapper::TRANSPORT_KEEP);
+  mbedtls_ssl_config *sslConfig = tls ? tls->get_ssl_config() : nullptr;
+  if (!sslConfig) {
+    nwsReleaseSockets(tls, tcp);
+    return NWS_GET_NETWORK;
+  }
+  // Public, read-only weather data, so the certificate is not checked (the device has no
+  // CA bundle; GitHub Direct did the same). The request carries only the site's location
+  // to 4 decimals and a station id; a forged answer could only show a wrong temperature.
+  mbedtls_ssl_conf_authmode(sslConfig, MBEDTLS_SSL_VERIFY_NONE);
+  tls->set_timeout(NWS_SOCKET_TIMEOUT_MS);
+  if (tls->connect() != NSAPI_ERROR_OK) {
+    nwsReleaseSockets(tls, tcp);
+    return NWS_GET_NETWORK;
+  }
+  serviceTransferWatchdog();
+
+  for (size_t sent = 0; sent < requestLen;) {
+    const nsapi_size_or_error_t n = tls->send(request + sent, requestLen - sent);
+    if (n <= 0) {
+      nwsReleaseSockets(tls, tcp);
+      return NWS_GET_NETWORK;
+    }
+    sent += (size_t)n;
+  }
+
+  NwsTlsRead readCtx = {tls, startMs};
+  NwsHttpReader reader;
+  reader.begin(nwsTlsRead, &readCtx, NWS_HTTP_BODY_MAX);
+  int status;
+  if (reader.readHead()) {
+    status = reader.status;
+    if (status == 200) jsonErr = nwsParseBody(reader, filter, doc);
+  } else {
+    status = (reader.ioError || reader.eof) ? NWS_GET_NETWORK : NWS_GET_BAD_RESPONSE;
+  }
+  nwsReleaseSockets(tls, tcp);
+  serviceTransferWatchdog();
+  return status;
+#else
+  (void)path;
+  (void)filter;
+  (void)doc;
+  return NWS_GET_NETWORK;
+#endif
+}
+
+// nwsHttpsRequest(), plus one log line per request with its result and how long it held
+// up loop() (the bench check for the blocking time)
+static int nwsHttpsGetJson(const char *path, JsonDocument &filter, JsonDocument &doc, DeserializationError &jsonErr) {
+  const unsigned long t0 = millis();
+  const int status = nwsHttpsRequest(path, filter, doc, jsonErr);
+  if (status == NWS_GET_THROTTLED) return status;
+  char result[24];
+  if (status >= 0) {
+    snprintf(result, sizeof(result), "HTTP %d%s", status,
+             (status == 200 && jsonErr != DeserializationError::Ok) ? ", incomplete" : "");
+  } else {
+    snprintf(result, sizeof(result), "%s", status == NWS_GET_NETWORK ? "no answer" : "not HTTP");
+  }
+  nwsLog("info", "GET %.100s: %s in %lu ms", path, result, (unsigned long)(millis() - t0));
+  return status;
+}
+
+static uint8_t gNwsCursor = 0;          // round-robin position in gClientMetadata
+static uint8_t gNwsNetFailStreak = 0;
+static double gNwsNetRetryAfter = 0.0;  // after a network failure nobody is asked before this
+
+// The second request of a two-request step, made on a later call so that a call makes
+// at most one request: the station list that /points pointed to, or the next station's
+// observations when the nearest one had none for the reading. A step that got no answer
+// stays pending and is asked again after the network backoff.
+enum NwsNextKind : uint8_t { NWS_NEXT_NONE = 0, NWS_NEXT_STATION_LIST, NWS_NEXT_STATION_OBS };
+struct NwsNextStep {
+  uint8_t kind;
+  char uid[NWS_UID_MAX];
+  char path[NWS_PATH_MAX];  // NWS_NEXT_STATION_LIST: the list path /points gave
+  float lat, lon;           // NWS_NEXT_STATION_LIST: the location /points was asked for
+  double target;            // NWS_NEXT_STATION_OBS: the reading time
+  uint8_t station;          // NWS_NEXT_STATION_OBS: the station to ask
+};
+static NwsNextStep gNwsNext;
+
+// api.weather.gov did not answer at all: wait for everyone, 5 min doubling to 6 h
+static void nwsNoteNetworkFailure(double now, const char *what) {
+  if (gNwsNetFailStreak < 255) gNwsNetFailStreak++;
+  double delay = NWS_NET_RETRY_BASE_SEC;
+  for (uint8_t i = 1; i < gNwsNetFailStreak && delay < NWS_RETRY_MAX_SEC; ++i) delay *= 2.0;
+  if (delay > NWS_RETRY_MAX_SEC) delay = NWS_RETRY_MAX_SEC;
+  gNwsNetRetryAfter = now + delay;
+  if (gNwsNetFailStreak == 1 || (gNwsNetFailStreak % 10) == 0) {
+    nwsLog("warn", "%s: api.weather.gov did not answer (%u in a row); next try in %u min", what,
+           (unsigned)gNwsNetFailStreak, (unsigned)(delay / 60.0));
+  }
+}
+
+static void nwsNoteClientFailure(NwsClientTemp &wx, double now, const char *what, int status) {
+  nwsNoteFailure(wx, now);
+  if (wx.failStreak == 1 || (wx.failStreak % 10) == 0) {
+    nwsLog("warn", "%s for %.32s failed (HTTP %d); retry in %u min", what, wx.uid, status,
+           (unsigned)(nwsRetryDelay(wx.failStreak) / 60.0));
+  }
+}
+
+// The client's weather entry, added when missing. When the store is full, an entry
+// whose client has no metadata makes room (kept at boot because the metadata did not
+// load; see loadOutdoorTemperature).
+static NwsClientTemp *nwsWeatherSlot(const char *clientUid) {
+  NwsClientTemp *wx = nwsFindOrAddClient(gNwsTemp, clientUid);
+  if (wx || !nwsValidUid(clientUid) || gNwsTemp.count < NWS_TEMP_MAX_CLIENTS) return wx;
+  for (uint8_t i = 0; i < gNwsTemp.count; ++i) {
+    if (findClientMetadata(gNwsTemp.clients[i].uid)) continue;
+    nwsLog("info", "Dropping the saved temperatures of unknown client %.32s to make room",
+           gNwsTemp.clients[i].uid);
+    nwsForgetClient(gNwsTemp, gNwsTemp.clients[i].uid);
+    gNwsTempDirty = true;
+    return nwsFindOrAddClient(gNwsTemp, clientUid);
+  }
+  return nullptr;
+}
+
+// The oldest of the client's readings that still needs a temperature (0 = none). Oldest
+// first, so none ages out of NWS's seven days while newer ones wait. Entries an older
+// firmware saved (legacyCount) are skipped: their times may be receive times (S-D03).
+static double nwsOldestReadingNeedingTemp(const NwsClientTemp &wx, const char *clientUid, double now) {
+  double oldest = 0.0;
+  for (uint8_t h = 0; h < gSensorHistoryCount; ++h) {
+    const SensorHourlyHistory &hist = gSensorHistory[h];
+    if (strcmp(hist.clientUid, clientUid) != 0) continue;
+    for (uint16_t j = hist.legacyCount; j < hist.snapshotCount; ++j) {
+      const uint16_t idx = (hist.writeIndex - hist.snapshotCount + j + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
+      const double t = hist.snapshots[idx].timestamp;
+      if ((oldest == 0.0 || t < oldest) && nwsReadingNeedsTemp(wx, t, now)) oldest = t;
+    }
+  }
+  return oldest;
+}
+
+// Finding the stations, request 1: /points for the client's location. Its station
+// list is asked for on the next call.
+static void nwsRequestPoints(const ClientMetadata &meta, NwsClientTemp &wx, double now) {
+  char path[NWS_PATH_MAX];
+  if (!nwsPointsPath(path, sizeof(path), meta.latitude, meta.longitude)) {
+    nwsNoteClientFailure(wx, now, "Station lookup", 0);
+    return;
+  }
+  JsonDocument filter;
+  JsonDocument doc;
+  DeserializationError err;
+  nwsPointsFilter(filter);
+  const int status = nwsHttpsGetJson(path, filter, doc, err);
+  if (status == NWS_GET_THROTTLED) return;
+  if (status == NWS_GET_NETWORK) {
+    nwsNoteNetworkFailure(now, "Station lookup");
+    return;
+  }
+  gNwsNetFailStreak = 0;
+  if (status == 404) {
+    nwsNoteUncovered(wx, now);
+    gNwsTempDirty = true;
+    nwsLog("info", "NWS has no forecast point for %.32s at %.4f, %.4f (outside the US?); asking again in a week",
+           wx.uid, (double)meta.latitude, (double)meta.longitude);
+    return;
+  }
+  char stationsPath[NWS_PATH_MAX];
+  if (status != 200 || err != DeserializationError::Ok ||
+      !nwsParsePoints(doc.as<JsonVariantConst>(), stationsPath, sizeof(stationsPath))) {
+    nwsNoteClientFailure(wx, now, "Station lookup", status);
+    return;
+  }
+  gNwsNext.kind = NWS_NEXT_STATION_LIST;
+  snprintf(gNwsNext.uid, sizeof(gNwsNext.uid), "%s", wx.uid);
+  snprintf(gNwsNext.path, sizeof(gNwsNext.path), "%s", stationsPath);
+  gNwsNext.lat = meta.latitude;
+  gNwsNext.lon = meta.longitude;
+}
+
+// Finding the stations, request 2: the two nearest stations in the list /points gave.
+// Returns the request's status (NWS_GET_NETWORK: no answer).
+static int nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat, float lon, double now) {
+  JsonDocument filter;
+  JsonDocument doc;
+  DeserializationError err;
+  nwsStationsFilter(filter);
+  const int status = nwsHttpsGetJson(path, filter, doc, err);
+  if (status == NWS_GET_THROTTLED) return status;
+  if (status == NWS_GET_NETWORK) {
+    nwsNoteNetworkFailure(now, "Station list");
+    return status;
+  }
+  gNwsNetFailStreak = 0;
+  char ids[NWS_STATIONS][NWS_STATION_ID_MAX];
+  const uint8_t n = (status == 200 && err == DeserializationError::Ok)
+                        ? nwsParseStations(doc.as<JsonVariantConst>(), ids, NWS_STATIONS)
+                        : 0;
+  if (n == 0) {
+    nwsNoteClientFailure(wx, now, "Station list", status);
+    return status;
+  }
+  nwsSetStations(wx, ids, n, lat, lon, now);
+  wx.uncovered = false;
+  nwsNoteSuccess(wx);
+  gNwsTempDirty = true;
+  nwsLog("info", "%.32s: nearest NWS station %s%s%s", wx.uid, wx.stations[0], n > 1 ? ", then " : "",
+         n > 1 ? wx.stations[1] : "");
+  return status;
+}
+
+// One station's observations around reading time target. When none matches and
+// another station is known, that one is asked on the next call. Returns the request's
+// status (NWS_GET_NETWORK: no answer; 0: no request was made).
+static int nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t station, double now) {
+  if (station >= nwsStationCount(wx)) return 0;  // the stations changed since: planned again
+  const double start = nwsObservationStart(wx, target);  // not before a move the reading is after
+  double end = target + NWS_OBS_MATCH_SEC;
+  if (end > now) end = now;
+  char path[NWS_PATH_MAX];
+  if (!nwsObservationsPath(path, sizeof(path), wx.stations[station], start, end)) {
+    nwsNoteClientFailure(wx, now, "Observation request", 0);
+    return 0;
+  }
+  JsonDocument filter;
+  JsonDocument doc;
+  DeserializationError err;
+  nwsObservationsFilter(filter);
+  const int status = nwsHttpsGetJson(path, filter, doc, err);
+  if (status == NWS_GET_THROTTLED) return status;
+  if (status == NWS_GET_NETWORK) {
+    nwsNoteNetworkFailure(now, "Observation request");
+    return status;
+  }
+  gNwsNetFailStreak = 0;
+  if (status == 404) {  // the station is gone: find the stations again
+    nwsLog("warn", "NWS station %s for %.32s not found; looking up stations again", wx.stations[station], wx.uid);
+    nwsClearStations(wx);
+    nwsNoteFailure(wx, now);
+    gNwsTempDirty = true;
+    return status;
+  }
+  if (status != 200 || err != DeserializationError::Ok) {
+    nwsNoteClientFailure(wx, now, "Observation request", status);
+    return status;
+  }
+  float tempF = 0.0f;
+  double obsEpoch = 0.0;
+  if (nwsNearestObservation(doc.as<JsonVariantConst>(), target, NWS_OBS_MATCH_SEC, &tempF, &obsEpoch)) {
+    const bool first = wx.count == 0;
+    if (nwsNoteMatched(wx, target, (uint32_t)obsEpoch, tempF, now)) gNwsTempDirty = true;
+    if (first && wx.count > 0) {
+      nwsLog("info", "%.32s: first outdoor temperature %.1f F from %s", wx.uid, (double)tempF, wx.stations[station]);
+    }
+    return status;
+  }
+  if (station + 1 < nwsStationCount(wx)) {
+    gNwsNext.kind = NWS_NEXT_STATION_OBS;
+    snprintf(gNwsNext.uid, sizeof(gNwsNext.uid), "%s", wx.uid);
+    gNwsNext.target = target;
+    gNwsNext.station = (uint8_t)(station + 1);
+    return status;
+  }
+  if (nwsNoteNoMatch(wx, target, now)) gNwsTempDirty = true;
+  return status;
+}
+
+// At most one api.weather.gov request per call, and per NWS_SERVICE_INTERVAL_MS, and only
+// at a quiet moment (NWS_QUIET_*): the pending second request of a step (gNwsNext), or
+// the next client's step: ask it for its location (a Notecard note), find its weather
+// stations, or fetch the observation for one of its readings.
+static void serviceOutdoorTemperature() {
+#if NWS_TEMP_ENABLED
+  static unsigned long lastRunMs = 0;
+  static unsigned long dueSinceMs = 0;  // when a call first had to wait for a quiet moment
+  const unsigned long nowMs = millis();
+  if (nowMs < 120000UL) return;  // let the network, the clock and the first notes settle after boot
+  if (lastRunMs != 0 && nowMs - lastRunMs < NWS_SERVICE_INTERVAL_MS) return;
+  if (gNwsLastRequestMs != 0 && nowMs - gNwsLastRequestMs < NWS_SERVICE_INTERVAL_MS) return;
+  if (gPaused || gDfuInProgress || gClientMetadataCount == 0) return;
+  if (Ethernet.linkStatus() != LinkON) return;
+  const double now = currentEpoch();
+  if (!(now >= NWS_MIN_VALID_EPOCH) || now < gNwsNetRetryAfter) return;
+
+  if (dueSinceMs == 0) dueSinceMs = nowMs ? nowMs : 1;
+  const bool justPolled = gLastPollDoneMs != 0 && nowMs - gLastPollDoneMs <= NWS_QUIET_AFTER_POLL_MS;
+  const bool webQuiet = gLastWebRequestMs == 0 || nowMs - gLastWebRequestMs >= NWS_QUIET_WEB_MS;
+  const bool waitedLong = nowMs - dueSinceMs >= NWS_QUIET_MAX_WAIT_MS;
+  if (!justPolled || (!webQuiet && !waitedLong)) return;
+  dueSinceMs = 0;
+  lastRunMs = nowMs;
+
+  if (gNwsNext.kind != NWS_NEXT_NONE) {
+    const NwsNextStep pending = gNwsNext;  // the request below may queue the step after it
+    gNwsNext.kind = NWS_NEXT_NONE;
+    NwsClientTemp *wx = findClientMetadata(pending.uid) ? nwsFindClient(gNwsTemp, pending.uid) : nullptr;
+    if (wx) {
+      const int status = (pending.kind == NWS_NEXT_STATION_LIST)
+                             ? nwsRequestStationList(*wx, pending.path, pending.lat, pending.lon, now)
+                             : nwsRequestObservations(*wx, pending.target, pending.station, now);
+      // No answer: keep the step for after the network backoff. Starting over would repeat
+      // the first request, whose answer resets that backoff.
+      if ((status == NWS_GET_NETWORK || status == NWS_GET_THROTTLED) && gNwsNext.kind == NWS_NEXT_NONE) {
+        gNwsNext = pending;
+      }
+      return;
+    }
+  }
+
+  for (uint8_t step = 0; step < gClientMetadataCount; ++step) {
+    const uint8_t i = (uint8_t)((gNwsCursor + step) % gClientMetadataCount);
+    const ClientMetadata &meta = gClientMetadata[i];
+    NwsClientTemp *wx = nwsWeatherSlot(meta.clientUid);
+    if (!wx) continue;
+    const double target = nwsOldestReadingNeedingTemp(*wx, meta.clientUid, now);
+    const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
+    const NwsAction action = nwsPlan(*wx, hasLocation, meta.latitude, meta.longitude, target > 0.0, now);
+    if (action == NWS_ACT_NONE) continue;
+    if (action == NWS_ACT_REQUEST_LOCATION && !gNotecardAvailable) continue;  // asked once the Notecard is back
+    gNwsCursor = (uint8_t)((i + 1) % gClientMetadataCount);  // the next call starts after this client
+    if (action == NWS_ACT_REQUEST_LOCATION) {
+      // The daily allowance is spent only by a request that was sent; a failed send
+      // backs off like a failed lookup (10 min, doubling)
+      if (sendLocationRequest(meta.clientUid)) {
+        wx->lastLocationRequest = (uint32_t)now;
+        gNwsTempDirty = true;  // saved, so a reboot does not ask again the same day
+        nwsLog("info", "Asked %.32s for its location (needed for outdoor temperature)", meta.clientUid);
+      } else {
+        nwsNoteFailure(*wx, now);
+        if (wx->failStreak == 1 || (wx->failStreak % 10) == 0) {
+          nwsLog("warn", "Could not send a location request to %.32s; retry in %u min", meta.clientUid,
+                 (unsigned)(nwsRetryDelay(wx->failStreak) / 60.0));
+        }
+      }
+    } else if (action == NWS_ACT_FIND_STATIONS) {
+      nwsRequestPoints(meta, *wx, now);
+    } else {
+      nwsRequestObservations(*wx, target, 0, now);
+    }
+    return;
+  }
+#endif
+}
+
+// Saved hourly with the hot tier, and skipped when nothing changed (hash gate)
+static bool saveOutdoorTemperature() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  if (!mbedFS || !gNwsTempDirty) return true;
+  const size_t len = nwsSerializeStore(gNwsTemp, nullptr, 0);
+  char *buf = (char *)malloc(len + 1);
+  if (!buf) return false;
+  nwsSerializeStore(gNwsTemp, buf, len + 1);
+  const uint32_t hash = fnv1a32(buf, len);
+  bool ok = true;
+  if (hash != gNwsTempLastHash) {
+    mkdir("/fs/history", 0777);
+    ok = serverWriteFileAtomic(NWS_TEMP_FILE, buf, len);
+    if (ok) gNwsTempLastHash = hash;
+  }
+  free(buf);
+  if (ok) gNwsTempDirty = false;
+  return ok;
+  #else
+  return false;
+  #endif
+#else
+  return false;
+#endif
+}
+
+// Boot: restore the samples, and drop clients the server no longer knows
+static void loadOutdoorTemperature() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+  memset(&gNwsTemp, 0, sizeof(gNwsTemp));
+  if (!mbedFS) return;
+  FILE *f = fopen(NWS_TEMP_FILE, "r");
+  if (!f) return;
+  fseek(f, 0, SEEK_END);
+  const long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size <= 0 || size > 65536) {  // a full store is about 33 KB
+    fclose(f);
+    Serial.println(F("Weather: outdoor_temp.json size invalid; starting fresh"));
+    return;
+  }
+  JsonDocument doc;
+  NwsFileReader reader = {f};
+  const DeserializationError err = deserializeJson(doc, reader);
+  fclose(f);
+  if (err) {
+    Serial.print(F("Weather: outdoor_temp.json unreadable ("));
+    Serial.print(err.c_str());
+    Serial.println(F("); starting fresh"));
+    return;
+  }
+  nwsLoadStore(gNwsTemp, doc.as<JsonArrayConst>(), currentEpoch());
+  // Clients the metadata does not list were removed. When the metadata did not load,
+  // that is unknown: they are kept (NWS cannot give their history back), and one
+  // makes room only when a known client needs it (nwsWeatherSlot).
+  if (!gClientMetadataLoaded) {
+    Serial.print(F("Weather: client metadata not loaded; keeping the outdoor temperature of all "));
+    Serial.print(gNwsTemp.count);
+    Serial.println(F(" saved clients"));
+    return;
+  }
+  for (uint8_t i = 0; i < gNwsTemp.count;) {
+    if (!findClientMetadata(gNwsTemp.clients[i].uid)) {
+      nwsForgetClient(gNwsTemp, gNwsTemp.clients[i].uid);  // compacts: i stays
+      gNwsTempDirty = true;
+    } else {
+      ++i;
+    }
+  }
+  Serial.print(F("Weather: outdoor temperature restored for "));
+  Serial.print(gNwsTemp.count);
+  Serial.println(F(" clients"));
+  #endif
+#endif
 }
 
 // Upload per-client configs (from in-memory snapshots) as individual files plus a manifest.
@@ -9169,6 +9483,7 @@ static void enableDfuMode() {
     gClientMetadataDirty = false;
   }
   saveHotTierSnapshot();
+  saveOutdoorTemperature();
   saveClientConfigSnapshots();
   saveHistorySettings();
 
@@ -9558,6 +9873,7 @@ static void handleWebRequests() {
   if (!client) {
     return;
   }
+  gLastWebRequestMs = millis();  // outdoor temperature lookups wait for a quiet moment
 
   // While an FTP backup is running, drop new web requests immediately so
   // browser polling does not pin LWIP socket slots that the FTPS data
@@ -13350,7 +13666,6 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
     ClientMetadata *meta = &gClientMetadata[gClientMetadataCount++];
     memset(meta, 0, sizeof(ClientMetadata));
     strlcpy(meta->clientUid, clientUid, sizeof(meta->clientUid));
-    meta->cachedTemperatureF = TEMPERATURE_UNAVAILABLE;  // Initialize to sentinel value
     meta->signalBars = -1;  // Unknown until daily report with signal data arrives
     gClientMetadataDirty = true;
     return meta;
@@ -13376,9 +13691,9 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
   
   // Reuse evicted slot
   ClientMetadata *meta = &gClientMetadata[evictIdx];
+  if (nwsForgetClient(gNwsTemp, meta->clientUid)) gNwsTempDirty = true;  // its weather samples go with it
   memset(meta, 0, sizeof(ClientMetadata));
   strlcpy(meta->clientUid, clientUid, sizeof(meta->clientUid));
-  meta->cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
   gClientMetadataDirty = true;
   return meta;
 }
@@ -16189,7 +16504,9 @@ static void loadSensorRegistry() {
 static void saveClientMetadataCache() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS || gClientMetadataCount == 0) {
+    // An empty table is written only after a change (the last client was removed), so
+    // a table that did not load is not overwritten by an empty one
+    if (!mbedFS || (gClientMetadataCount == 0 && !gClientMetadataDirty)) {
       return;
     }
     
@@ -16208,11 +16525,6 @@ static void saveClientMetadataCache() {
         obj["lat"] = meta.latitude;
         obj["lon"] = meta.longitude;
         obj["le"] = (uint32_t)meta.locationEpoch;  // integer epoch (see "u")
-      }
-      if (meta.nwsGridValid) {
-        obj["go"] = meta.nwsGridOffice;
-        obj["gx"] = meta.nwsGridX;
-        obj["gy"] = meta.nwsGridY;
       }
       if (meta.firmwareVersion[0] != '\0') {
         obj["fv"] = meta.firmwareVersion;
@@ -16241,7 +16553,8 @@ static void saveClientMetadataCache() {
       if (meta.staleDeletionPending) {
         obj["sdp"] = true;
       }
-      // Note: cachedTemperatureF and staleAlertSent are runtime-only, not persisted
+      // Note: staleAlertSent is runtime-only, not persisted. Weather stations and outdoor
+      // temperatures are saved separately (NWS_TEMP_FILE); older files' go/gx/gy are ignored.
     }
     
     size_t jsonLen = measureJson(doc);
@@ -16318,10 +16631,6 @@ static void loadClientMetadataCache() {
       meta.latitude = obj["lat"] | 0.0f;
       meta.longitude = obj["lon"] | 0.0f;
       meta.locationEpoch = obj["le"] | 0.0;
-      strlcpy(meta.nwsGridOffice, obj["go"] | "", sizeof(meta.nwsGridOffice));
-      meta.nwsGridX = obj["gx"] | 0;
-      meta.nwsGridY = obj["gy"] | 0;
-      meta.nwsGridValid = (meta.nwsGridOffice[0] != '\0');
       strlcpy(meta.firmwareVersion, obj["fv"] | "", sizeof(meta.firmwareVersion));
       strlcpy(meta.expectedFirmwareVersion, obj["efv"] | "", sizeof(meta.expectedFirmwareVersion));
       strlcpy(meta.otaState, obj["os"] | "", sizeof(meta.otaState));
@@ -16336,11 +16645,12 @@ static void loadClientMetadataCache() {
       meta.signalEpoch = obj["se"] | 0.0;
       strlcpy(meta.lastSystemAlarmType, obj["sa"] | "", sizeof(meta.lastSystemAlarmType));
       meta.lastSystemAlarmEpoch = obj["sae"] | 0.0;
-      meta.cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
       meta.staleAlertSent = false;
       meta.staleDeletionPending = obj["sdp"] | false;
     }
-    
+    // Complete: the outdoor temperature store may drop clients this table does not list
+    gClientMetadataLoaded = !arr.isNull();
+
     Serial.print(F("Client metadata loaded: "));
     Serial.print(gClientMetadataCount);
     Serial.println(F(" entries"));
@@ -16543,6 +16853,7 @@ static void checkStaleClients() {
   if (removeCount > 0) {
     saveSensorRegistry();
     gSensorRegistryDirty = false;
+    saveOutdoorTemperature();
   }
   // Persist metadata when a stale-deletion flag was set or cleared above.
   if (gClientMetadataDirty) {
@@ -17013,6 +17324,11 @@ static bool removeClientData(const char *clientUid) {
     gSensorRegistryDirty = true;
   }
 
+  // Remove the client's outdoor temperature samples
+  if (nwsForgetClient(gNwsTemp, clientUid)) {
+    gNwsTempDirty = true;
+  }
+
   // Remove client metadata
   for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
     if (strcmp(gClientMetadata[i].clientUid, clientUid) == 0) {
@@ -17086,12 +17402,14 @@ static void handleClientDeleteRequest(EthernetClient &client, const String &body
     Serial.print(F("Client removed: "));
     Serial.println(clientUid);
     
-    // Force immediate persistence save
+    // Force immediate persistence save (with the outdoor temperature, so a reboot
+    // before the hourly save does not bring the client's samples back)
     saveSensorRegistry();
     saveClientMetadataCache();
     gSensorRegistryDirty = false;
     gClientMetadataDirty = false;
-    
+    saveOutdoorTemperature();
+
     respondStatus(client, 200, F("Client removed"));
   } else {
     respondStatus(client, 404, F("Client not found"));
@@ -17431,7 +17749,93 @@ static bool cacheClientConfigFromBuffer(const char *clientUid, const char *buffe
 // Calibration Learning System Implementation
 // ============================================================================
 
+// Sends through a 512-byte buffer and holds back the last byte written, so a serialized
+// JSON object can be extended: drop its held closing '}', write more members, close it.
+class HistoryStreamPrint : public Print {
+ public:
+  explicit HistoryStreamPrint(Print &dst) : mDst(dst) {}
+  using Print::write;
+  size_t write(uint8_t c) override {
+    if (mHeld) put(mLast);
+    mLast = c;
+    mHeld = true;
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t n) override {
+    for (size_t i = 0; i < n; ++i) write(buf[i]);
+    return n;
+  }
+  void dropHeld() { mHeld = false; }
+  void finish() {
+    if (mHeld) put(mLast);
+    mHeld = false;
+    if (mLen > 0) mDst.write(mBuf, mLen);
+    mLen = 0;
+  }
 
+ private:
+  void put(uint8_t c) {
+    mBuf[mLen++] = c;
+    if (mLen == sizeof(mBuf)) {
+      mDst.write(mBuf, mLen);
+      mLen = 0;
+    }
+  }
+  Print &mDst;
+  uint8_t mBuf[512];
+  size_t mLen = 0;
+  bool mHeld = false;
+  uint8_t mLast = 0;
+};
+
+// The "temperature" member of /api/history, written straight to out (nullptr: only
+// measured), so the samples take no room in the JSON document. Returns its length.
+// NWS observations matched to each client's readings, at the observation's own time,
+// as [epoch, °F]; the VIN chart can draw them on a second axis. Every client is listed
+// with its lookup status, so the page can say why one has none: "uncovered" (NWS does
+// not cover its location), "noLocation" (still waiting for it), "finding" (looking up
+// its stations) or "ok" (stations known).
+static size_t writeHistoryTemperature(Print *out, double cutoffEpoch) {
+  size_t len = 0;
+  char buf[112];
+  auto put = [&](const char *s) {
+    const size_t n = strlen(s);
+    if (out) out->write((const uint8_t *)s, n);
+    len += n;
+  };
+  put("\"temperature\":[");
+  bool firstClient = true;
+  for (uint8_t c = 0; c < gClientMetadataCount; c++) {
+    const ClientMetadata &meta = gClientMetadata[c];
+    if (!nwsValidUid(meta.clientUid)) continue;  // its characters need no JSON escaping
+    const NwsClientTemp *wx = nwsFindClient(gNwsTemp, meta.clientUid);
+    const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
+    const uint8_t ns = wx ? nwsStationCount(*wx) : 0;
+    const char *status = (wx && wx->uncovered) ? "uncovered" : !hasLocation ? "noLocation" : ns > 0 ? "ok" : "finding";
+    snprintf(buf, sizeof(buf), "%s{\"client\":\"%s\",\"status\":\"%s\",\"stations\":[", firstClient ? "" : ",",
+             meta.clientUid, status);
+    put(buf);
+    firstClient = false;
+    for (uint8_t k = 0; k < ns; k++) {
+      snprintf(buf, sizeof(buf), "%s\"%s\"", k ? "," : "", wx->stations[k]);
+      put(buf);
+    }
+    put("],\"points\":[");
+    bool firstPoint = true;
+    for (uint16_t k = 0; wx && k < wx->count; k++) {
+      if (cutoffEpoch > 0.0 && (double)wx->sampleEpoch[k] < cutoffEpoch) continue;
+      const int tenths = wx->sampleTenthsF[k];
+      const int mag = tenths < 0 ? -tenths : tenths;
+      snprintf(buf, sizeof(buf), "%s[%lu,%s%d.%d]", firstPoint ? "" : ",", (unsigned long)wx->sampleEpoch[k],
+               tenths < 0 ? "-" : "", mag / 10, mag % 10);
+      put(buf);
+      firstPoint = false;
+    }
+    put("]}");
+  }
+  put("]");
+  return len;
+}
 
 static void sendHistoryJson(EthernetClient &client, const String &query) {
   // Build JSON response with historical sensor data for charting
@@ -17567,7 +17971,10 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
     sensorObj["change24h"] = roundTo(hist.snapshots[latestIdx].level - level24hAgo, 1);
   }
   
-  // Add stored voltage history from sensor snapshots
+  // Add stored voltage history from sensor snapshots. VIN belongs to the client, and every
+  // sensor's snapshot of one reading carries the same value, so each client reading is
+  // listed once: a snapshot is skipped when an earlier sensor of the same client already
+  // listed a voltage at that time.
   for (uint8_t h = 0; h < gSensorHistoryCount; h++) {
     SensorHourlyHistory &hist = gSensorHistory[h];
     for (uint16_t j = 0; j < hist.snapshotCount; j++) {
@@ -17575,15 +17982,28 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
       TelemetrySnapshot &snap = hist.snapshots[idx];
       if (snap.timestamp <= 0.0) continue;
       if (cutoffEpoch > 0.0 && snap.timestamp < cutoffEpoch) continue;
-      if (snap.voltage > 0) {
-        JsonObject voltObj = voltageArray.add<JsonObject>();
-        voltObj["timestamp"] = (uint32_t)snap.timestamp;  // S-D03: exact (see saveHotTierSnapshot)
-        voltObj["voltage"] = snap.voltage;
-        voltObj["client"] = hist.clientUid;
+      if (!(snap.voltage > 0)) continue;
+      bool listed = false;
+      for (uint8_t e = 0; e < h && !listed; e++) {
+        const SensorHourlyHistory &earlier = gSensorHistory[e];
+        if (strcmp(earlier.clientUid, hist.clientUid) != 0) continue;
+        for (uint16_t k = 0; k < earlier.snapshotCount && !listed; k++) {
+          const uint16_t ek = (earlier.writeIndex - earlier.snapshotCount + k + MAX_HOURLY_HISTORY_PER_SENSOR) % MAX_HOURLY_HISTORY_PER_SENSOR;
+          const TelemetrySnapshot &other = earlier.snapshots[ek];
+          listed = other.timestamp == snap.timestamp && other.voltage > 0;
+        }
       }
+      if (listed) continue;
+      JsonObject voltObj = voltageArray.add<JsonObject>();
+      voltObj["timestamp"] = (uint32_t)snap.timestamp;  // S-D03: exact (see saveHotTierSnapshot)
+      voltObj["voltage"] = snap.voltage;
+      voltObj["client"] = hist.clientUid;
     }
   }
-  
+
+  // The outdoor temperature ("temperature") is not in the document: it is written to the
+  // socket after it (writeHistoryTemperature), so its samples need no room here.
+
   // Add recent alarms from ring buffer
   for (uint8_t i = 0; i < alarmLogCount; i++) {
     int idx = (alarmLogWriteIndex - alarmLogCount + i + MAX_ALARM_LOG_ENTRIES) % MAX_ALARM_LOG_ENTRIES;
@@ -17639,19 +18059,32 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
     dataInfo["rangeNote"] = "Requested range exceeds hot tier. Daily summaries available for " +
                             String(gHistorySettings.warmTierRetentionMonths) + " months. Enable FTP for full archive.";
   }
-  
-  // Serialize and send
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-  
+
+  // Out of memory while building: an error, not a 200 with part of the history
+  if (doc.overflowed()) {
+    Serial.println(F("[ERROR] History JSON document overflowed - not enough memory"));
+    respondStatus(client, 500, F("History too large for available memory"));
+    return;
+  }
+
+  // Streamed to the socket (no String copy of the response): the document, then the
+  // outdoor temperature in place of its closing brace, then the brace
+  const size_t docLen = measureJson(doc);
+  const size_t tempLen = writeHistoryTemperature(nullptr, cutoffEpoch);
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: application/json"));
   client.println(F("Connection: close"));
   client.print(F("Content-Length: "));
-  client.println(jsonOut.length());
+  client.println((unsigned long)(docLen + 1 + tempLen));  // '}' out, ',' and '}' in
   client.println(F("Cache-Control: no-cache"));
   client.println();
-  client.print(jsonOut);
+  HistoryStreamPrint stream(client);
+  serializeJson(doc, stream);
+  stream.dropHeld();  // the document's closing '}'
+  stream.write(',');
+  writeHistoryTemperature(&stream, cutoffEpoch);
+  stream.write('}');
+  stream.finish();
 }
 
 // Helper to parse YYYYMM format into year and month
@@ -19982,9 +20415,8 @@ static void handleCalibrationPost(EthernetClient &client, const String &body) {
   // Validate sensor reading - warn if not in valid range
   bool sensorReadingValid = (sensorReading >= 4.0f && sensorReading <= 20.0f);
   
-  // Fetch NWS weather data for temperature compensation
-  // This will look up the client's GPS location and get a 6-hour average temperature
-  // If no location is cached, it will request it from the client
+  // Calibration temperature. Not used yet (S-D05): this returns TEMPERATURE_UNAVAILABLE,
+  // and asks the client for its location when none is cached.
   float temperatureF = nwsGetCalibrationTemperature(clientUid, timestamp);
   bool locationRequested = false;
   
@@ -20003,7 +20435,7 @@ static void handleCalibrationPost(EthernetClient &client, const String &body) {
   } else if (locationRequested) {
     Serial.println(F("NWS temperature: location requested from client"));
   } else {
-    Serial.println(F("NWS temperature data unavailable (API error)"));
+    Serial.println(F("NWS temperature: not used for calibration yet"));
   }
   
   // Save the calibration entry with temperature
@@ -20733,15 +21165,16 @@ static void handleLocationGet(EthernetClient &client, const String &path) {
     doc["latitude"] = meta->latitude;
     doc["longitude"] = meta->longitude;
     doc["locationEpoch"] = (uint32_t)meta->locationEpoch;  // integer epoch: shown as a time
-    doc["nwsGridValid"] = meta->nwsGridValid;
-    if (meta->nwsGridValid) {
-      doc["nwsGridOffice"] = meta->nwsGridOffice;
-      doc["nwsGridX"] = meta->nwsGridX;
-      doc["nwsGridY"] = meta->nwsGridY;
-    }
   } else {
     doc["hasLocation"] = false;
   }
+  // The NWS stations the outdoor temperature comes from (nearest first), once found
+  const NwsClientTemp *wx = nwsFindClient(gNwsTemp, clientUid.c_str());
+  if (wx && nwsStationCount(*wx) > 0) {
+    JsonArray st = doc["weatherStations"].to<JsonArray>();
+    for (uint8_t k = 0; k < nwsStationCount(*wx); ++k) st.add(wx->stations[k]);
+  }
+  if (wx && wx->uncovered) doc["weatherUncovered"] = true;
   
   String responseStr;
   serializeJson(doc, responseStr);
