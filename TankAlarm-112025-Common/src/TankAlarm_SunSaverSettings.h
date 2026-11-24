@@ -670,7 +670,7 @@ enum Finding : uint32_t {
   FINDING_PRESET_LVD = 1ul << 11,       // SW2 OFF: the load disconnects at the built-in 11.50 V
   FINDING_LIVE_SCALE = 1ul << 12,       // the charger's own LVD reads wrong with this firmware's scale
   FINDING_SYSTEM_24V = 1ul << 13,       // a 24 V system: the stored voltages were not judged
-  FINDING_SYSTEM_UNKNOWN = 1ul << 14    // the battery voltage fits neither system: not judged either
+  FINDING_SYSTEM_UNKNOWN = 1ul << 14    // the battery voltage tells no system: not judged either
 };
 
 static const uint8_t FINDING_BITS = 15;
@@ -710,8 +710,8 @@ inline const char *findingText(uint32_t finding) {
     case FINDING_SYSTEM_24V:
       return "This is a 24 V system: the stored voltages were not judged.";
     case FINDING_SYSTEM_UNKNOWN:
-      return "The battery voltage the charger reports fits neither a 12 V nor a 24 V system: the stored "
-             "voltages were not judged.";
+      return "The battery voltage the charger reports does not tell whether this is a 12 V or a 24 V "
+             "system: the stored voltages were not judged.";
     default:
       return "A finding this firmware has no text for.";
   }
