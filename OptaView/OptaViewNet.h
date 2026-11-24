@@ -12,8 +12,15 @@
  * -----------
  *   auto     DHCP first. When no address has arrived after 20 s, the fixed address is used.
  *            If the cable only goes in after that, DHCP gets one more try on the network the
- *            cable leads to, because the first try was made on no network at all.
- *   dhcp     DHCP only, for as long as it takes.
+ *            cable leads to, because the first try was made on no network at all. The same
+ *            holds when an address from DHCP is lost: the cable may have moved to a laptop.
+ *            The stack cannot tell "no cable" from "no DHCP server" while DHCP is waiting, but
+ *            it can once a fixed address is set, so a cable that is only out for a while still
+ *            ends up back on DHCP (unless it goes back in within 3 s of the fixed address, when
+ *            it looks like a cable that was in all along).
+ *   dhcp     DHCP only, for as long as it takes. The mode for a network that always has DHCP:
+ *            in auto mode a router that takes longer than 20 s to hand out addresses again, as
+ *            after a power cut, leaves the Opta on the fixed address.
  *   static   the fixed address only.
  *
  * Nothing is stored: a mode typed at the console lasts until power-off. OptaViewConfig.h sets
@@ -290,7 +297,10 @@ class OvNet : public OvConsoleExtra {
         if (up) {
           dhcpWorked_ = true;
           cameUp(STATE_DHCP_UP, now);
-        } else if (config_.mode == OV_NET_AUTO && !dhcpWorked_ && (uint32_t)(now - sinceMs_) >= OV_NET_DHCP_WAIT_MS) {
+        } else if (config_.mode == OV_NET_AUTO && (uint32_t)(now - sinceMs_) >= OV_NET_DHCP_WAIT_MS) {
+          // Also after an address from DHCP was lost: the cable may lead to a laptop now. If it
+          // is only out, the fixed address waits for a link, and DHCP gets one more try when the
+          // cable goes back in (STATE_STATIC_WAIT).
           driver_.stop();
           startStatic(true);
         }
@@ -315,6 +325,10 @@ class OvNet : public OvConsoleExtra {
         if (!up) {
           lastAddress_ = address_;
           address_ = ovIp4(0, 0, 0, 0);
+          if (state_ == STATE_DHCP_UP) {
+            // DHCP waits from here, with auto mode's fallback and its one extra try as at the start.
+            retried_ = false;
+          }
           state_ = state_ == STATE_DHCP_UP ? STATE_DHCP_WAIT : STATE_STATIC_WAIT;
           sinceMs_ = now;
           changed_ = true;
@@ -410,7 +424,18 @@ class OvNet : public OvConsoleExtra {
             out.print(text);
             out.print(")");
           }
-          out.println(". Is the cable in?");
+          out.print(". Is the cable in?");
+          if (config_.mode == OV_NET_AUTO) {
+            ovFormatIp4(config_.ip, text, sizeof(text));
+            out.print(" After ");
+            out.printU(OV_NET_DHCP_WAIT_MS / 1000UL);
+            out.print(" s without an answer the fixed address ");
+            out.print(text);
+            out.print(" is used (");
+            out.printU((uint32_t)((uint32_t)(clock_.nowMs() - sinceMs_) / 1000UL));
+            out.print(" s so far).");
+          }
+          out.println();
         } else {
           out.print("waiting for an address from DHCP, ");
           out.printU((uint32_t)((uint32_t)(clock_.nowMs() - sinceMs_) / 1000UL));
@@ -459,7 +484,7 @@ class OvNet : public OvConsoleExtra {
   uint32_t sinceMs_;    // when the state that is waiting began
   uint32_t checkedMs_;  // when the address in use was last looked at
   bool fallback_;       // the fixed address is in use because DHCP did not answer (auto mode)
-  bool dhcpWorked_;     // DHCP has given an address since the mode was chosen: no fallback any more
+  bool dhcpWorked_;     // DHCP has given an address since the mode was chosen
   bool retried_;        // the one extra DHCP try of auto mode is used up
   uint8_t reapplied_;   // times the fixed address had to be set again
   bool mismatch_;       // the address in use is not the fixed one, and setting it again did not help

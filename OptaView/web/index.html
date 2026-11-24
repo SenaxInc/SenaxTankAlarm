@@ -269,7 +269,7 @@ var notices = {};
 var history = [];
 var historyAt = 0;
 var nowCells = {};       // the Settings view's "Now" cells by register name
-var dialog = {open: false, busy: false, question: '', declined: false, confirmed: false, done: null, opener: null};
+var dialog = {open: false, busy: false, question: '', declined: false, confirmed: false, done: null, opener: null, local: null};
 
 function $(id) { return document.getElementById(id); }
 
@@ -320,7 +320,11 @@ function hex(value, digits) {
 function ApiError(status, body) {
   this.status = status;
   this.code = (body && body.error) || '';
-  this.message = (body && body.message) || ('OptaView answered with status ' + status + '.');
+  // OptaView ends its answers by closing the connection, so one that broke off on the way comes
+  // with the status it began with: a 200 that cannot be read is an answer that did not arrive whole.
+  this.message = (body && body.message) || (status === 200
+    ? 'The answer from OptaView did not arrive whole, so nothing was taken from it. Try again.'
+    : 'OptaView answered with status ' + status + '.');
   this.wait = (body && body.wait) || 0;
 }
 
@@ -951,18 +955,58 @@ function downloadSnapshot() {
       if (result.status === 401 && error.code === 'login') { sessionEnded(); }
       return fail(error);
     }
-    var link = el('a');
-    var url = URL.createObjectURL(new Blob([result.text], {type: 'application/json'}));
-    link.href = url;
-    link.download = 'optaview-snapshot.json';
-    add(document.body, link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+    // OptaView sends the snapshot without announcing its length, so an answer that broke off
+    // ends like one that is complete. Only whole JSON, down to its count of missing registers,
+    // is a snapshot.
+    var data = null;
+    try { data = JSON.parse(result.text); } catch (e) { data = null; }
+    if (!data || !Array.isArray(data.registers) || typeof data.missing !== 'number') {
+      return toast('The snapshot did not arrive whole, so it was not saved. Try again.');
+    }
+    if (data.missing === 0) { return saveSnapshot(result.text); }
+    // Some registers are missing: saved only when somebody has been told and still wants it.
+    if (dialog.open) {
+      // A command typed while the snapshot was read has a dialog open. No second one on top.
+      return toast('The snapshot is missing ' + data.missing + ' of its registers, so it was not saved while ' +
+                   'another dialog was open. Try again.');
+    }
+    var read = 0;
+    var marked = 0;
+    data.registers.forEach(function (entry) {
+      if (entry && entry.raw) { ++read; } else if (entry && entry.error) { ++marked; }
+    });
+    var text;
+    if (read === 0) {
+      text = 'No register could be read, so this snapshot holds nothing of the controller. Is it connected?';
+    } else {
+      text = data.missing + (data.missing === 1 ? ' register' : ' registers') + ' could not be read, so this ' +
+             'snapshot is not a full record of how the controller is set.';
+      if (marked === data.missing) {
+        text += data.missing === 1 ? ' It is marked with its "error".' : ' Each one is marked with its "error".';
+      } else {
+        // OptaView gives a request a minute and lists only what it reached by then.
+        text += ' OptaView ran out of time before it reached ' + (data.missing - marked) + ' of them.';
+      }
+    }
+    askHere('Snapshot', text, 'Save anyway', 'Save anyway keeps what was read. Cancel saves nothing.', $('snapBtn'))
+      .then(function (save) {
+        if (save) { saveSnapshot(result.text); }
+      });
   }, function () {
     $('snapBtn').disabled = false;
     offline();
   });
+}
+
+function saveSnapshot(text) {
+  var link = el('a');
+  var url = URL.createObjectURL(new Blob([text], {type: 'application/json'}));
+  link.href = url;
+  link.download = 'optaview-snapshot.json';
+  add(document.body, link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
 }
 
 function log(text) {
@@ -1118,6 +1162,35 @@ function exchange(body) {
   });
 }
 
+// A question the page asks for itself, with nothing sent to OptaView. Resolves with true for
+// the Yes button (named `yesLabel` here), and with false for Cancel, Escape, or when another
+// dialog is open already. The focus goes back to where it was, or to `back` when it was nowhere
+// (a button that is disabled while it works loses the focus).
+function askHere(title, text, yesLabel, hint, back) {
+  if (dialog.open) { return Promise.resolve(false); }
+  return new Promise(function (resolve) {
+    var active = document.activeElement;
+    dialog.open = true;
+    dialog.local = resolve;
+    dialog.done = null;
+    dialog.declined = false;
+    dialog.confirmed = false;
+    dialog.opener = active && active !== document.body ? active : back || null;
+    $('dialogTitle').textContent = title;
+    $('dialogText').textContent = text;
+    $('dialogHint').textContent = hint || '';
+    $('dialogYes').textContent = yesLabel;
+    clearTimeout(toastTimer);
+    $('toast').classList.remove('show');
+    show($('dialog'), true);
+    setBackground(true);
+    dialogButtons(true, true, false);
+    $('dialogYes').disabled = true;
+    setTimeout(function () { $('dialogYes').disabled = false; }, 700);
+    $('dialogNo').focus();
+  });
+}
+
 function ask(question) {
   dialog.question = question;
   dialogButtons(true, true, false);
@@ -1135,6 +1208,12 @@ function settle(hint) {
 }
 
 function answerDialog(yes) {
+  if (dialog.open && dialog.local) {
+    var local = dialog.local;
+    dialog.local = null;
+    closeDialog();
+    return local(yes);
+  }
   if (!dialog.open || dialog.busy || !dialog.question) { return; }
   var question = dialog.question;
   dialog.declined = !yes;
@@ -1147,17 +1226,21 @@ function answerDialog(yes) {
 function closeDialog() {
   if (!dialog.open) { return; }
   var done = dialog.done;
+  var local = dialog.local;
   var opener = dialog.opener;
   var outcome = dialog.confirmed ? 'confirmed' : 'closed';
   dialog.open = false;
   dialog.busy = false;
   dialog.question = '';
   dialog.done = null;
+  dialog.local = null;
   dialog.opener = null;
   show($('dialog'), false);
+  $('dialogYes').textContent = 'Yes';
   setBackground(false);
   if (opener && document.body.contains(opener)) { opener.focus(); }
   if (done) { done(outcome); }
+  if (local) { local(false); }
   scheduleLive();
 }
 

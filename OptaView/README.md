@@ -127,9 +127,18 @@ What to know before you rely on it:
 
 | Mode | |
 |---|---|
-| `auto` (the default) | DHCP first. When no address has arrived after 20 s, the fixed address. If the cable only goes in after that, DHCP gets one more try |
+| `auto` (the default) | DHCP first. When no address has arrived after 20 s, the fixed address. If the cable only goes in after that, DHCP gets one more try. An address from DHCP that is lost starts all of this again |
 | `dhcp` | DHCP only, for as long as it takes |
 | `static` | The fixed address at once |
+
+While it waits for DHCP the Opta cannot tell a cable that is out from a network without DHCP.
+A cable that was out for more than 20 s therefore finds the fixed address in use when it goes
+back in, and DHCP gets its one more try then. (A cable that goes back in within 3 s of the
+change to the fixed address looks like one that was in all along, and keeps the fixed address.)
+A router that needs longer than 20 s to hand out addresses again, as after a power cut, can
+leave the Opta on the fixed address, so on a network that always has DHCP use `dhcp`. Once the
+fixed address is in use and the extra try is spent, a cable moved from a laptop to a network
+with DHCP keeps the fixed address until `net auto` or a restart.
 
 The fixed address is 192.168.1.16 with the mask 255.255.255.0, unless you set another. These
 commands of the USB console change things until power-off:
@@ -171,7 +180,9 @@ Controller view (7).
 3. `dump` reads every register in the profile. Lines marked `~` come from Morningstar's
    specification and have not been seen on our bench, so look for values that make no sense.
 4. `snapshot` prints every raw value as JSON. Copy it out of the terminal and keep it: it is the
-   record of how the controller was set before you changed anything.
+   record of how the controller was set before you changed anything. Download a snapshot on the
+   page saves the same JSON as a file. It saves nothing that broke off on the way, and asks
+   first when some registers could not be read.
 5. `scalecheck 13.42` (with your own multimeter reading) settles the voltage scales. See
    [The voltage scales](#the-voltage-scales). Do this before writing any voltage.
 6. `set EV_lvr 13.25`, then `set EV_lvd 13.10`: each shows the old and the new value and waits
@@ -288,6 +299,10 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   that is logged in: it needs the session cookie, which scripts cannot read, and a header that
   a page from another site cannot send. The page itself is served with a policy that lets the
   browser run its one script and nothing else.
+- The session cookie and the id of each question come from the processor's random number
+  generator. When it does not answer, nobody gets a session and no question is asked on the
+  page, because a cookie or an id that could be guessed protects nothing. The USB console still
+  works then.
 
 ## The voltage scales
 
@@ -360,7 +375,7 @@ Not confirmed yet, and so the first things to try:
   tested with stand-ins for it, so all of this waits for an Opta: getting an address by DHCP,
   falling back to the fixed address, the listener on port 80, how quickly pages load (the
   library starts a thread for each connection), and the processor's random number generator
-  behind the session tokens.
+  behind the session tokens (if it does not answer, the page refuses every login and says so).
 - Every register marked `~`, including all the EEPROM settings.
 - Reading several registers in one request. OptaView tries it, and if the adapter does not
   answer blocks it falls back to single registers and says so.
@@ -428,7 +443,8 @@ This builds the firmware's web server and console as a program for your PC, with
 SunSaver behind them, and serves the page at <http://127.0.0.1:8080/>. Its terminal is the USB
 console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
 `sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
-next three replies are lost on the way). Add
+next three replies are lost on the way), `sim random off` (the Opta's random number generator
+fails). Add
 `PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
 simulated controller answers as the specification says, so the preview shows the page and not
 how a real SunSaver behaves.
@@ -439,11 +455,12 @@ NODE_PATH=<that folder>/node_modules make -C tests/host/optaview browser-test AR
 ```
 
 This drives the page of the preview in Chromium: choosing a PIN, the readings, a change with
-Cancel and with Yes, a value outside its limits, the restart, the switches, the snapshot,
-wrong PINs, sessions that end, a window the size of a phone, and an Opta that goes away. It
-also fails if the browser blocks anything under the page's policy or if the page asks anything
-of another server. `BROWSER_TEST_ARGS="--shots <folder>"` saves the screenshots this README
-uses. CI runs it as the `optaview-page` check.
+Cancel and with Yes, a value outside its limits, the restart, the switches, the snapshot
+(whole, broken off and with registers missing), a random number generator that fails, wrong
+PINs, sessions that end, a window the size of a phone, and an Opta that goes away. It also
+fails if the browser blocks anything under the page's policy or if the page asks anything of
+another server. `BROWSER_TEST_ARGS="--shots <folder>"` saves the screenshots this README uses.
+CI runs it as the `optaview-page` check.
 
 The page is one file, `web/index.html`. After editing it:
 

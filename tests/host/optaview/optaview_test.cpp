@@ -141,6 +141,27 @@ static void testReplyValidation() {
     CHECK_EQ(b.master.stats.exceptions, 1);
     CHECK(!mbIsLinkFailure(r.status));
   }
+  {  // The simulated controller has the specification's addresses and no others. A reserved one
+     // in the middle of the EEPROM is refused like the gap after the RAM registers: alone, in a
+     // block that touches it, and for a write. (A profile that maps a register there fails
+     // testSpans, and its reads fail.)
+    Bare b;
+    const uint16_t reserved[] = {0xE00B, 0xE00C, 0xE018, 0xE019, 0xE020, 0xE021,
+                                 0xE028, 0xE02F, 0xE039, 0xE03F, 0xE04E, 0xE050};
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i) {
+      uint16_t word = 0xAAAA;
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, reserved[i], 1, &word);
+      CHECK_MSG(r.status == MB_EXCEPTION && r.exception == 2, "0x%04X can be read", (unsigned)reserved[i]);
+      const MbResult w = b.master.writeRegister(1, reserved[i], 5);
+      CHECK_MSG(w.status == MB_EXCEPTION && w.exception == 2, "0x%04X can be written", (unsigned)reserved[i]);
+      CHECK_EQ(b.sim.regs.count(reserved[i]), 0);
+    }
+    uint16_t words[4];
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE009, 4, words).status, MB_EXCEPTION);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE009, 2, words).status, MB_OK);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE00D, 4, words).status, MB_OK);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE04F, 1, words).status, MB_OK);
+  }
   {  // A write acknowledged with another value is not a success.
     Bare b;
     b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
@@ -320,10 +341,10 @@ static void testTimeouts() {
     Bare b;
     b.sim.responseDelayMs = 990;
     uint16_t words[16];
-    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE000, 16, words);
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 16, words);
     CHECK_EQ(r.status, MB_OK);
     CHECK_MSG(r.elapsedMs > 1000 && r.elapsedMs < 1100, "elapsedMs %u", (unsigned)r.elapsedMs);
-    CHECK_EQ(words[0], b.sim.regs[0xE000]);
+    CHECK_EQ(words[0], b.sim.regs[0x0008]);
   }
   {  // A reply that arrives after the master gave up is thrown away before the next request,
      // so it cannot be taken for the answer to that one.
@@ -1704,11 +1725,11 @@ static void testReadsAndFallback() {
   }
   {  // A long read is cut into blocks of the size the profile allows: 16 for the SunSaver.
     Rig rig;
-    const std::string out = rig.run("get 0xE000 40");
-    CHECK_HAS(out, "0xE027  ");
+    const std::string out = rig.run("get 0x0008 40");
+    CHECK_HAS(out, "0x002F  ");
     CHECK_EQ(countOf(out, "--"), 0);
     CHECK_EQ(rig.sim.requests.size(), 3);
-    const uint16_t starts[] = {0xE000, 0xE010, 0xE020};
+    const uint16_t starts[] = {0x0008, 0x0018, 0x0028};
     const uint16_t counts[] = {16, 16, 8};
     for (size_t i = 0; i < 3 && i < rig.sim.requests.size(); ++i) {
       CHECK_EQ((rig.sim.requests[i][2] << 8) | rig.sim.requests[i][3], starts[i]);

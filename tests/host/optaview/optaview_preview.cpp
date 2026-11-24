@@ -21,6 +21,7 @@
 //   sim drop <n>           its next n replies are lost on the way (it does what was asked)
 //   sim skip <seconds>     this much time passes at once (a session ends after 30 minutes)
 //   sim writes             how many requests that change something it has received
+//   sim random off|on      the Opta's random number generator fails, or works again
 //   sim quit
 //
 // Options: --port <n> (default 8080; 0 takes any free port and prints it), --pin <digits>
@@ -178,6 +179,9 @@ class PcConn : public OvConn {
   int fd_;
 };
 
+// False while "sim random off" stands for an Opta whose random number generator fails.
+static bool gRandomWorks = true;
+
 class PcWebHost : public OvWebHost {
  public:
   PcWebHost() : listener_(-1), port_(0) {}
@@ -223,13 +227,17 @@ class PcWebHost : public OvWebHost {
     return nullptr;
   }
 
-  void random(uint8_t *out, size_t len) override {
+  bool random(uint8_t *out, size_t len) override {
+    if (!gRandomWorks) {
+      return false;
+    }
     FILE *source = fopen("/dev/urandom", "rb");
     if (source == nullptr || fread(out, 1, len, source) != len) {
       fprintf(stderr, "optaview_preview: /dev/urandom cannot be read\n");
       exit(1);
     }
     fclose(source);
+    return true;
   }
 
   bool address(char *out, size_t cap) override {
@@ -338,13 +346,16 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
     printf("sim: %u s have passed\n", (unsigned)number);
   } else if (what == "writes") {
     printf("sim: %u writes so far\n", sim.writes);
+  } else if (what == "random" && isOnOff(value, &on)) {
+    gRandomWorks = on;
+    printf("sim: the random number generator %s\n", on ? "works" : "fails");
   } else if (what == "quit") {
     printf("sim: bye\n");
     fflush(stdout);
     exit(0);
   } else {
     printf("sim: power off|on, battery <volts>, refuse on|off, delay <ms>, drop <replies>, skip <seconds>, writes, "
-           "quit\n");
+           "random off|on, quit\n");
   }
 }
 

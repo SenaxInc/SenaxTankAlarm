@@ -104,9 +104,22 @@ class SimSunSaver : public optaview::MbTransport {
   void loadDefaults() {
     regs.clear();
     coils.clear();
-    for (uint16_t a = 0x0008; a <= 0x0034; ++a) regs[a] = 0;
-    for (uint16_t a = 0x0038; a <= 0x003A; ++a) regs[a] = 0;
-    for (uint16_t a = 0xE000; a <= 0xE04F; ++a) regs[a] = 0;
+    // The addresses that exist, as the specification lists them. They are written out here and
+    // not taken from the profile, so that a register the profile puts at a reserved address
+    // (0xE00B, say) is refused by this controller as it would be by a real one, and fails its
+    // test. Everything in between is reserved and answers exception 2.
+    static const uint16_t kExisting[][2] = {
+        {0x0008, 0x0034}, {0x0038, 0x003A},  // RAM: measurements, status, daily values
+        {0xE000, 0xE00A},                    // EEPROM: charge settings, battery bank 1
+        {0xE00D, 0xE017},                    //         a second set of the same settings
+        {0xE01A, 0xE01F},                    //         temperature compensation, HVD/HVR, limits
+        {0xE022, 0xE027},                    //         load: LVD/LVR, LHVD/LHVR, compensation, warning
+        {0xE030, 0xE038},                    //         LED thresholds, MODBUS and meter ids, current limit
+        {0xE040, 0xE04D},                    //         the stored totals
+        {0xE04F, 0xE04F}};
+    for (size_t i = 0; i < sizeof(kExisting) / sizeof(kExisting[0]); ++i) {
+      for (uint32_t a = kExisting[i][0]; a <= kExisting[i][1]; ++a) regs[(uint16_t)a] = 0;
+    }
 
     regs[0x0008] = volts(13.68);   // adc_vb_f
     regs[0x0009] = volts(17.45);   // adc_va_f
