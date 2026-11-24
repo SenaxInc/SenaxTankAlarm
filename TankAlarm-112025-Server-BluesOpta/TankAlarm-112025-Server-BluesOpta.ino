@@ -13044,8 +13044,10 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
     count = 1;
   }
 
-  gClientMetadataDirty = true;
-  saveClientMetadataCache();
+  if (count > 0) {  // nothing changed otherwise, and an empty table is written as one
+    gClientMetadataDirty = true;
+    saveClientMetadataCache();
+  }
   char msg[80];
   snprintf(msg, sizeof(msg), "Expecting v%s on %u client(s)", ver, count);
   Serial.println(msg);
@@ -16481,16 +16483,17 @@ static void loadSensorRegistry() {
 // ============================================================================
 
 // True once the file holds every entry. Only saveChargerReportsIfDirty() looks at the result.
+// With no entry left (the last client was removed) the file is written as an empty list: a file
+// left as it was would bring the removed client back at the next start, and with it a charger
+// report that was deleted. Every caller saves after a change only, so an empty table that was
+// never loaded does not overwrite the file.
 static bool saveClientMetadataCache() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) {
       return false;
     }
-    if (gClientMetadataCount == 0) {
-      return true;
-    }
-    
+
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
     for (uint8_t i = 0; i < gClientMetadataCount; ++i) {

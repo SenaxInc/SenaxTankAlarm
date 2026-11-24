@@ -9150,35 +9150,41 @@ static bool bufferNoteForRetry(const char *fileName, const char *payload, bool s
       Serial.println(F("Warning: Filesystem not available; note dropped"));
       return false;
     }
+    // The record counts as buffered only when every byte of it was taken, its newline too: a
+    // record without one runs on into the next.
     const char *lead = noteBufferEndsInsideRecord() ? "\n" : "";
+    const size_t recordLength = strlen(lead) + strlen(fileName) + 3 + strlen(payload) + 1;
     FILE *file = fopen("/cfg/pending_notes.log", "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
       return false;
     }
-    const bool written = fprintf(file, "%s%s\t%c\t%s\n", lead, fileName, syncNow ? '1' : '0', payload) > 0;
+    const int printed = fprintf(file, "%s%s\t%c\t%s\n", lead, fileName, syncNow ? '1' : '0', payload);
+    const bool written = printed >= 0 && (size_t)printed == recordLength;
     const bool closed = fclose(file) == 0;  // the write reaches the flash here at the latest
     if (!written || !closed) {
       Serial.println(F("Failed to write note buffer; dropping payload"));
       return false;
     }
   #else
+    // As above. The record ends in '\n' alone, as on mbed, which noteBufferEndsInsideRecord()
+    // looks for.
     const bool lead = noteBufferEndsInsideRecord();
+    const size_t recordLength = (lead ? 1 : 0) + strlen(fileName) + 3 + strlen(payload) + 1;
     File file = LittleFS.open(NOTE_BUFFER_PATH, "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
       return false;
     }
-    if (lead) {
-      file.print('\n');
-    }
-    size_t written = file.print(fileName);
+    size_t written = lead ? file.print('\n') : 0;
+    written += file.print(fileName);
     written += file.print('\t');
     written += file.print(syncNow ? '1' : '0');
     written += file.print('\t');
-    written += file.println(payload);
+    written += file.print(payload);
+    written += file.print('\n');
     file.close();
-    if (written < strlen(fileName) + 3 + strlen(payload)) {
+    if (written != recordLength) {
       Serial.println(F("Failed to write note buffer; dropping payload"));
       return false;
     }
