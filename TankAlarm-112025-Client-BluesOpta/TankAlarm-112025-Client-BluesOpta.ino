@@ -891,6 +891,7 @@ static bool gChargerCheckWanted = false;          // a config change asks for a 
 static bool gChargerReportSyncNow = false;        // and for its report to be sent at once
 static unsigned long gChargerCheckEndMillis = 0;  // when the last pass ended, done or failed
 static uint8_t gChargerCheckFailures = 0;         // passes in a row that the link did not carry
+static bool gSolarPolledLastPass = false;         // the last pass of loop() polled the charger
 static bool gChargerReportSent = false;           // a report has gone out since boot
 static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
 static unsigned long gChargerReportMillis = 0;    // when it went out
@@ -1536,7 +1537,7 @@ static void logSolarHardwareTestHeartbeat(unsigned long now);
 static void logSolarPollSnapshot(unsigned long now, SolarAlertType alertType);
 static bool appendSolarDataToDaily(JsonDocument &doc);
 static void requestChargerCheck();
-static void serviceChargerCheck(unsigned long now);
+static void serviceChargerCheck(unsigned long now, bool lineFree);
 static void finishChargerCheck(unsigned long now);
 static void sendDueChargerReport(unsigned long now);
 static void recoverI2CBus();
@@ -2346,7 +2347,14 @@ void loop() {
   // In CRITICAL_HIBERNATE we still poll the solar charger (if enabled) to detect
   // battery recovery, but at reduced frequency (controlled by sleep duration).
   if (gSolarManager.isEnabled()) {
-    if (gSolarManager.poll(now)) {
+    // The poll and the charger check both talk to the charger, so a pass of loop() reads for one
+    // of them only. A short poll interval with the long sleep of ECO or LOW_POWER makes every
+    // pass due to poll: then a check that is under way takes the pass after one that polled, and
+    // the poll waits for the next pass.
+    const bool checkTurn = gSolarPolledLastPass && gSolarManager.chargerCheckActive();
+    const bool polled = !checkTurn && gSolarManager.poll(now);
+    gSolarPolledLastPass = polled;
+    if (polled) {
       // A poll was attempted - check alerts using the refreshed communication state
       // (suppress alarm sending in CRITICAL to save power).
       SolarAlertType alert = gSolarManager.checkAlerts();
@@ -2365,11 +2373,11 @@ void loop() {
 
       // Optional serial output for hardware bring-up.
       logSolarPollSnapshot(now, alert);
-    } else {
-      // No poll in this pass of loop(): read a few more registers of the charger check, if one
-      // is under way or due. Both talk to the charger, so they take turns.
-      serviceChargerCheck(now);
     }
+    // In every pass: a check that is due is set up and a report that waits is sent, which talk
+    // to nobody. A few registers of a check that is under way are read only in a pass without a
+    // poll.
+    serviceChargerCheck(now, !polled);
   }
   
   // Poll battery voltage (sourced from MPPT/Vin divider — never the Notecard)
@@ -7409,9 +7417,11 @@ static void requestChargerCheck() {
   gChargerReportDue = false;           // so was a report that still waits to go out
 }
 
-// Call from loop() while the charger is enabled. Starts a pass when one is due and reads a few
-// registers of it per call, so that loop() is never held for longer than a poll holds it.
-static void serviceChargerCheck(unsigned long now) {
+// Call from every pass of loop() while the charger is enabled. Starts a pass when one is due and
+// reads a few registers of it per call, so that loop() is never held for longer than a poll holds
+// it. `lineFree` is false in a pass in which a poll talked to the charger: then nothing is read,
+// and a report that waits is still sent.
+static void serviceChargerCheck(unsigned long now, bool lineFree) {
   // Not while a firmware update is being staged, and not in hibernation: the check can wait.
   if (gDfuInProgress || gPowerState == POWER_STATE_CRITICAL_HIBERNATE) {
     gSolarManager.cancelChargerCheck();
@@ -7439,8 +7449,8 @@ static void serviceChargerCheck(unsigned long now) {
     return;
   }
 
-  if (!gSolarManager.serviceChargerCheck(now)) {
-    return;  // not time for the next registers yet, or the pass is still under way
+  if (!lineFree || !gSolarManager.serviceChargerCheck(now)) {
+    return;  // a poll had this pass, it is not time for the next registers yet, or the pass goes on
   }
 
   // The pass ended. `now` is when this loop() began, before the requests that ended it.
@@ -9095,6 +9105,43 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   return kept;
 }
 
+// A write to the note buffer that failed part way can leave a record without its newline at the
+// end of the file. The next record would run on in the same line, and the replay would drop the
+// two as one line it cannot read. So a record goes in after a newline when the file does not end
+// with one: the broken record is then a line of its own, which the replay skips.
+static bool noteBufferEndsInsideRecord() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    FILE *file = fopen("/cfg/pending_notes.log", "r");
+    if (!file) {
+      return false;  // no buffer yet
+    }
+    bool inside = false;
+    if (fseek(file, -1, SEEK_END) == 0) {
+      const int last = fgetc(file);
+      inside = last != EOF && last != '\n';
+    }
+    fclose(file);
+    return inside;
+  #else
+    File file = LittleFS.open(NOTE_BUFFER_PATH, "r");
+    if (!file) {
+      return false;
+    }
+    bool inside = false;
+    const size_t size = file.size();
+    if (size > 0 && file.seek(size - 1)) {
+      const int last = file.read();
+      inside = last >= 0 && last != '\n';
+    }
+    file.close();
+    return inside;
+  #endif
+#else
+  return false;
+#endif
+}
+
 // Returns true when the note was written to the buffer, false when it is lost.
 static bool bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow) {
 #ifdef FILESYSTEM_AVAILABLE
@@ -9103,22 +9150,27 @@ static bool bufferNoteForRetry(const char *fileName, const char *payload, bool s
       Serial.println(F("Warning: Filesystem not available; note dropped"));
       return false;
     }
+    const char *lead = noteBufferEndsInsideRecord() ? "\n" : "";
     FILE *file = fopen("/cfg/pending_notes.log", "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
       return false;
     }
-    const bool written = fprintf(file, "%s\t%c\t%s\n", fileName, syncNow ? '1' : '0', payload) > 0;
+    const bool written = fprintf(file, "%s%s\t%c\t%s\n", lead, fileName, syncNow ? '1' : '0', payload) > 0;
     const bool closed = fclose(file) == 0;  // the write reaches the flash here at the latest
     if (!written || !closed) {
       Serial.println(F("Failed to write note buffer; dropping payload"));
       return false;
     }
   #else
+    const bool lead = noteBufferEndsInsideRecord();
     File file = LittleFS.open(NOTE_BUFFER_PATH, "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
       return false;
+    }
+    if (lead) {
+      file.print('\n');
     }
     size_t written = file.print(fileName);
     written += file.print('\t');

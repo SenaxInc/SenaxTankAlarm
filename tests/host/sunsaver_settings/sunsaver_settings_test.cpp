@@ -1275,7 +1275,7 @@ static void testLiveScale() {
     CHECK(ss::voltsFromRaw(b.sim.regs[0x001C], ss::SCALE_96667) > 11.30 - ss::LVD_COMPENSATION_ROOM_VOLTS);
     ss::Snapshot edited = snapshotOf(b.sim);
     CHECK_EQ(ss::judgeSettingsScale(edited).scale, ss::SCALE_100);
-    CHECK(!ss::storedLvdInEffect(edited));
+    CHECK(!ss::storedSettingsInEffect(edited));
     scale = source = 99;
     ss::judgeLiveScale(edited, ss::SCALE_100, &scale, &source);
     CHECK_EQ(scale, ss::SCALE_UNKNOWN);
@@ -1299,11 +1299,11 @@ static void testLiveScale() {
       other.raw[ss::I_ARRAY_FAULT] = (uint16_t)~ss::ARRAY_FAULT_EEPROM_EDIT;
       other.raw[ss::I_LOAD_FAULT] = (uint16_t)~ss::LOAD_FAULT_EEPROM_EDIT;
       other.raw[ss::I_V_LVD] = b.sim.volts(11.30);
-      CHECK(ss::storedLvdInEffect(other));
+      CHECK(ss::storedSettingsInEffect(other));
       ss::judgeLiveScale(other, ss::SCALE_100, &scale, &source);
       CHECK_EQ(scale, ss::SCALE_100);
       other.status[words[w]] = ss::SSIO_REFUSED;
-      CHECK(!ss::storedLvdInEffect(other));
+      CHECK(!ss::storedSettingsInEffect(other));
       ss::judgeLiveScale(other, ss::SCALE_100, &scale, &source);
       CHECK_EQ(scale, ss::SCALE_UNKNOWN);
       CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
@@ -1312,14 +1312,14 @@ static void testLiveScale() {
     CHECK_EQ(b.master.writeCoil(1, 0x00FF, true).status, MB_OK);
     CHECK_EQ(b.sim.resets, 1);
     const ss::Snapshot restarted = snapshotOf(b.sim);
-    CHECK(ss::storedLvdInEffect(restarted));
+    CHECK(ss::storedSettingsInEffect(restarted));
     ss::judgeLiveScale(restarted, ss::SCALE_100, &scale, &source);
     CHECK_EQ(scale, ss::SCALE_100);
     CHECK_EQ(source, ss::LIVE_SOURCE_STORED_LVD);
     // With switch 2 OFF the stored LVD is not used, and an edit changes nothing.
     b.sim.advance(b.sim.resetDownMs);  // the controller is silent while it starts
     CHECK_EQ(b.master.writeRegister(1, 0xE022, b.sim.setVolts(12.00)).status, MB_OK);
-    CHECK(!ss::storedLvdInEffect(snapshotOf(b.sim)));
+    CHECK(!ss::storedSettingsInEffect(snapshotOf(b.sim)));
     b.sim.regs[0x0025] = 0x0008;
     b.sim.regs[0x001C] = b.sim.volts(11.50);
     ss::judgeLiveScale(snapshotOf(b.sim), ss::SCALE_100, &scale, &source);
@@ -2077,6 +2077,49 @@ static void testFloatReference() {
       }
     }
     CHECK(near(Rigged::reference(unproven), 0.0, 1e-12));
+  }
+  {
+    // A write to the EEPROM, and no restart yet: the controller charges by the settings it
+    // started with until it restarts, so the stored ones say nothing about where it holds the
+    // battery. A float voltage raised from 13.30 V to 13.50 V would otherwise make a battery
+    // held at 13.30 V look as if it were not charged.
+    Bare b;
+    makeLiFePO4(b.sim);
+    b.sim.regs[0xE001] = b.sim.setVolts(13.30);
+    b.sim.regs[0xE00E] = b.sim.setVolts(13.30);
+    CHECK(near(Rigged::reference(b.sim, ss::SCALE_100), 13.30, 0.01));
+    CHECK_EQ(b.master.writeRegister(1, 0xE001, b.sim.setVolts(13.50)).status, MB_OK);
+    CHECK_EQ(b.master.writeRegister(1, 0xE00E, b.sim.setVolts(13.50)).status, MB_OK);
+    CHECK(!ss::storedSettingsInEffect(snapshotOf(b.sim)));
+    CHECK(near(Rigged::reference(b.sim, ss::SCALE_100), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(b.sim, ss::SCALE_96667), 0.0, 1e-12));
+    // Either word alone is enough, and so is a word that was not read. Other fault bits are no
+    // edit.
+    const uint8_t words[2] = {ss::I_ARRAY_FAULT, ss::I_LOAD_FAULT};
+    const uint16_t bits[2] = {ss::ARRAY_FAULT_EEPROM_EDIT, ss::LOAD_FAULT_EEPROM_EDIT};
+    const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, 12, ss::SCALE_100};
+    for (int w = 0; w < 2; ++w) {
+      ss::Snapshot one = snapshotOf(b.sim);
+      one.raw[words[1 - w]] = (uint16_t)(one.raw[words[1 - w]] & ~bits[1 - w]);
+      CHECK((one.raw[words[w]] & bits[w]) != 0);
+      ss::Evaluation evaluation;
+      ss::evaluate(one, want, &evaluation);
+      CHECK_EQ(evaluation.settingsScale.scale, ss::SCALE_100);
+      CHECK(near(ss::floatReferenceVolts(one, evaluation, ss::SCALE_100), 0.0, 1e-12));
+      ss::Snapshot other = one;
+      other.raw[ss::I_ARRAY_FAULT] = (uint16_t)~ss::ARRAY_FAULT_EEPROM_EDIT;
+      other.raw[ss::I_LOAD_FAULT] = (uint16_t)~ss::LOAD_FAULT_EEPROM_EDIT;
+      ss::evaluate(other, want, &evaluation);
+      CHECK(near(ss::floatReferenceVolts(other, evaluation, ss::SCALE_100), 13.50, 0.01));
+      other.status[words[w]] = ss::SSIO_REFUSED;
+      ss::evaluate(other, want, &evaluation);
+      CHECK(near(ss::floatReferenceVolts(other, evaluation, ss::SCALE_100), 0.0, 1e-12));
+    }
+    // The restart puts the new settings to work and clears the edit.
+    CHECK_EQ(b.master.writeCoil(1, 0x00FF, true).status, MB_OK);
+    CHECK_EQ(b.sim.resets, 1);
+    CHECK(ss::storedSettingsInEffect(snapshotOf(b.sim)));
+    CHECK(near(Rigged::reference(b.sim, ss::SCALE_100), 13.50, 0.01));
   }
 }
 

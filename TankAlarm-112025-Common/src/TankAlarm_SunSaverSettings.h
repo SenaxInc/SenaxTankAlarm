@@ -547,11 +547,12 @@ inline bool storedCompensationFits(const Snapshot &snapshot) {
          ohmsFromRaw(snapshot.raw[I_ER_ICOMP]) * LOAD_RATED_AMPS <= LVD_COMPENSATION_ROOM_VOLTS;
 }
 
-// The controller takes its stored LVD into use when it starts. A stored LVD that was changed
-// since is not the one in effect, and every write to its EEPROM raises the "EEPROM setting edit"
-// fault in both fault words until it restarts. So the stored LVD stands for the one in effect
-// only while both words were read and neither reports that edit: one that was not read could.
-inline bool storedLvdInEffect(const Snapshot &snapshot) {
+// The controller takes its stored settings into use when it starts: the LVD, the charging
+// voltages, the temperature compensation. One that was changed since is not the one in effect,
+// and every write to its EEPROM raises the "EEPROM setting edit" fault in both fault words until
+// it restarts. So the stored settings stand for those in effect only while both words were read
+// and neither reports that edit: one that was not read could.
+inline bool storedSettingsInEffect(const Snapshot &snapshot) {
   return have(snapshot, I_ARRAY_FAULT) && have(snapshot, I_LOAD_FAULT) &&
          (snapshot.raw[I_ARRAY_FAULT] & ARRAY_FAULT_EEPROM_EDIT) == 0 &&
          (snapshot.raw[I_LOAD_FAULT] & LOAD_FAULT_EEPROM_EDIT) == 0;
@@ -576,7 +577,7 @@ inline void judgeLiveScale(const Snapshot &snapshot, uint8_t settingsScale, uint
     wanted = PRESET_LVD_VOLTS * times;
     from = LIVE_SOURCE_PRESET_LVD;
   } else if (settingsScale != SCALE_UNKNOWN && have(snapshot, I_EV_LVD) && snapshot.raw[I_EV_LVD] != 0 &&
-             storedCompensationFits(snapshot) && storedLvdInEffect(snapshot)) {
+             storedCompensationFits(snapshot) && storedSettingsInEffect(snapshot)) {
     wanted = voltsFromRaw(snapshot.raw[I_EV_LVD], settingsScale) * times;
     from = LIVE_SOURCE_STORED_LVD;
   } else {
@@ -885,8 +886,10 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
 //
 // It is known only while the custom charge settings are in use (DIP switch 1 ON) with their
 // scale proven and temperature compensation off: a built-in or compensated profile moves its
-// float voltage with the temperature. The battery jumper picks the bank and cannot be read, so
-// the lower of the two banks counts. A bank without a float voltage holds the battery at its
+// float voltage with the temperature. And only while those stored are the ones in effect: after
+// a write to the EEPROM the controller charges by the settings it started with until it restarts
+// (see storedSettingsInEffect()). The battery jumper picks the bank and cannot be read, so the
+// lower of the two banks counts. A bank without a float voltage holds the battery at its
 // absorption voltage.
 //
 // With the scale of the live readings proven the figure is exact. Without it the lower of the
@@ -901,6 +904,9 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
     return 0.0;
   }
   if (!have(snapshot, I_EV_TEMPCOMP) || snapshot.raw[I_EV_TEMPCOMP] != 0) {
+    return 0.0;
+  }
+  if (!storedSettingsInEffect(snapshot)) {
     return 0.0;
   }
   const uint8_t absorbItems[2] = {I_EV_REG, I_EV_REG2};
