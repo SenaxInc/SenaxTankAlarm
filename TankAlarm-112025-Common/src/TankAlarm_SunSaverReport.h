@@ -198,10 +198,9 @@ inline bool decodeReport(JsonObjectConst in, Snapshot *snapshot, Evaluation *eva
 // Which report the server keeps
 // ---------------------------------------------------------------------------------------------
 //
-// A client's report can arrive late: the client keeps notes in flash while it cannot reach its
-// Notecard, and sends them after the next note that got through. The server therefore orders
-// the reports of a client by the time of the check, which the client sends as "epoch", and not
-// by their arrival.
+// A client's report can arrive late: the client keeps it while it cannot reach its Notecard,
+// and the Notecard keeps it until it syncs. The server therefore orders the reports of a client
+// by the time of the check, which the client sends as "epoch", and not by their arrival.
 
 // 2020-09-13. A clock that reads less was never set.
 static const double REPORT_EARLIEST_EPOCH = 1600000000.0;

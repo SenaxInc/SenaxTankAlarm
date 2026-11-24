@@ -329,10 +329,11 @@ public:
   // Returns true when a poll attempt was performed, regardless of read success.
   bool poll(unsigned long nowMillis);
 
-  // True for one Modbus timeout after a request that got no usable reply. Its reply may still
-  // be on its way, and the next request would take it for its own answer, so the poll and the
-  // charger check both keep off the line meanwhile: a poll that is due waits (poll() returns
-  // false) and so does the next step of a charger check.
+  // True for one Modbus timeout after a request that got no usable reply, the timeout that
+  // request had (a config update can change it). Its reply may still be on its way, and the next
+  // request would take it for its own answer, so the poll and the charger check both keep off the
+  // line meanwhile: a poll that is due waits (poll() returns false) and so does the next step of
+  // a charger check.
   bool lineResting() const;
   
   // Data access
@@ -413,8 +414,8 @@ public:
 
   // The voltage the charger holds a full battery at, as this firmware reads the battery. The
   // no-charge alert compares the battery with it. 0 (the default) means "not known": the alert
-  // then uses BATTERY_VOLTAGE_FLOAT per 12 V of pack. The client sets it from the charger check,
-  // and begin() clears it.
+  // then uses BATTERY_VOLTAGE_FLOAT per 12 V of pack. The client sets it from a charger check
+  // that completed and clears it after one that failed, and begin() clears it.
   void setFloatReference(float volts) { _floatReferenceV = volts; }
   float getFloatReference() const { return _floatReferenceV; }
 

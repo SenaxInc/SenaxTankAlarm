@@ -902,7 +902,7 @@ static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerpri
 static unsigned long gChargerReportMillis = 0;    // when it went out
 // The report that still has to go out, kept apart from the pass that made it so that it can
 // wait: for the clock (the server keeps the newest report by the time of the check), or for a
-// Notecard and a note buffer that would not take it. See sendDueChargerReport().
+// Notecard that would not take it. See sendDueChargerReport().
 static bool gChargerReportDue = false;
 static sunsaver::Snapshot gChargerReportSnapshot;      // what it holds
 static sunsaver::Evaluation gChargerReportEvaluation;  // and how that was judged
@@ -1569,6 +1569,7 @@ static void logSolarHardwareTestHeartbeat(unsigned long now);
 static void logSolarPollSnapshot(unsigned long now, SolarAlertType alertType);
 static bool appendSolarDataToDaily(JsonDocument &doc);
 static void requestChargerCheck();
+static bool chargerCheckHeldBack();
 static void serviceChargerCheck(unsigned long now, bool lineFree);
 static void finishChargerCheck(unsigned long now);
 static void sendDueChargerReport(unsigned long now);
@@ -2402,8 +2403,13 @@ void loop() {
   // something due, and the poll waits for the pass after (see sunsaver::LineTurns).
   bool solarPolled = false;
   if (gSolarManager.isEnabled()) {
+    // Only for those that will talk to the charger in the next pass: not a check that is held
+    // back, which serviceChargerCheck() drops without reading (in hibernation the poll is what
+    // tells that the battery recovered), and not programming while a firmware update is being
+    // staged.
     const bool othersWant =
-        gSolarManager.chargerCheckActive() || gSolarManager.chargerProgrammingWantsLine(currentEpoch());
+        (!chargerCheckHeldBack() && gSolarManager.chargerCheckActive()) ||
+        (!gDfuInProgress && gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
     solarPolled = !gSolarTurns.pollWaits(othersWant) && gSolarManager.poll(now);
     gSolarTurns.afterPoll(solarPolled, gSolarManager.lineResting());
     if (solarPolled) {
@@ -7554,20 +7560,9 @@ static void sendSolarAlarm(SolarAlertType alertType) {
 
 // The battery the charger's settings are judged against.
 static uint8_t chargerCheckChemistry() {
-  switch (gConfig.batteryMonitor.batteryType) {
-    case BATTERY_TYPE_AGM:
-    case BATTERY_TYPE_GEL:
-    case BATTERY_TYPE_SLA:
-      return sunsaver::CHEMISTRY_LEAD_SEALED;
-    case BATTERY_TYPE_FLOODED:
-      return sunsaver::CHEMISTRY_LEAD_FLOODED;
-    case BATTERY_TYPE_LIFEPO4:
-      return sunsaver::CHEMISTRY_LIFEPO4;
-    case BATTERY_TYPE_LI_ION:
-      return sunsaver::CHEMISTRY_LI_ION;
-    default:
-      return sunsaver::CHEMISTRY_NOT_JUDGED;  // no battery, custom thresholds, or the LiPo cell
-  }
+  // The server maps the battery type of the config it holds the same way, to tell whether the
+  // report it keeps is about the battery that config names.
+  return sunsaver::chemistryForBatteryType(gConfig.batteryMonitor.batteryType);
 }
 
 // Asks for a pass now, and for its report to reach the server at once: the battery or the
@@ -7580,13 +7575,17 @@ static void requestChargerCheck() {
   gChargerReportDue = false;           // so was a report that still waits to go out
 }
 
+// Not while a firmware update is being staged, and not in hibernation: the check can wait.
+static bool chargerCheckHeldBack() {
+  return gDfuInProgress || gPowerState == POWER_STATE_CRITICAL_HIBERNATE;
+}
+
 // Call from every pass of loop() while the charger is enabled. Starts a pass when one is due and
 // reads a few registers of it per call, so that loop() is never held for longer than a poll holds
 // it. `lineFree` is false in a pass in which a poll talked to the charger: then nothing is read,
 // and a report that waits is still sent.
 static void serviceChargerCheck(unsigned long now, bool lineFree) {
-  // Not while a firmware update is being staged, and not in hibernation: the check can wait.
-  if (gDfuInProgress || gPowerState == POWER_STATE_CRITICAL_HIBERNATE) {
+  if (chargerCheckHeldBack()) {
     gSolarManager.cancelChargerCheck();
     return;
   }
@@ -7628,6 +7627,10 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
       gChargerCheckFailures = 0;  // the daily try after a run of failures
     }
     ++gChargerCheckFailures;
+    // The charger's settings may have changed since the last pass that completed, and the polls
+    // may go on working while its settings cannot be read: the no-charge alert goes back to its
+    // default until a pass completes again.
+    gSolarManager.setFloatReference(0.0f);
     Serial.print(F("Charger check: the charger stopped answering part way ("));
     Serial.print(gChargerCheckFailures);
     Serial.print(F(" of "));
@@ -7704,7 +7707,10 @@ static void finishChargerCheck(unsigned long endedAt) {
   }
 }
 
-// Hands the report that is due to the Notecard, and keeps it due until that has worked.
+// Hands the report that is due to the Notecard, and keeps it due until that has worked. Not to
+// the note buffer: other notes push its oldest records out once it is full, and the report would
+// then count as sent while the server never sees it. A report kept here is lost at a restart,
+// but the first pass after it reports again, whatever it finds.
 static void sendDueChargerReport(unsigned long now) {
   if (!gChargerReportDue) {
     return;
@@ -7734,11 +7740,11 @@ static void sendDueChargerReport(unsigned long now) {
   body["st"] = "chg-check";
   body["epoch"] = gChargerReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
   sunsaver::encodeReport(gChargerReportSnapshot, gChargerReportEvaluation, body);
-  if (!publishNote(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow)) {
-    // Neither the Notecard nor the note buffer took it. It stays due, with everything that
-    // keeps a report from being sent twice left as it was.
+  if (!publishNoteToNotecard(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow)) {
+    // The Notecard did not take it. It stays due, with everything that keeps a report from being
+    // sent twice left as it was.
     if (!gChargerReportTried) {
-      Serial.println(F("Charger check: the report could not be sent or stored, trying again every 10 minutes"));
+      Serial.println(F("Charger check: the Notecard did not take the report, trying again every 10 minutes"));
     }
     gChargerReportTried = true;
     gChargerReportTryMillis = now;
@@ -9507,9 +9513,10 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   return sendNote(fileName, doc, syncNow, true);
 }
 
-// Returns true only when the Notecard has the note, for a caller that keeps the note in flash
-// itself until then: the note buffer drops its oldest records once it outgrows
-// NOTE_BUFFER_MAX_BYTES (pruneNoteBufferIfNeeded()), and a note it dropped would count as sent.
+// Returns true only when the Notecard has the note, for a caller that keeps the note itself
+// until then (a programming result in its journal in flash, a charger report in RAM): the note
+// buffer drops its oldest records once it outgrows NOTE_BUFFER_MAX_BYTES
+// (pruneNoteBufferIfNeeded()), and a note it dropped would count as sent.
 static bool publishNoteToNotecard(const char *fileName, JsonDocument &doc, bool syncNow) {
   return sendNote(fileName, doc, syncNow, false);
 }
@@ -9529,8 +9536,8 @@ static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool
   doc["fv"] = FIRMWARE_VERSION;
 
   // A document that ran out of memory while it was filled in still serializes, without the members
-  // that did not fit. Such a note would say less than it seems to (a charger programming result
-  // would be dropped as sent), so none is made, and the caller may try again.
+  // that did not fit. Such a note would say less than it seems to (a charger report or a
+  // programming result would be dropped as sent), so none is made, and the caller may try again.
   if (doc.overflowed()) {
     Serial.println(F("publishNote: out of memory while the note was filled in, dropping it"));
     return false;
