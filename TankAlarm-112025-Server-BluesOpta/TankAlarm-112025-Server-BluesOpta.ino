@@ -12826,13 +12826,9 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   meta->chargerReportEpoch = checkedAt;
   meta->chargerSnapshot = snapshot;
   meta->chargerEvaluation = evaluation;
-  // At a start, a report is kept only for a client that the metadata cache holds, so that a
-  // client that was removed does not come back with it (loadChargerReports). A client that is
-  // new here therefore goes into that cache now, not at its next periodic save: the client
-  // does not send an unchanged report again for a week.
-  if (gClientMetadataDirty && saveClientMetadataCache()) {
-    gClientMetadataDirty = false;
-  }
+  // Written at once, with the metadata cache that a client new here has to be in for its report
+  // to be kept at a start (see saveChargerReportsIfDirty()): the client does not send an
+  // unchanged report again for a week.
   gChargerReportsDirty = true;
   saveChargerReportsIfDirty(true);
 
@@ -12913,6 +12909,12 @@ static bool saveChargerReports() {
 // worked: at once when `force` is set, and otherwise (from loop()) every CHARGER_REPORTS_RETRY_MS
 // after a write that failed. The note a report came in is deleted once it has been handled, so
 // until a write works the report is in RAM only and would be lost at a restart.
+//
+// At a start a report is kept only for a client that the metadata cache holds (see
+// loadChargerReports()), and a client that is new here is in that cache only once it has been
+// written. So the cache is written first, every time, and the reports count as kept only when
+// both writes worked. gClientMetadataDirty cannot tell: other savers clear it after a write
+// that failed.
 static void saveChargerReportsIfDirty(bool force) {
   if (!gChargerReportsDirty) {
     return;
@@ -12922,10 +12924,18 @@ static void saveChargerReportsIfDirty(bool force) {
     return;
   }
   gChargerReportsTryMillis = nowMs;
-  if (saveChargerReports()) {
+  const bool ownersSaved = saveClientMetadataCache();
+  if (ownersSaved) {
+    gClientMetadataDirty = false;
+  }
+  // The reports are written even when the cache was not: those of clients it already held on
+  // flash are then kept.
+  const bool reportsSaved = saveChargerReports();
+  if (ownersSaved && reportsSaved) {
     gChargerReportsDirty = false;
   } else {
-    Serial.println(F("ERROR: Charger reports not saved, trying again in 5 minutes"));
+    Serial.println(ownersSaved ? F("ERROR: Charger reports not saved, trying again in 5 minutes")
+                               : F("ERROR: Client metadata not saved with the charger reports, trying again in 5 minutes"));
   }
 }
 
@@ -16470,7 +16480,7 @@ static void loadSensorRegistry() {
 // Client Metadata Persistence (LittleFS JSON)
 // ============================================================================
 
-// True once the file holds every entry. Only handleChargerReport() looks at the result.
+// True once the file holds every entry. Only saveChargerReportsIfDirty() looks at the result.
 static bool saveClientMetadataCache() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)

@@ -1264,6 +1264,69 @@ static void testLiveScale() {
     CHECK_EQ(source, ss::LIVE_SOURCE_PRESET_LVD);
   }
   {
+    // A write to the EEPROM, and no restart yet. The controller keeps the LVD it started with,
+    // and both fault words report the edit until it restarts. An x100 controller that still uses
+    // 11.50 V after its stored LVD went to 11.30 V reports a word that reads 11.12 V with x96.667,
+    // inside the room for 11.30 V, and 11.50 V with x100, outside it. Such a reading decides
+    // nothing while either word reports the edit.
+    Bare b;
+    CHECK_EQ(b.master.writeRegister(1, 0xE022, b.sim.setVolts(11.30)).status, MB_OK);
+    CHECK_EQ(b.sim.regs[0x001C], b.sim.volts(11.50));
+    CHECK(ss::voltsFromRaw(b.sim.regs[0x001C], ss::SCALE_96667) > 11.30 - ss::LVD_COMPENSATION_ROOM_VOLTS);
+    ss::Snapshot edited = snapshotOf(b.sim);
+    CHECK_EQ(ss::judgeSettingsScale(edited).scale, ss::SCALE_100);
+    CHECK(!ss::storedLvdInEffect(edited));
+    scale = source = 99;
+    ss::judgeLiveScale(edited, ss::SCALE_100, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+    // So the page does not call this firmware's scale wrong, and the no-charge alert keeps to the
+    // lower of the two figures.
+    ss::Evaluation e = judge(b.sim, ss::CHEMISTRY_LEAD_SEALED, 12, ss::SCALE_100);
+    CHECK_EQ(e.liveScale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(e.findings & ss::FINDING_LIVE_SCALE, 0);
+    // Either word alone is enough, and so is a word that was not read.
+    const uint8_t words[2] = {ss::I_ARRAY_FAULT, ss::I_LOAD_FAULT};
+    const uint16_t bits[2] = {ss::ARRAY_FAULT_EEPROM_EDIT, ss::LOAD_FAULT_EEPROM_EDIT};
+    for (int w = 0; w < 2; ++w) {
+      ss::Snapshot one = edited;
+      one.raw[words[1 - w]] = (uint16_t)(one.raw[words[1 - w]] & ~bits[1 - w]);
+      CHECK((one.raw[words[w]] & bits[w]) != 0);
+      ss::judgeLiveScale(one, ss::SCALE_100, &scale, &source);
+      CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+      // Other fault bits are no edit.
+      ss::Snapshot other = edited;
+      other.raw[ss::I_ARRAY_FAULT] = (uint16_t)~ss::ARRAY_FAULT_EEPROM_EDIT;
+      other.raw[ss::I_LOAD_FAULT] = (uint16_t)~ss::LOAD_FAULT_EEPROM_EDIT;
+      other.raw[ss::I_V_LVD] = b.sim.volts(11.30);
+      CHECK(ss::storedLvdInEffect(other));
+      ss::judgeLiveScale(other, ss::SCALE_100, &scale, &source);
+      CHECK_EQ(scale, ss::SCALE_100);
+      other.status[words[w]] = ss::SSIO_REFUSED;
+      CHECK(!ss::storedLvdInEffect(other));
+      ss::judgeLiveScale(other, ss::SCALE_100, &scale, &source);
+      CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+      CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+    }
+    // The restart puts the stored LVD to work and clears the edit: now the reading decides.
+    CHECK_EQ(b.master.writeCoil(1, 0x00FF, true).status, MB_OK);
+    CHECK_EQ(b.sim.resets, 1);
+    const ss::Snapshot restarted = snapshotOf(b.sim);
+    CHECK(ss::storedLvdInEffect(restarted));
+    ss::judgeLiveScale(restarted, ss::SCALE_100, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_100);
+    CHECK_EQ(source, ss::LIVE_SOURCE_STORED_LVD);
+    // With switch 2 OFF the stored LVD is not used, and an edit changes nothing.
+    b.sim.advance(b.sim.resetDownMs);  // the controller is silent while it starts
+    CHECK_EQ(b.master.writeRegister(1, 0xE022, b.sim.setVolts(12.00)).status, MB_OK);
+    CHECK(!ss::storedLvdInEffect(snapshotOf(b.sim)));
+    b.sim.regs[0x0025] = 0x0008;
+    b.sim.regs[0x001C] = b.sim.volts(11.50);
+    ss::judgeLiveScale(snapshotOf(b.sim), ss::SCALE_100, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_100);
+    CHECK_EQ(source, ss::LIVE_SOURCE_PRESET_LVD);
+  }
+  {
     // A low LVD, where the two scales are closer together than the room the test leaves: a
     // reading that both explain decides nothing.
     SimSunSaver sim;

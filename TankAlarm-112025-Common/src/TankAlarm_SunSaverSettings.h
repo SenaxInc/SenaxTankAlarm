@@ -547,6 +547,16 @@ inline bool storedCompensationFits(const Snapshot &snapshot) {
          ohmsFromRaw(snapshot.raw[I_ER_ICOMP]) * LOAD_RATED_AMPS <= LVD_COMPENSATION_ROOM_VOLTS;
 }
 
+// The controller takes its stored LVD into use when it starts. A stored LVD that was changed
+// since is not the one in effect, and every write to its EEPROM raises the "EEPROM setting edit"
+// fault in both fault words until it restarts. So the stored LVD stands for the one in effect
+// only while both words were read and neither reports that edit: one that was not read could.
+inline bool storedLvdInEffect(const Snapshot &snapshot) {
+  return have(snapshot, I_ARRAY_FAULT) && have(snapshot, I_LOAD_FAULT) &&
+         (snapshot.raw[I_ARRAY_FAULT] & ARRAY_FAULT_EEPROM_EDIT) == 0 &&
+         (snapshot.raw[I_LOAD_FAULT] & LOAD_FAULT_EEPROM_EDIT) == 0;
+}
+
 // Looks for the one scale that makes V_lvd read as the LVD the controller is known to use.
 // settingsScale is the verdict of judgeSettingsScale(); the stored LVD is only known with it.
 inline void judgeLiveScale(const Snapshot &snapshot, uint8_t settingsScale, uint8_t *scale, uint8_t *source) {
@@ -566,7 +576,7 @@ inline void judgeLiveScale(const Snapshot &snapshot, uint8_t settingsScale, uint
     wanted = PRESET_LVD_VOLTS * times;
     from = LIVE_SOURCE_PRESET_LVD;
   } else if (settingsScale != SCALE_UNKNOWN && have(snapshot, I_EV_LVD) && snapshot.raw[I_EV_LVD] != 0 &&
-             storedCompensationFits(snapshot)) {
+             storedCompensationFits(snapshot) && storedLvdInEffect(snapshot)) {
     wanted = voltsFromRaw(snapshot.raw[I_EV_LVD], settingsScale) * times;
     from = LIVE_SOURCE_STORED_LVD;
   } else {
