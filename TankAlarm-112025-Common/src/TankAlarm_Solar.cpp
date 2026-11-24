@@ -1257,13 +1257,15 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
                           _config.modbusTimeoutMs, _config.modbusBaudRate);
   // No poll runs, so the link is down (the charger is off in the config, or the link did not
   // start). It is started for a duty whose turn has come, on the settings the config holds, and
-  // stopped again after it.
+  // stopped again after it. Then service() talks only on a link started for it: a turn that comes
+  // after wantsLine() said no, in this same pass, waits for the next pass, and costs no try.
   const bool linkForDuty = !line.polling && _programming.mayTalk(port, line) &&
                            _programming.wantsLine(epochNow, (uint32_t)millis());
   if (linkForDuty && !startModbusLink()) {
     line.free = false;  // nothing talks: the duty waits, and the next pass tries again
   }
-  const bool talked = _programming.service(port, epochNow, line);
+  const bool talked = line.polling ? _programming.service(port, epochNow, line)
+                                   : _programming.service(port, epochNow, linkForDuty && line.free);
   if (linkForDuty && line.free) {
     ModbusRTUClient.end();
   }
@@ -1273,8 +1275,11 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   }
   return talked;
 #else
+  // Nothing to talk about with the controller, but a journal that flash did not take is written
+  // again: it holds the refusals and results that have yet to go out.
   (void)epochNow;
   (void)allowed;
+  _programming.maintain((uint32_t)millis());
   return false;
 #endif
 }
@@ -1355,6 +1360,7 @@ void SolarManager::chargerProgramReportTaken() {
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   (void)epochNow;
   (void)allowed;
+  _programming.maintain((uint32_t)millis());  // as in firmware without programming
   return false;
 }
 bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {

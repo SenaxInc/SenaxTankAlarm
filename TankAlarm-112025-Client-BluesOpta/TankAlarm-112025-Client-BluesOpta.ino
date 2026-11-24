@@ -925,17 +925,17 @@ static unsigned long gChargerReportTryMillis = 0;      // which was then
 #define CHARGER_JOURNAL_TMP_FILE CHARGER_JOURNAL_FILE ".tmp"  // where tankalarm_posix_write_file_atomic() writes it first
 #if defined(POSIX_FILE_IO_AVAILABLE)
 // loadChargerJournal() read the journal from its .tmp, which holds its only copy until
-// saveChargerJournal() renames it into place.
+// saveChargerJournal() renames it into place, or found a .tmp there that it could not open.
 static bool gChargerJournalInTmp = false;
 #endif
-#define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result nothing would take
+#define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result the Notecard did not take
 // The result that waits to go out (SolarManager::chargerProgramming()), as this sketch has seen
 // it. See sendDueChargerProgramReport().
 static bool gChargerProgramReportSeen = false;          // it has been shown on the serial console
 static uint32_t gChargerProgramReportId = 0;            // the request it answers
 static uint32_t gChargerProgramReportAt = 0;            // the millis() it came about
 static uint32_t gChargerProgramReportEpoch = 0;         // that moment as a time, once the clock has one
-static bool gChargerProgramReportTried = false;         // nothing would take it at the last try
+static bool gChargerProgramReportTried = false;         // the Notecard did not take it at the last try
 static unsigned long gChargerProgramReportTryMillis = 0;
 
 // Battery voltage monitoring via Notecard (when wired directly to battery)
@@ -1528,6 +1528,8 @@ static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &t
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
 static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
+static bool publishNoteToNotecard(const char *fileName, JsonDocument &doc, bool syncNow);
+static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool mayBuffer);
 static bool bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow);
 static void flushBufferedNotes();
 static void pruneNoteBufferIfNeeded();
@@ -5097,6 +5099,20 @@ static void attemptPendingConfigAckSend() {
   if (!gPendingConfigAck || !isPendingConfigAckRetryDue()) {
     return;
   }
+  // Not while a result of charger programming is in RAM alone, such as the answer to a request
+  // the config carried: flash did not take the journal, and the Notecard does not have the result
+  // yet. Until the config is acknowledged the server sends it again, a minute apart and up to five
+  // times (its MAX_CONFIG_DISPATCH_RETRIES), and with it the request: a client that restarted in
+  // that time takes the request on again. The next pass looks again (retryPendingConfigAckIfDue()).
+  static bool heldForResult = false;
+  if (gSolarManager.chargerProgramming().resultOnlyInRam()) {
+    if (!heldForResult) {
+      Serial.println(F("Config ACK waits: a charger programming result is neither in flash nor with the Notecard yet"));
+      heldForResult = true;
+    }
+    return;
+  }
+  heldForResult = false;
   if (sendConfigAck(gPendingConfigAckSuccess, gPendingConfigAckMessage, gPendingConfigAckVersion)) {
     clearPendingConfigAckState();
   } else {
@@ -7775,7 +7791,8 @@ static void keepChargerLookAfterLostFiles() {
 // the last run came that reached the charger, and the result that has yet to go out. No file, and
 // no .tmp of one: nothing was ever asked. Only its .tmp: a save whose rename failed, and failed
 // again in this start's recoverOrphanedTmpFiles(), which is read as the journal that rename would
-// have made it (saveChargerJournal() puts it in place before it writes another). A file that
+// have made it (saveChargerJournal() puts it in place before it writes another, and does the
+// same with a .tmp that may be there and cannot be opened). A file that
 // cannot be read, no flash to read it from, or flash that lost its files at this start
 // (keepChargerLookAfterLostFiles() writes the cautious journal for it): the charger may wait for
 // a restart, and gets a look (firmware without programming owes it nothing, see
@@ -7799,10 +7816,13 @@ static sunsaver::Journal loadChargerJournal() {
   if (file == nullptr && errno == ENOENT) {
     // Its .tmp alone is the journal, not a sign that none was ever written: reading none would
     // drop what it says, such as the look owed after a run cut short or a flash that lost its
-    // files. A .tmp beside the journal is a save that never took its place, and is not read.
+    // files. A .tmp beside the journal is a save that never took its place, and is not read. A
+    // .tmp that may be there and cannot be opened holds the only copy just the same: the charger
+    // gets a look, and saveChargerJournal() puts the .tmp in place before it writes another.
+    errno = 0;
     file = fopen(CHARGER_JOURNAL_TMP_FILE, "r");
+    gChargerJournalInTmp = file != nullptr || errno != ENOENT;
     if (file != nullptr) {
-      gChargerJournalInTmp = true;
       Serial.println(F("Charger programming: the journal is only in its .tmp, which could not be renamed, and is read from there"));
     }
   }
@@ -7856,8 +7876,10 @@ static sunsaver::Journal loadChargerJournal() {
 }
 
 // The journal's writer (SolarManager::ChargerJournalWriter): true only once the file holds it.
-// A journal that was read from its .tmp is renamed into place first, or nothing is written: the
-// write goes to that .tmp, and would take its only copy away before it took the journal's place.
+// A journal that was read from its .tmp, or a .tmp in its place that could not be opened, is
+// renamed into place first, or nothing is written: the write goes to that .tmp, and would take
+// its only copy away before it took the journal's place. A .tmp that could not be opened and is
+// not there has nothing to keep.
 static bool saveChargerJournal(const sunsaver::Journal &journal) {
 #if defined(POSIX_FILE_IO_AVAILABLE)
   if (!isStorageAvailable()) {
@@ -7874,7 +7896,8 @@ static bool saveChargerJournal(const sunsaver::Journal &journal) {
     return false;
   }
   if (gChargerJournalInTmp) {
-    if (rename(CHARGER_JOURNAL_TMP_FILE, CHARGER_JOURNAL_FILE) != 0) {
+    errno = 0;
+    if (rename(CHARGER_JOURNAL_TMP_FILE, CHARGER_JOURNAL_FILE) != 0 && errno != ENOENT) {
       return false;  // the .tmp stays as it is, and the next start reads it again
     }
     gChargerJournalInTmp = false;
@@ -8024,9 +8047,9 @@ static void printChargerProgramResult(uint32_t requestId, const sunsaver::Progra
   }
 }
 
-// Hands the result that is due to the Notecard, and keeps it due until that has worked: until
-// then it is in the journal in flash too. A newer result takes the place of one that has not gone
-// out yet, unless it answers an older request (sunsaver::Supervisor).
+// Hands the result that is due to the Notecard, and keeps it due until the Notecard has it:
+// until then it is in the journal in flash too. A newer result takes the place of one that has
+// not gone out yet, unless it answers an older request (sunsaver::Supervisor).
 static void sendDueChargerProgramReport(unsigned long now) {
   const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
   if (!programming.reportDue()) {
@@ -8069,9 +8092,11 @@ static void sendDueChargerProgramReport(unsigned long now) {
   body["req"] = requestId;
   body["epoch"] = gChargerProgramReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
   sunsaver::encodeProgramResult(programming.report(), body);
-  if (!publishNote(CONFIG_ACK_OUTBOX_FILE, doc, true)) {  // a person waits for it at the charger page
+  // To the Notecard, and not into the note buffer: the journal keeps the result until the
+  // Notecard has it, and the buffer drops its oldest records when it grows too large.
+  if (!publishNoteToNotecard(CONFIG_ACK_OUTBOX_FILE, doc, true)) {  // a person waits for it at the charger page
     if (!gChargerProgramReportTried) {
-      Serial.println(F("Charger programming: the result could not be sent or stored, trying again every 10 minutes"));
+      Serial.println(F("Charger programming: the Notecard did not take the result, which waits in the journal: trying again every 10 minutes"));
     }
     gChargerProgramReportTried = true;
     gChargerProgramReportTryMillis = now;
@@ -9479,6 +9504,19 @@ static void trimTelemetryOutbox() {
 // from where flushBufferedNotes() sends it later. False means the note is lost: a caller that
 // must not lose it has to keep it and try again.
 static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
+  return sendNote(fileName, doc, syncNow, true);
+}
+
+// Returns true only when the Notecard has the note, for a caller that keeps the note in flash
+// itself until then: the note buffer drops its oldest records once it outgrows
+// NOTE_BUFFER_MAX_BYTES (pruneNoteBufferIfNeeded()), and a note it dropped would count as sent.
+static bool publishNoteToNotecard(const char *fileName, JsonDocument &doc, bool syncNow) {
+  return sendNote(fileName, doc, syncNow, false);
+}
+
+// publishNote() with `mayBuffer`, and publishNoteToNotecard() without: whether a note that the
+// Notecard does not take goes into the note buffer.
+static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool mayBuffer) {
   // Build serialized payload once for both live send and buffering
   // fileName is already a plain .qo notefile name (e.g., "telemetry.qo")
   // Cross-device routing is handled by Notehub Routes — no fleet: prefix needed
@@ -9533,8 +9571,8 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   buffer[len] = '\0';
 
   if (!gNotecardAvailable) {
-    Serial.println(F("publishNote: Notecard unavailable — buffering"));
-    const bool kept = bufferNoteForRetry(fileName, buffer, syncNow);
+    Serial.println(mayBuffer ? F("publishNote: Notecard unavailable — buffering") : F("publishNote: Notecard unavailable"));
+    const bool kept = mayBuffer && bufferNoteForRetry(fileName, buffer, syncNow);
     if (dynamicBuf) free(dynamicBuf);
     return kept;
   }
@@ -9543,7 +9581,7 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   if (!req) {
     Serial.println(F("publishNote: newRequest(note.add) returned null"));
     gNotecardFailureCount++;
-    const bool kept = bufferNoteForRetry(fileName, buffer, syncNow);
+    const bool kept = mayBuffer && bufferNoteForRetry(fileName, buffer, syncNow);
     if (dynamicBuf) free(dynamicBuf);
     return kept;
   }
@@ -9557,7 +9595,7 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   if (!body) {
     Serial.println(F("publishNote: JParse failed on serialized JSON"));
     JDelete(req);
-    const bool kept = bufferNoteForRetry(fileName, buffer, syncNow);
+    const bool kept = mayBuffer && bufferNoteForRetry(fileName, buffer, syncNow);
     if (dynamicBuf) free(dynamicBuf);
     return kept;
   }
@@ -9587,7 +9625,7 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
       Serial.println(err);
       notecard.deleteResponse(rsp);
       gNotecardFailureCount++;
-      kept = bufferNoteForRetry(fileName, buffer, syncNow);
+      kept = mayBuffer && bufferNoteForRetry(fileName, buffer, syncNow);
     } else {
       notecard.deleteResponse(rsp);
       gLastSuccessfulNotecardComm = millis();
@@ -9599,7 +9637,7 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   } else {
     Serial.println(F("publishNote: requestAndResponse returned null (I2C failure?)"));
     gNotecardFailureCount++;
-    kept = bufferNoteForRetry(fileName, buffer, syncNow);
+    kept = mayBuffer && bufferNoteForRetry(fileName, buffer, syncNow);
   }
   if (dynamicBuf) free(dynamicBuf);
   return kept;

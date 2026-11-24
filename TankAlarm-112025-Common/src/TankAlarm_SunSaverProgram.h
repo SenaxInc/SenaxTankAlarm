@@ -1959,9 +1959,7 @@ class Supervisor {
   // `epochNow` is the client's clock, or anything below CLOCK_SET_EPOCH while it is not set.
   bool service(Port &port, double epochNow, bool ready) {
     const uint32_t nowMs = port.millisNow();
-    if (journalUnsaved_ && (uint32_t)(nowMs - journalTryMs_) >= JOURNAL_RETRY_MS) {
-      saveJournal(nowMs);
-    }
+    maintain(nowMs);
     if (dutyOwed()) {
       if (ready && dutyTurn(nowMs)) {
         // The run the duty is about is taken up again, if this client still holds it. After a
@@ -2014,7 +2012,8 @@ class Supervisor {
   uint32_t reportRequestId() const { return journal_.reportId; }
   uint32_t reportMillis() const { return reportMs_; }
   uint32_t reportEpoch() const { return journal_.reportEpoch; }
-  // The result has gone to the Notecard, or to the client's note buffer in flash.
+  // The Notecard has the result. Not the client's note buffer: that drops its oldest records once
+  // it grows too large, and the journal keeps the result until the Notecard takes it.
   void reportTaken(uint32_t nowMs) {
     if (journal_.reportDue) {
       journal_.reportDue = false;
@@ -2034,6 +2033,25 @@ class Supervisor {
     refuseWaiting(refusals, epochNow, nowMs);
     return true;
   }
+
+  // What service() does besides talking to the controller, for a client that does not call
+  // service(): its firmware cannot talk to the controller (built without programming, or with no
+  // RS-485). Once per pass of its loop. A journal that flash did not take is written again,
+  // JOURNAL_RETRY_MS after the last try, so that a result that waits to go out and the requests
+  // answered outlast a restart once the flash takes it. service() calls it too.
+  void maintain(uint32_t nowMs) {
+    if (journalUnsaved_ && (uint32_t)(nowMs - journalTryMs_) >= JOURNAL_RETRY_MS) {
+      saveJournal(nowMs);
+    }
+  }
+  // Flash did not take the journal as it is here: a restart would lose what changed since the
+  // last journal that it took.
+  bool journalUnsaved() const { return journalUnsaved_; }
+  // A result waits to go out and is in RAM alone: flash did not take the journal that holds it,
+  // and the Notecard does not have it yet. The client acknowledges no config while this holds, so
+  // that the server sends it again, with the request it may carry, as long as it waits for the
+  // acknowledgement: a client that restarted in that time takes the request on again.
+  bool resultOnlyInRam() const { return journal_.reportDue && journalUnsaved_; }
 
   const Journal &journal() const { return journal_; }
   // A request waits for the clock, the charger or a duty.

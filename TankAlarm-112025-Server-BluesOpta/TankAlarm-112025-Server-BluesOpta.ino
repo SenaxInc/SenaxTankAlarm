@@ -622,6 +622,13 @@ struct ClientMetadata {
   uint32_t chargerProgramRequestId;              // the request it answers
   double chargerProgramEpoch;                    // when the client made it, 0 = not known
   sunsaver::ProgramResult chargerProgram;
+  // And the last look at the charger that answers no request (request 0): a client makes one
+  // after a start at which it could not read its journal, or its flash had lost its files, since
+  // a run may have been cut short then. Kept apart from the result of a request, which it neither
+  // answers nor takes the place of.
+  bool chargerLookValid;                         // the two fields below hold one
+  double chargerLookEpoch;                       // when the client made it, 0 = not known
+  sunsaver::ProgramResult chargerLook;
 };
 
 struct SerialLogEntry {
@@ -2420,19 +2427,8 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;',
 function when(e){if(!e)return'';const d=new Date(e*1000);if(isNaN(d.getTime()))return'';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}
 const outcomeBadge={1:'cc-ok',2:'cc-ok',3:'cc-warn',4:'cc-warn',8:'cc-warn',9:'cc-warn'};
 function table(head,rows,kv){return '<table'+(kv?' class="cc-kv"':'')+'>'+(head?'<thead><tr>'+head.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead>':'')+'<tbody>'+(rows||[]).map(r=>'<tr>'+r.map((c,i)=>'<td'+(head&&i===0?' class="cc-name"':'')+'>'+esc(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
-function renderProgram(p){
-const box=el('ccProgram');const gen='/config-generator?uid='+encodeURIComponent(uid);
-if(!p){box.className='empty-state';box.innerHTML='This client has not been asked to program its charger. To ask, open its config in the <a href="'+gen+'">Config Generator</a>, set Battery to LiFePO4 at 12V and Voltage Monitor to RS485, check the values under SunSaver Charging Profile, tick <strong>Write these values to the charger</strong> and save.';return;}
-box.className='';let h='';
-const waiting=!!(p.asked&&!p.answered);
-if(waiting){
-h+='<p><span class="cc-verdict cc-none">Waiting</span>Request sent '+esc(when(p.asked))+'. '+esc(p.fresh?'The client writes the values once it has the config, its clock is set and the charger answers. Its result shows here.':'It is more than a day old now, so the client refuses it if it gets it. To ask again, save the config with "Write these values to the charger" ticked.')+'</p>';
-h+='<h3>Values asked for</h3>'+table(null,p.values,true)+'<p class="cc-note">'+esc(p.loadOk?'The request allows current to flow from the LOAD terminals during the run.':'The client refuses to begin while current flows from the LOAD terminals: the request does not allow it.')+'</p>';
-}
-const r=p.result;
-if(r){
-if(waiting)h+='<h3>Last result, for an earlier request</h3>';
-const name=String(r.outcome||'');const t=when(r.e);
+function resultHtml(r,waiting){
+let h='';const name=String(r.outcome||'');const t=when(r.e);
 h+='<p><span class="cc-verdict '+(outcomeBadge[r.o]||'cc-bad')+'">'+esc(name.charAt(0).toUpperCase()+name.slice(1))+'</span>'+esc(r.text)+'</p>';
 h+='<p class="cc-note">'+esc((r.summary&&r.summary!==r.outcome?r.summary+'. ':'')+(r.req?'For the request sent '+when(r.req)+'.':'For a run that a restart of the client may have cut short: the client could not tell from its flash, so it looked at the charger.')+(t?' Reported '+t+'.':''))+'</p>';
 if(r.followUp)h+='<p class="cc-note">The client looks at the charger again once it answers, and sends another result.</p>';
@@ -2443,7 +2439,27 @@ if((r.reasons||[]).length)h+='<ul class="cc-findings">'+r.reasons.map(x=>'<li cl
 if((r.notes||[]).length)h+='<ul class="cc-findings">'+r.notes.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
 if(r.asked)h+='<h3>'+(waiting?'Values that request asked for':'Values asked for')+'</h3>'+table(null,r.asked,true);
 if((r.registers||[]).length)h+='<h3>Registers, in the order of writing</h3>'+table(['Register','What it is','Before','Wanted','How it went'],r.registers);
+return h;
 }
+function lookHtml(lk){return '<h3>Look at the charger after a restart of the client</h3>'+resultHtml(lk,false);}
+function renderProgram(p){
+const box=el('ccProgram');const gen='/config-generator?uid='+encodeURIComponent(uid);
+if(!p){box.className='empty-state';box.innerHTML='This client has not been asked to program its charger. To ask, open its config in the <a href="'+gen+'">Config Generator</a>, set Battery to LiFePO4 at 12V and Voltage Monitor to RS485, check the values under SunSaver Charging Profile, tick <strong>Write these values to the charger</strong> and save.';return;}
+box.className='';let h='';
+const waiting=!!(p.asked&&!p.answered);
+if(waiting){
+h+='<p><span class="cc-verdict cc-none">Waiting</span>Request sent '+esc(when(p.asked))+'. '+esc(p.fresh?'The client writes the values once it has the config, its clock is set and the charger answers. Its result shows here.':'It is more than a day old now, so the client refuses it if it gets it. To ask again, save the config with "Write these values to the charger" ticked.')+'</p>';
+h+='<h3>Values asked for</h3>'+table(null,p.values,true)+'<p class="cc-note">'+esc(p.loadOk?'The request allows current to flow from the LOAD terminals during the run.':'The client refuses to begin while current flows from the LOAD terminals: the request does not allow it.')+'</p>';
+}
+const r=p.result,lk=p.look;
+/* a look that answers no request: first when it is the newest news */
+const lookFirst=!!lk&&(!r||(lk.e||0)>=(r.e||0));
+if(lk&&lookFirst)h+=lookHtml(lk);
+if(r){
+if(waiting)h+='<h3>Last result, for an earlier request</h3>';
+h+=resultHtml(r,waiting);
+}
+if(lk&&!lookFirst)h+=lookHtml(lk);
 h+='<p class="cc-note" style="margin-top:24px;">The client writes these values into the charger only when a person asks for it in the config of this client, once for each request. It checks the values and the charger first, writes one register at a time, reads each one back, and restarts the charger so that it uses them. The charger uses the stored charge values with DIP switch 1 ON, and the stored LVD and LVR with DIP switch 2 ON. <a href="'+gen+'">Change the values</a></p>';
 box.innerHTML=h;
 }
@@ -12987,6 +13003,8 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
 //   values    [[label, value], ...]: what it asked for
 //   result    the last result: "req" the request it answers, "e" when the client made it (0 = not
 //             known), and the members of sunsaver::describeProgramResult()
+//   look      the last look at the charger that answers no request (ClientMetadata::chargerLook):
+//             "e", and the members of sunsaver::describeProgramResult()
 static void describeChargerProgram(const ClientMetadata &meta, JsonObject out) {
   if (meta.chargerProgramAsked != 0) {
     out["asked"] = meta.chargerProgramAsked;
@@ -13009,11 +13027,17 @@ static void describeChargerProgram(const ClientMetadata &meta, JsonObject out) {
     result["e"] = (uint32_t)meta.chargerProgramEpoch;
     sunsaver::describeProgramResult(meta.chargerProgram, result);
   }
+  if (meta.chargerLookValid) {
+    JsonObject look = out["look"].to<JsonObject>();
+    look["e"] = (uint32_t)meta.chargerLookEpoch;
+    sunsaver::describeProgramResult(meta.chargerLook, look);
+  }
 }
 
 // GET /api/charger?client=<uid>: the client's last charger check, readable. "have" is false
 // when none has arrived. See sunsaver::describeReport() for the members. "program" is there when
-// the client was asked to program its charger, or sent a result: see describeChargerProgram().
+// the client was asked to program its charger, or sent a result or a look: see
+// describeChargerProgram().
 static void handleChargerGet(EthernetClient &client, const String &query) {
   const String uid = getQueryParam(query, "client");
   if (uid.length() == 0) {
@@ -13038,7 +13062,7 @@ static void handleChargerGet(EthernetClient &client, const String &query) {
     out["e"] = (uint32_t)meta->chargerReportEpoch;
     sunsaver::describeReport(meta->chargerSnapshot, meta->chargerEvaluation, out);
   }
-  if (meta && (meta->chargerProgramAsked != 0 || meta->chargerProgramValid)) {
+  if (meta && (meta->chargerProgramAsked != 0 || meta->chargerProgramValid || meta->chargerLookValid)) {
     describeChargerProgram(*meta, out["program"].to<JsonObject>());
   }
   if (doc.overflowed()) {
@@ -13376,19 +13400,28 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
   }
   const uint32_t requestId = doc["req"].is<uint32_t>() ? doc["req"].as<uint32_t>() : 0;
   // Ordered by request, and within one request by the client's time of the result, which is
-  // read as the time of a charger check is (see handleChargerReport()).
+  // read as the time of a charger check is (see handleChargerReport()). A look for request 0 is
+  // kept apart, by its time alone (ClientMetadata::chargerLook).
   const double madeAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
-  if (!sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId,
-                                       meta->chargerProgramEpoch, requestId, madeAt)) {
+  const bool look = requestId == 0;
+  if (look ? !sunsaver::reportReplaces(meta->chargerLookValid, meta->chargerLookEpoch, madeAt)
+           : !sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId,
+                                              meta->chargerProgramEpoch, requestId, madeAt)) {
     Serial.print(F("Charger programming result from "));
     Serial.print(clientUid);
     Serial.println(F(" is older than the one this server holds: not kept"));
     return;
   }
-  meta->chargerProgramValid = true;
-  meta->chargerProgramRequestId = requestId;
-  meta->chargerProgramEpoch = madeAt;
-  meta->chargerProgram = result;
+  if (look) {
+    meta->chargerLookValid = true;
+    meta->chargerLookEpoch = madeAt;
+    meta->chargerLook = result;
+  } else {
+    meta->chargerProgramValid = true;
+    meta->chargerProgramRequestId = requestId;
+    meta->chargerProgramEpoch = madeAt;
+    meta->chargerProgram = result;
+  }
   gChargerReportsDirty = true;
   saveChargerReportsIfDirty(true);  // the note is deleted once it has been handled
 
@@ -13406,7 +13439,8 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
 
 // The charger programming of each client that has any: the newest request sent ("a", its values
 // "ap" in the order of sunsaver::profileField(), "al" when it allowed current from the LOAD
-// terminals) and the last result ("r" the request it answers, "e" when the client made it, and
+// terminals), the last result ("r" the request it answers, "e" when the client made it, and
+// the members of sunsaver::encodeProgramResult()) and the last look for no request ("l": "e" and
 // the members of sunsaver::encodeProgramResult()). True once the file holds them.
 static bool saveChargerPrograms() {
 #ifdef FILESYSTEM_AVAILABLE
@@ -13418,7 +13452,8 @@ static bool saveChargerPrograms() {
     JsonArray arr = doc.to<JsonArray>();
     for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
       const ClientMetadata &meta = gClientMetadata[i];
-      if (meta.clientUid[0] == '\0' || (meta.chargerProgramAsked == 0 && !meta.chargerProgramValid)) {
+      if (meta.clientUid[0] == '\0' ||
+          (meta.chargerProgramAsked == 0 && !meta.chargerProgramValid && !meta.chargerLookValid)) {
         continue;
       }
       JsonObject obj = arr.add<JsonObject>();
@@ -13437,6 +13472,11 @@ static bool saveChargerPrograms() {
         obj["r"] = meta.chargerProgramRequestId;
         obj["e"] = (uint32_t)meta.chargerProgramEpoch;
         sunsaver::encodeProgramResult(meta.chargerProgram, obj);
+      }
+      if (meta.chargerLookValid) {
+        JsonObject look = obj["l"].to<JsonObject>();
+        look["e"] = (uint32_t)meta.chargerLookEpoch;
+        sunsaver::encodeProgramResult(meta.chargerLook, look);
       }
     }
     if (doc.overflowed()) {
@@ -13475,9 +13515,10 @@ static void loadChargerPrograms() {
       posix_log_error("fopen", "/fs" CHARGER_PROGRAMS_PATH);
       return;
     }
-    // An entry is under 800 bytes of JSON with a full plan of registers and the longest client id.
+    // An entry is under 1600 bytes of JSON with two full plans of registers (the result and the
+    // look) and the longest client id.
     const long fileSize = posix_file_size(fp);
-    if (fileSize <= 0 || fileSize > (long)MAX_CLIENT_METADATA * 800L + 64L) {
+    if (fileSize <= 0 || fileSize > (long)MAX_CLIENT_METADATA * 1600L + 64L) {
       fclose(fp);
       Serial.println(F("Charger programming file size invalid"));
       return;
@@ -13532,6 +13573,13 @@ static void loadChargerPrograms() {
         meta->chargerProgramRequestId = obj["r"].is<uint32_t>() ? obj["r"].as<uint32_t>() : 0;
         meta->chargerProgramEpoch = obj["e"] | 0.0;
         meta->chargerProgram = result;
+        any = true;
+      }
+      JsonObjectConst look = obj["l"].as<JsonObjectConst>();
+      if (!look.isNull() && sunsaver::decodeProgramResult(look, &result)) {
+        meta->chargerLookValid = true;
+        meta->chargerLookEpoch = look["e"] | 0.0;
+        meta->chargerLook = result;
         any = true;
       }
       if (any) {
@@ -17872,7 +17920,7 @@ static bool removeClientData(const char *clientUid) {
   for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
     if (strcmp(gClientMetadata[i].clientUid, clientUid) == 0) {
       const bool hadChargerReport = gClientMetadata[i].chargerReportValid || gClientMetadata[i].chargerProgramValid ||
-                                    gClientMetadata[i].chargerProgramAsked != 0;
+                                    gClientMetadata[i].chargerLookValid || gClientMetadata[i].chargerProgramAsked != 0;
       for (uint8_t j = i; j < gClientMetadataCount - 1; ++j) {
         memcpy(&gClientMetadata[j], &gClientMetadata[j + 1], sizeof(ClientMetadata));
       }

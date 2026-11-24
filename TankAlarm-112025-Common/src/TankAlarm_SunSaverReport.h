@@ -612,6 +612,9 @@ inline Journal decodeJournal(JsonObjectConst in) {
 // Whether a result that arrives takes the place of the one the server keeps for a client. The
 // result of a newer request does, and so does a later result of the same request: a client
 // reports twice when it had to look at the controller again. The times are reportCheckTime()s.
+// The server keeps a result for request 0 apart, by its time alone (reportReplaces()): a look
+// that a client made when it could not tell from its flash what was owed answers no request, and
+// takes the place of none.
 inline bool programResultReplaces(bool haveKept, uint32_t keptRequestId, double keptTime, uint32_t newRequestId,
                                   double newTime) {
   if (!haveKept || newRequestId > keptRequestId) {

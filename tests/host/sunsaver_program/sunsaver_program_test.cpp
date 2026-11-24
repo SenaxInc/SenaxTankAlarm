@@ -7477,6 +7477,101 @@ static void testSmallThings() {
   CHECK_EQ(ss::COIL_RESTART, 0x00FF);
 }
 
+// Firmware that never talks to the controller (built without programming, or without RS-485)
+// calls maintain() and not service(): it writes again a journal that flash did not take, as
+// service() does. resultOnlyInRam() is what holds back the client's config acknowledgement.
+static void testJournalMaintenance() {
+  const ss::Profile profile = ss::lifepo4Profile();
+  {
+    // A request refused while flash takes nothing: the refusal is in RAM alone until flash takes
+    // the journal, which maintain() tries again every JOURNAL_RETRY_MS.
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(!supervisor.journalUnsaved());
+    CHECK(!supervisor.resultOnlyInRam());
+    desk.failSaves = 2;
+    CHECK(supervisor.request(kRequestId, profile, 0, ss::REFUSE_NOT_BUILT, true, desk.clock(), desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), 1);  // a refusal is written once
+    CHECK(supervisor.reportDue());
+    CHECK(supervisor.journalUnsaved());
+    CHECK(supervisor.resultOnlyInRam());
+    desk.advance(ss::JOURNAL_RETRY_MS - 1);
+    supervisor.maintain(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 1);
+    desk.advance(1);
+    supervisor.maintain(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 2);  // refused again
+    CHECK(supervisor.resultOnlyInRam());
+    supervisor.maintain(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 2);  // and not tried again at once
+    desk.advance(ss::JOURNAL_RETRY_MS);
+    supervisor.maintain(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 3);
+    CHECK(!supervisor.journalUnsaved());
+    CHECK(!supervisor.resultOnlyInRam());
+    CHECK(supervisor.reportDue());  // it has yet to go out, and is safe in flash now
+    CHECK(desk.flash.reportDue && desk.flash.reportId == kRequestId);
+    CHECK_EQ(desk.flash.report.refusals, ss::REFUSE_NOT_BUILT);
+    CHECK_EQ(desk.flash.answeredId, kRequestId);
+    desk.advance(10ull * ss::JOURNAL_RETRY_MS);
+    supervisor.maintain(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 3);  // nothing to write
+    // A restart now sends the refusal, and takes the request as answered.
+    ss::Supervisor restarted;
+    desk.boot(restarted);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId);
+    CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_NOT_BUILT);
+    CHECK(!desk.ask(restarted, kRequestId));
+    CHECK(desk.bus.log.empty());
+  }
+  {
+    // The Notecard has the result before flash takes the journal: it is no longer in RAM alone,
+    // although the journal in flash still lacks the request.
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.failSaves = 2;
+    CHECK(supervisor.request(kRequestId, profile, 0, ss::REFUSE_NOT_BUILT, true, desk.clock(), desk.millisNow()));
+    CHECK(supervisor.resultOnlyInRam());
+    supervisor.reportTaken(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 2);
+    CHECK(supervisor.journalUnsaved());
+    CHECK(!supervisor.reportDue());
+    CHECK(!supervisor.resultOnlyInRam());
+    desk.advance(ss::JOURNAL_RETRY_MS);
+    supervisor.maintain(desk.millisNow());
+    CHECK_EQ(desk.saves.size(), 3);
+    CHECK(!supervisor.journalUnsaved());
+    CHECK(!desk.flash.reportDue && desk.flash.answeredId == kRequestId);
+  }
+  {
+    // A request that waits, in flash: no result, so nothing in RAM alone. One whose journal flash
+    // refuses is refused at once, and that refusal is.
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(supervisor.request(kRequestId, profile, 0, 0, true, desk.clock(), desk.millisNow()));
+    CHECK(supervisor.requestWaiting());
+    CHECK(!supervisor.journalUnsaved());
+    CHECK(!supervisor.resultOnlyInRam());
+    desk.failSaves = 2;
+    CHECK(supervisor.request(kRequestId + 1, profile, 0, 0, true, desk.clock(), desk.millisNow()));
+    CHECK(!supervisor.requestWaiting());
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId + 1);
+    CHECK_EQ(supervisor.report().refusals, ss::REFUSE_JOURNAL);
+    CHECK(supervisor.resultOnlyInRam());
+    // service() writes it again on the same timetable.
+    desk.advance(ss::JOURNAL_RETRY_MS);
+    CHECK(!desk.pass(supervisor));  // and the Notecard takes the result in that pass
+    CHECK_EQ(desk.saves.size(), 5);  // the first request, two refused for the second, the retry, and that the result went out
+    CHECK(!supervisor.journalUnsaved());
+    CHECK(!supervisor.resultOnlyInRam());
+    CHECK(desk.bus.log.empty());
+  }
+}
+
 int main() {
   startTestTimeLimit();
   testProfile();
@@ -7499,6 +7594,7 @@ int main() {
   testWantsLine();
   testWithdraw();
   testJournalKeeps();
+  testJournalMaintenance();
   testLineForDuty();
   testLineTurns();
   testReadFunction();

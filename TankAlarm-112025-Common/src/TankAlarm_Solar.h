@@ -427,7 +427,8 @@ public:
   //
   // With TANKALARM_SUNSAVER_PROGRAMMING 0 nothing here sends to the controller: every request
   // is refused with REFUSE_NOT_BUILT, the journal keeps only the requests answered and the
-  // result that has yet to go out, and serviceChargerProgramming() does nothing.
+  // result that has yet to go out, and serviceChargerProgramming() only writes again a journal
+  // that flash did not take (sunsaver::Supervisor::maintain()).
   // ---------------------------------------------------------------------------------------
 
   // Once at start, with the journal from flash (sunsaver::cautiousJournal() when the file is
@@ -463,9 +464,10 @@ public:
   bool chargerProgrammingWantsLine(double epochNow) const;
 
   // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis(),
-  // reportEpoch()), the journal, and whether a request or a duty is open.
+  // reportEpoch(), resultOnlyInRam()), the journal, and whether a request or a duty is open.
   const sunsaver::Supervisor& chargerProgramming() const { return _programming; }
-  // The result has gone to the Notecard or into the note buffer in flash.
+  // The Notecard has the result (not the note buffer, which may drop it: see
+  // sunsaver::Supervisor::reportTaken()).
   void chargerProgramReportTaken();
 
 private:
