@@ -7744,7 +7744,9 @@ static void sendDueChargerReport(unsigned long now) {
 // nothing that says so, and Supervisor::begin() keeps the cautious journal only in memory while
 // the look waits for the charger, so it goes into the new file system now: a restart before the
 // look still owes it. Flash that cannot take it is not used at this start, so that it stays empty
-// and the next start reads it the same way.
+// and the next start reads it the same way. It is unmounted too: some writers check only mbedFS
+// (the firmware marker, the solar state, the note buffer), and any file they left would make the
+// next start read a file system with files and no journal as one that was never asked anything.
 static void keepChargerLookAfterLostFiles() {
 #if defined(POSIX_FILE_IO_AVAILABLE)
   if (!gStorageLostFiles || !isStorageAvailable()) {
@@ -7754,6 +7756,9 @@ static void keepChargerLookAfterLostFiles() {
     return;
   }
   gStorageAvailable = false;
+  mbedFS->unmount();
+  delete mbedFS;  // takes "/cfg" away, so that no fopen() reaches the partition either
+  mbedFS = nullptr;
   Serial.println(F("The charger journal could not be written to the flash that lost its files: running without persistence"));
 #endif
 }
