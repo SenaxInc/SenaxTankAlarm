@@ -7442,16 +7442,12 @@ static void logSolarPollSnapshot(unsigned long now, SolarAlertType alertType) {
   SOLAR_TEST_PRINT(roundTo(data.loadCurrent, 2));
   SOLAR_TEST_PRINT(F(" cs="));
   SOLAR_TEST_PRINT(gSolarManager.getChargeStateDescription());
-  SOLAR_TEST_PRINT(F(" faults=0x"));
-  if (data.faults < 0x1000) SOLAR_TEST_PRINT('0');
-  if (data.faults < 0x0100) SOLAR_TEST_PRINT('0');
-  if (data.faults < 0x0010) SOLAR_TEST_PRINT('0');
-  SOLAR_TEST_PRINT(data.faults);
+  SOLAR_TEST_PRINT(F(" arrayFaults=0x"));
+  Serial.print(data.arrayFaults, HEX);
+  SOLAR_TEST_PRINT(F(" loadFaults=0x"));
+  Serial.print(data.loadFaults, HEX);
   SOLAR_TEST_PRINT(F(" alarms=0x"));
-  if (data.alarms < 0x1000) SOLAR_TEST_PRINT('0');
-  if (data.alarms < 0x0100) SOLAR_TEST_PRINT('0');
-  if (data.alarms < 0x0010) SOLAR_TEST_PRINT('0');
-  SOLAR_TEST_PRINT(data.alarms);
+  Serial.print((unsigned long)data.alarms, HEX);
 
   if (alertType != SOLAR_ALERT_NONE) {
     SOLAR_TEST_PRINT(F(" alert="));
@@ -8157,22 +8153,19 @@ static bool appendSolarDataToDaily(JsonDocument &doc) {
   solar["av"] = roundTo(data.arrayVoltage, 2);         // Array voltage
   solar["ic"] = roundTo(data.chargeCurrent, 2);        // Charge current
   
-  // Daily statistics (Task 1.2 & 2.1)
-#ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
-  solar["bvMin"] = roundTo(data.batteryVoltageMinDaily, 2);
-  solar["bvMax"] = roundTo(data.batteryVoltageMaxDaily, 2);
-  if (data.ampHoursDaily > 0.0f) {
-    solar["ah"] = roundTo(data.ampHoursDaily, 1);      // Amp-hours today (only if non-zero)
-  }
-  solar["ht"] = data.heatsinkTemp;  // Heatsink temp °C
-#else
-  // Software daily min/max (omitted if unseeded)
+  // Daily statistics (Task 1.2 & 2.1): the lowest and highest battery voltage since the last
+  // daily report, kept in software (omitted if unseeded). sendDailyReport() starts them over.
   if (data.batteryVoltageMinDaily > 0.1f) {
     solar["bvMin"] = roundTo(data.batteryVoltageMinDaily, 2);
   }
   if (data.batteryVoltageMaxDaily > 0.1f) {
     solar["bvMax"] = roundTo(data.batteryVoltageMaxDaily, 2);
   }
+#ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
+  if (data.ampHoursDaily > 0.0f) {
+    solar["ah"] = roundTo(data.ampHoursDaily, 1);      // Amp-hours, the controller's own "today" (only if non-zero)
+  }
+  solar["ht"] = data.heatsinkTemp;  // Heatsink temp °C
 #endif
 
   // Omitted: healthy, battOk (derivable from bv thresholds); cs (charge state string)
@@ -8225,8 +8218,9 @@ static bool pollBatteryVoltage(BatteryData &data, const BatteryConfig &cfg) {
   data.usbPowered = false;
   data.uptimeMinutes = (uint32_t)(millis() / 60000UL);
 
-  // Running min/max across this boot. voltageMin starts at 0 (memset) which would otherwise
-  // permanently win the min comparison — seed it on first valid sample.
+  // Running min/max since the last daily report (sendDailyReport() sets both to 0 once a report
+  // has gone out). voltageMin starts at 0 (memset) which would otherwise permanently win the min
+  // comparison — seed it on first valid sample.
   if (data.voltageMin <= 0.0f || data.voltage < data.voltageMin) {
     data.voltageMin = data.voltage;
   }
@@ -9311,6 +9305,11 @@ static void sendDailyReport() {
   // block is a windowed 24-hour total instead of lifetime-since-boot. Matches the
   // adjacent I2C error reset pattern.
   gSolarManager.resetModbusErrorStats();
+  // The battery's lowest and highest voltage (solar bvMin/bvMax, battery vMin/vMax) start over
+  // with the next reading too, so that each report covers its own day and not the time since boot.
+  gSolarManager.resetDailyStats();
+  gBatteryData.voltageMin = 0.0f;
+  gBatteryData.voltageMax = 0.0f;
 }
 
 static bool appendDailyMonitor(JsonDocument &doc, JsonArray &array, uint8_t monitorIndex, size_t payloadLimit) {

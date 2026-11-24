@@ -13,6 +13,7 @@
 
 #include "test_support.h"  // ../optaview: the test macros, the simulator and the OptaView headers
 
+#include "TankAlarm_Solar.h"  // the poll's register addresses and bits
 #include "TankAlarm_SunSaverReport.h"
 #include "TankAlarm_SunSaverSettings.h"
 
@@ -333,6 +334,196 @@ static void testTableAgainstProfile() {
 
   const OvRegister *rts = profile.findRegisterAt(0x0010);
   CHECK(rts != nullptr && rts->hasSentinel && rts->sentinelRaw == ss::RTS_NOT_CONNECTED);
+}
+
+// ============================================================================
+// The poll's registers and bits (TankAlarm_Solar.h) against OptaView's profile
+// ============================================================================
+// SolarManager talks through ArduinoModbus, which does not build here, so this holds what it reads
+// with: every SS_REG_ address is the register the profile names, every SS_*_FAULT_ and SS_ALARM_
+// bit is the profile's bit of that name and every named bit has one, and the charge and load
+// states are the profile's values. Until 2026-11 the client read most of these at addresses that
+// belong to other registers.
+static void testPollRegisters() {
+  OvProfile profile;
+  char error[200] = "";
+  const bool loaded = profile.load(OV_BUILTIN_PROFILE, strlen(OV_BUILTIN_PROFILE), error, sizeof(error));
+  CHECK_MSG(loaded, "the SunSaver profile did not load: %s", error);
+  if (!loaded) {
+    return;
+  }
+
+  // The registers.
+  const struct {
+    uint16_t addr;
+    const char *name;
+    const char *labels;  // the label set of a state or a bit field, "" for none
+    uint8_t type;
+  } kPoll[] = {{SS_REG_BATTERY_VOLTAGE, "adc_vb_f", "", OV_U16},
+               {SS_REG_ARRAY_VOLTAGE, "adc_va_f", "", OV_U16},
+               {SS_REG_LOAD_VOLTAGE, "adc_vl_f", "", OV_U16},
+               {SS_REG_CHARGE_CURRENT, "adc_ic_f", "", OV_I16},
+               {SS_REG_LOAD_CURRENT, "adc_il_f", "", OV_I16},
+               {SS_REG_HEATSINK_TEMP, "T_hs", "", OV_I8},
+               {SS_REG_BATTERY_TEMP, "T_batt", "", OV_I8},
+               {SS_REG_CHARGE_STATE, "charge_state", "charge_state", OV_ENUM},
+               {SS_REG_ARRAY_FAULT, "array_fault", "array_fault", OV_BITS},
+               {SS_REG_LOAD_STATE, "load_state", "load_state", OV_ENUM},
+               {SS_REG_LOAD_FAULT, "load_fault", "load_fault", OV_BITS},
+               {SS_REG_ALARM_HI, "alarm", "alarm", OV_BITS},
+               {SS_REG_AHC_DAILY, "Ahc_daily", "", OV_U16}};
+  for (size_t n = 0; n < sizeof(kPoll) / sizeof(kPoll[0]); ++n) {
+    const OvRegister *reg = profile.findRegisterAt(kPoll[n].addr);
+    CHECK_MSG(reg != nullptr && strcmp(reg->name, kPoll[n].name) == 0, "the poll reads %s at 0x%04X, the profile has %s",
+              kPoll[n].name, (unsigned)kPoll[n].addr, reg != nullptr ? reg->name : "nothing there");
+    if (reg == nullptr) {
+      continue;
+    }
+    const char *labels = reg->labels != nullptr ? reg->labels->name : "";
+    CHECK_MSG(strcmp(labels, kPoll[n].labels) == 0, "%s: labels '%s' in the profile", kPoll[n].name, labels);
+    CHECK_MSG(reg->type == kPoll[n].type, "%s: type %d in the profile", kPoll[n].name, (int)reg->type);
+  }
+  // The alarm's two words: the high word first, at the lower address, as SolarManager joins them.
+  const OvRegister *alarm = profile.findRegisterAt(SS_REG_ALARM_HI);
+  CHECK(alarm != nullptr && alarm->words == 2 && !alarm->loFirst);
+  CHECK_EQ(SS_REG_ALARM_LO, SS_REG_ALARM_HI + 1);
+  CHECK(profile.findRegisterAt(SS_REG_ALARM_LO) == nullptr);  // no register of its own
+  // Today's charge in tenths of an Ah, as SolarManager scales it.
+  const OvRegister *ahc = profile.findRegisterAt(SS_REG_AHC_DAILY);
+  CHECK(ahc != nullptr && ahc->scale != nullptr && near(ahc->scale->num / ahc->scale->den, 0.1, 1e-12));
+  // Where the charger check reads the same registers, it reads them at the same addresses.
+  CHECK_EQ(ss::item(ss::I_ADC_VB_F).addr, SS_REG_BATTERY_VOLTAGE);
+  CHECK_EQ(ss::item(ss::I_ADC_IL_F).addr, SS_REG_LOAD_CURRENT);
+  CHECK_EQ(ss::item(ss::I_T_BATT).addr, SS_REG_BATTERY_TEMP);
+  CHECK_EQ(ss::item(ss::I_CHARGE_STATE).addr, SS_REG_CHARGE_STATE);
+  CHECK_EQ(ss::item(ss::I_ARRAY_FAULT).addr, SS_REG_ARRAY_FAULT);
+  CHECK_EQ(ss::item(ss::I_LOAD_STATE).addr, SS_REG_LOAD_STATE);
+  CHECK_EQ(ss::item(ss::I_LOAD_FAULT).addr, SS_REG_LOAD_FAULT);
+
+  // The charge and load states.
+  const struct {
+    uint16_t addr;
+    unsigned value;
+    const char *name;
+  } kStates[] = {{SS_REG_CHARGE_STATE, CHARGE_STATE_START, "START"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_NIGHT_CHECK, "NIGHT_CHECK"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_DISCONNECT, "DISCONNECT"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_NIGHT, "NIGHT"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_FAULT, "FAULT"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_BULK, "BULK"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_ABSORPTION, "ABSORPTION"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_FLOAT, "FLOAT"},
+                 {SS_REG_CHARGE_STATE, CHARGE_STATE_EQUALIZE, "EQUALIZE"},
+                 {SS_REG_LOAD_STATE, LOAD_STATE_START, "START"},
+                 {SS_REG_LOAD_STATE, LOAD_STATE_ON, "LOAD_ON"},
+                 {SS_REG_LOAD_STATE, LOAD_STATE_LVD_WARNING, "LVD_WARNING"},
+                 {SS_REG_LOAD_STATE, LOAD_STATE_LVD, "LVD"},
+                 {SS_REG_LOAD_STATE, LOAD_STATE_FAULT, "FAULT"},
+                 {SS_REG_LOAD_STATE, LOAD_STATE_DISCONNECT, "DISCONNECT"}};
+  unsigned chargeStates = 0;
+  unsigned loadStates = 0;
+  for (size_t n = 0; n < sizeof(kStates) / sizeof(kStates[0]); ++n) {
+    const OvRegister *reg = profile.findRegisterAt(kStates[n].addr);
+    const bool named = reg != nullptr && reg->labels != nullptr && kStates[n].value < reg->labels->count &&
+                       reg->labels->items[kStates[n].value] != nullptr;
+    CHECK_MSG(named && strcmp(reg->labels->items[kStates[n].value], kStates[n].name) == 0,
+              "0x%04X, value %u is %s here, %s in the profile", (unsigned)kStates[n].addr, kStates[n].value,
+              kStates[n].name, named ? reg->labels->items[kStates[n].value] : "(none)");
+    ++(kStates[n].addr == SS_REG_CHARGE_STATE ? chargeStates : loadStates);
+  }
+  const OvRegister *chargeState = profile.findRegisterAt(SS_REG_CHARGE_STATE);
+  const OvRegister *loadState = profile.findRegisterAt(SS_REG_LOAD_STATE);
+  CHECK(chargeState != nullptr && chargeState->labels != nullptr && chargeState->labels->count == chargeStates);
+  CHECK(loadState != nullptr && loadState->labels != nullptr && loadState->labels->count == loadStates);
+
+  // The fault and alarm bits.
+  const struct {
+    uint16_t addr;
+    uint32_t mask;
+    const char *label;  // the start of the profile's name for the bit
+  } kBits[] = {{SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_OVERCURRENT, "Overcurrent"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_FETS_SHORTED, "FETs shorted"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_SOFTWARE, "Software bug"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_BATTERY_HVD, "Battery HVD"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_ARRAY_HVD, "Array HVD"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_EEPROM_EDIT, "EEPROM setting edit"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_RTS_SHORTED, "RTS shorted"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_RTS_DISCONNECTED, "RTS was valid, now disconnected"},
+               {SS_REG_ARRAY_FAULT, SS_ARRAY_FAULT_LOCAL_TEMP, "Local temperature sensor failed"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_SHORT_CIRCUIT, "External short circuit"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_OVERCURRENT, "Overcurrent"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_FETS_SHORTED, "FETs shorted"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_SOFTWARE, "Software bug"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_HVD, "HVD"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_HEATSINK_HOT, "Heatsink over-temperature"},
+               {SS_REG_LOAD_FAULT, SS_LOAD_FAULT_EEPROM_EDIT, "EEPROM setting edit"},
+               {SS_REG_ALARM_HI, SS_ALARM_RTS_OPEN, "RTS open"},
+               {SS_REG_ALARM_HI, SS_ALARM_RTS_SHORTED, "RTS shorted"},
+               {SS_REG_ALARM_HI, SS_ALARM_RTS_DISCONNECTED, "RTS disconnected"},
+               {SS_REG_ALARM_HI, SS_ALARM_THS_OPEN, "Ths open"},
+               {SS_REG_ALARM_HI, SS_ALARM_THS_SHORTED, "Ths shorted"},
+               {SS_REG_ALARM_HI, SS_ALARM_HOT, "SSMPPT hot"},
+               {SS_REG_ALARM_HI, SS_ALARM_CURRENT_LIMIT, "Current limit"},
+               {SS_REG_ALARM_HI, SS_ALARM_CURRENT_OFFSET, "Current offset"},
+               {SS_REG_ALARM_HI, SS_ALARM_UNCALIBRATED, "Uncalibrated"},
+               {SS_REG_ALARM_HI, SS_ALARM_RTS_MISWIRE, "RTS miswire"},
+               {SS_REG_ALARM_HI, SS_ALARM_MISWIRE, "Miswire"},
+               {SS_REG_ALARM_HI, SS_ALARM_FET_OPEN, "FET open"},
+               {SS_REG_ALARM_HI, SS_ALARM_P12, "P12"},
+               {SS_REG_ALARM_HI, SS_ALARM_HIGH_VA_CURRENT_LIMIT, "High Va current limit"}};
+  const uint16_t kFields[] = {SS_REG_ARRAY_FAULT, SS_REG_LOAD_FAULT, SS_REG_ALARM_HI};
+  for (size_t f = 0; f < sizeof(kFields) / sizeof(kFields[0]); ++f) {
+    const OvRegister *reg = profile.findRegisterAt(kFields[f]);
+    CHECK(reg != nullptr && reg->labels != nullptr);
+    if (reg == nullptr || reg->labels == nullptr) {
+      continue;
+    }
+    uint32_t named = 0;  // the bits the profile names
+    for (uint8_t bit = 0; bit < reg->labels->count && bit < 32; ++bit) {
+      if (reg->labels->items[bit] != nullptr) {
+        named |= (uint32_t)1 << bit;
+      }
+    }
+    uint32_t defined = 0;  // the bits defined here
+    for (size_t n = 0; n < sizeof(kBits) / sizeof(kBits[0]); ++n) {
+      if (kBits[n].addr != kFields[f]) {
+        continue;
+      }
+      const uint32_t mask = kBits[n].mask;
+      CHECK_MSG(mask != 0 && (mask & (mask - 1)) == 0, "%s: 0x%X is not one bit", kBits[n].label, (unsigned)mask);
+      CHECK_MSG((defined & mask) == 0, "%s: bit 0x%X is defined twice", kBits[n].label, (unsigned)mask);
+      defined |= mask;
+      uint8_t bit = 0;
+      while (bit < 31 && (mask >> bit) != 1) {
+        ++bit;
+      }
+      const char *theirs = bit < reg->labels->count ? reg->labels->items[bit] : nullptr;
+      CHECK_MSG(theirs != nullptr && startsWith(theirs, kBits[n].label), "0x%04X bit %d: '%s' here, '%s' in the profile",
+                (unsigned)kFields[f], (int)bit, kBits[n].label, theirs != nullptr ? theirs : "(none)");
+    }
+    CHECK_MSG(defined == named, "0x%04X: the profile names bits 0x%X, TankAlarm_Solar.h defines 0x%X",
+              (unsigned)kFields[f], (unsigned)named, (unsigned)defined);
+  }
+  CHECK_EQ(SS_ARRAY_FAULT_EEPROM_EDIT, ss::ARRAY_FAULT_EEPROM_EDIT);
+  CHECK_EQ(SS_LOAD_FAULT_EEPROM_EDIT, ss::LOAD_FAULT_EEPROM_EDIT);
+
+  // The simulated controller, which was written from the specification apart from the profile,
+  // answers the same addresses with what the poll expects there.
+  Bare b;
+  BusReader bus(b.master);
+  b.sim.regs[0x000E] = 0xFFF6;  // T_batt: -10 C
+  b.sim.setU32HiLo(0x0023, SS_ALARM_RTS_DISCONNECTED | SS_ALARM_P12);
+  uint16_t word = 0;
+  CHECK(bus.readRegister(SS_REG_HEATSINK_TEMP, &word) == ss::SSIO_OK && (int8_t)(uint8_t)(word & 0xFF) == 31);
+  CHECK(bus.readRegister(SS_REG_BATTERY_TEMP, &word) == ss::SSIO_OK && (int8_t)(uint8_t)(word & 0xFF) == -10);
+  CHECK(bus.readRegister(SS_REG_CHARGE_STATE, &word) == ss::SSIO_OK && word == CHARGE_STATE_FLOAT);
+  CHECK(bus.readRegister(SS_REG_ARRAY_FAULT, &word) == ss::SSIO_OK && word == 0);
+  CHECK(bus.readRegister(SS_REG_LOAD_STATE, &word) == ss::SSIO_OK && word == LOAD_STATE_ON);
+  CHECK(bus.readRegister(SS_REG_LOAD_FAULT, &word) == ss::SSIO_OK && word == 0);
+  uint16_t high = 0;
+  CHECK(bus.readRegister(SS_REG_ALARM_HI, &high) == ss::SSIO_OK && bus.readRegister(SS_REG_ALARM_LO, &word) == ss::SSIO_OK &&
+        (((uint32_t)high << 16) | word) == (SS_ALARM_RTS_DISCONNECTED | SS_ALARM_P12));
+  CHECK(bus.readRegister(SS_REG_AHC_DAILY, &word) == ss::SSIO_OK && word == 52);  // 5.2 Ah
 }
 
 // ============================================================================
@@ -2546,6 +2737,7 @@ static void testReportOrder() {
 int main() {
   startTestTimeLimit();
   testTableAgainstProfile();
+  testPollRegisters();
   testValuesAgainstOptaView();
   testText();
   testReader();

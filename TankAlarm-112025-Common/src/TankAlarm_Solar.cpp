@@ -24,8 +24,64 @@ static RS485Class sSolarRS485(Serial2, PB_10, PB_14, PB_13);
 #endif
 
 // Static message buffers for descriptions (avoid dynamic allocation)
-static char _faultDescBuffer[128];
-static char _alarmDescBuffer[128];
+static char _faultDescBuffer[160];
+static char _alarmDescBuffer[160];
+
+// Short names of the fault and alarm bits (TankAlarm_Solar.h), for alarm notes and daily reports.
+struct SolarBitTag {
+  uint32_t mask;
+  const char *tag;
+};
+
+static const SolarBitTag kArrayFaultTags[] = {
+    {SS_ARRAY_FAULT_OVERCURRENT, "Overcurrent"},  {SS_ARRAY_FAULT_FETS_SHORTED, "FET-Short"},
+    {SS_ARRAY_FAULT_SOFTWARE, "SW-Fault"},        {SS_ARRAY_FAULT_BATTERY_HVD, "Batt-HVD"},
+    {SS_ARRAY_FAULT_ARRAY_HVD, "Array-HVD"},      {SS_ARRAY_FAULT_EEPROM_EDIT, "EEPROM-Edit"},
+    {SS_ARRAY_FAULT_RTS_SHORTED, "RTS-Short"},    {SS_ARRAY_FAULT_RTS_DISCONNECTED, "RTS-Disc"},
+    {SS_ARRAY_FAULT_LOCAL_TEMP, "Temp-Sensor"}};
+
+static const SolarBitTag kLoadFaultTags[] = {
+    {SS_LOAD_FAULT_SHORT_CIRCUIT, "Load-Short"},  {SS_LOAD_FAULT_OVERCURRENT, "Load-Overcurrent"},
+    {SS_LOAD_FAULT_FETS_SHORTED, "Load-FET-Short"}, {SS_LOAD_FAULT_SOFTWARE, "Load-SW-Fault"},
+    {SS_LOAD_FAULT_HVD, "Load-HVD"},              {SS_LOAD_FAULT_HEATSINK_HOT, "Load-Hot"},
+    {SS_LOAD_FAULT_EEPROM_EDIT, "Load-EEPROM-Edit"}};
+
+static const SolarBitTag kAlarmTags[] = {
+    {SS_ALARM_RTS_OPEN, "RTS-Open"},         {SS_ALARM_RTS_SHORTED, "RTS-Short"},
+    {SS_ALARM_RTS_DISCONNECTED, "RTS-Disc"}, {SS_ALARM_THS_OPEN, "Ths-Open"},
+    {SS_ALARM_THS_SHORTED, "Ths-Short"},     {SS_ALARM_HOT, "Hot"},
+    {SS_ALARM_CURRENT_LIMIT, "I-Limit"},     {SS_ALARM_CURRENT_OFFSET, "I-Offset"},
+    {SS_ALARM_UNCALIBRATED, "Uncal"},        {SS_ALARM_RTS_MISWIRE, "RTS-Miswire"},
+    {SS_ALARM_MISWIRE, "Miswire"},           {SS_ALARM_FET_OPEN, "FET-Open"},
+    {SS_ALARM_P12, "P12"},                   {SS_ALARM_HIGH_VA_CURRENT_LIMIT, "High-Va-I-Limit"}};
+
+// Appends the name of every bit set in `bits` to `out`, separated by spaces. A bit without a name
+// shows as `unnamed` and its number ("Bit8").
+static void appendBitTags(uint32_t bits, const SolarBitTag *tags, size_t count, const char *unnamed, char *out,
+                          size_t cap) {
+  for (uint8_t bit = 0; bit < 32; ++bit) {
+    const uint32_t mask = (uint32_t)1 << bit;
+    if ((bits & mask) == 0) {
+      continue;
+    }
+    char name[24];
+    const char *tag = nullptr;
+    for (size_t i = 0; i < count; ++i) {
+      if (tags[i].mask == mask) {
+        tag = tags[i].tag;
+        break;
+      }
+    }
+    if (tag == nullptr) {
+      snprintf(name, sizeof(name), "%s%u", unnamed, (unsigned)bit);
+      tag = name;
+    }
+    if (out[0] != '\0') {
+      strlcat(out, " ", cap);
+    }
+    strlcat(out, tag, cap);
+  }
+}
 
 // --- Modbus diagnostics (field troubleshooting of scOk:0) ---
 // File-local because ModbusRTUClient lives in this translation unit. Exposed via the
@@ -316,7 +372,8 @@ SolarManager::SolarManager()
   // 2026-04-22: alertOnFault default flipped to FALSE because the status/fault
   // register addresses on this firmware revision are not yet verified and
   // returned implausible values during bench testing. Re-enable in user config
-  // (or per-build override) once SS_REG_FAULTS / SS_REG_ALARMS are confirmed.
+  // (or per-build override) once the fault and alarm registers (SS_REG_ARRAY_FAULT,
+  // SS_REG_LOAD_FAULT, SS_REG_ALARM_HI and _LO) are confirmed on hardware.
   _config.alertOnFault = false;
   _config.alertOnCommFailure = false;
   _config.includeInDailyReport = true;
@@ -490,28 +547,33 @@ bool SolarManager::readRegisters() {
   SolarData nextData = _data;
 
   // ==========================================================================
-  // 2026-04-22 FIELD-READY POLICY:
+  // 2026-04-22 FIELD-READY POLICY (addresses corrected 2026-11-24):
   // Only the live/filtered ADC block at 0x0008..0x000C has been bench-verified
-  // on this SunSaver MPPT firmware revision. The previously-coded addresses
-  // for temperature (0x001B/0x001C), status (0x002B/0x002C/0x002E/0x002F),
-  // daily Ah (0x0034) and daily V min/max (0x003D/0x003E) all returned either
-  // zeros or values that look like extra voltage snapshots, NOT the documented
-  // SunSaver semantics. Reading them and feeding the result into derived
-  // health flags (chargeState/faults/alarms/heatsinkTemp) caused false
-  // "FAULT" indications in the bench capture (e.g. faults=0x4235 with no
-  // physical fault). Until the addresses are confirmed against a Morningstar
-  // datasheet for this exact firmware, we skip those reads entirely.
+  // on this SunSaver MPPT firmware revision. In April the temperature, status,
+  // daily Ah and daily V min/max reads returned either zeros or values that look
+  // like extra voltage snapshots, and fed false "FAULT" indications into the
+  // derived health flags (e.g. faults=0x4235 with no physical fault). The
+  // addresses this firmware used then belonged to other registers (0x002B and
+  // 0x002C are the battery's lowest and highest voltage today), and they were
+  // read several at a time, which the MRC-1 bridge does not answer reliably
+  // (see readRegistersIndividually()). TankAlarm_Solar.h now has the
+  // specification's addresses, which a host test holds equal to OptaView's
+  // profile, but none of them has been read on hardware yet, so production
+  // builds still skip them.
   //
-  // To re-enable for bench experimentation, define SOLAR_ENABLE_UNVERIFIED_REGISTERS.
+  // To read them for bench work, define SOLAR_ENABLE_UNVERIFIED_REGISTERS.
   //
-  // BENCH-VERIFICATION TODO (per /memories/repo/sunsaver-production-fix-2026-04-22.md):
-  //   1. Probe register addresses 0x0021, 0x0023, 0x002F, 0x0032 alongside the currently
-  //      coded 0x002B/0x002C/0x002E and look for sane values matching the SunSaver PDU
-  //      charge_state enum (range 0..8) and the documented fault/alarm bitfield widths.
-  //   2. Capture `faults` and `alarms` while inducing known conditions on the bench:
-  //      flip a DIP switch (expect SS_FAULT_DIP_SW_FAULT), disconnect the RTS sensor
-  //      (expect SS_FAULT_RTS_DISCONN / SS_ALARM_RTS_DISCONN), short the array briefly
-  //      (expect SS_FAULT_OVERCURRENT). Watch the bit positions actually change.
+  // BENCH-VERIFICATION TODO:
+  //   1. Watch the charge state against the controller's LED through one charge
+  //      cycle (bulk, absorption, float), the temperatures against a thermometer,
+  //      and the battery temperature with and without an RTS. OptaView's `watch`
+  //      shows the same registers.
+  //   2. Capture the faults and alarms while inducing known conditions on the bench:
+  //      disconnect the RTS (expect SS_ARRAY_FAULT_RTS_DISCONNECTED or
+  //      SS_ALARM_RTS_DISCONNECTED), write a setting (expect SS_ARRAY_FAULT_EEPROM_EDIT
+  //      and SS_LOAD_FAULT_EEPROM_EDIT until the controller restarts). Watch the bit
+  //      positions actually change. The specification does not say how the alarm's
+  //      24 bits split across 0x0023 and 0x0024: see which word the RTS alarm shows in.
   //   3. Once at least chargeState + faults + alarms verify against known conditions,
   //      gate by SOLAR_ENABLE_UNVERIFIED_REGISTERS for a beta cohort first, observe a
   //      fleet-wide passive capture (collect bits but suppress SMS) before baking into
@@ -609,29 +671,42 @@ bool SolarManager::readRegisters() {
   // Suspect register blocks: only read when explicitly enabled for bench work.
   // In production these stay zeroed so derived health logic does not false-trip.
 #ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
-  uint16_t temperatureRegs[2];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_HEATSINK_TEMP, 2, temperatureRegs, _cachedHoldingFC)) {
-    nextData.heatsinkTemp = (int8_t)((int16_t)temperatureRegs[0]);
-    nextData.batteryTemp = (int8_t)((int16_t)temperatureRegs[1]);
+  // One register per request, like the realtime block. A register this controller refuses costs
+  // one request (fastFail: the other function code is not tried, and the poll's cached one stays
+  // as it is). The first read that fails ends the rest for this poll, since the line rests after
+  // a request that got no reply, and a field that was not read keeps its last value.
+  bool statusLine = success;
+  auto readStatus = [&](uint16_t address, uint16_t *word) -> bool {
+    if (statusLine) {
+      statusLine = readRegistersIndividually(_config.modbusSlaveId, address, 1, word, _cachedHoldingFC, true);
+    }
+    return statusLine;
+  };
+  uint16_t word = 0;
+  uint16_t alarmHigh = 0;
+  if (readStatus(SS_REG_HEATSINK_TEMP, &word)) {
+    nextData.heatsinkTemp = (int8_t)(uint8_t)(word & 0xFF);  // signed degrees C in the low byte
   }
-
-  uint16_t statusRegs[5];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_CHARGE_STATE, 5, statusRegs, _cachedHoldingFC)) {
-    nextData.chargeState = (SolarChargeState)(statusRegs[0] & 0xFF);
-    nextData.faults = statusRegs[1];
-    nextData.alarms = statusRegs[3];
-    nextData.loadOn = (statusRegs[4] != 0);
+  if (readStatus(SS_REG_BATTERY_TEMP, &word)) {
+    nextData.batteryTemp = (int8_t)(uint8_t)(word & 0xFF);
   }
-
-  uint16_t dailyChargeRegs[1];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_AH_DAILY, 1, dailyChargeRegs, _cachedHoldingFC)) {
-    nextData.ampHoursDaily = dailyChargeRegs[0] * 0.1f;  // Scale: 0.1 Ah per count
+  if (readStatus(SS_REG_CHARGE_STATE, &word)) {
+    nextData.chargeState = (SolarChargeState)(word & 0xFF);
   }
-
-  uint16_t dailyVoltageRegs[2];
-  if (success && readRegistersWithFallback(_config.modbusSlaveId, SS_REG_BATTERY_V_MIN_DAILY, 2, dailyVoltageRegs, _cachedHoldingFC)) {
-    nextData.batteryVoltageMinDaily = scaleVoltage(dailyVoltageRegs[0]);
-    nextData.batteryVoltageMaxDaily = scaleVoltage(dailyVoltageRegs[1]);
+  if (readStatus(SS_REG_ARRAY_FAULT, &word)) {
+    nextData.arrayFaults = word;
+  }
+  if (readStatus(SS_REG_LOAD_STATE, &word)) {
+    nextData.loadOn = (word == LOAD_STATE_ON || word == LOAD_STATE_LVD_WARNING);
+  }
+  if (readStatus(SS_REG_LOAD_FAULT, &word)) {
+    nextData.loadFaults = word;
+  }
+  if (readStatus(SS_REG_ALARM_HI, &alarmHigh) && readStatus(SS_REG_ALARM_LO, &word)) {
+    nextData.alarms = ((uint32_t)alarmHigh << 16) | word;
+  }
+  if (readStatus(SS_REG_AHC_DAILY, &word)) {
+    nextData.ampHoursDaily = word * 0.1f;  // Scale: 0.1 Ah per count
   }
 #else
   // Force unverified fields to safe defaults every poll so a stale value from
@@ -639,13 +714,16 @@ bool SolarManager::readRegisters() {
   nextData.heatsinkTemp = 0;
   nextData.batteryTemp = 0;
   nextData.chargeState = CHARGE_STATE_START;
-  nextData.faults = 0;
+  nextData.arrayFaults = 0;
+  nextData.loadFaults = 0;
   nextData.alarms = 0;
   nextData.loadOn = false;
   nextData.ampHoursDaily = 0.0f;
-  nextData.wattHoursDaily = 0.0f;
+#endif
 
-  // Track daily min/max in software for production builds (Task 2.1 & SR-5)
+  // The lowest and highest battery voltage since the last daily report (resetDailyStats()), in
+  // software in every build (Task 2.1 & SR-5): the controller's own daily registers keep its own
+  // day, which has no clock behind it.
   if (success) {
     if (!nextData.dailyStatsSeeded) {
       nextData.batteryVoltageMinDaily = nextData.batteryVoltage;
@@ -660,7 +738,6 @@ bool SolarManager::readRegisters() {
       }
     }
   }
-#endif
 
   // Track no-charge alert (Task 2.2, R-1 & SR-2)
   if (success) {
@@ -780,7 +857,7 @@ void SolarManager::resetModbusErrorStats() {
 
 void SolarManager::updateHealthStatus() {
   // Update derived flags
-  _data.hasFault = (_data.faults != 0);
+  _data.hasFault = (_data.arrayFaults != 0 || _data.loadFaults != 0);
   _data.hasAlarm = (_data.alarms != 0);
   
 #ifdef SOLAR_ENABLE_UNVERIFIED_REGISTERS
@@ -940,29 +1017,15 @@ const char* SolarManager::getChargeStateDescription() const {
 }
 
 const char* SolarManager::getFaultDescription() const {
-  if (_data.faults == 0) {
+  if (_data.arrayFaults == 0 && _data.loadFaults == 0) {
     return "No faults";
   }
-  
+
   _faultDescBuffer[0] = '\0';
-  
-  if (_data.faults & SS_FAULT_OVERCURRENT)    strlcat(_faultDescBuffer, "Overcurrent ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_FET_SHORT)      strlcat(_faultDescBuffer, "FET-Short ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_SOFTWARE)       strlcat(_faultDescBuffer, "SW-Fault ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_BATT_HVD)       strlcat(_faultDescBuffer, "Batt-HVD ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_ARRAY_HVD)      strlcat(_faultDescBuffer, "Array-HVD ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_DIP_SW_FAULT)   strlcat(_faultDescBuffer, "DIP-SW ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_RESET_FAULT)    strlcat(_faultDescBuffer, "Reset ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_RTS_DISCONN)    strlcat(_faultDescBuffer, "RTS-Disc ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_RTS_SHORT)      strlcat(_faultDescBuffer, "RTS-Short ", sizeof(_faultDescBuffer));
-  if (_data.faults & SS_FAULT_HEATSINK_LIMIT) strlcat(_faultDescBuffer, "Heatsink-Limit ", sizeof(_faultDescBuffer));
-  
-  // Trim trailing space
-  size_t len = strlen(_faultDescBuffer);
-  if (len > 0 && _faultDescBuffer[len - 1] == ' ') {
-    _faultDescBuffer[len - 1] = '\0';
-  }
-  
+  appendBitTags(_data.arrayFaults, kArrayFaultTags, sizeof(kArrayFaultTags) / sizeof(kArrayFaultTags[0]), "Bit",
+                _faultDescBuffer, sizeof(_faultDescBuffer));
+  appendBitTags(_data.loadFaults, kLoadFaultTags, sizeof(kLoadFaultTags) / sizeof(kLoadFaultTags[0]), "Load-Bit",
+                _faultDescBuffer, sizeof(_faultDescBuffer));
   return _faultDescBuffer;
 }
 
@@ -970,39 +1033,19 @@ const char* SolarManager::getAlarmDescription() const {
   if (_data.alarms == 0) {
     return "No alarms";
   }
-  
+
   _alarmDescBuffer[0] = '\0';
-  
-  if (_data.alarms & SS_ALARM_RTS_OPEN)        strlcat(_alarmDescBuffer, "RTS-Open ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_RTS_SHORT)       strlcat(_alarmDescBuffer, "RTS-Short ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_RTS_DISCONN)     strlcat(_alarmDescBuffer, "RTS-Disc ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_HEATSINK_LIMIT)  strlcat(_alarmDescBuffer, "Heatsink ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_CURRENT_LIMIT)   strlcat(_alarmDescBuffer, "I-Limit ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_CURRENT_OFFSET)  strlcat(_alarmDescBuffer, "I-Offset ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_BATT_SENSE)      strlcat(_alarmDescBuffer, "Batt-Sense ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_BATT_SENSE_DISC) strlcat(_alarmDescBuffer, "Sense-Disc ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_UNCALIBRATED)    strlcat(_alarmDescBuffer, "Uncal ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_RTS_MISWIRE)     strlcat(_alarmDescBuffer, "RTS-Miswire ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_HVD)             strlcat(_alarmDescBuffer, "HVD ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_LOG_TIMEOUT)     strlcat(_alarmDescBuffer, "Log-Timeout ", sizeof(_alarmDescBuffer));
-  if (_data.alarms & SS_ALARM_EEPROM)          strlcat(_alarmDescBuffer, "EEPROM ", sizeof(_alarmDescBuffer));
-  
-  // Trim trailing space
-  size_t len = strlen(_alarmDescBuffer);
-  if (len > 0 && _alarmDescBuffer[len - 1] == ' ') {
-    _alarmDescBuffer[len - 1] = '\0';
-  }
-  
+  appendBitTags(_data.alarms, kAlarmTags, sizeof(kAlarmTags) / sizeof(kAlarmTags[0]), "Bit", _alarmDescBuffer,
+                sizeof(_alarmDescBuffer));
   return _alarmDescBuffer;
 }
 
 void SolarManager::resetDailyStats() {
-  // Note: The SunSaver resets its own daily stats at midnight (based on its RTC)
-  // This just resets our local tracking
+  // The client's own daily figures start over with the next poll. The client calls this once a
+  // daily report has gone out, so each report covers the time since the one before. The
+  // controller has no clock, and its own daily registers keep a day of their own.
   _data.batteryVoltageMinDaily = _data.batteryVoltage;
   _data.batteryVoltageMaxDaily = _data.batteryVoltage;
-  _data.ampHoursDaily = 0.0f;
-  _data.wattHoursDaily = 0.0f;
   _data.dailyStatsSeeded = false;
 }
 

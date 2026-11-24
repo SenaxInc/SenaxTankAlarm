@@ -138,10 +138,10 @@ struct BatteryData {
   bool usbPowered;            // Legacy Notecard field — always false on MPPT/Vin sources.
   uint32_t uptimeMinutes;     // Device uptime in minutes (firmware-computed since Fix 11)
   
-  // Historical data: running min/max across the current boot session (no firmware-side
-  // multi-day persistence yet; voltageAvg/analysisHours are reserved and not populated).
-  float voltageMin;           // Minimum voltage observed this boot
-  float voltageMax;           // Maximum voltage observed this boot
+  // Historical data: running min/max since the last daily report, which sets both to 0 (no
+  // firmware-side multi-day persistence yet; voltageAvg/analysisHours are reserved and not populated).
+  float voltageMin;           // Minimum voltage observed since the last daily report
+  float voltageMax;           // Maximum voltage observed since the last daily report
   float voltageAvg;           // Reserved — not populated by the current firmware
   uint16_t analysisHours;     // Reserved — not populated by the current firmware
   

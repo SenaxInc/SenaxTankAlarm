@@ -50,21 +50,31 @@
 #define SS_REG_CHARGE_CURRENT       0x000B  // adc_ic_f: filtered charge current
 #define SS_REG_LOAD_CURRENT         0x000C  // adc_il_f: filtered load current
 
-// Temperature
-#define SS_REG_HEATSINK_TEMP        0x001B  // Register 28: Heatsink Temperature (°C, signed)
-#define SS_REG_BATTERY_TEMP         0x001C  // Register 29: Battery Temperature (°C, signed, if RTS connected)
+// The registers below are where the SunSaver MPPT MODBUS Specification v11 puts them, as written
+// out in OptaView's profile (OptaView/profiles/sunsaver-mppt.json). The host test
+// tests/host/sunsaver_settings checks every address and bit here against that profile. None of
+// them has been confirmed on hardware yet, so production builds do not read them: see
+// SOLAR_ENABLE_UNVERIFIED_REGISTERS in SolarManager::readRegisters(). The addresses this file
+// had before (0x001B, 0x001C, 0x002B to 0x002F, 0x0034, 0x0038, 0x003D, 0x003E) belong to other
+// registers, which is why the bench read "values that look like extra voltage snapshots" there:
+// 0x002B and 0x002C are the battery's lowest and highest voltage today.
 
-// Status Registers
-#define SS_REG_CHARGE_STATE         0x002B  // Register 44: Charge State
-#define SS_REG_FAULTS               0x002C  // Register 45: Faults (bitfield)
-#define SS_REG_ALARMS               0x002E  // Register 47: Alarms (bitfield)
-#define SS_REG_LOAD_STATE           0x002F  // Register 48: Load State
+// Temperatures: signed degrees C in the low byte
+#define SS_REG_HEATSINK_TEMP        0x000D  // T_hs
+#define SS_REG_BATTERY_TEMP         0x000E  // T_batt: the remote sensor (RTS) when one is connected, else the controller's own
 
-// Daily Statistics
-#define SS_REG_BATTERY_V_MIN_DAILY  0x003D  // Register 62: Minimum Battery Voltage Today
-#define SS_REG_BATTERY_V_MAX_DAILY  0x003E  // Register 63: Maximum Battery Voltage Today
-#define SS_REG_AH_DAILY             0x0034  // Register 53: Amp-hours charged today
-#define SS_REG_WH_DAILY             0x0038  // Register 57: Watt-hours charged today (if available)
+// Status
+#define SS_REG_CHARGE_STATE         0x0011  // charge_state: a SolarChargeState
+#define SS_REG_ARRAY_FAULT          0x0012  // array_fault: SS_ARRAY_FAULT_* bits
+#define SS_REG_LOAD_STATE           0x001A  // load_state: a SolarLoadState
+#define SS_REG_LOAD_FAULT           0x001B  // load_fault: SS_LOAD_FAULT_* bits
+#define SS_REG_ALARM_HI             0x0023  // alarm, high word: SS_ALARM_* bits 16 and up
+#define SS_REG_ALARM_LO             0x0024  // alarm, low word: SS_ALARM_* bits 0 to 15
+
+// The charge the controller counted on its own "today", 0.1 Ah per count. It has no clock, so its
+// day need not be the client's, whose own figures cover the time between two daily reports (see
+// SolarManager::resetDailyStats()).
+#define SS_REG_AHC_DAILY            0x002D  // Ahc_daily
 
 // ============================================================================
 // Stored charge settings
@@ -101,7 +111,7 @@
 #define SS_SCALE_DIVISOR            32768.0f  // Common divisor
 
 // ============================================================================
-// Charge State Values
+// Charge State Values (charge_state, 0x0011)
 // ============================================================================
 enum SolarChargeState : uint8_t {
   CHARGE_STATE_START      = 0,  // Controller starting up
@@ -109,42 +119,64 @@ enum SolarChargeState : uint8_t {
   CHARGE_STATE_DISCONNECT = 2,  // Disconnected
   CHARGE_STATE_NIGHT      = 3,  // Night mode (solar offline)
   CHARGE_STATE_FAULT      = 4,  // Fault condition
-  CHARGE_STATE_BULK       = 5,  // Bulk charging (battery below 80%)
-  CHARGE_STATE_ABSORPTION = 6,  // Absorption charging (battery 80-100%)
-  CHARGE_STATE_FLOAT      = 7,  // Float charging (battery fully charged)
+  CHARGE_STATE_BULK       = 5,  // Bulk: all the current the array gives, the battery below its absorption voltage
+  CHARGE_STATE_ABSORPTION = 6,  // Absorption: the battery held at its absorption (top-up) voltage
+  CHARGE_STATE_FLOAT      = 7,  // Float: the absorption time is done, the battery held at its float voltage
   CHARGE_STATE_EQUALIZE   = 8   // Equalization charging (if configured)
 };
 
 // ============================================================================
-// Fault Bitfield Definitions (Register 45)
+// Load State Values (load_state, 0x001A)
 // ============================================================================
-#define SS_FAULT_OVERCURRENT        (1 << 0)  // Bit 0: Overcurrent
-#define SS_FAULT_FET_SHORT          (1 << 1)  // Bit 1: FET short
-#define SS_FAULT_SOFTWARE           (1 << 2)  // Bit 2: Software fault
-#define SS_FAULT_BATT_HVD           (1 << 3)  // Bit 3: Battery high voltage disconnect
-#define SS_FAULT_ARRAY_HVD          (1 << 4)  // Bit 4: Array high voltage disconnect
-#define SS_FAULT_DIP_SW_FAULT       (1 << 5)  // Bit 5: DIP switch changed
-#define SS_FAULT_RESET_FAULT        (1 << 6)  // Bit 6: Settings reset (EEPROM corrupt)
-#define SS_FAULT_RTS_DISCONN        (1 << 7)  // Bit 7: RTS (temp sensor) disconnected
-#define SS_FAULT_RTS_SHORT          (1 << 8)  // Bit 8: RTS shorted
-#define SS_FAULT_HEATSINK_LIMIT     (1 << 9)  // Bit 9: Heatsink temperature limit
+enum SolarLoadState : uint8_t {
+  LOAD_STATE_START       = 0,
+  LOAD_STATE_ON          = 1,
+  LOAD_STATE_LVD_WARNING = 2,  // still on: the LVD is near
+  LOAD_STATE_LVD         = 3,  // off: low voltage disconnect
+  LOAD_STATE_FAULT       = 4,
+  LOAD_STATE_DISCONNECT  = 5
+};
 
 // ============================================================================
-// Alarm Bitfield Definitions (Register 47)
+// Fault and alarm bits
 // ============================================================================
-#define SS_ALARM_RTS_OPEN           (1 << 0)  // Bit 0: RTS open
-#define SS_ALARM_RTS_SHORT          (1 << 1)  // Bit 1: RTS shorted
-#define SS_ALARM_RTS_DISCONN        (1 << 2)  // Bit 2: RTS disconnected
-#define SS_ALARM_HEATSINK_LIMIT     (1 << 3)  // Bit 3: Heatsink temperature limit
-#define SS_ALARM_CURRENT_LIMIT      (1 << 4)  // Bit 4: Current limit reached
-#define SS_ALARM_CURRENT_OFFSET     (1 << 5)  // Bit 5: Current offset error
-#define SS_ALARM_BATT_SENSE         (1 << 6)  // Bit 6: Battery sense out of range
-#define SS_ALARM_BATT_SENSE_DISC    (1 << 7)  // Bit 7: Battery sense disconnected
-#define SS_ALARM_UNCALIBRATED       (1 << 8)  // Bit 8: Controller uncalibrated
-#define SS_ALARM_RTS_MISWIRE        (1 << 9)  // Bit 9: RTS miswired
-#define SS_ALARM_HVD                (1 << 10) // Bit 10: High voltage disconnect
-#define SS_ALARM_LOG_TIMEOUT        (1 << 11) // Bit 11: Log timeout
-#define SS_ALARM_EEPROM             (1 << 12) // Bit 12: EEPROM access error
+// array_fault (0x0012)
+#define SS_ARRAY_FAULT_OVERCURRENT      (1u << 0)  // Overcurrent
+#define SS_ARRAY_FAULT_FETS_SHORTED     (1u << 1)  // FETs shorted
+#define SS_ARRAY_FAULT_SOFTWARE         (1u << 2)  // Software bug
+#define SS_ARRAY_FAULT_BATTERY_HVD      (1u << 3)  // Battery HVD
+#define SS_ARRAY_FAULT_ARRAY_HVD        (1u << 4)  // Array HVD
+#define SS_ARRAY_FAULT_EEPROM_EDIT      (1u << 5)  // EEPROM setting edit: settings were written, a restart is due
+#define SS_ARRAY_FAULT_RTS_SHORTED      (1u << 6)  // RTS shorted
+#define SS_ARRAY_FAULT_RTS_DISCONNECTED (1u << 7)  // RTS was valid, now disconnected
+#define SS_ARRAY_FAULT_LOCAL_TEMP       (1u << 8)  // Local temperature sensor failed
+
+// load_fault (0x001B)
+#define SS_LOAD_FAULT_SHORT_CIRCUIT     (1u << 0)  // External short circuit
+#define SS_LOAD_FAULT_OVERCURRENT       (1u << 1)  // Overcurrent
+#define SS_LOAD_FAULT_FETS_SHORTED      (1u << 2)  // FETs shorted
+#define SS_LOAD_FAULT_SOFTWARE          (1u << 3)  // Software bug
+#define SS_LOAD_FAULT_HVD               (1u << 4)  // HVD
+#define SS_LOAD_FAULT_HEATSINK_HOT      (1u << 5)  // Heatsink over-temperature
+#define SS_LOAD_FAULT_EEPROM_EDIT       (1u << 6)  // EEPROM setting edit: settings were written, a restart is due
+
+// alarm (0x0023 and 0x0024). The specification does not say how its 24 bits split across the two
+// words. As in OptaView's profile, bit 0 is taken as the lowest bit of the low word (0x0024), so
+// the alarms are (0x0023 << 16) | 0x0024. Bits 8, 9, 12 and 13 have no name.
+#define SS_ALARM_RTS_OPEN               (1ul << 0)   // RTS open
+#define SS_ALARM_RTS_SHORTED            (1ul << 1)   // RTS shorted
+#define SS_ALARM_RTS_DISCONNECTED       (1ul << 2)   // RTS disconnected
+#define SS_ALARM_THS_OPEN               (1ul << 3)   // Ths open: the heatsink sensor
+#define SS_ALARM_THS_SHORTED            (1ul << 4)   // Ths shorted
+#define SS_ALARM_HOT                    (1ul << 5)   // SSMPPT hot
+#define SS_ALARM_CURRENT_LIMIT          (1ul << 6)   // Current limit
+#define SS_ALARM_CURRENT_OFFSET         (1ul << 7)   // Current offset
+#define SS_ALARM_UNCALIBRATED           (1ul << 10)  // Uncalibrated
+#define SS_ALARM_RTS_MISWIRE            (1ul << 11)  // RTS miswire
+#define SS_ALARM_MISWIRE                (1ul << 14)  // Miswire
+#define SS_ALARM_FET_OPEN               (1ul << 15)  // FET open
+#define SS_ALARM_P12                    (1ul << 16)  // P12
+#define SS_ALARM_HIGH_VA_CURRENT_LIMIT  (1ul << 17)  // High Va current limit
 
 // ============================================================================
 // Battery Health Thresholds (12V AGM System)
@@ -165,20 +197,20 @@ struct SolarData {
   float chargeCurrent;        // Charging current (A)
   float loadCurrent;          // Load current (A)
   int8_t heatsinkTemp;        // Heatsink temperature (°C)
-  int8_t batteryTemp;         // Battery temperature (°C, if RTS connected)
-  
+  int8_t batteryTemp;         // Battery temperature (°C): the RTS when one is connected, else the controller's own sensor
+
   // Status
   SolarChargeState chargeState; // Current charge state
-  uint16_t faults;            // Fault bitfield
-  uint16_t alarms;            // Alarm bitfield
-  bool loadOn;                // Load output state
-  
-  // Daily statistics
-  float batteryVoltageMinDaily; // Minimum battery voltage today
-  float batteryVoltageMaxDaily; // Maximum battery voltage today
-  float ampHoursDaily;        // Amp-hours charged today
-  float wattHoursDaily;       // Watt-hours charged today
-  
+  uint16_t arrayFaults;       // SS_ARRAY_FAULT_* bits
+  uint16_t loadFaults;        // SS_LOAD_FAULT_* bits
+  uint32_t alarms;            // SS_ALARM_* bits
+  bool loadOn;                // Load output on (LOAD_STATE_ON or LOAD_STATE_LVD_WARNING)
+
+  // Daily statistics: the client's own, since the last daily report (resetDailyStats())
+  float batteryVoltageMinDaily; // Lowest battery voltage
+  float batteryVoltageMaxDaily; // Highest battery voltage
+  float ampHoursDaily;        // Amp-hours charged, the controller's own "today" (SS_REG_AHC_DAILY)
+
   // Derived health indicators
   bool batteryHealthy;        // Overall battery health status
   bool solarHealthy;          // Overall solar system health status
@@ -377,7 +409,8 @@ public:
   uint32_t getModbusErrIllegalFunc()  const;
   uint32_t getModbusErrOther()        const;
 
-  // Reset daily statistics (call at midnight or report time)
+  // Starts the daily figures (the battery's lowest and highest voltage) over with the next poll.
+  // The client calls it once a daily report has gone out, so that each report covers its own day.
   void resetDailyStats();
 
   // Force a poll execution on the next opportunity
