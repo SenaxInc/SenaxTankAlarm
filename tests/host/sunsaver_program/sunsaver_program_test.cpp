@@ -118,13 +118,14 @@ struct TestBus : ss::Bus {
   std::vector<Asked> log;
   std::function<void(size_t index, char kind, uint16_t addr)> before;
   long disorder;
+  uint8_t slave;  // the Modbus id the requests go to
 
-  TestBus(SimSunSaver &s, ModbusMaster &m) : sim(s), master(m), function(MB_FC_READ_INPUT), disorder(0) {}
+  TestBus(SimSunSaver &s, ModbusMaster &m) : sim(s), master(m), function(MB_FC_READ_INPUT), disorder(0), slave(1) {}
 
   ss::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
     const uint64_t at = announce('r', addr);
     uint16_t word = 0;
-    const MbResult result = master.readRegisters(1, function, addr, 1, &word);
+    const MbResult result = master.readRegisters(slave, function, addr, 1, &word);
     if (result.status == MB_OK) {
       *raw = word;
     }
@@ -133,13 +134,17 @@ struct TestBus : ss::Bus {
 
   ss::IoStatus writeRegister(uint16_t addr, uint16_t raw) override {
     const uint64_t at = announce('w', addr);
-    return noted('w', addr, raw, at, master.writeRegister(1, addr, raw));
+    return noted('w', addr, raw, at, master.writeRegister(slave, addr, raw));
   }
 
   ss::IoStatus writeCoil(uint16_t addr) override {
     const uint64_t at = announce('c', addr);
-    return noted('c', addr, 0xFF00, at, master.writeCoil(1, addr, true));
+    return noted('c', addr, 0xFF00, at, master.writeCoil(slave, addr, true));
   }
+
+  // The simulator's clock is the client's here: a Station waits on it, and only on it.
+  uint32_t millisNow() override { return (uint32_t)sim.elapsedMs(); }
+  uint16_t timeoutMs() const override { return (uint16_t)master.responseTimeoutMs; }
 
   size_t count(char kind) const {
     size_t n = 0;
@@ -421,7 +426,8 @@ static bool plainAscii(const char *text) {
   return true;
 }
 
-// The requests of a run on a factory-default controller in which nothing goes wrong.
+// The requests of a run on a factory-default controller in which nothing goes wrong. After each
+// restart command the controller misses one request while it restarts.
 typedef std::vector<std::pair<char, uint16_t> > Sequence;
 
 static Sequence quietRun() {
@@ -430,6 +436,7 @@ static Sequence quietRun() {
     s.push_back(std::make_pair('r', ss::item(i).addr));
   }
   s.push_back(std::make_pair('c', A_COIL_RESTART));
+  s.push_back(std::make_pair('r', A_ARRAY_FAULT));  // no answer
   s.push_back(std::make_pair('r', A_ARRAY_FAULT));
   s.push_back(std::make_pair('r', A_LOAD_FAULT));
   for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
@@ -443,6 +450,7 @@ static Sequence quietRun() {
   s.push_back(std::make_pair('r', A_ARRAY_FAULT));
   s.push_back(std::make_pair('r', A_LOAD_FAULT));
   s.push_back(std::make_pair('c', A_COIL_RESTART));
+  s.push_back(std::make_pair('r', A_ARRAY_FAULT));  // no answer
   s.push_back(std::make_pair('r', A_ARRAY_FAULT));
   s.push_back(std::make_pair('r', A_LOAD_FAULT));
   for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
@@ -809,7 +817,7 @@ static void testQuietRun() {
     CHECK_EQ(result.loadStateBefore, 1);
     CHECK_EQ(result.loadStateEdit, 1);
     CHECK_EQ(result.loadStateAfter, 1);
-    CHECK_EQ(result.probes, 0);
+    CHECK_EQ(result.probes, 1);  // the controller missed one request while it restarted
     CHECK_EQ(result.profile.lvdCv, 1310);
     CHECK(near(ss::batteryVolts(result), 13.68, 0.005));
     for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
@@ -821,11 +829,13 @@ static void testQuietRun() {
 
     // What went over the line, request by request.
     checkSequence(station.bus, quietRun());
-    CHECK_EQ(station.bus.log.size(), 106);
+    CHECK_EQ(station.bus.log.size(), 108);
     CHECK_EQ(station.bus.count('w'), 15);
     CHECK_EQ(station.bus.count('c'), 2);
     for (size_t i = 0; i < station.bus.log.size(); ++i) {
-      CHECK_EQ(station.bus.log[i].status, ss::SSIO_OK);
+      // The first request after each restart command finds the controller restarting.
+      const bool restarting = i > 0 && station.bus.log[i - 1].kind == 'c';
+      CHECK_EQ(station.bus.log[i].status, restarting ? ss::SSIO_NO_REPLY : ss::SSIO_OK);
       if (station.bus.log[i].kind == 'w') {
         CHECK_EQ(station.bus.log[i].value, wantedWord(fresh, station.bus.log[i].addr, profile));
       }
@@ -996,8 +1006,9 @@ static void testPendingBefore() {
     // It waited once, before the restart command, and never to write.
     CHECK_EQ(station.commits.size(), 1);
     CHECK(station.commits.size() == 1 && station.commits[0] == ss::COMMIT_RESTART);
-    // 49 reads, the command, the two fault words, the 17 registers again, the load state.
-    CHECK_EQ(station.bus.log.size(), ss::ITEM_COUNT + 1 + 2 + ss::PLAN_ENTRIES + 1);
+    // 49 reads, the command, a request the restarting controller misses, the two fault words,
+    // the 17 registers again, the load state.
+    CHECK_EQ(station.bus.log.size(), ss::ITEM_COUNT + 1 + 1 + 2 + ss::PLAN_ENTRIES + 1);
     CHECK(!station.programmer.controllerUnknown());
   }
   // Only one of the two fault words says so: that is enough.
@@ -1408,7 +1419,7 @@ static void testFirstRestart() {
     const ss::ProgramResult &result = station.run();
     CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
     CHECK_EQ(result.restart, ss::RESTART_DONE);
-    CHECK(result.probes >= 2 && result.probes <= 4);  // those of the last restart
+    CHECK(result.probes >= 4 && result.probes <= 5);  // those of the last restart: 9 s, about 2 s apart
     CHECK_EQ(station.sim.resets, 2);
     checkPauses(station);
     // The requests it missed were for the array fault word, one per step.
@@ -1419,7 +1430,7 @@ static void testFirstRestart() {
       CHECK_EQ(station.bus.log[i].addr, A_ARRAY_FAULT);
       ++missed;
     }
-    CHECK(missed >= 2 && missed <= 4);
+    CHECK(missed >= 4 && missed <= 5);
   }
   // After each probe the restarting controller missed, the run asks for a pause of its own, so
   // that a client whose rest after a miss is shorter than PROBE_GAP_MS still leaves it that long.
@@ -1448,9 +1459,11 @@ static void testFirstRestart() {
     CHECK(missedProbes >= 4);  // two restarts, each with at least two
   }
 
-  // It never comes back from the command. Nothing is written, and the run owes it nothing.
+  // It never comes back from the command. Nothing is written, and the run owes it nothing. (A
+  // short timeout, so that BACK_PROBES ends the wait and not the time limit: see testTimeLimit().)
   {
     Station station;
+    station.master.responseTimeoutMs = 300;
     station.bus.before = [&](size_t, char kind, uint16_t) {
       if (kind == 'c') {
         station.sim.resetDownMs = 3600UL * 1000UL;
@@ -1461,6 +1474,7 @@ static void testFirstRestart() {
     CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
     CHECK_EQ(result.refusals, 0);
     CHECK_EQ(result.probes, ss::BACK_PROBES);
+    CHECK_EQ(result.notes & ss::NOTE_TIME_LIMIT, 0);
     CHECK(!result.wroteAny);
     CHECK_EQ(station.bus.count('w'), 0);
     CHECK_EQ(station.bus.count('c'), 1);
@@ -1498,28 +1512,149 @@ static void testFirstRestart() {
     const ss::ProgramResult &result = station.run();
     CHECK_EQ(result.outcome, ss::OUTCOME_NO_LINK);
     CHECK_EQ(result.restart, ss::RESTART_UNCONFIRMED);
-    CHECK_EQ(station.bus.log.size(), ss::ITEM_COUNT + 1 + 1 + ss::READ_ATTEMPTS);
+    // The command, the probe it missed while it restarted, the array fault word, and the load fault word twice.
+    CHECK_EQ(station.bus.log.size(), ss::ITEM_COUNT + 1 + 1 + 1 + ss::READ_ATTEMPTS);
     CHECK_EQ(station.bus.count('w'), 0);
   }
 
-  // The command is acknowledged and nothing restarts. With no edit pending there is nothing to
-  // show that, so the run writes; and then it is the second restart that fails, visibly.
+  // The command is acknowledged and nothing restarts. With no edit pending, only a controller
+  // that goes away for a moment shows that it restarted: this one goes on answering, so nothing
+  // shows that the command works, and nothing is written.
   {
     Station station;
     station.sim.resetWorks = false;
     const ss::ProgramResult &result = station.run();
-    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
-    CHECK_EQ(result.restart, ss::RESTART_NOT_DONE);
-    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 15);
-    CHECK_EQ(station.bus.count('c'), 1 + ss::RESTART_ATTEMPTS);
+    CHECK_EQ(result.outcome, ss::OUTCOME_REFUSED);
+    CHECK_EQ(result.refusals, ss::REFUSE_NO_RESTART);
+    CHECK_EQ(result.restart, ss::RESTART_UNPROVEN);
+    CHECK(!result.wroteAny);
+    CHECK_EQ(station.bus.count('w'), 0);
+    CHECK_EQ(station.bus.count('c'), 1);
     CHECK_EQ(station.sim.resets, 0);
-    CHECK(holdsProfile(station.sim, profile));
-    CHECK(editPending(station.sim));
-    // The run knows what is wrong, so there is nothing for it to find out later.
+    CHECK(onlyPlanChanged(station.sim, fresh));
+    CHECK(!editPending(station.sim));
+    // Asked QUIET_PROBES times, PROBE_GAP_MS apart, as a restart may not begin at once; then
+    // its load fault word.
+    const size_t command = station.bus.nth('c', 0);
+    CHECK_EQ(station.bus.log.size() - command, 1 + ss::QUIET_PROBES + 1);
+    for (size_t i = command + 1; i < station.bus.log.size(); ++i) {
+      const bool probe = i + 1 < station.bus.log.size();
+      CHECK_EQ(station.bus.log[i].status, ss::SSIO_OK);
+      CHECK_EQ(station.bus.log[i].addr, probe ? A_ARRAY_FAULT : A_LOAD_FAULT);
+      if (probe && i > command + 1) {
+        CHECK(station.bus.log[i].at - station.bus.log[i - 1].end >= ss::PROBE_GAP_MS);
+      }
+    }
     CHECK(!station.programmer.controllerUnknown());
     CHECK(!station.programmer.resume());
-    CHECK_EQ(result.loadStateAfter, 1);
     checkPauses(station);
+  }
+  // The same controller with an edit pending: that it is still pending shows the command did
+  // nothing. Asked twice, refused, and nothing written.
+  {
+    Station station;
+    station.sim.resetWorks = false;
+    station.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    chargeForPending(station.sim);
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_REFUSED);
+    CHECK_EQ(result.refusals, ss::REFUSE_NO_RESTART);
+    CHECK_EQ(result.restart, ss::RESTART_NOT_DONE);
+    CHECK_EQ(station.bus.count('c'), ss::RESTART_ATTEMPTS);
+    CHECK_EQ(station.bus.count('w'), 0);
+    CHECK(editPending(station.sim));
+  }
+  // A controller that restarts without missing a request: the pending edit it cleared shows the
+  // restart. It is asked a few seconds first, as it would be if its restart were yet to come.
+  {
+    Station station;
+    station.sim.resetDownMs = 0;
+    station.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    chargeForPending(station.sim);
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(station.sim.resets, 2);
+    const size_t command = station.bus.nth('c', 0);
+    for (size_t i = 1; i <= ss::QUIET_PROBES; ++i) {
+      CHECK_EQ(station.bus.log[command + i].status, ss::SSIO_OK);
+      CHECK_EQ(station.bus.log[command + i].addr, A_ARRAY_FAULT);
+    }
+    CHECK_EQ(station.bus.log[command + ss::QUIET_PROBES + 1].addr, A_LOAD_FAULT);
+    CHECK_EQ(station.bus.log[command + ss::QUIET_PROBES + 2].kind, 'w');
+  }
+  // One that restarts a moment after the command: it answers the first looks, then misses one
+  // while it restarts. The miss shows the restart.
+  {
+    Station station;
+    station.bus.before = [&](size_t index, char kind, uint16_t) {
+      if (kind == 'c') {
+        station.sim.resetWorks = station.bus.count('c') > 0;  // the first one takes effect late: below
+      }
+      if (station.bus.count('c') == 1 && index == station.bus.nth('c', 0) + 4) {
+        station.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    const size_t command = station.bus.nth('c', 0);
+    for (size_t i = command + 1; i < command + 4; ++i) {
+      CHECK_EQ(station.bus.log[i].status, ss::SSIO_OK);
+    }
+    CHECK_EQ(station.bus.log[command + 4].status, ss::SSIO_NO_REPLY);
+    CHECK_EQ(station.bus.log[command + 5].addr, A_ARRAY_FAULT);  // asked again until it is back
+    CHECK_EQ(station.bus.log[command + 6].addr, A_LOAD_FAULT);
+    CHECK_EQ(station.bus.log[command + 7].kind, 'w');
+  }
+  // The first restart is shown, the second is not: the controller goes on answering after it,
+  // and reports no pending edit before or after (it never does). The values are written, and
+  // nothing shows they are in effect.
+  {
+    Station station;
+    station.bus.before = [&](size_t, char kind, uint16_t) {
+      station.sim.regs[A_ARRAY_FAULT] = 0;
+      station.sim.regs[A_LOAD_FAULT] = 0;
+      if (kind == 'c' && station.bus.count('c') == 1) {
+        station.sim.resetWorks = false;
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+    CHECK_EQ(result.restart, ss::RESTART_UNPROVEN);
+    CHECK(!ss::outcomeIsGood(result.outcome));
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 15);
+    CHECK_EQ(station.bus.count('c'), 2);  // a pending edit it could clear was never seen: one command
+    CHECK_EQ(station.sim.resets, 1);
+    CHECK(!station.programmer.controllerUnknown());
+    checkPauses(station);
+  }
+  // The pending edit is not seen while the controller waits (its load fault word is silent then),
+  // and the last restart command does nothing: the controller answers on, and then reports the
+  // edit. That shows what the second command has to clear, and its clearing shows the restart,
+  // although this controller restarts without missing a request.
+  {
+    Station station;
+    station.bus.before = [&](size_t, char kind, uint16_t addr) {
+      if (kind == 'r' && addr == A_LOAD_FAULT && station.bus.count('w') > 0 && station.bus.count('c') == 1) {
+        station.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+      }
+      if (kind == 'c' && station.bus.count('c') == 1) {
+        station.sim.resetWorks = false;
+      } else if (kind == 'c' && station.bus.count('c') == 2) {
+        station.sim.resetWorks = true;
+        station.sim.resetDownMs = 0;
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(station.bus.count('c'), 3);
+    CHECK_EQ(station.sim.resets, 2);
+    CHECK(!editPending(station.sim));
+    for (size_t i = station.bus.nth('c', 2) + 1; i < station.bus.log.size(); ++i) {
+      CHECK_EQ(station.bus.log[i].status, ss::SSIO_OK);  // it missed nothing after the last command
+    }
   }
 }
 
@@ -1540,7 +1675,7 @@ static void testWrites() {
   const ss::Profile profile = ss::lifepo4Profile();
   const SimSunSaver fresh;
   const Sequence quiet = quietRun();
-  const size_t firstWrite = ss::ITEM_COUNT + 3;  // after the reads, the command and the two fault words
+  const size_t firstWrite = ss::ITEM_COUNT + 4;  // after the reads, the command, a missed probe and the two fault words
   CHECK_EQ(quiet[firstWrite].first, 'w');
   CHECK_EQ(quiet[firstWrite].second, A_EV_EQ2);
 
@@ -1604,7 +1739,7 @@ static void testWrites() {
     CHECK(!station.programmer.controllerUnknown());
     // The registers that were written are read once more after the restart, the others are not.
     const size_t lastCommand = station.bus.nth('c', 1);
-    CHECK_EQ(station.bus.log.size() - lastCommand, 1 + 2 + 4 + 1);
+    CHECK_EQ(station.bus.log.size() - lastCommand, 1 + 1 + 2 + 4 + 1);
     checkPauses(station);
   }
   // The controller refuses to store anything.
@@ -1834,8 +1969,10 @@ static void testFinalRestart() {
   }
 
   // The controller does not come back from it. The run ends not knowing, and is taken up again.
+  // (A short timeout, so that BACK_PROBES ends the wait and not the time limit.)
   {
     Station station;
+    station.master.responseTimeoutMs = 300;
     station.bus.before = [&](size_t, char kind, uint16_t) {
       if (kind == 'c' && station.bus.count('c') == 1) {
         station.sim.resetDownMs = 3600UL * 1000UL;
@@ -1978,7 +2115,8 @@ static void testFinalRestart() {
     CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 14);
   }
 
-  // A register cannot be read again after the restart: said, and no more than that.
+  // A register cannot be read again after the restart: the run cannot say that the charger holds
+  // what it asked for, and says so.
   {
     Station station;
     station.bus.before = [&](size_t, char kind, uint16_t) {
@@ -1987,18 +2125,26 @@ static void testFinalRestart() {
       }
     };
     const ss::ProgramResult &result = station.run();
-    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(result.outcome, ss::OUTCOME_UNVERIFIED);
+    CHECK(!ss::outcomeIsGood(result.outcome));
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
     CHECK_EQ(result.notes, ss::NOTE_SW1_OFF | ss::NOTE_VERIFY_INCOMPLETE);
-    CHECK_EQ(statusOf(result, A_ET_FLOAT), ss::ENTRY_WRITTEN);
+    CHECK_EQ(statusOf(result, A_ET_FLOAT), ss::ENTRY_UNREAD);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_UNREAD), 1);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 14);
     CHECK_EQ(result.loadStateAfter, 1);
     CHECK_EQ(station.bus.log.size(), quietRun().size());
+    CHECK(!station.programmer.controllerUnknown());
+    // It was written, and read back, before the restart.
+    CHECK_TEXT(textFrom([&](ss::Text *t) { ss::describeRun(result, t); }),
+               std::string("unverified: 15 of 17 registers written, 2 already set, 1 not read after the restart"));
   }
   // Two registers in a row miss one request each: each is asked once more, and both are read.
   {
     Station station;
     station.bus.before = [&](size_t index, char kind, uint16_t) {
       if (kind == 'r' && station.bus.count('c') == 2) {
-        const size_t firstRead = station.bus.nth('c', 1) + 3;  // after the array and load fault words
+        const size_t firstRead = station.bus.nth('c', 1) + 4;  // after the missed probe and the two fault words
         if (index == firstRead || index == firstRead + 2) {
           station.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
         }
@@ -2008,7 +2154,7 @@ static void testFinalRestart() {
     CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
     CHECK_EQ(result.notes & ss::NOTE_VERIFY_INCOMPLETE, 0);
     CHECK_EQ(station.bus.log.size(), quietRun().size() + 2);
-    const size_t firstRead = station.bus.nth('c', 1) + 3;
+    const size_t firstRead = station.bus.nth('c', 1) + 4;
     CHECK_EQ(station.bus.log[firstRead + 1].addr, station.bus.log[firstRead].addr);
     CHECK_EQ(station.bus.log[firstRead + 3].addr, station.bus.log[firstRead + 2].addr);
     CHECK(station.bus.log[firstRead + 2].addr != station.bus.log[firstRead].addr);
@@ -2016,20 +2162,22 @@ static void testFinalRestart() {
     checkPauses(station);
   }
   // The controller stops answering after its restart was seen: three registers are asked for,
-  // twice each, and then the run ends without asking for the other fourteen.
+  // twice each, and then the run ends without asking for the other fourteen. None of the 17 is
+  // confirmed.
   {
     Station station;
     station.bus.before = [&](size_t index, char, uint16_t) {
-      if (station.bus.count('c') == 2 && index >= station.bus.nth('c', 1) + 3) {
+      if (station.bus.count('c') == 2 && index >= station.bus.nth('c', 1) + 4) {
         station.sim.powered = false;
       }
     };
     const ss::ProgramResult &result = station.run();
-    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(result.outcome, ss::OUTCOME_UNVERIFIED);
     CHECK_EQ(result.restart, ss::RESTART_DONE);
     CHECK_EQ(result.notes, ss::NOTE_SW1_OFF | ss::NOTE_VERIFY_INCOMPLETE);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_UNREAD), ss::PLAN_ENTRIES);
     CHECK_EQ(result.loadStateAfter, ss::LOAD_STATE_NOT_READ);
-    CHECK_EQ(station.bus.log.size() - station.bus.nth('c', 1), 1 + 2 + ss::VERIFY_MISSES * ss::READ_ATTEMPTS);
+    CHECK_EQ(station.bus.log.size() - station.bus.nth('c', 1), 1 + 1 + 2 + ss::VERIFY_MISSES * ss::READ_ATTEMPTS);
     CHECK(!station.programmer.controllerUnknown());
     checkPauses(station);
   }
@@ -2045,7 +2193,8 @@ static void testFinalRestart() {
       }
     };
     const ss::ProgramResult &result = station.run();
-    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(result.outcome, ss::OUTCOME_UNVERIFIED);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_UNREAD), 4);
     CHECK_EQ(result.loadStateAfter, 1);  // read at the very end: the run went through all 17
     CHECK_EQ(station.bus.log.size(), quietRun().size());
   }
@@ -2156,7 +2305,7 @@ static void testRecovery() {
     CHECK_EQ(result.loadStateAfter, 1);
     CHECK(!station.programmer.controllerUnknown());
     checkPauses(station);
-    CHECK_EQ(station.bus.log.size(), 2 + 1 + 2 + 1);
+    CHECK_EQ(station.bus.log.size(), 2 + 1 + 1 + 2 + 1);  // with the probe it missed while it restarted
   }
 
   // It waits, and the command does not work: said, and nothing to find out later.
@@ -2499,6 +2648,8 @@ static bool sameProfile(const ss::Profile &a, const ss::Profile &b) {
   return true;
 }
 
+static bool sameResult(const ss::ProgramResult &a, const ss::ProgramResult &b);
+
 static void testRequestJson() {
   // The recommended values, as a browser writes them.
   {
@@ -2655,39 +2806,121 @@ static void testRequestJson() {
   CHECK_EQ(ss::REQUEST_WAIT_MS, 3600000u);
   CHECK_EQ(ss::DUTY_RETRY_MS, 600000u);
   CHECK_EQ(ss::DUTY_SLOW_RETRY_MS, 86400000u);
+  // A controller that answers right after a restart command is asked ten times more, half a
+  // second apart, before its answers count (the documents say so).
+  CHECK_EQ(ss::QUIET_PROBES, 10u);
+  CHECK_EQ(ss::PROBE_GAP_MS, 500u);
 
   // The journal.
   {
-    const ss::Journal journal = {kRequestId, ss::JOURNAL_WRITING};
+    const ss::Journal empty = ss::emptyJournal();
+    CHECK(empty.requestId == 0 && empty.phase == ss::JOURNAL_IDLE && empty.controller == 0 && empty.answeredId == 0 &&
+          empty.waitingId == 0 && !empty.reportDue);
+    CHECK_EQ(ss::JOURNAL_IDLE, 0);
+    CHECK_EQ(ss::JOURNAL_RESTARTING, 1);
+    CHECK_EQ(ss::JOURNAL_WRITING, 2);
+    CHECK_EQ(ss::JOURNAL_PHASE_LAST, ss::JOURNAL_WRITING);
+    const ss::Journal cautious = ss::cautiousJournal();
+    CHECK(cautious.phase == ss::JOURNAL_WRITING && cautious.requestId == 0 && cautious.controller == 0 &&
+          cautious.answeredId == 0 && cautious.waitingId == 0 && !cautious.reportDue);
+
+    ss::Journal journal = ss::emptyJournal();
+    journal.requestId = kRequestId;
+    journal.phase = ss::JOURNAL_WRITING;
+    journal.controller = 1;
+    journal.answeredId = kRequestId + 5;
     JsonDocument doc;
     ss::encodeJournal(journal, doc.to<JsonObject>());
     std::string wire;
     serializeJson(doc, wire);
-    CHECK_TEXT(wire, std::string("{\"req\":1795500000,\"ph\":3}"));
+    CHECK_TEXT(wire, std::string("{\"req\":1795500000,\"ph\":2,\"ctl\":1,\"ans\":1795500005}"));
+
+    // Every member, through the file and back.
+    ss::ProgramResult refused;
+    ss::refusedResult(ss::lifepo4Profile(), ss::PROFILE_LVD, ss::REFUSE_PROFILE, &refused);
     for (uint8_t phase = 0; phase <= ss::JOURNAL_PHASE_LAST; ++phase) {
-      const ss::Journal out = {kRequestId + phase, phase};
-      JsonDocument file;
-      ss::encodeJournal(out, file.to<JsonObject>());
-      std::string text;
-      serializeJson(file, text);
-      JsonDocument back = parsed(text);
-      const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
-      CHECK_EQ(in.requestId, kRequestId + phase);
-      CHECK_EQ(in.phase, phase);
+      for (int due = 0; due < 2; ++due) {
+        ss::Journal out = ss::emptyJournal();
+        out.requestId = kRequestId + phase;
+        out.phase = phase;
+        out.controller = (uint8_t)(phase == 2 ? 247 : phase);
+        out.answeredId = kRequestId + 100 + phase;
+        out.waitingId = due == 1 ? kRequestId + 200 : 0u;
+        out.reportDue = due == 1;
+        if (out.reportDue) {
+          out.reportId = kRequestId + 300;
+          out.reportEpoch = phase == 1 ? 0u : (uint32_t)kClientNow;
+          out.report = refused;
+        }
+        JsonDocument file;
+        ss::encodeJournal(out, file.to<JsonObject>());
+        std::string text;
+        serializeJson(file, text);
+        CHECK_EQ(text.find("wait") != std::string::npos, due == 1);  // left out when nothing waits
+        CHECK_EQ(text.find("rep") != std::string::npos, due == 1);   // and when nothing is due
+        JsonDocument back = parsed(text);
+        const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
+        CHECK_MSG(in.requestId == out.requestId && in.phase == out.phase && in.controller == out.controller &&
+                      in.answeredId == out.answeredId && in.waitingId == out.waitingId && in.reportDue == out.reportDue,
+                  "the journal changed on its way: %s", text.c_str());
+        if (due == 1) {
+          CHECK_EQ(in.reportId, out.reportId);
+          CHECK_EQ(in.reportEpoch, out.reportEpoch);
+          CHECK(sameResult(in.report, refused));
+        }
+      }
     }
-    CHECK_EQ(ss::JOURNAL_IDLE, 0);
-    CHECK_EQ(ss::JOURNAL_TAKEN, 1);
-    CHECK_EQ(ss::JOURNAL_RESTARTING, 2);
-    CHECK_EQ(ss::JOURNAL_WRITING, 3);
-    CHECK_EQ(ss::cautiousJournal().phase, ss::JOURNAL_WRITING);
-    CHECK_EQ(ss::cautiousJournal().requestId, 0);
+
+    // The longest journal there can be fits the client's buffer.
+    {
+      ss::Journal longest;
+      longest.requestId = 0xFFFFFFFFu;
+      longest.phase = ss::JOURNAL_WRITING;
+      longest.controller = 247;
+      longest.answeredId = 0xFFFFFFFFu;
+      longest.waitingId = 0xFFFFFFFFu;
+      longest.reportDue = true;
+      longest.reportId = 0xFFFFFFFFu;
+      longest.reportEpoch = 0xFFFFFFFFu;
+      ss::ProgramResult &result = longest.report;
+      ss::clearResult(&result);
+      result.outcome = ss::OUTCOME_LAST;
+      result.restart = ss::RESTART_STATUS_LAST;
+      result.followUp = true;
+      result.wroteAny = true;
+      result.scale = ss::SCALE_96667;
+      result.liveScale = ss::SCALE_96667;
+      result.refusals = 0xFFFFFFFFul;
+      result.profileErrors = 0xFFFF;
+      result.notes = 0xFFFF;
+      result.probes = 0xFF;
+      const ss::Profile widest = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+      result.profile = widest;
+      result.seen = 0xFF;
+      result.loadStateBefore = 0xFF;
+      result.loadStateEdit = 0xFF;
+      result.loadStateAfter = 0xFF;
+      const SimSunSaver fresh;
+      ss::buildPlan(snapshotOf(fresh), ss::lifepo4Profile(), ss::SCALE_100, result.entries);
+      result.planned = ss::PLAN_ENTRIES;
+      for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
+        result.entries[i].status = ss::ENTRY_STATUS_LAST;
+      }
+      JsonDocument file;
+      ss::encodeJournal(longest, file.to<JsonObject>());
+      CHECK(!file.overflowed());
+      const size_t length = measureJson(file);
+      CHECK_MSG(length <= ss::JOURNAL_JSON_MAX, "the longest journal is %zu characters", length);
+      CHECK_MSG(length + 64 > ss::JOURNAL_JSON_MAX, "the longest journal is %zu characters: the bound is loose", length);
+    }
+
     // A file that is no journal: the client may owe the controller a restart.
     static const char *const kNoJournals[] = {"{}",
                                               "{\"req\":5}",
                                               "{\"ph\":1}",
                                               "{\"req\":\"5\",\"ph\":1}",
                                               "{\"req\":5,\"ph\":\"1\"}",
-                                              "{\"req\":5,\"ph\":4}",
+                                              "{\"req\":5,\"ph\":3}",
                                               "{\"req\":5,\"ph\":-1}",
                                               "{\"req\":5,\"ph\":1.5}",
                                               "{\"req\":-5,\"ph\":1}",
@@ -2885,8 +3118,10 @@ static void testResultJson() {
     checkRoundTrip(station.programmer.result(), "a recovery");
   }
   {
-    // A run whose restart found no answer: the client owes the controller another look.
+    // A run whose restart found no answer: the client owes the controller another look. (A short
+    // timeout, so that BACK_PROBES ends the wait and not the time limit.)
     Station station;
+    station.master.responseTimeoutMs = 300;
     station.bus.before = [&station](size_t, char kind, uint16_t) {
       if (kind == 'c' && station.bus.count('w') > 0) {
         station.sim.powered = false;
@@ -3029,8 +3264,10 @@ static void testResultJson() {
                       }),
                       "a plan with a register this code does not know");
       checkUnreadable(changed(wire, [at](JsonObject o) {
+                        char unknown[3];
+                        snprintf(unknown, sizeof(unknown), "%02X", (unsigned)(ss::ENTRY_STATUS_LAST + 1));
                         std::string plan = o["en"].as<std::string>();
-                        plan.replace(at + 2, 2, "08");
+                        plan.replace(at + 2, 2, unknown);
                         o["en"] = plan;
                       }),
                       "a plan with a status this code has no name for");
@@ -3226,7 +3463,7 @@ static void testResultJson() {
     CHECK_TEXT(page["battery"].as<std::string>(), std::string("13.23 V or 13.68 V: how this charger encodes its live readings is not proven"));
     CHECK_EQ(page["notes"].size(), 2);
     CHECK(has(page["notes"][0].as<const char *>(), "DIP switch 3 is ON"));
-    CHECK(has(page["notes"][1].as<const char *>(), "could not be read again"));
+    CHECK(has(page["notes"][1].as<const char *>(), "Not every register could be read again"));
     CHECK_HAS(shown, "\"11.50 V\",\"13.10 V\",\"lost after the restart: it holds 11.50 V\"]");
     CHECK_HAS(shown, "\"12.60 V\",\"13.25 V\",\"altered by the charger: it holds 12.00 V\"]");
     CHECK(page["summary"] == "restart failed: 13 of 17 registers written, 2 already set");
@@ -3289,26 +3526,47 @@ static void testResultJson() {
 struct PowerLoss {};
 
 static const size_t kNever = (size_t)-1;
-static const uint64_t kSimIdleMs = 5000;  // see Desk
+static const uint64_t kSimIdleMs = 5000;  // see Desk: longer than the longest Modbus timeout
 
 struct Report {
   uint32_t requestId;
   uint32_t atMs;
+  uint32_t epoch;  // Supervisor::reportEpoch()
   ss::ProgramResult result;
 };
 
 // A client as the Supervisor sees it: the controller on its line, a flash that holds the
 // journal, a clock, and a loop that calls service() and sends what is due.
 //
-// The client has its own clock. The simulator's moves with it while a run waits on the line,
-// and by a few seconds at most while the client does other things: its clock refuses to pass
-// a simulated day, and these tests wait for days. Every gap the simulator sees is still at
-// least as long as the client waited, up to those few seconds.
+// The client has its own clock. The simulator's moves with it while a run waits on the line or
+// for a reply, and by a few seconds at most while the client does other things: its clock
+// refuses to pass a simulated day, and these tests wait for days. Every gap the simulator sees
+// is still at least as long as the client waited, up to those few seconds.
 static bool sameJournal(const ss::Journal &a, uint32_t requestId, uint8_t phase) {
   return a.requestId == requestId && a.phase == phase;
 }
 
-struct Desk : ss::Port {
+// The journal holds `requestId` as the request that waits: taken on, its run not yet at a
+// commit point.
+static bool holdsWaiting(const ss::Journal &a, uint32_t requestId) { return requestId != 0 && a.waitingId == requestId; }
+
+// The journal of a client that has answered `requestId` and owes nothing more: no request
+// waits, no result is due, and the controller waits for nothing from it.
+static bool settledOn(const ss::Journal &a, uint32_t requestId) {
+  return a.answeredId == requestId && a.phase == ss::JOURNAL_IDLE && a.waitingId == 0 && !a.reportDue;
+}
+
+// A journal as a client wrote it: the last run that reached a commit point and how far it came.
+static ss::Journal journalOf(uint32_t requestId, uint8_t phase) {
+  ss::Journal journal = ss::emptyJournal();
+  journal.requestId = requestId;
+  journal.phase = phase;
+  journal.controller = 1;
+  journal.answeredId = requestId;
+  return journal;
+}
+
+struct Desk : ss::Port, ss::JournalStore {
   SimSunSaver sim;
   ModbusMaster master;
   TestBus bus;
@@ -3318,6 +3576,7 @@ struct Desk : ss::Port {
   std::vector<size_t> saveAt;       // and how many requests had gone out by then
   unsigned failSaves;               // this many of the next writes fail: flash keeps what it holds
   size_t failSave;                  // or the write with this index does
+  size_t failFrom;                  // or every write from this index on
   size_t dieAtRequest;              // the client loses power as it is about to make this request
   size_t dieAtSave;                 // or to write this journal
   bool dieAfterSave;                // or just after flash took it
@@ -3336,6 +3595,7 @@ struct Desk : ss::Port {
         bus(sim, master),
         failSaves(0),
         failSave(kNever),
+        failFrom(kNever),
         dieAtRequest(kNever),
         dieAtSave(kNever),
         dieAfterSave(false),
@@ -3346,22 +3606,33 @@ struct Desk : ss::Port {
         epochBase(kClientNow),
         ready(true) {
     sim.configure(9600, MB_8N2);
-    const ss::Journal none = {0, ss::JOURNAL_IDLE};
-    flash = none;
+    flash = ss::emptyJournal();
   }
 
+  // The client waits for each reply, or for its timeout: that time is the client's too.
   ss::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
     cut();
-    return bus.readRegister(addr, raw);
+    const uint64_t began = sim.elapsedMs();
+    const ss::IoStatus status = bus.readRegister(addr, raw);
+    clockMs += sim.elapsedMs() - began;
+    return status;
   }
   ss::IoStatus writeRegister(uint16_t addr, uint16_t raw) override {
     cut();
-    return bus.writeRegister(addr, raw);
+    const uint64_t began = sim.elapsedMs();
+    const ss::IoStatus status = bus.writeRegister(addr, raw);
+    clockMs += sim.elapsedMs() - began;
+    return status;
   }
   ss::IoStatus writeCoil(uint16_t addr) override {
     cut();
-    return bus.writeCoil(addr);
+    const uint64_t began = sim.elapsedMs();
+    const ss::IoStatus status = bus.writeCoil(addr);
+    clockMs += sim.elapsedMs() - began;
+    return status;
   }
+  uint8_t controller() const override { return bus.slave; }
+  uint16_t timeoutMs() const override { return (uint16_t)master.responseTimeoutMs; }
   bool saveJournal(const ss::Journal &journal) override {
     const size_t index = saves.size();
     if (index == dieAtSave && !dieAfterSave) {
@@ -3369,7 +3640,7 @@ struct Desk : ss::Port {
     }
     saves.push_back(journal);
     saveAt.push_back(bus.log.size());
-    if (failSaves > 0 || index == failSave) {
+    if (failSaves > 0 || index == failSave || (failFrom != kNever && index >= failFrom)) {
       failSaves -= failSaves > 0 ? 1 : 0;
       return false;
     }
@@ -3392,7 +3663,7 @@ struct Desk : ss::Port {
   // Time passes while the client does other things.
   void advance(uint64_t ms) {
     clockMs += ms;
-    const uint64_t last = bus.log.empty() ? 0 : bus.log.back().at;
+    const uint64_t last = bus.log.empty() ? 0 : bus.log.back().end;
     const uint64_t since = sim.elapsedMs() - last;
     if (since < kSimIdleMs) {
       const uint64_t step = ms < kSimIdleMs - since ? ms : kSimIdleMs - since;
@@ -3404,9 +3675,10 @@ struct Desk : ss::Port {
 
   void collect(ss::Supervisor &supervisor) {
     if (supervisor.reportDue()) {
-      const Report report = {supervisor.reportRequestId(), supervisor.reportMillis(), supervisor.report()};
+      const Report report = {supervisor.reportRequestId(), supervisor.reportMillis(), supervisor.reportEpoch(),
+                             supervisor.report()};
       reports.push_back(report);
-      supervisor.reportTaken();
+      supervisor.reportTaken(millisNow());
       CHECK(!supervisor.reportDue());
     }
   }
@@ -3423,23 +3695,17 @@ struct Desk : ss::Port {
   // One pass of the client's loop. True when it talked to the controller.
   //
   // The client lets programming have a pass that a poll would take when wantsLine() says yes. So
-  // it must never say no where service() talks, and it may say yes where service() does not
-  // only when flash refuses the journal of a request that could have run. Every test checks
-  // that here, in every pass.
+  // with a line that is ready it must say yes exactly where service() talks to the controller.
+  // Every test checks that here, in every pass.
   bool pass(ss::Supervisor &supervisor) {
     const bool wanted = supervisor.wantsLine(clock(), millisNow());
     const bool lineReady = ready && !lineResting();
-    const size_t savesBefore = saves.size();
     const bool ran = supervisor.service(*this, clock(), lineReady);
-    CHECK(!ran || wanted);
-    if (wanted && lineReady && !ran) {
-      CHECK(saves.size() > savesBefore && !sameJournal(flash, saves.back().requestId, saves.back().phase));
-      ++wantedRefused;
-    }
+    CHECK_MSG(ran == (wanted && lineReady), "wantsLine() said %s, the line was %sready, and service() %s",
+              wanted ? "yes" : "no", lineReady ? "" : "not ", ran ? "ran" : "did not run");
     collect(supervisor);
     return ran;
   }
-  unsigned wantedRefused = 0;  // passes in which wantsLine() said yes and flash refused the journal
 
   // The loop for `ms`, a pass every `everyMs`. Returns how many passes talked to the controller.
   unsigned loopFor(ss::Supervisor &supervisor, uint64_t ms, uint32_t everyMs = 1000) {
@@ -3459,8 +3725,8 @@ struct Desk : ss::Port {
   // What Supervisor::request() returns: false for a request it ignores.
   bool ask(ss::Supervisor &supervisor, uint32_t requestId, const ss::Profile &profile = ss::lifepo4Profile(),
            uint16_t profileErrors = 0, uint32_t clientRefusals = 0, bool loadCurrentAllowed = true) {
-    const bool taken =
-        supervisor.request(requestId, profile, profileErrors, clientRefusals, loadCurrentAllowed, millisNow());
+    const bool taken = supervisor.request(requestId, profile, profileErrors, clientRefusals, loadCurrentAllowed, clock(),
+                                          millisNow());
     collect(supervisor);
     return taken;
   }
@@ -3470,7 +3736,7 @@ struct Desk : ss::Port {
     dieAtRequest = kNever;
     dieAtSave = kNever;
     bootedAt = clockMs;
-    supervisor.begin(flash, millisNow());
+    supervisor.begin(flash, this, millisNow());
     collect(supervisor);
   }
 
@@ -3500,12 +3766,13 @@ static void testSupervisor() {
   const ss::Profile profile = ss::lifepo4Profile();
   const Sequence quiet = quietRun();
   const size_t firstRestart = ss::ITEM_COUNT;    // the request index of the first restart command
-  const size_t firstWrite = ss::ITEM_COUNT + 3;  // and of the first write
+  const size_t firstWrite = ss::ITEM_COUNT + 4;  // and of the first write
 
   // Nothing asked: nothing done.
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     CHECK(!supervisor.reportDue());
     CHECK(!supervisor.requestWaiting());
     CHECK(!supervisor.dutyOwed());
@@ -3519,15 +3786,19 @@ static void testSupervisor() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.advance(5000);
-    desk.ask(supervisor, kRequestId);
+    CHECK(desk.ask(supervisor, kRequestId));
     CHECK(supervisor.requestWaiting());
     CHECK(desk.reports.empty());
-    CHECK(desk.saves.empty());  // the request is only taken on at the next pass of the loop
+    // The request is in flash before the client acknowledges the config that carries it.
+    CHECK_EQ(desk.saves.size(), 1);
+    CHECK(holdsWaiting(desk.flash, kRequestId) && sameJournal(desk.flash, 0, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.flash.answeredId, kRequestId);
     const uint64_t began = desk.clockMs;
     CHECK(desk.pass(supervisor));
     const uint64_t took = desk.clockMs - began;
-    CHECK_MSG(took > 6000 && took < 20000, "the run took %llu ms", (unsigned long long)took);
+    CHECK_MSG(took > 9000 && took < 13000, "the run took %llu ms", (unsigned long long)took);  // 10.7 s
     CHECK(!supervisor.requestWaiting());
     CHECK(!supervisor.dutyOwed());
     CHECK_EQ(desk.reports.size(), 1);
@@ -3538,28 +3809,41 @@ static void testSupervisor() {
       CHECK(!report.result.followUp);
       CHECK_EQ(ss::countEntries(report.result, ss::ENTRY_WRITTEN), 15);
       CHECK_EQ(report.atMs, desk.millisNow());  // when the run ended, not when it began
+      const double end = desk.clock();
+      CHECK_MSG(report.epoch + 1.0 >= end && report.epoch <= end, "the result is dated %u, the run ended at %.3f",
+                (unsigned)report.epoch, end);
     }
     checkSequence(desk.bus, quiet);
     checkPausesIn(desk.bus.log, desk.master.responseTimeoutMs);
     CHECK_EQ(desk.bus.disorder, 0);
     CHECK(holdsProfile(desk.sim, profile));
     CHECK(!editPending(desk.sim));
-    // The journal says each thing before it is done.
-    CHECK_EQ(desk.saves.size(), 4);
-    if (desk.saves.size() == 4) {
-      CHECK(sameJournal(desk.saves[0], kRequestId, ss::JOURNAL_TAKEN));
+    // The journal says each thing before it is done, and keeps the result until it has gone out.
+    CHECK_EQ(desk.saves.size(), 5);
+    if (desk.saves.size() == 5) {
+      CHECK(holdsWaiting(desk.saves[0], kRequestId) && sameJournal(desk.saves[0], 0, ss::JOURNAL_IDLE));
       CHECK(sameJournal(desk.saves[1], kRequestId, ss::JOURNAL_RESTARTING));
       CHECK(sameJournal(desk.saves[2], kRequestId, ss::JOURNAL_WRITING));
-      CHECK(sameJournal(desk.saves[3], kRequestId, ss::JOURNAL_IDLE));
+      CHECK(sameJournal(desk.saves[3], kRequestId, ss::JOURNAL_IDLE) && desk.saves[3].reportDue);
+      CHECK_EQ(desk.saves[3].reportId, kRequestId);
+      CHECK_EQ(desk.saves[3].report.outcome, ss::OUTCOME_PROGRAMMED);
+      CHECK_EQ(desk.saves[3].reportEpoch, desk.reports[0].epoch);
+      CHECK(sameJournal(desk.saves[4], kRequestId, ss::JOURNAL_IDLE) && !desk.saves[4].reportDue);
+      for (size_t i = 0; i < desk.saves.size(); ++i) {
+        CHECK_EQ(desk.saves[i].answeredId, kRequestId);
+        CHECK_EQ(desk.saves[i].waitingId, i == 0 ? kRequestId : 0u);
+        CHECK_EQ(desk.saves[i].controller, i == 0 ? 0 : 1);  // the controller the run talked to
+      }
       CHECK_EQ(desk.saveAt[0], 0);
       CHECK_EQ(desk.saveAt[1], firstRestart);
       CHECK_EQ(desk.saveAt[2], firstWrite);
       CHECK_EQ(desk.saveAt[3], quiet.size());
+      CHECK_EQ(desk.saveAt[4], quiet.size());
       CHECK_EQ(quiet[firstRestart].first, 'c');
       CHECK_EQ(quiet[firstWrite].first, 'w');
     }
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
-    CHECK(sameJournal(supervisor.journal(), kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(supervisor.journal(), kRequestId) && sameJournal(supervisor.journal(), kRequestId, ss::JOURNAL_IDLE));
 
     // The same config again, and an older one: nothing.
     CHECK(!desk.ask(supervisor, kRequestId));
@@ -3568,34 +3852,38 @@ static void testSupervisor() {
     CHECK(!supervisor.requestWaiting());
     CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), 0);
     CHECK_EQ(desk.bus.log.size(), quiet.size());
-    CHECK_EQ(desk.saves.size(), 4);
+    CHECK_EQ(desk.saves.size(), 5);
     CHECK_EQ(desk.reports.size(), 1);
 
-    // A new request for the same values: a run that finds nothing to do.
-    desk.epochBase += 0;  // the clock has moved on by itself: two hours later
+    // A new request for the same values, two hours later: a run that finds nothing to do. It
+    // comes to no commit point, so the journal still names the run before it.
     CHECK(desk.ask(supervisor, kRequestId + 7200));
     CHECK(desk.pass(supervisor));
     CHECK_EQ(desk.reports.size(), 2);
     CHECK_EQ(desk.reports.back().requestId, kRequestId + 7200);
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_UNCHANGED);
     CHECK_EQ(desk.bus.log.size(), quiet.size() + ss::ITEM_COUNT);
-    CHECK_EQ(desk.saves.size(), 6);
-    CHECK(sameJournal(desk.saves[4], kRequestId + 7200, ss::JOURNAL_TAKEN));
-    CHECK(sameJournal(desk.saves[5], kRequestId + 7200, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.saves.size(), 8);
+    if (desk.saves.size() == 8) {
+      CHECK(holdsWaiting(desk.saves[5], kRequestId + 7200) && sameJournal(desk.saves[5], kRequestId, ss::JOURNAL_IDLE));
+      CHECK(desk.saves[6].reportDue && desk.saves[6].reportId == kRequestId + 7200 && desk.saves[6].waitingId == 0);
+      CHECK(settledOn(desk.saves[7], kRequestId + 7200) && sameJournal(desk.saves[7], kRequestId, ss::JOURNAL_IDLE));
+    }
     CHECK_EQ(desk.sim.resets, 2);  // and no third restart
   }
   // The request says whether current may flow from the LOAD terminals.
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ask(supervisor, kRequestId, profile, 0, 0, false);
     CHECK(desk.pass(supervisor));
     CHECK_EQ(desk.reports.size(), 1);
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_REFUSED);
     CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_LOAD_CURRENT);
     CHECK_EQ(desk.bus.count('c') + desk.bus.count('w'), 0);
-    CHECK_EQ(desk.saves.size(), 2);  // taken on, and done: the run never came to a commit point
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.saves.size(), 3);  // taken on, answered, and sent: the run never came to a commit point
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, 0, ss::JOURNAL_IDLE));
     // And which values it wants.
     ss::Profile wanted = profile;
     wanted.lvdCv = 1250;
@@ -3607,10 +3895,11 @@ static void testSupervisor() {
   }
 
   // Refused as it arrives: the values, or what the client knows about itself. Nothing is sent to
-  // the controller and nothing is written to flash.
+  // the controller. Flash keeps the request's id, and its result until that has gone out.
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     ss::Profile wanted = profile;
     wanted.lvdCv = 900;
     CHECK(desk.ask(supervisor, kRequestId, wanted, ss::PROFILE_LVD));
@@ -3636,9 +3925,14 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.profileErrors, ss::PROFILE_LVD | ss::PROFILE_GRID);
     CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), 0);
     CHECK(desk.bus.log.empty());
-    CHECK(desk.saves.empty());
+    CHECK_EQ(desk.saves.size(), 3 * 2);  // each with its result, then without it once it went out
+    if (desk.saves.size() == 6) {
+      CHECK(desk.saves[0].reportDue && desk.saves[0].reportId == kRequestId && desk.saves[0].answeredId == kRequestId);
+      CHECK(settledOn(desk.saves[1], kRequestId));
+    }
     CHECK_EQ(desk.reports.size(), 3);
     CHECK(sameJournal(supervisor.journal(), 0, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId + 2));
     // A request that was refused does not stand in the way of the next one.
     desk.ask(supervisor, kRequestId + 3);
     CHECK(desk.pass(supervisor));
@@ -3649,11 +3943,13 @@ static void testSupervisor() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.clockSet = false;
     desk.ask(supervisor, kRequestId);
     CHECK_EQ(desk.loopFor(supervisor, 1800000), 0);
     CHECK(supervisor.requestWaiting());
-    CHECK(desk.saves.empty());
+    CHECK_EQ(desk.saves.size(), 1);  // written once, not at every pass
+    CHECK(holdsWaiting(desk.flash, kRequestId));
     CHECK(desk.reports.empty());
     desk.clockSet = true;  // half an hour later it knows the time
     CHECK(desk.pass(supervisor));
@@ -3663,6 +3959,7 @@ static void testSupervisor() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.clockSet = false;
     desk.advance(777);
     desk.ask(supervisor, kRequestId);
@@ -3676,7 +3973,9 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_REFUSED);
     CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_STALE);
     CHECK(sameProfile(desk.reports.back().result.profile, profile));
-    CHECK(desk.saves.empty());
+    CHECK_EQ(desk.reports.back().epoch, 0u);  // the client never knew the time
+    CHECK_EQ(desk.saves.size(), 3);
+    CHECK(settledOn(desk.flash, kRequestId));
     CHECK(desk.bus.log.empty());
     // The clock comes right after all: that request is over, and the config again changes nothing.
     desk.clockSet = true;
@@ -3690,12 +3989,13 @@ static void testSupervisor() {
     // a clock that does not run, and is not refused as too old.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.epochBase = 86400.0;  // 1970-01-02
     desk.ask(supervisor, kRequestId);
     CHECK_EQ(desk.loopFor(supervisor, 600000), 0);
     CHECK(supervisor.requestWaiting());
     CHECK(desk.reports.empty());
-    CHECK(desk.saves.empty());
+    CHECK_EQ(desk.saves.size(), 1);
     desk.epochBase = kClientNow - (double)desk.clockMs / 1000.0;
     CHECK(desk.pass(supervisor));
     CHECK_EQ(desk.reports.size(), 1);
@@ -3711,6 +4011,7 @@ static void testSupervisor() {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
       Desk desk;
       ss::Supervisor supervisor;
+      desk.boot(supervisor);
       desk.epochBase = (double)kRequestId + cases[i].age - (double)desk.clockMs / 1000.0;
       desk.ask(supervisor, kRequestId);
       CHECK_EQ(desk.pass(supervisor), cases[i].runs);
@@ -3719,19 +4020,26 @@ static void testSupervisor() {
         CHECK_MSG((desk.reports[0].result.outcome == ss::OUTCOME_PROGRAMMED) == cases[i].runs, "a request %.0f s old", cases[i].age);
         CHECK_EQ(desk.reports[0].result.refusals, cases[i].runs ? 0u : (uint32_t)ss::REFUSE_STALE);
       }
-      CHECK_EQ(desk.saves.empty(), !cases[i].runs);  // a stale request leaves no trace in flash
+      // Taken on, at its two commit points, answered and sent; or taken on, refused and sent.
+      CHECK_EQ(desk.saves.size(), cases[i].runs ? 5u : 3u);
+      CHECK(settledOn(desk.flash, kRequestId));
       CHECK_EQ(desk.bus.log.empty(), !cases[i].runs);
       if (!cases[i].runs) {
-        // It is not asked about twice, and it does not stand in the way of a request that is in time.
-        desk.ask(supervisor, kRequestId);
+        // It is not asked about twice, and it does not stand in the way of a newer request that is
+        // in time. (The server's ids only grow: one that is older than an answered one is ignored.)
+        CHECK(!desk.ask(supervisor, kRequestId));
         CHECK(!supervisor.requestWaiting());
         const uint32_t inTime = (uint32_t)desk.clock();
-        CHECK(inTime != kRequestId);
-        desk.ask(supervisor, inTime);
-        CHECK(supervisor.requestWaiting());
-        CHECK(desk.pass(supervisor));
-        CHECK_EQ(desk.reports.back().requestId, inTime);
-        CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
+        if (inTime > kRequestId) {
+          CHECK(desk.ask(supervisor, inTime));
+          CHECK(supervisor.requestWaiting());
+          CHECK(desk.pass(supervisor));
+          CHECK_EQ(desk.reports.back().requestId, inTime);
+          CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
+        } else {
+          CHECK(!desk.ask(supervisor, inTime));
+          CHECK(!supervisor.requestWaiting());
+        }
       }
     }
   }
@@ -3740,12 +4048,13 @@ static void testSupervisor() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ready = false;
     desk.ask(supervisor, kRequestId);
     CHECK(!desk.pass(supervisor));
     CHECK(supervisor.requestWaiting());
     CHECK_EQ(desk.saves.size(), 1);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_TAKEN));
+    CHECK(holdsWaiting(desk.flash, kRequestId));
     CHECK_EQ(desk.loopFor(supervisor, 1800000), 0);
     CHECK_EQ(desk.saves.size(), 1);  // written once, not at every pass
     CHECK(desk.reports.empty());
@@ -3753,11 +4062,12 @@ static void testSupervisor() {
     CHECK(desk.pass(supervisor));
     CHECK_EQ(desk.reports.size(), 1);
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
   }
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ready = false;
     desk.advance(123456);
     desk.ask(supervisor, kRequestId);
@@ -3775,12 +4085,12 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_REFUSED);
     CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_NO_CHARGER);
     CHECK(desk.bus.log.empty());
-    // The journal no longer says that the request is under way.
-    CHECK(sameJournal(supervisor.journal(), kRequestId, ss::JOURNAL_IDLE));
+    // The journal no longer says that the request waits.
+    CHECK(settledOn(supervisor.journal(), kRequestId));
     desk.ready = true;
     CHECK(!desk.pass(supervisor));
-    CHECK_EQ(desk.saves.size(), 2);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.saves.size(), 3);
+    CHECK(settledOn(desk.flash, kRequestId));
     CHECK(!desk.ask(supervisor, kRequestId));  // the config again: it has had its answer
     CHECK(!supervisor.requestWaiting());
     CHECK_EQ(desk.loopFor(supervisor, 60000), 0);
@@ -3791,6 +4101,7 @@ static void testSupervisor() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ready = false;
     desk.ask(supervisor, kRequestId);
     CHECK(!desk.pass(supervisor));
@@ -3817,10 +4128,11 @@ static void testSupervisor() {
     // A newer request that is refused as it arrives still ends the one that waited.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ready = false;
     desk.ask(supervisor, kRequestId);
     CHECK(!desk.pass(supervisor));
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_TAKEN));
+    CHECK(holdsWaiting(desk.flash, kRequestId));
     desk.ask(supervisor, kRequestId + 5, profile, ss::PROFILE_HVD);
     CHECK(!supervisor.requestWaiting());
     CHECK_EQ(desk.reports.size(), 1);
@@ -3829,32 +4141,37 @@ static void testSupervisor() {
     CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), 0);
     CHECK(desk.bus.log.empty());
     CHECK_EQ(desk.reports.size(), 1);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId + 5));
   }
 
   // Flash does not take the journal.
   {
-    // As the request is taken on: refused, and the controller is not touched.
+    // As the request is taken on: refused at once, before the config is acknowledged, and the
+    // controller is not touched.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.failSaves = 1;
-    desk.ask(supervisor, kRequestId);
-    CHECK(!desk.pass(supervisor));
+    CHECK(desk.ask(supervisor, kRequestId));
+    CHECK(!supervisor.requestWaiting());
+    CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
     CHECK_EQ(desk.reports.size(), 1);
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_REFUSED);
     CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_JOURNAL);
+    CHECK(!desk.pass(supervisor));
     CHECK(desk.bus.log.empty());
-    CHECK(sameJournal(desk.flash, 0, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, 0, ss::JOURNAL_IDLE));
     CHECK(sameJournal(supervisor.journal(), 0, ss::JOURNAL_IDLE));
-    desk.ask(supervisor, kRequestId);
+    CHECK(!desk.ask(supervisor, kRequestId));
     CHECK(!supervisor.requestWaiting());
     CHECK_EQ(desk.loopFor(supervisor, 60000), 0);
-    CHECK_EQ(desk.saves.size(), 1);
+    CHECK_EQ(desk.saves.size(), 3);  // the request, which flash refused; its refusal; and that it went out
   }
   {
     // Before the first restart command: refused, and no command goes out.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.failSave = 1;
     desk.ask(supervisor, kRequestId);
     CHECK(desk.pass(supervisor));
@@ -3864,14 +4181,15 @@ static void testSupervisor() {
     CHECK_EQ(desk.bus.log.size(), ss::ITEM_COUNT);
     CHECK_EQ(desk.bus.count('c') + desk.bus.count('w'), 0);
     CHECK_EQ(desk.sim.resets, 0);
-    CHECK_EQ(desk.saves.size(), 3);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.saves.size(), 4);
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, 0, ss::JOURNAL_IDLE));
     CHECK(!supervisor.dutyOwed());
   }
   {
     // Before the first write: refused after the controller's first restart, and nothing written.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.failSave = 2;
     desk.ask(supervisor, kRequestId);
     CHECK(desk.pass(supervisor));
@@ -3883,43 +4201,62 @@ static void testSupervisor() {
     CHECK_EQ(desk.bus.log.size(), firstWrite);
     CHECK_EQ(desk.bus.count('w'), 0);
     CHECK_EQ(desk.sim.resets, 1);
-    CHECK_EQ(desk.saves.size(), 4);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.saves.size(), 5);
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
     CHECK(!supervisor.dutyOwed());
   }
   {
-    // At the end of a run: the journal in flash still says "writing". It is written again ten
-    // minutes later, and until then the client itself knows better.
+    // At the end of a run: the journal in flash still says "writing", both when the result is
+    // due and once it has gone out. It is written again ten minutes later, and until then the
+    // client itself knows better.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.failFrom = 3;
+    desk.ask(supervisor, kRequestId);
+    CHECK(desk.pass(supervisor));
+    desk.failFrom = kNever;
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(desk.saves.size(), 5);
+    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_WRITING));
+    CHECK(settledOn(supervisor.journal(), kRequestId) && sameJournal(supervisor.journal(), kRequestId, ss::JOURNAL_IDLE));
+    CHECK(!supervisor.dutyOwed());
+    CHECK_EQ(desk.loopFor(supervisor, ss::JOURNAL_RETRY_MS - 1), 0);
+    CHECK_EQ(desk.saves.size(), 5);
+    desk.advance(1);
+    CHECK(!desk.pass(supervisor));
+    CHECK_EQ(desk.saves.size(), 6);
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), 0);
+    CHECK_EQ(desk.saves.size(), 6);
+    CHECK_EQ(desk.bus.log.size(), quiet.size());
+  }
+  {
+    // A write that flash refuses is made good by the next one that it takes: here the one that
+    // says the result has gone out.
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.failSave = 3;
     desk.ask(supervisor, kRequestId);
     CHECK(desk.pass(supervisor));
-    CHECK_EQ(desk.reports.size(), 1);
-    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_WRITING));
-    CHECK(sameJournal(supervisor.journal(), kRequestId, ss::JOURNAL_IDLE));
-    CHECK(!supervisor.dutyOwed());
-    CHECK_EQ(desk.loopFor(supervisor, ss::JOURNAL_RETRY_MS - 1), 0);
-    CHECK_EQ(desk.saves.size(), 4);
-    desk.advance(1);
-    CHECK(!desk.pass(supervisor));
     CHECK_EQ(desk.saves.size(), 5);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
-    CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), 0);
+    CHECK(settledOn(desk.flash, kRequestId));
+    CHECK_EQ(desk.loopFor(supervisor, 2 * ss::JOURNAL_RETRY_MS, 60000), 0);
     CHECK_EQ(desk.saves.size(), 5);
-    CHECK_EQ(desk.bus.log.size(), quiet.size());
   }
   {
     // And when flash keeps refusing: a try every ten minutes, no more.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ask(supervisor, kRequestId);
-    desk.failSave = 3;
+    desk.failFrom = 3;
     CHECK(desk.pass(supervisor));
-    desk.failSaves = 1000;
     desk.loopFor(supervisor, 6 * ss::JOURNAL_RETRY_MS + 1000);
-    CHECK_EQ(desk.saves.size(), 4 + 6);
+    desk.failFrom = kNever;
+    CHECK_EQ(desk.saves.size(), 5 + 6);
     // A client that restarts in that state looks at the controller, finds nothing to do, and says so.
     desk.failSaves = 0;
     ss::Supervisor restarted;
@@ -3939,8 +4276,7 @@ static void testSupervisor() {
   {
     // Nothing under way. The id of the last request is remembered across the restart.
     Desk desk;
-    const ss::Journal idle = {kRequestId, ss::JOURNAL_IDLE};
-    desk.flash = idle;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_IDLE);
     ss::Supervisor supervisor;
     desk.boot(supervisor);
     CHECK(desk.reports.empty());
@@ -3952,13 +4288,16 @@ static void testSupervisor() {
     desk.ask(supervisor, kRequestId + 1);
     CHECK(supervisor.requestWaiting());
   }
-  {
-    // A request it had taken on and not begun: it says so, and that is the end of that request.
+  for (int owed = 0; owed < 2; ++owed) {
+    // A request it had taken on and not begun, waiting for the clock, the charger or a duty: it
+    // says so, and that is the end of that request. A duty that was owed stays owed.
     Desk desk;
-    const ss::Journal taken = {kRequestId, ss::JOURNAL_TAKEN};
-    desk.flash = taken;
+    desk.flash = journalOf(kRequestId - 50, owed == 1 ? ss::JOURNAL_WRITING : ss::JOURNAL_IDLE);
+    desk.flash.waitingId = kRequestId;
+    desk.flash.answeredId = kRequestId;
     desk.advance(4000);
     ss::Supervisor supervisor;
+    desk.ready = false;
     desk.boot(supervisor);
     CHECK_EQ(desk.reports.size(), 1);
     if (desk.reports.size() == 1) {
@@ -3967,26 +4306,32 @@ static void testSupervisor() {
       CHECK_EQ(desk.reports[0].result.notes, ss::NOTE_NOTHING_WRITTEN);
       CHECK(!desk.reports[0].result.followUp);
       CHECK_EQ(desk.reports[0].atMs, 0);
+      CHECK_EQ(desk.reports[0].epoch, 0u);  // the client's clock is not set yet when it starts
     }
-    CHECK(!supervisor.dutyOwed());
+    CHECK_EQ(supervisor.dutyOwed(), owed == 1);
     CHECK(!supervisor.requestWaiting());
-    CHECK(!desk.pass(supervisor));
-    CHECK_EQ(desk.saves.size(), 1);
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
-    CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), 0);
-    CHECK(desk.bus.log.empty());
-    CHECK_EQ(desk.saves.size(), 1);
-    CHECK_EQ(desk.reports.size(), 1);
-    desk.ask(supervisor, kRequestId);
+    CHECK_EQ(desk.saves.size(), 2);  // the answer, and that it went out
+    CHECK(desk.flash.waitingId == 0 && desk.flash.answeredId == kRequestId && !desk.flash.reportDue);
+    CHECK(sameJournal(desk.flash, kRequestId - 50, owed == 1 ? ss::JOURNAL_WRITING : ss::JOURNAL_IDLE));
+    desk.ready = true;
+    CHECK_EQ(desk.loopFor(supervisor, 7200000, 60000), owed == 1 ? 1u : 0u);
+    CHECK_EQ(desk.bus.log.empty(), owed == 0);
+    CHECK_EQ(desk.reports.size(), owed == 1 ? 2u : 1u);
+    CHECK_EQ(desk.reports.back().requestId, owed == 1 ? kRequestId - 50 : kRequestId);
+    CHECK(!supervisor.dutyOwed());
+    CHECK(settledOn(desk.flash, kRequestId));
+    CHECK(!desk.ask(supervisor, kRequestId));
     CHECK(!supervisor.requestWaiting());
   }
   for (int which = 0; which < 4; ++which) {
     // A run that had come to its first restart command, or to its writes: the client asks the
     // controller whether it waits for a restart, as soon as it can be talked to.
     Desk desk;
-    const ss::Journal journal = {which < 2 ? kRequestId : (which == 2 ? (uint32_t)(kRequestId + 9) : (uint32_t)0),
-                                 which == 0 ? (uint8_t)ss::JOURNAL_RESTARTING
-                                            : (which == 1 ? (uint8_t)ss::JOURNAL_WRITING : (which == 2 ? (uint8_t)9 : ss::cautiousJournal().phase))};
+    ss::Journal journal = which == 3 ? ss::cautiousJournal() : ss::emptyJournal();
+    if (which < 3) {
+      journal.requestId = which < 2 ? kRequestId : kRequestId + 9;
+      journal.phase = which == 0 ? (uint8_t)ss::JOURNAL_RESTARTING : (which == 1 ? (uint8_t)ss::JOURNAL_WRITING : (uint8_t)9);
+    }
     desk.flash = journal;
     if (which == 1) {
       desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
@@ -4015,8 +4360,9 @@ static void testSupervisor() {
     CHECK_EQ(desk.bus.count('c'), which == 1 ? 1 : 0);
     CHECK(!editPending(desk.sim));
     CHECK(!supervisor.dutyOwed());
-    CHECK_EQ(desk.saves.size(), 1);
+    CHECK_EQ(desk.saves.size(), 2);  // the result, and that it went out
     CHECK(sameJournal(desk.flash, journal.requestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, journal.requestId));
     CHECK_EQ(desk.loopFor(supervisor, 2 * 86400000ull, 600000), 0);
     CHECK_EQ(desk.reports.size(), 1);
   }
@@ -4026,6 +4372,7 @@ static void testSupervisor() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.bus.before = [&desk](size_t, char kind, uint16_t) {
       if (kind == 'c' && desk.bus.count('w') > 0) {
         desk.sim.powered = false;
@@ -4043,7 +4390,7 @@ static void testSupervisor() {
     }
     CHECK(supervisor.dutyOwed());
     CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_WRITING));
-    CHECK_EQ(desk.saves.size(), 3);
+    CHECK_EQ(desk.saves.size(), 5);  // the request, the two commit points, the result and that it went out
     CHECK(editPending(desk.sim));
     desk.bus.before = nullptr;
 
@@ -4063,7 +4410,8 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_RESTART_FAILED);
     CHECK_EQ(desk.reports.back().requestId, kRequestId);
     CHECK(supervisor.dutyOwed());
-    CHECK_EQ(desk.saves.size(), 3);  // the journal stays as it is
+    CHECK_EQ(desk.saves.size(), 7);  // the result of the try, and that it went out: the phase stays
+    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_WRITING));
 
     CHECK_EQ(desk.loopFor(supervisor, secondTry + ss::DUTY_RETRY_MS - 1 - desk.clockMs), 0);
     desk.advance(1);
@@ -4120,7 +4468,7 @@ static void testSupervisor() {
     CHECK(!editPending(desk.sim));
     CHECK(holdsProfile(desk.sim, profile));
     CHECK(!supervisor.dutyOwed());
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId + 200000) && sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
     CHECK_EQ(desk.bus.count('w'), 15);  // nothing was written a second time
     CHECK_EQ(desk.bus.disorder, 0);
     checkPausesIn(desk.bus.log, desk.master.responseTimeoutMs);
@@ -4155,6 +4503,7 @@ static void testSupervisor() {
     // after a restart of the client.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.bus.before = [&desk](size_t, char kind, uint16_t) {
       if (kind == 'c' && desk.bus.count('w') > 0) {
         desk.sim.powered = false;
@@ -4178,6 +4527,7 @@ static void testSupervisor() {
     // is done at once, and the request runs in the pass after it.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.bus.before = [&desk](size_t, char kind, uint16_t) {
       if (kind == 'c' && desk.bus.count('w') > 0) {
         desk.sim.powered = false;
@@ -4205,7 +4555,7 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
     CHECK_EQ(ss::countEntries(desk.reports.back().result, ss::ENTRY_WRITTEN), 1);
     CHECK(holdsProfile(desk.sim, wanted));
-    CHECK(sameJournal(desk.flash, kRequestId + 60, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId + 60) && sameJournal(desk.flash, kRequestId + 60, ss::JOURNAL_IDLE));
     CHECK(!desk.pass(supervisor));
   }
   {
@@ -4213,6 +4563,7 @@ static void testSupervisor() {
     // recovery does what is left to do.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.bus.before = [&desk](size_t, char kind, uint16_t) {
       if (kind == 'c' && desk.bus.count('w') > 0) {
         desk.sim.powered = false;
@@ -4240,8 +4591,7 @@ static void testSupervisor() {
   // A recovery that cannot reach the controller is owed again, on the same timetable.
   {
     Desk desk;
-    const ss::Journal writing = {kRequestId, ss::JOURNAL_WRITING};
-    desk.flash = writing;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
     desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
     desk.sim.powered = false;
     ss::Supervisor supervisor;
@@ -4251,7 +4601,8 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_NO_LINK);
     CHECK(desk.reports.back().result.followUp);
     CHECK(supervisor.dutyOwed());
-    CHECK(desk.saves.empty());
+    CHECK_EQ(desk.saves.size(), 2);
+    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_WRITING));
     const uint64_t firstTry = desk.clockMs;
     CHECK_EQ(desk.loopFor(supervisor, firstTry + ss::DUTY_RETRY_MS - 1 - desk.clockMs), 0);
     desk.sim.powered = true;
@@ -4311,6 +4662,7 @@ static void testSupervisor() {
     // During the first reading: nothing was sent, nothing is owed.
     Desk desk;
     ss::Supervisor supervisor(30);
+    desk.boot(supervisor);
     desk.ask(supervisor, kRequestId);
     CHECK(desk.pass(supervisor));
     CHECK_EQ(desk.bus.log.size(), 30);
@@ -4318,13 +4670,14 @@ static void testSupervisor() {
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_STOPPED);
     CHECK(!desk.reports.back().result.followUp);
     CHECK(!supervisor.dutyOwed());
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId) && sameJournal(desk.flash, 0, ss::JOURNAL_IDLE));
     CHECK_EQ(desk.loopFor(supervisor, 2 * 86400000ull, 600000), 0);
   }
   {
     // In the middle of the writes: the controller waits for a restart, and gets it at the duty's turn.
     Desk desk;
     ss::Supervisor supervisor(70);
+    desk.boot(supervisor);
     desk.ask(supervisor, kRequestId);
     CHECK(desk.pass(supervisor));
     CHECK(desk.bus.count('w') > 3 && desk.bus.count('w') < 15);
@@ -4371,9 +4724,20 @@ static void checkAfterRestart(Desk &desk, const SimSunSaver &fresh, const ss::Pr
   CHECK_MSG(desk.bus.disorder == 0, "%s %u: the settings were out of order at some moment", what, (unsigned)at);
   CHECK_MSG(onlyPlanChanged(desk.sim, fresh) && beforeOrTarget(desk.sim, fresh, profile), "%s %u: a register holds what nobody asked for",
             what, (unsigned)at);
-  // What the restarted client says depends on how far the journal had come, and on nothing else.
+  // What the restarted client says depends on what its journal held, and on nothing else.
   const size_t said = desk.reports.size() - reported;
-  if (held.phase == ss::JOURNAL_IDLE) {
+  if (held.reportDue) {
+    // A result that had not gone out, or had and flash did not know it yet, goes out now.
+    CHECK_MSG(said == 1, "%s %u: %u reports after a restart with a result due", what, (unsigned)at, (unsigned)said);
+    if (said == 1) {
+      CHECK_EQ(desk.reports.back().requestId, held.reportId);
+      CHECK_EQ(desk.reports.back().epoch, held.reportEpoch);
+      CHECK_MSG(sameResult(desk.reports.back().result, held.report), "%s %u: the result changed across the restart", what,
+                (unsigned)at);
+      CHECK_MSG(ss::outcomeIsGood(held.report.outcome), "%s %u: a run that ended reported %s", what, (unsigned)at,
+                ss::outcomeName(held.report.outcome));
+    }
+  } else if (held.phase == ss::JOURNAL_IDLE && held.waitingId == 0) {
     CHECK_MSG(said == 0, "%s %u: %u reports after a restart with nothing under way", what, (unsigned)at, (unsigned)said);
   } else {
     CHECK_MSG(said == 1, "%s %u: %u reports after the restart", what, (unsigned)at, (unsigned)said);
@@ -4397,7 +4761,7 @@ static void checkAfterRestart(Desk &desk, const SimSunSaver &fresh, const ss::Pr
   const size_t asked = desk.bus.log.size();
   desk.ask(supervisor, kRequestId);
   desk.loopFor(supervisor, 3000);
-  if (held.requestId == kRequestId) {
+  if (held.answeredId == kRequestId) {
     CHECK_MSG(desk.bus.log.size() == asked && desk.reports.size() == reported + said, "%s %u: the request ran a second time", what,
               (unsigned)at);
   } else {
@@ -4412,7 +4776,7 @@ static void checkAfterRestart(Desk &desk, const SimSunSaver &fresh, const ss::Pr
   CHECK_MSG(holdsProfile(desk.sim, profile) && !editPending(desk.sim), "%s %u: the controller does not hold the profile", what,
             (unsigned)at);
   CHECK_MSG(desk.bus.disorder == 0, "%s %u: out of order after the next request", what, (unsigned)at);
-  CHECK(sameJournal(desk.flash, kRequestId + 600, ss::JOURNAL_IDLE));
+  CHECK(settledOn(desk.flash, kRequestId + 600));
 }
 
 // Supervisor::wantsLine() in the plain cases. Desk::pass() checks it against service() in every
@@ -4421,11 +4785,12 @@ static void testWantsLine() {
   {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));  // nothing asked, nothing owed
     desk.ask(supervisor, kRequestId);
     CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
-    // A request that is not in the journal yet runs only with the clock set and while it is
-    // fresh: not before, and not when it is too old or too far ahead.
+    // A request runs only with the clock set and while it is fresh: not before, and not when it
+    // is too old or too far ahead.
     CHECK(!supervisor.wantsLine(0.0, desk.millisNow()));
     CHECK(!supervisor.wantsLine(ss::CLOCK_SET_EPOCH - 1.0, desk.millisNow()));
     CHECK(supervisor.wantsLine((double)kRequestId + ss::REQUEST_MAX_AGE_SECONDS, desk.millisNow()));
@@ -4436,36 +4801,62 @@ static void testWantsLine() {
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));  // done
   }
   {
-    // Taken on, then the charger could not be talked to: the request is in the journal, and runs
-    // whatever the clock says now.
+    // Waiting for the charger: both limits still hold, up to the moment the run would start.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ready = false;
+    desk.epochBase = (double)kRequestId + ss::REQUEST_MAX_AGE_SECONDS - 30.0;  // the request is a day old, nearly
     desk.ask(supervisor, kRequestId);
     CHECK(!desk.pass(supervisor));
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_TAKEN));
-    CHECK(supervisor.wantsLine(0.0, desk.millisNow()));
-    desk.ready = true;
-    CHECK(desk.pass(supervisor));
+    CHECK(holdsWaiting(desk.flash, kRequestId));
+    CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    CHECK(!supervisor.wantsLine(0.0, desk.millisNow()));  // and not without the clock
+    desk.advance(30000);
+    CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    desk.advance(1000);
+    CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    desk.ready = true;  // ready, a second too late
+    CHECK(!desk.pass(supervisor));
+    CHECK(desk.bus.log.empty());
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_STALE);
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
   }
   {
-    // Flash refuses the journal: wantsLine() said yes, and service() refuses the request.
+    // The hour of waiting ends a moment before the charger is ready.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.ready = false;
+    desk.ask(supervisor, kRequestId);
+    CHECK_EQ(desk.loopFor(supervisor, ss::REQUEST_WAIT_MS - 1, 600000), 0);
+    CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    desk.advance(1);
+    CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    desk.ready = true;
+    CHECK(!desk.pass(supervisor));
+    CHECK(desk.bus.log.empty());
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_STALE);
+  }
+  {
+    // Flash refuses the request: it is refused at once, and nothing wants the line.
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.failSaves = 1;
     desk.ask(supervisor, kRequestId);
-    CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
-    CHECK(!desk.pass(supervisor));
-    CHECK_EQ(desk.wantedRefused, 1u);
     CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_JOURNAL);
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    CHECK(!desk.pass(supervisor));
   }
   {
     // A duty after a start with a journal that could not be read: at once, then at its turns.
     Desk desk;
     ss::Supervisor supervisor;
-    supervisor.begin(ss::cautiousJournal(), desk.millisNow());
+    supervisor.begin(ss::cautiousJournal(), &desk, desk.millisNow());
     CHECK(supervisor.dutyOwed());
     CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
     CHECK(supervisor.wantsLine(0.0, desk.millisNow()));  // a duty does not wait for the clock
@@ -4504,19 +4895,20 @@ static void testWithdraw() {
     // Waiting for the clock: withdrawn, refused with the reasons given, never taken on again.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.clockSet = false;
-    CHECK(!supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.millisNow()));  // nothing waits
+    CHECK(!supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.clock(), desk.millisNow()));  // nothing waits
     CHECK_EQ(supervisor.waitingRequestId(), 0u);
     CHECK(desk.ask(supervisor, kRequestId));
     CHECK_EQ(supervisor.waitingRequestId(), kRequestId);
     CHECK(!desk.pass(supervisor));
-    CHECK(!supervisor.withdraw(0, desk.millisNow()));  // no reason: nothing to do
+    CHECK(!supervisor.withdraw(0, desk.clock(), desk.millisNow()));  // no reason: nothing to do
     CHECK(supervisor.requestWaiting());
-    CHECK(supervisor.withdraw(ss::REFUSE_WITHDRAWN | ss::REFUSE_NOT_LIFEPO4, desk.millisNow()));
+    CHECK(supervisor.withdraw(ss::REFUSE_WITHDRAWN | ss::REFUSE_NOT_LIFEPO4, desk.clock(), desk.millisNow()));
     desk.collect(supervisor);
     CHECK(!supervisor.requestWaiting());
     CHECK_EQ(supervisor.waitingRequestId(), 0u);
-    CHECK(!supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.millisNow()));  // once
+    CHECK(!supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.clock(), desk.millisNow()));  // once
     CHECK_EQ(desk.reports.size(), 1);
     CHECK_EQ(desk.reports.back().requestId, kRequestId);
     const ss::ProgramResult &result = desk.reports.back().result;
@@ -4531,7 +4923,8 @@ static void testWithdraw() {
     desk.clockSet = true;
     CHECK_EQ(desk.loopFor(supervisor, 60000), 0u);
     CHECK(desk.bus.log.empty());
-    CHECK(desk.saves.empty());
+    CHECK_EQ(desk.saves.size(), 3);  // the request, its refusal, and that the refusal went out
+    CHECK(settledOn(desk.flash, kRequestId));
     CHECK_EQ(desk.reports.size(), 1);
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
     // A newer request is taken on, and runs.
@@ -4545,17 +4938,19 @@ static void testWithdraw() {
     // the next pass, and nothing is sent.
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.ready = false;
     CHECK(desk.ask(supervisor, kRequestId));
     CHECK(!desk.pass(supervisor));
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_TAKEN));
-    CHECK(supervisor.withdraw(ss::REFUSE_NO_CHARGER, desk.millisNow()));
+    CHECK(holdsWaiting(desk.flash, kRequestId));
+    CHECK(supervisor.withdraw(ss::REFUSE_NO_CHARGER, desk.clock(), desk.millisNow()));
+    CHECK(desk.flash.reportDue && !holdsWaiting(desk.flash, kRequestId));  // in flash before it goes out
     desk.collect(supervisor);
     CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_NO_CHARGER);
-    CHECK(sameJournal(supervisor.journal(), kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(supervisor.journal(), kRequestId));
     desk.ready = true;
     CHECK(!desk.pass(supervisor));
-    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_IDLE));
+    CHECK(settledOn(desk.flash, kRequestId));
     CHECK(desk.bus.log.empty());
     CHECK(!supervisor.dutyOwed());
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
@@ -4569,10 +4964,10 @@ static void testWithdraw() {
     // A duty is owed and a request waits behind it: the request goes, the duty stays and runs.
     Desk desk;
     ss::Supervisor supervisor;
-    supervisor.begin(ss::cautiousJournal(), desk.millisNow());
+    supervisor.begin(ss::cautiousJournal(), &desk, desk.millisNow());
     desk.ready = false;
     CHECK(desk.ask(supervisor, kRequestId));
-    CHECK(supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.millisNow()));
+    CHECK(supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.clock(), desk.millisNow()));
     desk.collect(supervisor);
     CHECK_EQ(desk.reports.size(), 1);
     CHECK_EQ(desk.reports.back().result.refusals, ss::REFUSE_WITHDRAWN);
@@ -4600,6 +4995,190 @@ static void testWithdraw() {
   }
 }
 
+// What the journal keeps for the client across its restarts, and the one result it holds for
+// the server.
+static void testJournalKeeps() {
+  const ss::Profile profile = ss::lifepo4Profile();
+
+  // A result that had not gone out when the client restarted goes out after it, with the time it
+  // came about.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_IDLE);
+    desk.flash.reportDue = true;
+    desk.flash.reportId = kRequestId;
+    desk.flash.reportEpoch = (uint32_t)kClientNow;
+    ss::refusedResult(profile, 0, ss::REFUSE_STALE, &desk.flash.report);
+    desk.advance(3000);
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK_EQ(desk.reports.size(), 1);
+    if (desk.reports.size() == 1) {
+      CHECK_EQ(desk.reports[0].requestId, kRequestId);
+      CHECK_EQ(desk.reports[0].epoch, (uint32_t)kClientNow);
+      CHECK_EQ(desk.reports[0].atMs, 0u);  // the client's millis() when it started: the best it knows
+      CHECK_EQ(desk.reports[0].result.refusals, ss::REFUSE_STALE);
+    }
+    CHECK_EQ(desk.saves.size(), 1);  // that it went out
+    CHECK(settledOn(desk.flash, kRequestId));
+    CHECK(!desk.ask(supervisor, kRequestId));
+  }
+  // The newest request it has answered, even one it refused, is remembered across the restart.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.ask(supervisor, kRequestId);
+    CHECK(desk.pass(supervisor));
+    CHECK(desk.ask(supervisor, kRequestId + 10, profile, ss::PROFILE_LVD));
+    CHECK_EQ(desk.reports.size(), 2);
+    ss::Supervisor restarted;
+    desk.boot(restarted);
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK(!desk.ask(restarted, kRequestId + 10, profile, ss::PROFILE_LVD));
+    CHECK(!desk.ask(restarted, kRequestId + 5));
+    CHECK(!restarted.requestWaiting());
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK(desk.ask(restarted, kRequestId + 11));
+  }
+
+  // The slot holds one result. One of an older request never takes the place of one for a newer
+  // request that has yet to go out: the server keeps the newest request's result anyway.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);  // the older request owes a look
+    ss::Supervisor supervisor;
+    desk.ready = false;
+    desk.boot(supervisor);
+    CHECK(desk.reports.empty());
+    // A newer request waits behind the duty and is withdrawn. Its refusal has not gone out yet.
+    CHECK(supervisor.request(kRequestId + 100, profile, 0, 0, true, desk.clock(), desk.millisNow()));
+    CHECK(supervisor.withdraw(ss::REFUSE_WITHDRAWN, desk.clock(), desk.millisNow()));
+    CHECK(supervisor.reportDue() && supervisor.reportRequestId() == kRequestId + 100);
+    // The duty runs and ends: its result for the older request is not kept.
+    CHECK(supervisor.service(desk, desk.clock(), true));
+    CHECK(!supervisor.dutyOwed());
+    CHECK(supervisor.reportDue());
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId + 100);
+    CHECK_EQ(supervisor.report().refusals, ss::REFUSE_WITHDRAWN);
+    CHECK(desk.flash.reportDue && desk.flash.reportId == kRequestId + 100);  // and so does flash
+    CHECK_EQ(desk.flash.phase, ss::JOURNAL_IDLE);
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId + 100);
+    CHECK(settledOn(desk.flash, kRequestId + 100));
+  }
+  {
+    // A later result of the same request takes the place of one that has not gone out, and so
+    // does a result of a newer request.
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.powered = false;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(supervisor.service(desk, desk.clock(), true));  // no answer: still owed
+    CHECK(supervisor.dutyOwed());
+    CHECK(supervisor.reportDue() && supervisor.reportRequestId() == kRequestId);
+    CHECK_EQ(supervisor.report().outcome, ss::OUTCOME_NO_LINK);
+    desk.sim.powered = true;
+    desk.advance(ss::DUTY_RETRY_MS);
+    CHECK(supervisor.service(desk, desk.clock(), true));
+    CHECK(!supervisor.dutyOwed());
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId);
+    CHECK_EQ(supervisor.report().outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(supervisor.request(kRequestId + 1, profile, ss::PROFILE_HVD, 0, true, desk.clock(), desk.millisNow()));
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId + 1);
+    CHECK_EQ(supervisor.report().refusals, ss::REFUSE_PROFILE);
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 1);
+  }
+
+  // The journal names the controller its run talked to. A duty goes to that one, even when the
+  // config names another now and after the client restarted; once it is settled, the config
+  // decides again.
+  {
+    Desk desk;
+    desk.bus.slave = 7;
+    desk.sim.slaveId = 7;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK_EQ(supervisor.controllerToUse(3), 3);  // nothing owed: the config decides
+    desk.bus.before = [&desk](size_t, char kind, uint16_t) {
+      if (kind == 'c' && desk.bus.count('w') > 0) {
+        desk.sim.powered = false;
+      }
+    };
+    desk.ask(supervisor, kRequestId);
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(desk.flash.controller, 7);
+    CHECK_EQ(supervisor.controllerToUse(1), 7);
+    desk.advance(20000);
+    ss::Supervisor restarted;
+    desk.boot(restarted);
+    CHECK(restarted.dutyOwed());
+    CHECK_EQ(restarted.controllerToUse(1), 7);
+    desk.bus.before = nullptr;
+    desk.sim.powered = true;
+    CHECK(desk.pass(restarted));
+    CHECK(!restarted.dutyOwed());
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(restarted.controllerToUse(1), 1);
+    CHECK(!editPending(desk.sim));
+  }
+  {
+    // A journal that names no controller, such as one that could not be read: the config decides.
+    Desk desk;
+    ss::Supervisor supervisor;
+    supervisor.begin(ss::cautiousJournal(), &desk, 0);
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(supervisor.controllerToUse(4), 4);
+  }
+
+  // A journal whose request that waits is newer than the newest it has answered (this code never
+  // writes one): once that request is answered as interrupted, the same config does not bring
+  // it back.
+  {
+    Desk desk;
+    desk.flash = ss::emptyJournal();
+    desk.flash.waitingId = kRequestId;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(!desk.ask(supervisor, kRequestId));
+    CHECK(!supervisor.requestWaiting());
+    CHECK(desk.ask(supervisor, kRequestId + 1));
+    CHECK(supervisor.requestWaiting());
+  }
+
+  // A clock that reads less than CLOCK_SET_EPOCH was never set: a result made then has no time.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(supervisor.request(kRequestId, profile, ss::PROFILE_HVD, 0, true, 1000.0, desk.millisNow()));
+    CHECK(supervisor.reportDue());
+    CHECK_EQ(supervisor.reportEpoch(), 0u);
+    CHECK(supervisor.request(kRequestId + 1, profile, ss::PROFILE_HVD, 0, true, ss::CLOCK_SET_EPOCH + 5.5,
+                             desk.millisNow()));
+    CHECK_EQ(supervisor.reportEpoch(), (uint32_t)ss::CLOCK_SET_EPOCH + 5u);
+  }
+
+  // Without a store nothing can be kept, so nothing is taken on.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    CHECK(supervisor.request(kRequestId, profile, 0, 0, true, desk.clock(), desk.millisNow()));
+    CHECK(!supervisor.requestWaiting());
+    CHECK(supervisor.reportDue());
+    CHECK_EQ(supervisor.report().refusals, ss::REFUSE_JOURNAL);
+    CHECK(!supervisor.service(desk, desk.clock(), true));
+    CHECK(desk.bus.log.empty());
+  }
+}
+
 static void testSupervisorSweeps() {
   const ss::Profile profile = ss::lifepo4Profile();
   const SimSunSaver fresh;
@@ -4612,13 +5191,14 @@ static void testSupervisorSweeps() {
     for (size_t at = 0; at <= length; ++at) {
       Desk desk;
       ss::Supervisor supervisor;
+      desk.boot(supervisor);
       desk.dieAtRequest = at;
       if (both == 1) {
         desk.onDeath = [&desk]() { powerCycle(desk.sim); };
       }
-      desk.ask(supervisor, kRequestId);
       bool died = false;
       try {
+        desk.ask(supervisor, kRequestId);
         desk.pass(supervisor);
       } catch (const PowerLoss &) {
         died = true;
@@ -4632,24 +5212,27 @@ static void testSupervisorSweeps() {
       checkAfterRestart(desk, fresh, profile, both == 1 ? "client and controller gone at request" : "client gone at request",
                         at, both == 1);
     }
-    for (size_t save = 0; save < 4; ++save) {
+    // The journal is written five times: the request, the two commit points, the result, and
+    // that the result has gone out.
+    for (size_t save = 0; save < 5; ++save) {
       for (int after = 0; after < 2; ++after) {
         Desk desk;
         ss::Supervisor supervisor;
+        desk.boot(supervisor);
         desk.dieAtSave = save;
         desk.dieAfterSave = after == 1;
         if (both == 1) {
           desk.onDeath = [&desk]() { powerCycle(desk.sim); };
         }
-        desk.ask(supervisor, kRequestId);
         bool died = false;
         try {
+          desk.ask(supervisor, kRequestId);
           desk.pass(supervisor);
         } catch (const PowerLoss &) {
           died = true;
         }
         CHECK(died);
-        CHECK(desk.reports.empty());
+        CHECK_EQ(desk.reports.size(), save == 4 ? 1u : 0u);  // the last write follows the result's way out
         checkAfterRestart(desk, fresh, profile, after == 1 ? "client gone after journal write" : "client gone at journal write",
                           save, both == 1);
       }
@@ -4660,12 +5243,13 @@ static void testSupervisorSweeps() {
   for (size_t at = 0; at < length; at += 3) {
     Desk desk;
     ss::Supervisor supervisor;
+    desk.boot(supervisor);
     desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
     chargeForPending(desk.sim);
     desk.dieAtRequest = at;
-    desk.ask(supervisor, kRequestId);
     bool died = false;
     try {
+      desk.ask(supervisor, kRequestId);
       desk.pass(supervisor);
     } catch (const PowerLoss &) {
       died = true;
@@ -4679,7 +5263,7 @@ static void testSupervisorSweeps() {
     ss::Supervisor restarted;
     desk.boot(restarted);
     desk.loopFor(restarted, 5000);
-    if (held.phase == ss::JOURNAL_TAKEN) {
+    if (held.phase == ss::JOURNAL_IDLE) {
       // Before the first commit point the client had sent nothing, and owes nothing: the
       // controller waits as it did before, and the next run restarts it first.
       CHECK_MSG(editPending(desk.sim) == waited, "pending before, client gone at request %u", (unsigned)at);
@@ -4694,6 +5278,322 @@ static void testSupervisorSweeps() {
               ss::outcomeName(desk.reports.back().result.outcome));
     CHECK_EQ(desk.bus.disorder, 0);
   }
+}
+
+// ============================================================================
+// The time limit
+// ============================================================================
+
+// The moment from a run's first step at which only its shortest safe end is left.
+static uint32_t cutFor(uint16_t timeoutMs) {
+  return ss::RUN_LIMIT_MS - ss::RUN_END_TIMEOUTS * (uint32_t)timeoutMs - ss::RUN_END_SLACK_MS;
+}
+
+// A hook that moves the clock on to the cut just before the request with index `at` goes out.
+static void cutAt(Station &station, size_t at) {
+  station.bus.before = [&station, at](size_t index, char, uint16_t) {
+    if (index == at) {
+      station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+    }
+  };
+}
+
+// The client's loop is held for the whole of a run: never longer than RUN_LIMIT_MS, whatever the
+// Modbus timeout and however the line behaves. Past the cut only the shortest safe end is left:
+// nothing more is written, a controller that was written to still gets its restart command, and
+// one that may still wait for its restart is owed a later look.
+static void testTimeLimit() {
+  const ss::Profile profile = ss::lifepo4Profile();
+  const SimSunSaver fresh;
+  CHECK_EQ(ss::RUN_LIMIT_MS, 60000u);
+  CHECK_EQ(cutFor(4000), 30000u);  // the longest timeout a client's config allows leaves half a minute
+  CHECK_EQ(cutFor(1000), 51000u);
+
+  // The run of the finding: a 4 s timeout, and a controller that is gone after the restart
+  // command that follows the writes. Twenty probes, each with its rest, would take 160 s.
+  {
+    Desk desk;
+    desk.master.responseTimeoutMs = 4000;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.bus.before = [&desk](size_t, char kind, uint16_t) {
+      if (kind == 'c' && desk.bus.count('w') > 0) {
+        desk.sim.powered = false;
+      }
+    };
+    desk.ask(supervisor, kRequestId);
+    const uint64_t began = desk.clockMs;
+    CHECK(desk.pass(supervisor));
+    const uint64_t took = desk.clockMs - began;
+    CHECK_MSG(took > cutFor(4000) && took <= ss::RUN_LIMIT_MS, "the run took %llu ms", (unsigned long long)took);
+    CHECK_EQ(desk.reports.size(), 1);
+    if (desk.reports.size() == 1) {
+      const ss::ProgramResult &result = desk.reports[0].result;
+      CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+      CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+      CHECK(result.followUp);
+      CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+      CHECK(result.probes < ss::BACK_PROBES);
+      CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 15);
+    }
+    CHECK(supervisor.dutyOwed());
+    // Its later look has a minute of its own, and ends the run as it would have ended.
+    desk.bus.before = nullptr;
+    desk.sim.powered = true;
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_RETRY_MS + 1000, 60000), 1u);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK((desk.reports.back().result.notes & ss::NOTE_TIME_LIMIT) != 0);  // it tells how the run went
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+  }
+
+  // The controller never comes back from the first restart command: at a 2 s timeout the time
+  // limit ends the wait before BACK_PROBES does. Nothing was written.
+  {
+    Station station;
+    station.master.responseTimeoutMs = 2000;
+    station.bus.before = [&](size_t, char kind, uint16_t) {
+      if (kind == 'c') {
+        station.sim.resetDownMs = 3600UL * 1000UL;
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK(result.probes < ss::BACK_PROBES);
+    CHECK(!result.wroteAny);
+    CHECK(!result.followUp);
+    CHECK_EQ(station.bus.count('w'), 0);
+    const uint64_t took = station.bus.log.back().end - station.bus.log.front().at;
+    CHECK_MSG(took > cutFor(2000) && took <= ss::RUN_LIMIT_MS, "the run took %llu ms", (unsigned long long)took);
+  }
+
+  // The cut comes as the first restart command is due: it is not sent, since nothing has been
+  // written that needs it.
+  {
+    Station station;
+    cutAt(station, ss::ITEM_COUNT - 1);
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_NO_LINK);
+    CHECK_EQ(result.restart, ss::RESTART_NOT_NEEDED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(station.bus.count('c'), 0);
+    CHECK_EQ(station.bus.log.size(), ss::ITEM_COUNT);
+    CHECK_EQ(station.sim.resets, 0);
+    CHECK(!result.followUp);
+    CHECK(onlyPlanChanged(station.sim, fresh));
+  }
+  // The cut comes during the first reading: the run ends there.
+  {
+    Station station;
+    cutAt(station, 10);
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_NO_LINK);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(station.bus.log.size(), 11u);
+    CHECK_EQ(station.bus.count('c') + station.bus.count('w'), 0);
+  }
+
+  // The cut comes as the third register is written: its read-back follows, then the restart
+  // command, and nothing more is written. A probe that the restarting controller misses ends
+  // the wait, so the run owes it a look.
+  {
+    const size_t thirdWrite = ss::ITEM_COUNT + 4 + 4;  // two writes with their read-backs before it
+    Station station;
+    cutAt(station, thirdWrite);
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(station.bus.log[thirdWrite].kind, 'w');
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(station.bus.count('w'), 3);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 3);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_PENDING), ss::PLAN_ENTRIES - 3 - 2);
+    CHECK_EQ(station.bus.log[thirdWrite + 1].kind, 'r');  // the read-back
+    CHECK_EQ(station.bus.log[thirdWrite + 1].addr, station.bus.log[thirdWrite].addr);
+    CHECK_EQ(station.bus.log[thirdWrite + 2].kind, 'c');
+    CHECK_EQ(station.bus.log.size(), thirdWrite + 4);  // and one probe
+    CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    CHECK_EQ(station.bus.disorder, 0);
+    checkPauses(station);
+    // Taken up again, with a time limit of its own: the controller had restarted.
+    station.bus.before = nullptr;
+    station.sim.advance(5000);
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 3);
+    CHECK(!editPending(station.sim));
+    CHECK(!station.programmer.controllerUnknown());
+    CHECK(onlyPlanChanged(station.sim, fresh) && beforeOrTarget(station.sim, fresh, profile));
+  }
+
+  // The same, and the read-back of that register gets no reply: past the cut it is not asked
+  // again, and the restart command follows.
+  {
+    const size_t thirdWrite = ss::ITEM_COUNT + 4 + 4;
+    Station station;
+    station.bus.before = [&station, thirdWrite](size_t index, char, uint16_t) {
+      if (index == thirdWrite) {
+        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+      } else if (index == thirdWrite + 1) {
+        station.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(station.bus.log[thirdWrite].kind, 'w');
+    CHECK_EQ(station.bus.log[thirdWrite + 1].kind, 'r');
+    CHECK_EQ(station.bus.log[thirdWrite + 1].status, ss::SSIO_NO_REPLY);
+    CHECK_EQ(station.bus.log[thirdWrite + 2].kind, 'c');
+    CHECK_EQ(station.bus.count('w'), 3);
+    CHECK(result.followUp);
+    checkPauses(station);
+  }
+
+  // A timeout so long that no safe end fits in RUN_LIMIT_MS (no config allows one): neither a
+  // run nor a look at the controller sends anything, and the look stays owed.
+  {
+    Station station;
+    station.master.responseTimeoutMs = 9000;
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_NO_LINK);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK(station.bus.log.empty());
+    Station looking;
+    looking.master.responseTimeoutMs = 9000;
+    looking.programmer.startRecovery(false);
+    looking.drive();
+    CHECK_EQ(looking.programmer.result().outcome, ss::OUTCOME_NO_LINK);
+    CHECK(looking.programmer.result().followUp);
+    CHECK(looking.bus.log.empty());
+  }
+
+  // The cut comes while the controller waits for its restart: the command goes out at once.
+  {
+    Station station;
+    station.bus.before = [&](size_t, char kind, uint16_t addr) {
+      if (kind == 'r' && addr == A_LOAD_STATE && station.bus.count('w') == 15 && station.bus.count('c') == 1) {
+        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(station.bus.count('c'), 2);
+    const size_t lastWrite = station.bus.nth('w', 14);
+    CHECK_EQ(station.bus.log[lastWrite + 2].addr, A_LOAD_STATE);
+    CHECK_EQ(station.bus.log[lastWrite + 3].kind, 'c');  // and not the two fault words first
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_WRITTEN), 15);
+  }
+
+  // The cut comes as the registers are read again after the restart: those not read are
+  // unconfirmed, and the run says so.
+  {
+    Station station;
+    station.bus.before = [&](size_t index, char, uint16_t) {
+      if (station.bus.count('c') == 2 && index == station.bus.nth('c', 1) + 6) {
+        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_UNVERIFIED);
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK((result.notes & ss::NOTE_VERIFY_INCOMPLETE) != 0);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_UNREAD), ss::PLAN_ENTRIES - 3);
+    CHECK_EQ(result.loadStateAfter, ss::LOAD_STATE_NOT_READ);
+    CHECK(!result.followUp);
+    CHECK_EQ(station.bus.log.size(), station.bus.nth('c', 1) + 7);
+  }
+
+  // The cut comes after a restart command that did nothing: there is no time for the second
+  // command, so the run leaves it to a later look.
+  {
+    Station station;
+    station.bus.before = [&](size_t, char kind, uint16_t) {
+      if (kind == 'c' && station.bus.count('c') == 1) {
+        station.sim.resetWorks = false;
+        station.sim.advance(cutFor((uint16_t)station.master.responseTimeoutMs));
+      }
+    };
+    const ss::ProgramResult &result = station.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+    CHECK_EQ(result.restart, ss::RESTART_NOT_DONE);
+    CHECK((result.notes & ss::NOTE_TIME_LIMIT) != 0);
+    CHECK_EQ(station.bus.count('c'), 2);
+    CHECK(result.followUp);
+    CHECK(station.programmer.controllerUnknown());
+    CHECK(editPending(station.sim));
+    // Past the cut the controller that answers is not asked ten times more: one look at each of
+    // its fault words, and the run ends.
+    CHECK_EQ(station.bus.log.size(), station.bus.nth('c', 1) + 3);
+    // The later look sends the command it could not send then, and leaves nothing owed.
+    station.bus.before = nullptr;
+    station.sim.resetWorks = true;
+    CHECK(station.programmer.resume());
+    station.drive();
+    CHECK_EQ(result.restart, ss::RESTART_DONE);
+    CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(station.bus.count('c'), 3);
+    CHECK(!editPending(station.sim));
+    CHECK(!result.followUp);
+    CHECK(!station.programmer.controllerUnknown());
+  }
+
+  // Every way the line can go dead, at every request of a run, at the shortest and the longest
+  // timeout, with replies that come at once and replies that come just in time. Whatever happens,
+  // the run holds the client no longer than RUN_LIMIT_MS, writes nothing past the cut, and leaves
+  // the client owing a look to a controller that may wait for its restart.
+  const uint16_t timeouts[] = {500, 1000, 4000};
+  unsigned cut = 0;
+  for (size_t t = 0; t < sizeof(timeouts) / sizeof(timeouts[0]); ++t) {
+    for (int slow = 0; slow < 2; ++slow) {
+      for (size_t dead = 0;; ++dead) {
+        Desk desk;
+        desk.master.responseTimeoutMs = timeouts[t];
+        if (slow == 1) {
+          desk.sim.responseDelayMs = timeouts[t] - 150;
+        }
+        ss::Supervisor supervisor;
+        desk.boot(supervisor);
+        desk.bus.before = [&desk, dead](size_t index, char, uint16_t) {
+          if (index == dead) {
+            desk.sim.powered = false;
+          }
+        };
+        desk.ask(supervisor, kRequestId);
+        const uint64_t began = desk.clockMs;
+        CHECK(desk.pass(supervisor));
+        const uint64_t took = desk.clockMs - began;
+        CHECK_MSG(took <= ss::RUN_LIMIT_MS, "timeout %u, %s replies, dead from request %u: the run took %llu ms",
+                  (unsigned)timeouts[t], slow == 1 ? "slow" : "quick", (unsigned)dead, (unsigned long long)took);
+        const uint64_t start = desk.bus.log.empty() ? 0 : desk.bus.log.front().at;
+        for (size_t i = 0; i < desk.bus.log.size(); ++i) {
+          if (desk.bus.log[i].kind == 'w') {
+            CHECK_MSG(desk.bus.log[i].at - start < cutFor(timeouts[t]), "timeout %u: a write %llu ms into the run",
+                      (unsigned)timeouts[t], (unsigned long long)(desk.bus.log[i].at - start));
+          }
+        }
+        CHECK_EQ(desk.reports.size(), 1);
+        if (editPending(desk.sim)) {
+          CHECK_MSG(supervisor.dutyOwed(), "timeout %u, %s replies, dead from request %u: the controller waits, and no look is owed",
+                    (unsigned)timeouts[t], slow == 1 ? "slow" : "quick", (unsigned)dead);
+        }
+        CHECK(desk.bus.disorder == 0);
+        if (!desk.reports.empty() && (desk.reports.back().result.notes & ss::NOTE_TIME_LIMIT) != 0) {
+          ++cut;
+        }
+        if (dead >= desk.bus.log.size()) {
+          break;  // the line stayed up for the whole run
+        }
+      }
+    }
+  }
+  CHECK(cut > 100);  // the cut was reached in many of those runs, not only in a few
 }
 
 // ============================================================================
@@ -4718,6 +5618,7 @@ static void testText() {
 
   for (uint8_t status = 0; status <= ss::ENTRY_STATUS_LAST; ++status) {
     CHECK(plainAscii(ss::entryStatusName(status)));
+    CHECK(strcmp(ss::entryStatusName(status), "?") != 0);
     for (uint8_t other = 0; other < status; ++other) {
       CHECK(strcmp(ss::entryStatusName(status), ss::entryStatusName(other)) != 0);
     }
@@ -4726,6 +5627,7 @@ static void testText() {
 
   for (uint8_t restart = 0; restart <= ss::RESTART_STATUS_LAST; ++restart) {
     CHECK(plainAscii(ss::restartText(restart)));
+    CHECK(strcmp(ss::restartText(restart), "?") != 0);
     for (uint8_t other = 0; other < restart; ++other) {
       CHECK(strcmp(ss::restartText(restart), ss::restartText(other)) != 0);
     }
@@ -4976,7 +5878,9 @@ int main() {
   testSupervisor();
   testWantsLine();
   testWithdraw();
+  testJournalKeeps();
   testSupervisorSweeps();
+  testTimeLimit();
   CHECK_EQ(gAllocLive, 0);
 
   if (gFailures != 0) {

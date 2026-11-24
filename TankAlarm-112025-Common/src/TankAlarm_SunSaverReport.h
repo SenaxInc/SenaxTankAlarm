@@ -375,26 +375,6 @@ inline bool readLoadAllowed(JsonObjectConst in) { return in["loadOk"].is<bool>()
 inline uint32_t readRequestId(JsonObjectConst in) { return in["req"].is<uint32_t>() ? in["req"].as<uint32_t>() : 0; }
 
 // ---------------------------------------------------------------------------------------------
-// Programming: the client's journal
-// ---------------------------------------------------------------------------------------------
-
-inline void encodeJournal(const Journal &journal, JsonObject out) {
-  out["req"] = journal.requestId;
-  out["ph"] = journal.phase;
-}
-
-// A file that is no journal reads as cautiousJournal(): the client may owe the controller a
-// restart, and finds out by asking it.
-inline Journal decodeJournal(JsonObjectConst in) {
-  if (in.isNull() || !in["req"].is<uint32_t>() || !in["ph"].is<uint32_t>() ||
-      in["ph"].as<uint32_t>() > JOURNAL_PHASE_LAST) {
-    return cautiousJournal();
-  }
-  const Journal journal = {in["req"].as<uint32_t>(), (uint8_t)in["ph"].as<uint32_t>()};
-  return journal;
-}
-
-// ---------------------------------------------------------------------------------------------
 // Programming: the result of a run
 // ---------------------------------------------------------------------------------------------
 //
@@ -562,6 +542,68 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
   *result = read;
   return true;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Programming: the client's journal
+// ---------------------------------------------------------------------------------------------
+//
+// The journal as the client keeps it in flash (sunsaver::Journal):
+//   req, ph, ctl   the last run that reached a commit point, its JournalPhase, and the Modbus id
+//                  of its controller (0: not known)
+//   ans            the newest request the client has answered or taken on
+//   wait           the request that waits (left out when none does)
+//   rep            the result that has yet to go to the server (left out when there is none): the
+//                  compact result of encodeProgramResult(), with "rq", the request it answers,
+//                  and "ep", when it came about (0: not known)
+// It is written whole, as a new file that takes the place of the old one, and is no longer than
+// JOURNAL_JSON_MAX.
+
+static const size_t JOURNAL_JSON_MAX = 640;
+
+inline void encodeJournal(const Journal &journal, JsonObject out) {
+  out["req"] = journal.requestId;
+  out["ph"] = journal.phase;
+  out["ctl"] = journal.controller;
+  out["ans"] = journal.answeredId;
+  if (journal.waitingId != 0) {
+    out["wait"] = journal.waitingId;
+  }
+  if (journal.reportDue) {
+    JsonObject report = out["rep"].to<JsonObject>();
+    report["rq"] = journal.reportId;
+    report["ep"] = journal.reportEpoch;
+    encodeProgramResult(journal.report, report);
+  }
+}
+
+// A file that is no journal reads as cautiousJournal(): the client may owe the controller a
+// restart, and finds out by asking it. A result in it that this code cannot read is left out:
+// the rest of the journal still holds.
+inline Journal decodeJournal(JsonObjectConst in) {
+  if (in.isNull() || !in["req"].is<uint32_t>() || !in["ph"].is<uint32_t>() ||
+      in["ph"].as<uint32_t>() > JOURNAL_PHASE_LAST) {
+    return cautiousJournal();
+  }
+  Journal journal = emptyJournal();
+  journal.requestId = in["req"].as<uint32_t>();
+  journal.phase = (uint8_t)in["ph"].as<uint32_t>();
+  journal.controller = reportByte(in, "ctl", 247, 0);  // Modbus ids go from 1 to 247
+  journal.answeredId = in["ans"].is<uint32_t>() ? in["ans"].as<uint32_t>() : 0;
+  journal.waitingId = in["wait"].is<uint32_t>() ? in["wait"].as<uint32_t>() : 0;
+  JsonObjectConst report = in["rep"].as<JsonObjectConst>();
+  if (!report.isNull() && report["rq"].is<uint32_t>() && decodeProgramResult(report, &journal.report)) {
+    journal.reportDue = true;
+    journal.reportId = report["rq"].as<uint32_t>();
+    journal.reportEpoch = report["ep"].is<uint32_t>() ? report["ep"].as<uint32_t>() : 0;
+  } else {
+    clearResult(&journal.report);
+  }
+  return journal;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Programming: the result the server keeps, and the result for a person
+// ---------------------------------------------------------------------------------------------
 
 // Whether a result that arrives takes the place of the one the server keeps for a client. The
 // result of a newer request does, and so does a later result of the same request: a client

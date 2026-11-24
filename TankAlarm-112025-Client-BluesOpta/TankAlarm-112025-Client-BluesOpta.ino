@@ -913,7 +913,8 @@ static unsigned long gChargerReportTryMillis = 0;      // which was then
 // request). The procedure, its limits and its journal are in TankAlarm_SunSaverProgram.h
 // (Common library); SolarManager runs it, and only in firmware built with
 // TANKALARM_SUNSAVER_PROGRAMMING set to 1 in TankAlarm_Solar.h. Other firmware answers every
-// request with "not built". The journal in flash lets a run that a restart of this client cut
+// request with "not built". The journal in flash keeps the requests answered, a request that
+// waits and the result that has yet to go out, and lets a run that a restart of this client cut
 // short be settled when it starts again. Every result goes to the server.
 #define CHARGER_JOURNAL_FILE "/cfg/charger_journal.json"
 #define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result nothing would take
@@ -7648,28 +7649,28 @@ static void sendDueChargerReport(unsigned long now) {
 // PC against a simulated SunSaver; SolarManager talks to the controller. This sketch reads the
 // request, keeps the journal in flash and sends the results to the server.
 
-// The journal in flash: how far the last run came (sunsaver::Journal). No file: no run was ever
-// taken on. A file that cannot be read: the controller may wait for a restart, and gets a look.
-// Only firmware built with programming reads it.
+// The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
+// the last run came that reached the charger, and the result that has yet to go out. No file:
+// nothing was ever asked. A file that cannot be read: the charger may wait for a restart, and
+// gets a look (firmware without programming owes it nothing, see beginChargerProgramming()).
 static sunsaver::Journal loadChargerJournal() {
-  const sunsaver::Journal none = {0, sunsaver::JOURNAL_IDLE};
-#if TANKALARM_SUNSAVER_PROGRAMMING && defined(POSIX_FILE_IO_AVAILABLE)
+  const sunsaver::Journal none = sunsaver::emptyJournal();
+#if defined(POSIX_FILE_IO_AVAILABLE)
   if (!isStorageAvailable()) {
-    // Without flash no run can be recorded, and so none is taken on.
-    Serial.println(F("Charger programming: built in, but no flash to keep its journal"));
+    // Without flash nothing can be kept, and so no request is taken on.
+    Serial.println(F("Charger programming: no flash to keep its journal"));
     return none;
   }
   errno = 0;
   FILE *file = fopen(CHARGER_JOURNAL_FILE, "r");
   if (file == nullptr) {
     if (errno == ENOENT) {
-      Serial.println(F("Charger programming: built in, nothing owed to the charger"));
       return none;
     }
     Serial.println(F("Charger programming: the journal could not be opened, so the charger gets a look"));
     return sunsaver::cautiousJournal();
   }
-  char buf[96];
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
   const size_t len = fread(buf, 1, sizeof(buf) - 1, file);
   const bool failed = ferror(file) != 0;
   fclose(file);
@@ -7679,17 +7680,15 @@ static sunsaver::Journal loadChargerJournal() {
   if (!failed && deserializeJson(doc, buf) == DeserializationError::Ok) {
     journal = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
   }
-  switch (journal.phase) {
-    case sunsaver::JOURNAL_IDLE:
-      Serial.println(F("Charger programming: built in, nothing owed to the charger"));
-      break;
-    case sunsaver::JOURNAL_TAKEN:
-      Serial.println(F("Charger programming: a request was taken on before this restart, and nothing was sent"));
-      break;
-    default:
-      Serial.println(F("Charger programming: a run was cut short by this restart, so the charger gets a look"));
-      addSerialLog("Charger programming: a run was cut short by a restart");
-      break;
+  if (journal.phase != sunsaver::JOURNAL_IDLE) {
+    Serial.println(F("Charger programming: a run was cut short by this restart, so the charger gets a look"));
+    addSerialLog("Charger programming: a run was cut short by a restart");
+  }
+  if (journal.waitingId != 0) {
+    Serial.println(F("Charger programming: a request waited at this restart, and is answered as interrupted"));
+  }
+  if (journal.reportDue) {
+    Serial.println(F("Charger programming: a result had yet to go out at this restart, and is due again"));
   }
   return journal;
 #else
@@ -7705,9 +7704,9 @@ static bool saveChargerJournal(const sunsaver::Journal &journal) {
   }
   JsonDocument doc;
   sunsaver::encodeJournal(journal, doc.to<JsonObject>());
-  char buf[64];
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 2];
   const size_t len = serializeJson(doc, buf, sizeof(buf));
-  if (len == 0 || len >= sizeof(buf) - 1) {
+  if (len == 0 || len > sunsaver::JOURNAL_JSON_MAX) {
     return false;
   }
   return tankalarm_posix_write_file_atomic(CHARGER_JOURNAL_FILE, buf, len);
@@ -7748,7 +7747,8 @@ static void handleChargerProgramRequest(JsonObjectConst program) {
   const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
   const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
   if (waitingId != 0 && requestId < waitingId) {
-    if (gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_WITHDRAWN | chargerProgramClientRefusals())) {
+    if (gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_WITHDRAWN | chargerProgramClientRefusals(),
+                                             currentEpoch())) {
       logChargerProgramWithdrawn(waitingId);
     }
     return;
@@ -7760,7 +7760,7 @@ static void handleChargerProgramRequest(JsonObjectConst program) {
   const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
   const uint32_t refusals = chargerProgramClientRefusals();
   if (!gSolarManager.requestChargerProgram(requestId, profile, profileErrors, refusals,
-                                           sunsaver::readLoadAllowed(program))) {
+                                           sunsaver::readLoadAllowed(program), currentEpoch())) {
     return;  // the config again: this request has had its answer, or waits already
   }
   Serial.print(F("Charger programming: request "));
@@ -7776,7 +7776,7 @@ static void handleChargerProgramRequest(JsonObjectConst program) {
 static void withdrawUnsuitedChargerProgram() {
   const uint32_t refusals = chargerProgramClientRefusals();
   const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
-  if (refusals != 0 && gSolarManager.withdrawChargerProgram(refusals)) {
+  if (refusals != 0 && gSolarManager.withdrawChargerProgram(refusals, currentEpoch())) {
     logChargerProgramWithdrawn(waitingId);
   }
 }
@@ -7845,8 +7845,9 @@ static void printChargerProgramResult(uint32_t requestId, const sunsaver::Progra
   }
 }
 
-// Hands the result that is due to the Notecard, and keeps it due until that has worked. A newer
-// result takes the place of one that has not gone out yet (sunsaver::Supervisor).
+// Hands the result that is due to the Notecard, and keeps it due until that has worked: until
+// then it is in the journal in flash too. A newer result takes the place of one that has not gone
+// out yet, unless it answers an older request (sunsaver::Supervisor).
 static void sendDueChargerProgramReport(unsigned long now) {
   const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
   if (!programming.reportDue()) {
@@ -7863,7 +7864,12 @@ static void sendDueChargerProgramReport(unsigned long now) {
     printChargerProgramResult(requestId, programming.report());
   }
   // The server keeps the newest result of a request by its time, as it keeps charger reports
-  // (see sendDueChargerReport()): the time is worked out once, when the clock has one.
+  // (see sendDueChargerReport()). The supervisor knows the time when the clock was set as the
+  // result came about. Otherwise it is worked out once, when the clock has one: from the millis()
+  // of the result, which for a result kept across a restart is the moment of that restart.
+  if (gChargerProgramReportEpoch == 0) {
+    gChargerProgramReportEpoch = programming.reportEpoch();
+  }
   if (gChargerProgramReportEpoch == 0) {
     const double nowEpoch = currentEpoch();
     if (nowEpoch <= 0.0) {

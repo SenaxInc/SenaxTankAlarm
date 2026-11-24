@@ -425,31 +425,34 @@ public:
   // its flash and sends the results to the server. None of it is touched by begin() and end(),
   // which a config change calls to restart the link.
   //
-  // With TANKALARM_SUNSAVER_PROGRAMMING 0 nothing here sends to the controller: the caller
-  // refuses every request with REFUSE_NOT_BUILT, the journal is not looked at, and
-  // serviceChargerProgramming() does nothing.
+  // With TANKALARM_SUNSAVER_PROGRAMMING 0 nothing here sends to the controller: every request
+  // is refused with REFUSE_NOT_BUILT, the journal keeps only the requests answered and the
+  // result that has yet to go out, and serviceChargerProgramming() does nothing.
   // ---------------------------------------------------------------------------------------
 
-  // Once at start, with the journal from flash: sunsaver::cautiousJournal() when the file is
-  // there and cannot be read, {0, JOURNAL_IDLE} when there is none.
+  // Once at start, with the journal from flash (sunsaver::cautiousJournal() when the file is
+  // there and cannot be read, sunsaver::emptyJournal() when there is none) and the function that
+  // writes it.
   void beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer);
 
   // A config carried a request. See sunsaver::Supervisor::request(): false for a request that
-  // this client has dealt with already.
+  // this client has dealt with already. The request is in flash, or answered, on return.
   bool requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
-                             uint32_t clientRefusals, bool loadCurrentAllowed);
+                             uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow);
 
   // A request that waits is given up (see sunsaver::Supervisor::withdraw()). False when none
   // waits.
-  bool withdrawChargerProgram(uint32_t refusals);
+  bool withdrawChargerProgram(uint32_t refusals, double epochNow);
 
   // Call from every pass of loop(), whether the charger is enabled or not: a request that waits
   // runs out of time here too. `allowed` is false while the client must not talk to the
   // controller (a firmware update is being staged, or a poll has just talked to it). The
-  // controller is talked to only once a poll has succeeded and the line is not resting. Returns
-  // true when a run talked to it: that held loop() for the whole run (about 20 seconds, a minute
-  // at most, with the watchdog fed), and the controller may hold other settings now. A charger
-  // check under way is dropped then, and the next poll is due at once.
+  // controller is talked to only once a poll has succeeded and the line is not resting. A duty
+  // left by a run that was cut short goes to the controller that run talked to, whatever the
+  // config names now. Returns true when a run talked to it: that held loop() for the whole run
+  // (about 10 seconds, never more than a minute: see sunsaver::RUN_LIMIT_MS; with the watchdog
+  // fed), and the controller may hold other settings now. A charger check under way is dropped
+  // then, and the next poll is due at once.
   bool serviceChargerProgramming(double epochNow, bool allowed);
 
   // Whether programming would talk to the controller now if the line were free: a run or a look
@@ -457,10 +460,11 @@ public:
   // it have the pass after a poll, when every pass is due to poll. False without programming.
   bool chargerProgrammingWantsLine(double epochNow) const;
 
-  // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis()),
-  // the journal, and whether a request or a duty is open.
+  // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis(),
+  // reportEpoch()), the journal, and whether a request or a duty is open.
   const sunsaver::Supervisor& chargerProgramming() const { return _programming; }
-  void chargerProgramReportTaken() { _programming.reportTaken(); }
+  // The result has gone to the Notecard or into the note buffer in flash.
+  void chargerProgramReportTaken();
 
 private:
   SolarConfig _config;
@@ -478,8 +482,14 @@ private:
   bool _chargerSettingsRead;
 
   // Charger programming
+  class JournalFile : public sunsaver::JournalStore {
+   public:
+    JournalFile() : writer(nullptr) {}
+    bool saveJournal(const sunsaver::Journal &journal) override { return writer != nullptr && writer(journal); }
+    ChargerJournalWriter writer;
+  };
   sunsaver::Supervisor _programming;
-  ChargerJournalWriter _journalWriter;
+  JournalFile _journalFile;
   
   // Modbus communication
   bool readRegisters();

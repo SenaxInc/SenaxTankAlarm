@@ -19,8 +19,9 @@
  *      is missing or wrong (the Refusal bits).
  *   2. Makes the plan: 17 registers, each with the word it has to hold. A register that already
  *      holds its word is not written.
- *   3. Restarts the controller (coil 0x00FF), waits, and asks until it answers. A controller
- *      that refuses the command, or does not come back from it, is not written to.
+ *   3. Restarts the controller (coil 0x00FF) and asks until it is back. A controller that
+ *      refuses the command, does not come back from it, or shows no sign of having restarted
+ *      (it neither fell silent nor cleared a pending edit) is not written to.
  *   4. Writes one register at a time with function 6, and reads each one back.
  *   5. Restarts the controller again, which puts the new settings to work.
  *   6. Reads the registers once more, from the restarted controller.
@@ -40,8 +41,10 @@
  *     this file and nowhere else, so no config can widen them.
  *   The restart. Every EEPROM write raises the controller's "EEPROM setting edit" fault, and it
  *     stays raised until the controller restarts. So the restart command is tried before
- *     anything is written, on the controller as the run found it. And once a write request has
- *     been sent, the run goes on to the restart command whatever happens to the writes after it.
+ *     anything is written, on the controller as the run found it, and it has to show that it
+ *     works: the controller falls silent and comes back, or clears an edit that was pending.
+ *     And once a write request has been sent, the run goes on to the restart command whatever
+ *     happens to the writes after it, and whatever its time limit says.
  *   Read-back. The controller does not check what it is given, and an acknowledgement can be
  *     lost on the way back from a controller that stored the value. So the acknowledgement
  *     decides nothing: what the register reads afterwards does.
@@ -94,6 +97,11 @@ class Bus : public Reader {
   virtual IoStatus writeRegister(uint16_t addr, uint16_t raw) = 0;
   // Switches a coil on with function 5.
   virtual IoStatus writeCoil(uint16_t addr) = 0;
+  // The client's millis(): a run keeps to its time limit by it (RUN_LIMIT_MS).
+  virtual uint32_t millisNow() = 0;
+  // How long a request waits for its reply before it counts as unanswered. A run keeps the time
+  // that its end may need by it.
+  virtual uint16_t timeoutMs() const = 0;
 };
 
 // Restarts the controller. Its acknowledgement may never come: the controller may restart first.
@@ -273,10 +281,16 @@ enum EntryStatus : uint8_t {
   ENTRY_ALTERED,      // the controller holds another word than it was given
   ENTRY_REFUSED,      // the controller refused the write
   ENTRY_NO_ANSWER,    // it could not be read after the write
-  ENTRY_LOST          // it held the word after the write, and no longer does after the restart
+  ENTRY_LOST,         // it held the word after the write, and no longer does after the restart
+  ENTRY_UNREAD        // it held the word, and could not be read again after the restart
 };
 
-static const uint8_t ENTRY_STATUS_LAST = ENTRY_LOST;
+static const uint8_t ENTRY_STATUS_LAST = ENTRY_UNREAD;
+
+// A register whose word the last reading of a run is to confirm.
+inline bool awaitsReading(uint8_t status) {
+  return status == ENTRY_WRITTEN || status == ENTRY_UNCHANGED || status == ENTRY_UNREAD;
+}
 
 inline const char *entryStatusName(uint8_t status) {
   switch (status) {
@@ -288,6 +302,7 @@ inline const char *entryStatusName(uint8_t status) {
     case ENTRY_REFUSED: return "refused";
     case ENTRY_NO_ANSWER: return "no answer";
     case ENTRY_LOST: return "lost after the restart";
+    case ENTRY_UNREAD: return "not read after the restart";
     default: return "?";
   }
 }
@@ -411,10 +426,11 @@ enum Outcome : uint8_t {
   OUTCOME_STOPPED,         // a register did not take its word, and the run stopped there
   OUTCOME_RESTART_FAILED,  // everything was written, but the restart could not be confirmed
   OUTCOME_VERIFY_FAILED,   // written and restarted, but a register no longer holds its word
-  OUTCOME_INTERRUPTED      // the client restarted during a run (see Programmer::startRecovery)
+  OUTCOME_INTERRUPTED,     // the client restarted during a run (see Programmer::startRecovery)
+  OUTCOME_UNVERIFIED       // written and restarted, but registers could not be read again to confirm it
 };
 
-static const uint8_t OUTCOME_LAST = OUTCOME_INTERRUPTED;
+static const uint8_t OUTCOME_LAST = OUTCOME_UNVERIFIED;
 
 inline const char *outcomeName(uint8_t outcome) {
   switch (outcome) {
@@ -426,6 +442,7 @@ inline const char *outcomeName(uint8_t outcome) {
     case OUTCOME_RESTART_FAILED: return "restart failed";
     case OUTCOME_VERIFY_FAILED: return "verify failed";
     case OUTCOME_INTERRUPTED: return "interrupted";
+    case OUTCOME_UNVERIFIED: return "unverified";
     default: return "none";
   }
 }
@@ -441,6 +458,9 @@ inline const char *outcomeText(uint8_t outcome) {
     case OUTCOME_RESTART_FAILED: return "Written, but the charger's restart could not be confirmed.";
     case OUTCOME_VERIFY_FAILED: return "Written and restarted, but a register no longer holds its value.";
     case OUTCOME_INTERRUPTED: return "Interrupted: the client restarted during the run.";
+    case OUTCOME_UNVERIFIED:
+      return "Written and restarted, but not every register could be read again to confirm it. The next "
+             "charger check shows what the charger holds.";
     default: return "No run has ended yet.";
   }
 }
@@ -486,8 +506,8 @@ inline const char *refusalText(uint32_t refusal) {
       return "Current is flowing from the charger's LOAD terminals. If this Opta is powered from them it "
              "could lose power part way. Confirm in the request that it is not.";
     case REFUSE_NO_RESTART:
-      return "The restart command, which every change of settings has to end with, did not work on this "
-             "charger. Nothing was written.";
+      return "The restart command, which every change of settings has to end with, could not be shown to "
+             "work on this charger. Nothing was written.";
     case REFUSE_NOT_BUILT: return "This client's firmware was built without charger programming.";
     case REFUSE_STALE:
       return "The request was more than a day old when the client could act on it, or the client's clock "
@@ -503,17 +523,21 @@ inline const char *refusalText(uint32_t refusal) {
   }
 }
 
-// How the last restart command of a run went.
+// How the last restart command of a run went. A restart counts as done only with something to
+// show for it: the controller reported a pending edit before the command and no longer does, or
+// it fell silent after the command and answers again. A controller that answers all along and
+// had no pending edit may have ignored the command (RESTART_UNPROVEN).
 enum RestartStatus : uint8_t {
   RESTART_NOT_NEEDED = 0,  // no restart command was sent
-  RESTART_DONE,            // the controller answers again and reports no pending edit
+  RESTART_DONE,            // the controller restarted, and reports no pending edit
   RESTART_REFUSED,         // it refused the command
-  RESTART_NOT_DONE,        // it answers, and still reports the pending edit after two commands
+  RESTART_NOT_DONE,        // it answers, and still reports the pending edit after two commands (or one, at the time limit)
   RESTART_NO_ANSWER,       // it has not answered since the command
-  RESTART_UNCONFIRMED      // it answers, but its fault registers could not be read
+  RESTART_UNCONFIRMED,     // it answers, but its fault registers could not be read
+  RESTART_UNPROVEN         // it answered all along and had no pending edit: nothing shows that it restarted
 };
 
-static const uint8_t RESTART_STATUS_LAST = RESTART_UNCONFIRMED;
+static const uint8_t RESTART_STATUS_LAST = RESTART_UNPROVEN;
 
 inline const char *restartText(uint8_t restart) {
   switch (restart) {
@@ -521,11 +545,14 @@ inline const char *restartText(uint8_t restart) {
     case RESTART_DONE: return "The charger restarted.";
     case RESTART_REFUSED: return "The charger refused the restart command.";
     case RESTART_NOT_DONE:
-      return "The charger took the restart command twice and still reports that it waits for a restart.";
+      return "The charger took the restart command and still reports that it waits for a restart.";
     case RESTART_NO_ANSWER: return "The charger has not answered since the restart command.";
     case RESTART_UNCONFIRMED:
       return "The charger answers again, but its fault registers could not be read, so its restart is not "
              "confirmed.";
+    case RESTART_UNPROVEN:
+      return "The charger kept answering after the restart command and had no pending edit to clear, so "
+             "nothing shows that it restarted.";
     default: return "?";
   }
 }
@@ -537,12 +564,13 @@ enum Note : uint16_t {
   NOTE_SW3_ON = 1u << 2,               // automatic equalization is switched on
   NOTE_WAS_PENDING = 1u << 3,          // the controller was waiting for a restart when the run began
   NOTE_EDIT_FAULT_NOT_SEEN = 1u << 4,  // no "EEPROM setting edit" fault after the writes
-  NOTE_VERIFY_INCOMPLETE = 1u << 5,    // a register could not be read again after the restart
+  NOTE_VERIFY_INCOMPLETE = 1u << 5,    // registers could not be read again after the restart
   NOTE_NOTHING_WRITTEN = 1u << 6,      // an interrupted run that had not begun to write
-  NOTE_AT_FIRST_RESTART = 1u << 7      // the client restarted while the charger restarted for the first time
+  NOTE_AT_FIRST_RESTART = 1u << 7,     // the client restarted while the charger restarted for the first time
+  NOTE_TIME_LIMIT = 1u << 8            // the run reached its time limit and was cut short
 };
 
-static const uint8_t NOTE_BITS = 8;
+static const uint8_t NOTE_BITS = 9;
 
 inline const char *noteText(uint16_t note) {
   switch (note) {
@@ -558,12 +586,15 @@ inline const char *noteText(uint16_t note) {
       return "The charger did not report the 'EEPROM setting edit' fault after the writes. The specification "
              "says it does, so nothing here shows that the restart command did its work.";
     case NOTE_VERIFY_INCOMPLETE:
-      return "A register could not be read again after the restart. The next charger check shows what the "
+      return "Not every register could be read again after the restart. The next charger check shows what the "
              "charger holds.";
     case NOTE_NOTHING_WRITTEN: return "Nothing had been written.";
     case NOTE_AT_FIRST_RESTART:
       return "The client restarted at the moment the charger restarted. If this Opta is powered from the "
              "charger's LOAD terminals it cannot program the charger: power it from the battery.";
+    case NOTE_TIME_LIMIT:
+      return "The charger answered so slowly that the run reached its time limit and was cut short. Past it "
+             "nothing more is written, and a charger that was written to is still sent its restart.";
     default: return "A note this firmware has no text for.";
   }
 }
@@ -656,13 +687,18 @@ inline double batteryVolts(const ProgramResult &result) {
 // The run
 // ---------------------------------------------------------------------------------------------
 
-static const uint16_t RESTART_WAIT_MS = 3000;  // the line is left alone for this long after a restart command
-static const uint16_t PROBE_GAP_MS = 500;      // and for this long after a request the restarting controller missed
-static const uint8_t BACK_PROBES = 20;         // such requests before the run gives up on the controller
+static const uint16_t RESTART_WAIT_MS = 500;   // the line is left alone for this long after a restart command
+static const uint16_t PROBE_GAP_MS = 500;      // and between two requests that look for the controller after it
+static const uint8_t BACK_PROBES = 20;         // requests it may leave unanswered before the run gives up on it
+static const uint8_t QUIET_PROBES = 10;        // requests it answers without a pause before the run takes it that
+                                               // it did not restart
 static const uint8_t WRITE_ATTEMPTS = 2;       // writes of one register
 static const uint8_t RESTART_ATTEMPTS = 2;     // restart commands that the controller took without restarting
 static const uint8_t READ_ATTEMPTS = 2;        // requests for a register that stays silent
 static const uint8_t VERIFY_MISSES = 3;        // registers in a row without a value end the last reading
+static const uint32_t RUN_LIMIT_MS = 60000;    // no run takes longer than this (see Programmer::step())
+static const uint8_t RUN_END_TIMEOUTS = 7;     // Modbus timeouts that the shortest safe end of a run may take
+static const uint16_t RUN_END_SLACK_MS = 2000; // and the requests that are answered on its way
 
 // The two points at which a run waits for its caller before it goes on.
 enum Commit : uint8_t {
@@ -679,7 +715,14 @@ enum Commit : uint8_t {
 //          wait: one Modbus timeout if programmer.missed(), and at least programmer.pauseMs()
 //   then:  programmer.result(), and programmer.controllerUnknown()
 //
-// It keeps no clock. It asks for the pauses it needs, and counts requests where it has to give up.
+// It asks for the pauses it needs, and counts requests where it has to give up. It reads the
+// bus's clock for one thing only, its time limit: no run takes longer than RUN_LIMIT_MS, a
+// minute. Once only the time is left that the shortest safe end may need (RUN_END_TIMEOUTS
+// Modbus timeouts and RUN_END_SLACK_MS), the run takes that end: nothing more is written, a
+// register gets one request where it would get two, nothing is read that the end does not need,
+// and the run ends unless it has written. Then the controller still gets one restart command,
+// and when the run cannot see it restart, the client owes it a look (controllerUnknown()). A run
+// on a line that answers takes about 10 seconds.
 class Programmer {
  public:
   Programmer() { reset(); }
@@ -711,8 +754,8 @@ class Programmer {
   // Takes a run up again that ended without learning whether the controller restarted
   // (controllerUnknown()), once the link works again. It keeps what the run found and did, asks
   // the controller whether it still waits for a restart, sends the command if it does, reads the
-  // registers once more and ends with the outcome the run would have had. Returns false, and
-  // does nothing, when the last run is not such a run.
+  // registers once more and ends with the outcome the run would have had. Its time limit starts
+  // again. Returns false, and does nothing, when the last run is not such a run.
   bool resume() {
     if (recovery_ || !controllerUnknown()) {
       return false;
@@ -723,6 +766,9 @@ class Programmer {
     pauseMs_ = 0;
     stage_ = 0;
     readTries_ = 0;
+    timed_ = false;
+    overdue_ = false;
+    restartCut_ = false;
     phase_ = PHASE_RECOVER;
     return true;
   }
@@ -732,6 +778,21 @@ class Programmer {
     missed_ = false;
     pauseMs_ = 0;
     while (budget > 0 && active() && awaiting() == COMMIT_NONE && !missed_ && pauseMs_ == 0) {
+      const uint32_t now = bus.millisNow();
+      if (!timed_) {
+        // The request under way when the cut comes may take a timeout and the rest after it. The
+        // end that follows takes at most five timeouts more: a write's read-back and the restart
+        // command, each with its rest, and one for the requests that look for the controller
+        // after that command.
+        timed_ = true;
+        startMs_ = now;
+        const uint32_t reserve = (uint32_t)RUN_END_TIMEOUTS * bus.timeoutMs() + RUN_END_SLACK_MS;
+        cutMs_ = reserve < RUN_LIMIT_MS ? RUN_LIMIT_MS - reserve : 0;
+      }
+      if (!overdue_ && (uint32_t)(now - startMs_) >= cutMs_) {
+        overdue_ = true;
+        result_.notes |= NOTE_TIME_LIMIT;
+      }
       bool asked = false;
       switch (phase_) {
         case PHASE_READ_BEFORE: asked = stepReadBefore(bus); break;
@@ -761,9 +822,7 @@ class Programmer {
 
   void go() {
     if (phase_ == PHASE_AWAIT_RESTART) {
-      firstRestart_ = true;
-      restartAttempts_ = 0;
-      phase_ = PHASE_RESTART;
+      beginRestart(true, pendingAtStart_);
     } else if (phase_ == PHASE_AWAIT_WRITE) {
       entry_ = 0;
       readingBack_ = false;
@@ -809,7 +868,7 @@ class Programmer {
     PHASE_RECOVER,        // a recovery, or a run taken up again: the two fault words
     PHASE_AWAIT_RESTART,
     PHASE_RESTART,        // the restart command
-    PHASE_WAIT_BACK,      // asking until the controller answers, then its fault words
+    PHASE_WAIT_BACK,      // asking until the controller is back, then its fault words
     PHASE_AWAIT_WRITE,
     PHASE_WRITE,          // one register after the other: write, read back
     PHASE_OBSERVE,        // the load state and the fault words while the controller waits for its restart
@@ -825,9 +884,16 @@ class Programmer {
   bool recovery_;
   bool loadAllowed_;
   bool missed_;
-  bool firstRestart_;  // the restart command under way is the one before the writes
-  bool stopped_;       // a register did not take its word
-  bool readingBack_;   // the register at entry_ has been written and is to be read
+  bool firstRestart_;    // the restart command under way is the one before the writes
+  bool stopped_;         // a register did not take its word, or the time limit stopped the writes
+  bool readingBack_;     // the register at entry_ has been written and is to be read
+  bool pendingAtStart_;  // the controller reported a pending edit when the run read it
+  bool editSeen_;        // and after the writes
+  bool sawPending_;      // it reported a pending edit when the restart command under way went out
+  bool silent_;          // it has missed a request since that command: it went away to restart
+  bool timed_;           // startMs_ and cutMs_ are set: the run has made its first step
+  bool overdue_;         // the run has reached cutMs_, and takes the shortest safe way to its end
+  bool restartCut_;      // the time limit left a second restart command unsent
   IoStatus lastWrite_;
   uint8_t entry_;
   uint8_t stage_;
@@ -835,9 +901,12 @@ class Programmer {
   uint8_t restartAttempts_;
   uint8_t readTries_;
   uint8_t verifyMisses_;
+  uint8_t quiet_;        // requests the controller answered since the restart command, before it went away
   uint8_t toWrite_;
   uint16_t pauseMs_;
-  uint16_t heldFault_;  // array_fault, kept until load_fault has been read too
+  uint16_t heldFault_;   // array_fault, kept until load_fault has been read too
+  uint32_t startMs_;
+  uint32_t cutMs_;       // from startMs_ to the moment the run turns to its end
 
   void reset() {
     clearResult(&result_);
@@ -849,6 +918,13 @@ class Programmer {
     firstRestart_ = false;
     stopped_ = false;
     readingBack_ = false;
+    pendingAtStart_ = false;
+    editSeen_ = false;
+    sawPending_ = false;
+    silent_ = false;
+    timed_ = false;
+    overdue_ = false;
+    restartCut_ = false;
     lastWrite_ = SSIO_OK;
     entry_ = 0;
     stage_ = 0;
@@ -856,16 +932,21 @@ class Programmer {
     restartAttempts_ = 0;
     readTries_ = 0;
     verifyMisses_ = 0;
+    quiet_ = 0;
     toWrite_ = 0;
     pauseMs_ = 0;
     heldFault_ = 0;
+    startMs_ = 0;
+    cutMs_ = 0;
   }
 
   void finish(uint8_t outcome) {
     result_.outcome = outcome;
-    // A restart command went out and nothing shows that it worked. That matters when this run
-    // wrote, and for a recovery, which exists to settle exactly this.
-    const bool restartOpen = result_.restart == RESTART_NO_ANSWER || result_.restart == RESTART_UNCONFIRMED;
+    // A restart command went out and nothing shows that it worked, or the time limit left its
+    // second try unsent. That matters when this run wrote, and for a recovery, which exists to
+    // settle exactly this.
+    const bool restartOpen =
+        result_.restart == RESTART_NO_ANSWER || result_.restart == RESTART_UNCONFIRMED || restartCut_;
     result_.followUp = recovery_ ? (restartOpen || outcome == OUTCOME_NO_LINK) : (restartOpen && result_.wroteAny);
     phase_ = PHASE_ENDED;
   }
@@ -876,7 +957,7 @@ class Programmer {
 
   // One request for a register. FETCH_VALUE with *raw set, FETCH_AGAIN when it was silent and is
   // to be asked once more (the step ends there), FETCH_NONE when it gives no value: the
-  // controller refused it, or it was silent READ_ATTEMPTS times.
+  // controller refused it, or it was silent READ_ATTEMPTS times, or once past the time limit.
   Fetch fetch(Bus &bus, uint16_t addr, uint16_t *raw) {
     uint16_t word = 0;
     const IoStatus status = bus.readRegister(addr, &word);
@@ -887,7 +968,7 @@ class Programmer {
     }
     if (status != SSIO_REFUSED) {
       missed_ = true;
-      if (++readTries_ < READ_ATTEMPTS) {
+      if (++readTries_ < READ_ATTEMPTS && !overdue_) {
         return FETCH_AGAIN;
       }
     }
@@ -896,6 +977,10 @@ class Programmer {
   }
 
   bool stepReadBefore(Bus &bus) {
+    if (overdue_) {
+      finish(OUTCOME_NO_LINK);  // nothing has been sent that changes the controller
+      return false;
+    }
     const bool passEnded = reader_.step(bus, 1);
     missed_ = reader_.missed();
     if (passEnded) {
@@ -919,7 +1004,6 @@ class Programmer {
     result_.liveScale = liveScale;
 
     uint32_t refusals = 0;
-    bool pending = false;
     result_.profileErrors = validateProfile(result_.profile);
     if (result_.profileErrors != 0) {
       refusals |= REFUSE_PROFILE;
@@ -961,7 +1045,7 @@ class Programmer {
         refusals |= REFUSE_FAULT;
       }
       if (editPending(result_.arrayFault, result_.loadFault)) {
-        pending = true;
+        pendingAtStart_ = true;
         result_.notes |= NOTE_WAS_PENDING;
       }
     }
@@ -989,7 +1073,7 @@ class Programmer {
     }
     toWrite_ = buildPlan(snapshot, result_.profile, settings.scale, result_.entries);
     result_.planned = PLAN_ENTRIES;
-    if (toWrite_ == 0 && !pending) {
+    if (toWrite_ == 0 && !pendingAtStart_) {
       finish(OUTCOME_UNCHANGED);
       return;
     }
@@ -998,6 +1082,14 @@ class Programmer {
 
   // A recovery, or a run taken up again: is the controller waiting for a restart?
   bool stepRecover(Bus &bus) {
+    if (overdue_) {
+      if (recovery_) {
+        finish(OUTCOME_NO_LINK);
+      } else {
+        conclude();  // it still does not know
+      }
+      return false;
+    }
     uint16_t raw = 0;
     const Fetch got = fetch(bus, item(stage_ == 0 ? I_ARRAY_FAULT : I_LOAD_FAULT).addr, &raw);
     if (got == FETCH_AGAIN) {
@@ -1026,9 +1118,7 @@ class Programmer {
       }
     }
     if (pending) {
-      firstRestart_ = false;
-      restartAttempts_ = 0;
-      phase_ = PHASE_RESTART;
+      beginRestart(false, true);
     } else {
       if (!recovery_) {
         result_.restart = RESTART_DONE;  // it answers, and no longer waits
@@ -1038,19 +1128,35 @@ class Programmer {
     return true;
   }
 
+  // A restart command is to go out. `first`: the one before the writes. `pending`: the
+  // controller reported a pending edit, so its clearing shows that the command did its work.
+  void beginRestart(bool first, bool pending) {
+    firstRestart_ = first;
+    sawPending_ = pending;
+    restartAttempts_ = 0;
+    phase_ = PHASE_RESTART;
+  }
+
+  // The restart command goes out even past the time limit when the run has written: then it is
+  // the one request the controller must get. The one before the writes does not.
   bool stepRestart(Bus &bus) {
+    if (overdue_ && firstRestart_) {
+      finish(OUTCOME_NO_LINK);  // nothing has been sent that changes the controller
+      return false;
+    }
     ++restartAttempts_;
     result_.probes = 0;
+    silent_ = false;
+    quiet_ = 0;
     const IoStatus status = bus.writeCoil(COIL_RESTART);
     if (status == SSIO_REFUSED) {
       restartSettled(RESTART_REFUSED);
       return true;
     }
     if (status != SSIO_OK) {
-      missed_ = true;  // a controller may restart before it acknowledges
+      missed_ = true;   // a controller may restart before it acknowledges
+      silent_ = true;
     }
-    // A controller that restarts is silent for a while. One that did not restart answers the
-    // first request after the wait, and its fault words say so.
     pauseMs_ = RESTART_WAIT_MS;
     stage_ = 0;
     readTries_ = 0;
@@ -1058,25 +1164,30 @@ class Programmer {
     return true;
   }
 
+  // Asks after the command until the controller is back: a controller that restarts misses the
+  // requests that come while it does, as many as it takes. One that keeps answering is asked a
+  // few seconds longer, as a restart may not begin at once. Then its fault words decide.
   bool stepWaitBack(Bus &bus) {
     if (stage_ == 0) {
-      // Asked until it answers: a restarting controller misses as many requests as it takes.
       uint16_t word = 0;
       const IoStatus status = bus.readRegister(item(I_ARRAY_FAULT).addr, &word);
-      if (status == SSIO_OK) {
-        heldFault_ = word;
-        stage_ = 1;
-        readTries_ = 0;
-      } else if (status == SSIO_REFUSED) {
+      if (status == SSIO_REFUSED) {
         restartSettled(RESTART_UNCONFIRMED);
-      } else {
+      } else if (status != SSIO_OK) {
         missed_ = true;
+        silent_ = true;
         ++result_.probes;
-        if (result_.probes >= BACK_PROBES) {
+        if (result_.probes >= BACK_PROBES || overdue_) {
           restartSettled(RESTART_NO_ANSWER);
         } else {
           pauseMs_ = PROBE_GAP_MS;
         }
+      } else if (!silent_ && ++quiet_ < QUIET_PROBES && !overdue_) {
+        pauseMs_ = PROBE_GAP_MS;  // it answers: its restart may be yet to come
+      } else {
+        heldFault_ = word;
+        stage_ = 1;
+        readTries_ = 0;
       }
       return true;
     }
@@ -1087,12 +1198,16 @@ class Programmer {
     }
     if (got == FETCH_NONE) {
       restartSettled(RESTART_UNCONFIRMED);
-    } else if (!editPending(heldFault_, raw)) {
-      restartSettled(RESTART_DONE);
-    } else if (restartAttempts_ < RESTART_ATTEMPTS) {
-      phase_ = PHASE_RESTART;  // it answers and still waits: the command did not do its work
+    } else if (editPending(heldFault_, raw)) {
+      if (restartAttempts_ < RESTART_ATTEMPTS && !overdue_) {
+        sawPending_ = true;
+        phase_ = PHASE_RESTART;  // it answers and still waits: the command did not do its work
+      } else {
+        restartCut_ = restartAttempts_ < RESTART_ATTEMPTS;  // a later look may send the second
+        restartSettled(RESTART_NOT_DONE);
+      }
     } else {
-      restartSettled(RESTART_NOT_DONE);
+      restartSettled(sawPending_ || silent_ ? RESTART_DONE : RESTART_UNPROVEN);
     }
     return true;
   }
@@ -1112,13 +1227,12 @@ class Programmer {
     // controller has just shown that it takes the command.
     if (status == RESTART_DONE) {
       firstRestart_ = false;
-      restartAttempts_ = 0;
       if (toWrite_ > 0) {
         phase_ = PHASE_AWAIT_WRITE;
       } else {
         beginVerify();  // it held the settings already, and only had a restart to make up for
       }
-    } else if (status == RESTART_REFUSED || status == RESTART_NOT_DONE) {
+    } else if (status == RESTART_REFUSED || status == RESTART_NOT_DONE || status == RESTART_UNPROVEN) {
       result_.refusals |= REFUSE_NO_RESTART;
       finish(OUTCOME_REFUSED);
     } else {
@@ -1127,8 +1241,19 @@ class Programmer {
   }
 
   // The register at entry_: written, then read back. What it reads decides, not the
-  // acknowledgement.
+  // acknowledgement. Past the time limit no register is written any more: a run that has
+  // written goes on to the restart without looking at the controller first, one that has not
+  // ends.
   bool stepWrite(Bus &bus) {
+    if (overdue_ && !readingBack_) {
+      stopped_ = true;
+      if (result_.wroteAny) {
+        beginRestart(false, false);
+      } else {
+        finish(OUTCOME_NO_LINK);
+      }
+      return false;
+    }
     while (entry_ < PLAN_ENTRIES && result_.entries[entry_].status != ENTRY_PENDING) {
       ++entry_;
     }
@@ -1187,12 +1312,18 @@ class Programmer {
   void beginObserve() {
     stage_ = 0;
     readTries_ = 0;
+    editSeen_ = false;
     phase_ = PHASE_OBSERVE;
   }
 
   // What the controller does while it waits for its restart: the load state, and whether it
-  // reports the pending edit as the specification says. None of it changes what the run does.
+  // reports the pending edit as the specification says. Past the time limit the restart comes
+  // at once.
   bool stepObserve(Bus &bus) {
+    if (overdue_) {
+      beginRestart(false, editSeen_);
+      return false;
+    }
     static const uint8_t kItems[3] = {I_LOAD_STATE, I_ARRAY_FAULT, I_LOAD_FAULT};
     uint16_t raw = 0;
     const Fetch got = fetch(bus, item(kItems[stage_]).addr, &raw);
@@ -1204,16 +1335,16 @@ class Programmer {
         result_.loadStateEdit = loadStateOf(raw);
       } else if (stage_ == 1) {
         heldFault_ = raw;
-      } else if (!editPending(heldFault_, raw)) {
+      } else if (editPending(heldFault_, raw)) {
+        editSeen_ = true;
+      } else {
         result_.notes |= NOTE_EDIT_FAULT_NOT_SEEN;
       }
     } else if (stage_ == 1) {
       stage_ = 2;  // without the array faults the load faults cannot settle the question
     }
     if (++stage_ >= 3) {
-      firstRestart_ = false;
-      restartAttempts_ = 0;
-      phase_ = PHASE_RESTART;
+      beginRestart(false, editSeen_);
     }
     return true;
   }
@@ -1225,11 +1356,25 @@ class Programmer {
     phase_ = PHASE_VERIFY;
   }
 
+  // The registers from entry_ on that were not read again keep no confirmed word.
+  void leaveUnread() {
+    for (uint8_t i = entry_; i < result_.planned && i < PLAN_ENTRIES; ++i) {
+      if (awaitsReading(result_.entries[i].status)) {
+        result_.entries[i].status = ENTRY_UNREAD;
+        result_.notes |= NOTE_VERIFY_INCOMPLETE;
+      }
+    }
+  }
+
   // The registers once more, as the controller holds them now: a word that was only in its
   // working memory would be gone after the restart. Then the load state.
   bool stepVerify(Bus &bus) {
-    while (entry_ < result_.planned && result_.entries[entry_].status != ENTRY_WRITTEN &&
-           result_.entries[entry_].status != ENTRY_UNCHANGED) {
+    if (overdue_) {
+      leaveUnread();
+      conclude();
+      return false;
+    }
+    while (entry_ < result_.planned && !awaitsReading(result_.entries[entry_].status)) {
       ++entry_;
     }
     uint16_t raw = 0;
@@ -1241,8 +1386,10 @@ class Programmer {
       }
       ++entry_;
       if (got == FETCH_NONE) {
+        entry.status = ENTRY_UNREAD;
         result_.notes |= NOTE_VERIFY_INCOMPLETE;
         if (++verifyMisses_ >= VERIFY_MISSES) {
+          leaveUnread();
           conclude();  // the controller has stopped answering: the rest would only take time
         }
         return true;
@@ -1251,6 +1398,8 @@ class Programmer {
       entry.found = raw;
       if (raw != entry.target) {
         entry.status = ENTRY_LOST;
+      } else {
+        entry.status = entry.before == entry.target ? (uint8_t)ENTRY_UNCHANGED : (uint8_t)ENTRY_WRITTEN;
       }
       return true;
     }
@@ -1274,6 +1423,8 @@ class Programmer {
       finish(OUTCOME_RESTART_FAILED);
     } else if (countEntries(result_, ENTRY_LOST) != 0) {
       finish(OUTCOME_VERIFY_FAILED);
+    } else if (countEntries(result_, ENTRY_UNREAD) != 0) {
+      finish(OUTCOME_UNVERIFIED);
     } else {
       finish(OUTCOME_PROGRAMMED);
     }
@@ -1286,53 +1437,82 @@ class Programmer {
 //
 // A request reaches a client in its config, with an id: the server's time when a person asked.
 // The client may get the same config again, may get it days late, and may lose power at any
-// moment of a run. The Supervisor decides what is done about a request and when. It keeps a
-// journal in the client's flash that says how far a run has come:
+// moment. The Supervisor decides what is done about a request and when. It keeps a journal in
+// the client's flash, so that a restart of the client loses nothing that the controller or a
+// person waits for:
 //
-//   JOURNAL_IDLE         nothing is under way, and nothing is owed
-//   JOURNAL_TAKEN        a request was taken on; nothing has been sent that changes the controller
-//   JOURNAL_RESTARTING   the first restart command may have gone out; nothing has been written
-//   JOURNAL_WRITING      registers may have been written: the controller may wait for a restart
+//   - the newest request the client has answered or taken on: none that is not newer is acted on;
+//   - a request that waits: if the client restarts first, it is answered as interrupted;
+//   - how far the last run came that reached the controller, and which controller that was:
+//       JOURNAL_IDLE         nothing is owed to the controller
+//       JOURNAL_RESTARTING   the first restart command may have gone out; nothing has been written
+//       JOURNAL_WRITING      registers may have been written: the controller may wait for a restart
+//   - the result that has yet to go to the server.
+//
+// Each of these is in flash before the client goes on: a request before the config that carries
+// it is acknowledged, a commit point before the run passes it, a result before the journal
+// stops showing what it answers.
 //
 // A client that starts with RESTARTING or WRITING in its journal owes the controller a look, and
 // the restart command if it waits (Programmer::startRecovery). So does a client whose run ended
 // without learning whether the controller restarted (Programmer::resume). That duty comes before
 // any new request. It is tried as soon as the charger answers, then every 10 minutes, and once a
-// day after three tries.
+// day after three tries, and always on the controller that its run talked to.
 //
-// A run holds the client for as long as it takes: about 20 seconds, a minute at most. Nothing
+// A run holds the client for as long as it takes: about 10 seconds on a line that answers, and
+// never longer than RUN_LIMIT_MS, a minute, whatever the Modbus timeout (see Programmer). Nothing
 // else talks to the controller meanwhile, and the time between the first write and the restart
 // that ends the run is as short as the line allows.
 
-enum JournalPhase : uint8_t { JOURNAL_IDLE = 0, JOURNAL_TAKEN, JOURNAL_RESTARTING, JOURNAL_WRITING };
+enum JournalPhase : uint8_t { JOURNAL_IDLE = 0, JOURNAL_RESTARTING, JOURNAL_WRITING };
 
 static const uint8_t JOURNAL_PHASE_LAST = JOURNAL_WRITING;
 
 struct Journal {
-  uint32_t requestId;  // the newest request this client took on
-  uint8_t phase;       // JournalPhase: how far its run has come
+  uint32_t requestId;    // the request of the last run that reached a commit point
+  uint8_t phase;         // JournalPhase: how far that run came
+  uint8_t controller;    // the Modbus id of the controller that run talked to, 0 when not known
+  uint32_t answeredId;   // the newest request this client has answered or taken on
+  uint32_t waitingId;    // the request that waits, or runs and has not reached a commit point; 0 for none
+  bool reportDue;        // `report` has yet to go to the server
+  uint32_t reportId;     // the request it answers
+  uint32_t reportEpoch;  // when it came about, in whole seconds; 0 when the client's clock was not set
+  ProgramResult report;
 };
 
-// The journal of a client whose journal cannot be read: it may owe the controller a restart.
-inline Journal cautiousJournal() {
-  const Journal journal = {0, JOURNAL_WRITING};
+// The journal of a client that owes nothing and has answered nothing.
+inline Journal emptyJournal() {
+  Journal journal;
+  memset(&journal, 0, sizeof(journal));
   return journal;
 }
 
-// What the Supervisor needs from the client, besides the controller.
-class Port : public Bus {
+// The journal of a client whose journal cannot be read: it may owe the controller a restart.
+inline Journal cautiousJournal() {
+  Journal journal = emptyJournal();
+  journal.phase = JOURNAL_WRITING;
+  return journal;
+}
+
+// Where the client keeps the journal.
+class JournalStore {
  public:
   // Writes the journal to the client's flash. True only once it is there, whole.
   virtual bool saveJournal(const Journal &journal) = 0;
+};
+
+// What a run needs from the client, besides the controller.
+class Port : public Bus {
+ public:
   // Leaves the line alone between two requests of a run: for at least `ms`, and for one Modbus
   // timeout when the last request got no reply. Keeps the client's watchdog fed.
   virtual void rest(uint16_t ms, bool afterMiss) = 0;
-  // The client's millis().
-  virtual uint32_t millisNow() = 0;
+  // The Modbus id of the controller this port talks to.
+  virtual uint8_t controller() const = 0;
 };
 
 static const uint32_t REQUEST_WAIT_MS = 3600000ul;        // a request waits this long for the clock and the charger
-static const double REQUEST_MAX_AGE_SECONDS = 86400.0;    // and may be this old when it arrives
+static const double REQUEST_MAX_AGE_SECONDS = 86400.0;    // and may be this old when it runs
 static const double REQUEST_MAX_AHEAD_SECONDS = 3600.0;   // or this far ahead of the client's clock
 static const double CLOCK_SET_EPOCH = 1600000000.0;       // 2020-09-13: a clock that reads less was never set
 static const uint32_t DUTY_RETRY_MS = 600000ul;           // between two tries of a duty
@@ -1350,78 +1530,80 @@ inline bool requestIsFresh(uint32_t requestId, double epochNow) {
 
 class Supervisor {
  public:
-  explicit Supervisor(uint16_t stepLimit = RUN_STEP_LIMIT) : stepLimit_(stepLimit) {
-    const Journal none = {0, JOURNAL_IDLE};
-    begin(none, 0);
+  explicit Supervisor(uint16_t stepLimit = RUN_STEP_LIMIT) : store_(nullptr), stepLimit_(stepLimit) {
+    begin(emptyJournal(), nullptr, 0);
   }
 
-  // Once, when the client starts, with the journal from its flash: cautiousJournal() when the
-  // file is there and cannot be read, {0, JOURNAL_IDLE} when there is none.
-  void begin(const Journal &journal, uint32_t nowMs) {
+  // Once, when the client starts, with the journal from its flash (cautiousJournal() when the
+  // file is there and cannot be read, emptyJournal() when there is none) and the store that
+  // keeps it. A request that waited is answered now as interrupted, and a result that had yet
+  // to go out is due again.
+  void begin(const Journal &journal, JournalStore *store, uint32_t nowMs) {
+    store_ = store;
     programmer_ = Programmer();
     journal_ = journal;
     if (journal_.phase > JOURNAL_PHASE_LAST) {
       journal_.phase = JOURNAL_WRITING;  // a phase of a newer firmware: the cautious reading
     }
+    if (journal_.answeredId < journal_.requestId) {
+      journal_.answeredId = journal_.requestId;
+    }
+    if (journal_.answeredId < journal_.waitingId) {
+      journal_.answeredId = journal_.waitingId;
+    }
     journalUnsaved_ = false;
     journalTryMs_ = nowMs;
-    waiting_ = false;
-    taken_ = false;
-    waitingId_ = 0;
+    memset(&waitingProfile_, 0, sizeof(waitingProfile_));
     waitingLoadAllowed_ = false;
     waitingSinceMs_ = nowMs;
-    memset(&waitingProfile_, 0, sizeof(waitingProfile_));
-    refusedId_ = 0;
-    dutyForced_ = false;
+    runId_ = 0;
+    dutyForced_ = dutyOwed();
     dutyTries_ = 0;
     dutyTryMs_ = nowMs;
-    reportDue_ = false;
-    reportRequestId_ = 0;
     reportMs_ = nowMs;
-    clearResult(&report_);
-    if (journal_.phase == JOURNAL_TAKEN) {
-      // The client restarted between taking the request on and its run.
+    if (journal_.waitingId != 0) {
+      // The client restarted while the request waited, or before its run reached the controller.
+      const uint32_t requestId = journal_.waitingId;
+      journal_.waitingId = 0;
       ProgramResult result;
       interruptedResult(&result);
-      post(journal_.requestId, result, nowMs);
-      journal_.phase = JOURNAL_IDLE;
-      journalUnsaved_ = true;
-      journalTryMs_ = nowMs - JOURNAL_RETRY_MS;  // due at the first service()
-    } else if (dutyOwed()) {
-      dutyForced_ = true;
+      post(requestId, result, 0.0, nowMs);
+      saveJournal(nowMs);
     }
   }
 
   // A config carried a request. `profileErrors` is what readProfile() found, `clientRefusals`
   // the Refusal bits the client found by itself (REFUSE_NOT_BUILT, REFUSE_NOT_LIFEPO4,
-  // REFUSE_NO_CHARGER). A request this client has dealt with is ignored: a config is sent again
-  // when its acknowledgement is lost. A new request takes the place of one that still waits.
+  // REFUSE_NO_CHARGER). A request that is not newer than every one this client has answered or
+  // taken on is ignored: a config is sent again when its acknowledgement is lost. A new request
+  // takes the place of one that still waits. The request is in flash, or answered, on return.
   // Returns false for a request that is ignored, true for one that waits now or was refused.
   bool request(uint32_t requestId, const Profile &profile, uint16_t profileErrors, uint32_t clientRefusals,
-               bool loadCurrentAllowed, uint32_t nowMs) {
-    if (requestId == 0 || requestId <= journal_.requestId || requestId == refusedId_ ||
-        (waiting_ && requestId <= waitingId_)) {
+               bool loadCurrentAllowed, double epochNow, uint32_t nowMs) {
+    if (requestId == 0 || requestId <= journal_.answeredId) {
       return false;
     }
-    dropWaiting(nowMs);
+    journal_.answeredId = requestId;
     uint32_t refusals = clientRefusals;
     if (profileErrors != 0) {
       refusals |= REFUSE_PROFILE;
     }
-    if (refusals != 0) {
-      refusedId_ = requestId;
-      ProgramResult result;
-      refusedResult(profile, profileErrors, refusals, &result);
-      post(requestId, result, nowMs);
-      return true;
+    if (refusals == 0) {
+      journal_.waitingId = requestId;
+      waitingProfile_ = profile;
+      waitingLoadAllowed_ = loadCurrentAllowed;
+      waitingSinceMs_ = nowMs;
+      if (saveJournal(nowMs)) {
+        dutyForced_ = true;  // a duty that is owed is tried now, and not at its next turn
+        return true;
+      }
+      refusals = REFUSE_JOURNAL;  // flash does not keep it: a restart of the client would lose it
     }
-    waiting_ = true;
-    taken_ = false;
-    waitingId_ = requestId;
-    waitingProfile_ = profile;
-    waitingLoadAllowed_ = loadCurrentAllowed;
-    waitingSinceMs_ = nowMs;
-    dutyForced_ = true;  // a duty that is owed is tried now, and not at its next turn
+    journal_.waitingId = 0;
+    ProgramResult result;
+    refusedResult(profile, profileErrors, refusals, &result);
+    post(requestId, result, epochNow, nowMs);
+    saveJournal(nowMs);
     return true;
   }
 
@@ -1432,120 +1614,118 @@ class Supervisor {
   bool service(Port &port, double epochNow, bool ready) {
     const uint32_t nowMs = port.millisNow();
     if (journalUnsaved_ && (uint32_t)(nowMs - journalTryMs_) >= JOURNAL_RETRY_MS) {
-      saveJournal(port, nowMs);
+      saveJournal(nowMs);
     }
     if (dutyOwed()) {
       if (ready && dutyTurn(nowMs)) {
         // The run the duty is about is taken up again, if this client still holds it. After a
         // restart of the client, or after a recovery, it holds none: a recovery asks the controller.
+        runId_ = journal_.requestId;
         if (!programmer_.resume()) {
           programmer_.startRecovery(journal_.phase == JOURNAL_RESTARTING);
         }
         drive(port);
-        settle(port);
+        settle(port, epochNow, nowMs);
         return true;
       }
-      if (waiting_ && waitOver(nowMs)) {
-        refuseWaiting(REFUSE_NO_CHARGER, nowMs);  // the duty comes first, and the charger did not let it be done
+      if (journal_.waitingId != 0 && waitOver(nowMs)) {
+        refuseWaiting(REFUSE_NO_CHARGER, epochNow, nowMs);  // the duty comes first, and the charger did not let it be done
       }
       return false;
     }
-    if (!waiting_) {
+    if (journal_.waitingId == 0) {
       return false;
     }
-    if (!taken_) {
-      if (!(epochNow >= CLOCK_SET_EPOCH)) {
-        if (waitOver(nowMs)) {
-          refuseWaiting(REFUSE_STALE, nowMs);
-        }
-        return false;
-      }
-      if (!requestIsFresh(waitingId_, epochNow)) {
-        refuseWaiting(REFUSE_STALE, nowMs);
-        return false;
-      }
-      const Journal next = {waitingId_, JOURNAL_TAKEN};
-      if (!port.saveJournal(next)) {
-        refuseWaiting(REFUSE_JOURNAL, nowMs);
-        return false;
-      }
-      journal_ = next;
-      journalUnsaved_ = false;
-      taken_ = true;
-    }
-    if (!ready) {
-      if (waitOver(nowMs)) {
-        refuseWaiting(REFUSE_NO_CHARGER, nowMs);
-      }
+    // Both limits hold up to the moment the run starts.
+    const bool clockSet = epochNow >= CLOCK_SET_EPOCH;
+    if (clockSet && !requestIsFresh(journal_.waitingId, epochNow)) {
+      refuseWaiting(REFUSE_STALE, epochNow, nowMs);
       return false;
     }
-    waiting_ = false;
-    taken_ = false;
+    if (waitOver(nowMs)) {
+      // An hour has gone by: waiting for the clock (which may have come just now), or for the charger.
+      refuseWaiting(clockSet && !ready ? REFUSE_NO_CHARGER : REFUSE_STALE, epochNow, nowMs);
+      return false;
+    }
+    if (!clockSet || !ready) {
+      return false;
+    }
+    runId_ = journal_.waitingId;
     programmer_.start(waitingProfile_, waitingLoadAllowed_);
     drive(port);
-    settle(port);
+    settle(port, epochNow, nowMs);
     return true;
   }
 
-  // A result waits to be sent to the server, with the request it answers and the client's
-  // millis() when it came about. The newest takes the place of one that was not sent yet.
-  bool reportDue() const { return reportDue_; }
-  const ProgramResult &report() const { return report_; }
-  uint32_t reportRequestId() const { return reportRequestId_; }
+  // A result waits to be sent to the server: the request it answers, the client's millis() when
+  // it came about, and that moment as a time when the clock was set then (0 otherwise, or after
+  // a restart of the client: the time of reportMillis() is the best that is known). A newer
+  // result of the same request takes the place of one that was not sent yet, and so does the
+  // result of a newer request. A result of an older request never does: the server keeps the
+  // newest request's anyway.
+  bool reportDue() const { return journal_.reportDue; }
+  const ProgramResult &report() const { return journal_.report; }
+  uint32_t reportRequestId() const { return journal_.reportId; }
   uint32_t reportMillis() const { return reportMs_; }
-  void reportTaken() { reportDue_ = false; }
+  uint32_t reportEpoch() const { return journal_.reportEpoch; }
+  // The result has gone to the Notecard, or to the client's note buffer in flash.
+  void reportTaken(uint32_t nowMs) {
+    if (journal_.reportDue) {
+      journal_.reportDue = false;
+      saveJournal(nowMs);
+    }
+  }
 
   // The client gives up the request that waits: a newer config no longer asks for it
   // (REFUSE_WITHDRAWN), or the client can no longer take it on (REFUSE_NOT_LIFEPO4,
-  // REFUSE_NO_CHARGER). It is refused with `refusals` as it stands, its result goes to the
-  // server, and the same id is not taken on again. A duty that is owed stays owed. Returns false,
-  // and does nothing, when no request waits or `refusals` holds no bit.
-  bool withdraw(uint32_t refusals, uint32_t nowMs) {
-    if (!waiting_ || refusals == 0) {
+  // REFUSE_NO_CHARGER). It is refused with `refusals` as it stands, and its result goes to the
+  // server. A duty that is owed stays owed. Returns false, and does nothing, when no request
+  // waits or `refusals` holds no bit.
+  bool withdraw(uint32_t refusals, double epochNow, uint32_t nowMs) {
+    if (journal_.waitingId == 0 || refusals == 0) {
       return false;
     }
-    refuseWaiting(refusals, nowMs);
+    refuseWaiting(refusals, epochNow, nowMs);
     return true;
   }
 
   const Journal &journal() const { return journal_; }
   // A request waits for the clock, the charger or a duty.
-  bool requestWaiting() const { return waiting_; }
+  bool requestWaiting() const { return journal_.waitingId != 0; }
   // The id of the request that waits, 0 when none does.
-  uint32_t waitingRequestId() const { return waiting_ ? waitingId_ : 0; }
+  uint32_t waitingRequestId() const { return journal_.waitingId; }
   // Whether service() would talk to the controller now if it were ready: a duty whose turn has
-  // come, or a request that can run (one in the journal, or a fresh one with the clock set). The
-  // client gives such a pass to programming when every pass of its loop is due to poll. It cannot
-  // tell that flash will refuse the journal, so it may say yes where service() then refuses the
-  // request without a run. It never says no where service() would talk.
+  // come, or a request that can run (a fresh one with the clock set, within its hour). The
+  // client gives such a pass to programming when every pass of its loop is due to poll. It never
+  // says no where service() would talk, nor yes where service() would not.
   bool wantsLine(double epochNow, uint32_t nowMs) const {
     if (dutyOwed()) {
       return dutyTurn(nowMs);
     }
-    return waiting_ && (taken_ || requestIsFresh(waitingId_, epochNow));
+    return journal_.waitingId != 0 && requestIsFresh(journal_.waitingId, epochNow) && !waitOver(nowMs);
   }
   // The controller may wait for a restart, and the client has yet to settle that.
   bool dutyOwed() const { return journal_.phase == JOURNAL_RESTARTING || journal_.phase == JOURNAL_WRITING; }
+  // The Modbus id to talk to: the controller a duty is owed to, when the journal knows which
+  // one that is, and otherwise `configured`, the one the client's config names.
+  uint8_t controllerToUse(uint8_t configured) const {
+    return dutyOwed() && journal_.controller != 0 ? journal_.controller : configured;
+  }
 
  private:
   Programmer programmer_;
   Journal journal_;
+  JournalStore *store_;
   bool journalUnsaved_;  // flash did not take the journal as it is here
   uint32_t journalTryMs_;
-  bool waiting_;
-  bool taken_;           // the waiting request is in the journal
-  uint32_t waitingId_;
   Profile waitingProfile_;
   bool waitingLoadAllowed_;
   uint32_t waitingSinceMs_;
-  uint32_t refusedId_;   // the last request that was refused without a run
+  uint32_t runId_;       // the request the run under way answers
   bool dutyForced_;      // try the duty at the next chance, whatever its timer says
   uint8_t dutyTries_;
   uint32_t dutyTryMs_;
-  bool reportDue_;
-  uint32_t reportRequestId_;
   uint32_t reportMs_;
-  ProgramResult report_;
   uint16_t stepLimit_;
 
   bool waitOver(uint32_t nowMs) const { return (uint32_t)(nowMs - waitingSinceMs_) >= REQUEST_WAIT_MS; }
@@ -1557,35 +1737,30 @@ class Supervisor {
     return dutyForced_ || (uint32_t)(nowMs - dutyTryMs_) >= gap;
   }
 
-  void post(uint32_t requestId, const ProgramResult &result, uint32_t nowMs) {
-    report_ = result;
-    reportRequestId_ = requestId;
-    reportMs_ = nowMs;
-    reportDue_ = true;
-  }
-
-  void saveJournal(Port &port, uint32_t nowMs) {
-    journalTryMs_ = nowMs;
-    journalUnsaved_ = !port.saveJournal(journal_);
-  }
-
-  // The waiting request is given up. If it was in the journal, the journal says so.
-  void dropWaiting(uint32_t nowMs) {
-    if (waiting_ && taken_ && journal_.phase == JOURNAL_TAKEN) {
-      journal_.phase = JOURNAL_IDLE;
-      journalUnsaved_ = true;
-      journalTryMs_ = nowMs - JOURNAL_RETRY_MS;
+  void post(uint32_t requestId, const ProgramResult &result, double epochNow, uint32_t nowMs) {
+    if (journal_.reportDue && journal_.reportId > requestId) {
+      return;  // the result of a newer request has yet to go out
     }
-    waiting_ = false;
-    taken_ = false;
+    journal_.report = result;
+    journal_.reportId = requestId;
+    journal_.reportEpoch = epochNow >= CLOCK_SET_EPOCH ? (uint32_t)epochNow : 0u;
+    journal_.reportDue = true;
+    reportMs_ = nowMs;
   }
 
-  void refuseWaiting(uint32_t reasons, uint32_t nowMs) {
-    refusedId_ = waitingId_;
+  bool saveJournal(uint32_t nowMs) {
+    journalTryMs_ = nowMs;
+    journalUnsaved_ = store_ == nullptr || !store_->saveJournal(journal_);
+    return !journalUnsaved_;
+  }
+
+  void refuseWaiting(uint32_t reasons, double epochNow, uint32_t nowMs) {
+    const uint32_t requestId = journal_.waitingId;
+    journal_.waitingId = 0;
     ProgramResult result;
     refusedResult(waitingProfile_, 0, reasons, &result);
-    post(waitingId_, result, nowMs);
-    dropWaiting(nowMs);
+    post(requestId, result, epochNow, nowMs);
+    saveJournal(nowMs);
   }
 
   // Runs what programmer_ was started on to its end, with the two commit points in the journal.
@@ -1601,8 +1776,13 @@ class Supervisor {
         continue;
       }
       Journal next = journal_;
+      next.requestId = runId_;
       next.phase = commit == COMMIT_RESTART ? (uint8_t)JOURNAL_RESTARTING : (uint8_t)JOURNAL_WRITING;
-      if (port.saveJournal(next)) {
+      next.controller = port.controller();
+      if (next.waitingId == runId_) {
+        next.waitingId = 0;  // from here on the journal speaks for the request
+      }
+      if (store_ != nullptr && store_->saveJournal(next)) {
         journal_ = next;
         journalUnsaved_ = false;
         programmer_.go();
@@ -1613,8 +1793,11 @@ class Supervisor {
   }
 
   // A run or a duty has come to its end: its result goes out, and the journal says what is owed.
-  void settle(Port &port) {
+  // `epochAtStart` and `startMs` are the client's clock and millis() when it began.
+  void settle(Port &port, double epochAtStart, uint32_t startMs) {
     const uint32_t nowMs = port.millisNow();
+    const double epochNow =
+        epochAtStart >= CLOCK_SET_EPOCH ? epochAtStart + (double)(uint32_t)(nowMs - startMs) / 1000.0 : epochAtStart;
     dutyForced_ = false;
     dutyTryMs_ = nowMs;
     ProgramResult result = programmer_.result();
@@ -1624,19 +1807,19 @@ class Supervisor {
       result.outcome = OUTCOME_STOPPED;
       result.followUp = dutyOwed();
     }
-    const bool owed = result.followUp;
-    post(journal_.requestId, result, nowMs);
-    if (owed) {
+    if (journal_.waitingId == runId_) {
+      journal_.waitingId = 0;  // a run that ended before its first commit point
+    }
+    post(runId_, result, epochNow, nowMs);
+    if (result.followUp) {
       if (dutyTries_ < 0xFF) {
         ++dutyTries_;
       }
-      return;
-    }
-    dutyTries_ = 0;
-    if (journal_.phase != JOURNAL_IDLE) {
+    } else {
+      dutyTries_ = 0;
       journal_.phase = JOURNAL_IDLE;
-      saveJournal(port, nowMs);
     }
+    saveJournal(nowMs);
   }
 };
 
@@ -1676,14 +1859,33 @@ inline void describeRefusal(uint32_t refusal, const ProgramResult &result, Text 
   }
 }
 
-// One line that sums a run up: "programmed: 14 of 17 registers written, 3 already set".
+// One line that sums a run up: "programmed: 14 of 17 registers written, 3 already set". A
+// register that held its word and was not read after the restart counts as it went before it:
+// written when it needed the word, already set when it held it.
 inline void describeRun(const ProgramResult &result, Text *out) {
   out->add(outcomeName(result.outcome));
   if (result.planned == 0) {
     return;
   }
-  out->add(": ").addUnsigned(countEntries(result, ENTRY_WRITTEN)).add(" of ").addUnsigned(result.planned);
-  out->add(" registers written, ").addUnsigned(countEntries(result, ENTRY_UNCHANGED)).add(" already set");
+  uint8_t written = countEntries(result, ENTRY_WRITTEN);
+  uint8_t set = countEntries(result, ENTRY_UNCHANGED);
+  uint8_t unread = 0;
+  for (uint8_t i = 0; i < result.planned && i < PLAN_ENTRIES; ++i) {
+    const PlanEntry &entry = result.entries[i];
+    if (entry.status == ENTRY_UNREAD) {
+      ++unread;
+      if (entry.before == entry.target) {
+        ++set;
+      } else {
+        ++written;
+      }
+    }
+  }
+  out->add(": ").addUnsigned(written).add(" of ").addUnsigned(result.planned);
+  out->add(" registers written, ").addUnsigned(set).add(" already set");
+  if (unread != 0) {
+    out->add(", ").addUnsigned(unread).add(" not read after the restart");
+  }
 }
 
 inline void describeLoadState(uint8_t state, Text *out) {

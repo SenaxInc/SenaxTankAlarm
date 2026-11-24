@@ -2213,6 +2213,8 @@ window.updatePowerConfigInfo=function(){
     const bvNow=parseInt(document.getElementById('batteryVoltage').value,10)||12;
     const on=vmon==='rs485'&&bt==='lifepo4'&&bvNow===12;
     cp.style.display=on?'block':'none';
+    /* A hidden field must not hold the form back: a disabled one is left out of its checks */
+    cp.querySelectorAll('input').forEach(el=>{el.disabled=!on;});
     const cl=document.getElementById('cpCheckLink');if(cl)cl.innerHTML=on?chargerCheckLink(' The result of each write shows on the ','charger page of this client','.'):'';
   }
   /* Vin divider config section */
@@ -2409,7 +2411,7 @@ const uid=new URLSearchParams(window.location.search).get('uid')||'';
 const el=id=>document.getElementById(id);
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function when(e){if(!e)return'';const d=new Date(e*1000);if(isNaN(d.getTime()))return'';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}
-const outcomeBadge={1:'cc-ok',2:'cc-ok',3:'cc-warn',4:'cc-warn',8:'cc-warn'};
+const outcomeBadge={1:'cc-ok',2:'cc-ok',3:'cc-warn',4:'cc-warn',8:'cc-warn',9:'cc-warn'};
 function table(head,rows,kv){return '<table'+(kv?' class="cc-kv"':'')+'>'+(head?'<thead><tr>'+head.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead>':'')+'<tbody>'+(rows||[]).map(r=>'<tr>'+r.map((c,i)=>'<td'+(head&&i===0?' class="cc-name"':'')+'>'+esc(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
 function renderProgram(p){
 const box=el('ccProgram');const gen='/config-generator?uid='+encodeURIComponent(uid);
@@ -12314,6 +12316,19 @@ static uint8_t purgePendingConfigNotes(const char *clientUid) {
   return purged;
 }
 
+// The time a config is sent with, as "_ts". A client reads it in whole seconds and sets aside a
+// config whose second is not later than that of the config it holds. So for one client the
+// second always moves on, even when the server's clock went back or two configs leave within one
+// second: the config is then sent a second after the one before. A request to program the
+// charger in a config (stampChargerProgramRequest()) is only acted on when the config is.
+static double nextConfigDispatchEpoch(double previous) {
+  const double now = currentEpoch();
+  if (now > 0.0 && previous > 0.0 && floor(now) <= floor(previous)) {
+    return floor(previous) + 1.0;
+  }
+  return now;
+}
+
 // Send a cached config JSON payload to a specific client via Notecard note.add.
 // Returns true on success, false on failure (with error logged to Serial).
 // Automatically purges any stale pending config notes for the same client first.
@@ -12476,7 +12491,7 @@ static ConfigDispatchStatus dispatchClientConfig(const char *clientUid, JsonVari
     snprintf(snapPre->configVersion, sizeof(snapPre->configVersion), "%08lX", (unsigned long)hash);
     snapPre->pendingDispatch = true;
     snapPre->dispatchAttempts = 1;           // First dispatch attempt
-    snapPre->lastDispatchEpoch = currentEpoch();
+    snapPre->lastDispatchEpoch = nextConfigDispatchEpoch(snapPre->lastDispatchEpoch);
     saveClientConfigSnapshots();
   }
 
@@ -12548,7 +12563,7 @@ static void dispatchPendingConfigs() {
     // Increment attempt counter BEFORE sending so it advances even on failure.
     // This ensures auto-cancel triggers even if the Notecard I2C is down.
     gClientConfigs[i].dispatchAttempts++;
-    gClientConfigs[i].lastDispatchEpoch = currentEpoch();
+    gClientConfigs[i].lastDispatchEpoch = nextConfigDispatchEpoch(gClientConfigs[i].lastDispatchEpoch);
 
     if (sendConfigViaNotecard(gClientConfigs[i].uid, gClientConfigs[i].payload)) {
       // pendingDispatch stays true until config ACK received from client
@@ -13224,7 +13239,9 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
   }
   uint32_t requestId = (uint32_t)now;
   if (meta && requestId <= meta->chargerProgramAsked) {
-    requestId = meta->chargerProgramAsked + 1;  // the server's clock went back: the client takes only a newer id
+    // The server's clock went back. The client takes only a newer id, and the config that carries
+    // it has a newer time too (nextConfigDispatchEpoch()).
+    requestId = meta->chargerProgramAsked + 1;
   }
   program["req"] = requestId;
   return 0;
