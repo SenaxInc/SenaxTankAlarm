@@ -2829,16 +2829,30 @@ static void testRequestJson() {
     CHECK(cautious.phase == ss::JOURNAL_WRITING && cautious.requestId == 0 && cautious.controller == 0 &&
           cautious.answeredId == 0 && cautious.waitingId == 0 && !cautious.reportDue);
 
+    CHECK(empty.readFunction == 0 && cautious.readFunction == 0);
     ss::Journal journal = ss::emptyJournal();
     journal.requestId = kRequestId;
     journal.phase = ss::JOURNAL_WRITING;
     journal.controller = 1;
+    journal.readFunction = 4;
     journal.answeredId = kRequestId + 5;
     JsonDocument doc;
     ss::encodeJournal(journal, doc.to<JsonObject>());
     std::string wire;
     serializeJson(doc, wire);
-    CHECK_TEXT(wire, std::string("{\"req\":1795500000,\"ph\":2,\"ctl\":1,\"ans\":1795500005}"));
+    CHECK_TEXT(wire, std::string("{\"req\":1795500000,\"ph\":2,\"ctl\":1,\"fc\":4,\"ans\":1795500005}"));
+    // A read function that is none of the two, or a journal of a firmware that kept none: not known.
+    static const char *const kFunctions[][2] = {{"3", "3"}, {"4", "4"}, {"0", "0"},   {"1", "0"},  {"2", "0"},
+                                                {"5", "0"}, {"255", "0"}, {"-4", "0"}, {"4.5", "0"}, {"\"4\"", "0"},
+                                                {"null", "0"}, {"", "0"}};
+    for (size_t i = 0; i < sizeof(kFunctions) / sizeof(kFunctions[0]); ++i) {
+      const std::string member = kFunctions[i][0][0] == '\0' ? std::string() : std::string(",\"fc\":") + kFunctions[i][0];
+      JsonDocument file = parsed("{\"req\":5,\"ph\":2,\"ctl\":7" + member + "}");
+      const ss::Journal in = ss::decodeJournal(file.as<JsonObjectConst>());
+      CHECK_MSG(in.phase == ss::JOURNAL_WRITING && in.requestId == 5 && in.controller == 7 &&
+                    in.readFunction == (uint8_t)atoi(kFunctions[i][1]),
+                "a journal with fc %s reads as function %u", kFunctions[i][0], (unsigned)in.readFunction);
+    }
 
     // Every member, through the file and back.
     ss::ProgramResult refused;
@@ -2849,6 +2863,7 @@ static void testRequestJson() {
         out.requestId = kRequestId + phase;
         out.phase = phase;
         out.controller = (uint8_t)(phase == 2 ? 247 : phase);
+        out.readFunction = (uint8_t)(phase == 0 ? 0 : 2 + phase);  // 0, 3 and 4
         out.answeredId = kRequestId + 100 + phase;
         out.waitingId = due == 1 ? kRequestId + 200 : 0u;
         out.reportDue = due == 1;
@@ -2866,7 +2881,8 @@ static void testRequestJson() {
         JsonDocument back = parsed(text);
         const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
         CHECK_MSG(in.requestId == out.requestId && in.phase == out.phase && in.controller == out.controller &&
-                      in.answeredId == out.answeredId && in.waitingId == out.waitingId && in.reportDue == out.reportDue,
+                      in.readFunction == out.readFunction && in.answeredId == out.answeredId &&
+                      in.waitingId == out.waitingId && in.reportDue == out.reportDue,
                   "the journal changed on its way: %s", text.c_str());
         if (due == 1) {
           CHECK_EQ(in.reportId, out.reportId);
@@ -2882,6 +2898,7 @@ static void testRequestJson() {
       longest.requestId = 0xFFFFFFFFu;
       longest.phase = ss::JOURNAL_WRITING;
       longest.controller = 247;
+      longest.readFunction = 4;
       longest.answeredId = 0xFFFFFFFFu;
       longest.waitingId = 0xFFFFFFFFu;
       longest.reportDue = true;
@@ -3590,11 +3607,12 @@ static ss::Journal journalOf(uint32_t requestId, uint8_t phase) {
   journal.requestId = requestId;
   journal.phase = phase;
   journal.controller = 1;
+  journal.readFunction = MB_FC_READ_INPUT;  // what a Desk reads with, unless a test says otherwise
   journal.answeredId = requestId;
   return journal;
 }
 
-struct Desk : ss::Port, ss::JournalStore {
+struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
   SimSunSaver sim;
   ModbusMaster master;
   TestBus bus;
@@ -3619,6 +3637,8 @@ struct Desk : ss::Port, ss::JournalStore {
   bool polling;                     // the client polls: the charger is on in its config
   bool held;                        // a firmware update is being staged: nobody talks to the charger
   int configured;                   // the Modbus id the config names: -1 for the one this desk talks to
+  uint8_t pollFunction;             // the read function the poll found for that controller, 0 for none
+  ss::FunctionChoice choice;        // what this pass reads with (ChargerProgramPort): set by pass()
   std::vector<Report> reports;
 
   Desk()
@@ -3638,15 +3658,21 @@ struct Desk : ss::Port, ss::JournalStore {
         ready(true),
         polling(true),
         held(false),
-        configured(-1) {
+        configured(-1),
+        pollFunction(MB_FC_READ_INPUT),
+        choice(MB_FC_READ_INPUT) {
     sim.configure(9600, MB_8N2);
     flash = ss::emptyJournal();
   }
 
+  // The client's port reads with the function it was given, or finds one (ss::FunctionChoice).
+  ss::IoStatus readRegister(uint16_t addr, uint16_t *raw) override { return choice.read(*this, addr, raw); }
+  uint8_t readFunction() const override { return choice.function(); }
   // The client waits for each reply, or for its timeout: that time is the client's too.
-  ss::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
+  ss::IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) override {
     cut();
     const uint64_t began = sim.elapsedMs();
+    bus.function = function;
     const ss::IoStatus status = bus.readRegister(addr, raw);
     clockMs += sim.elapsedMs() - began;
     return status;
@@ -3745,6 +3771,8 @@ struct Desk : ss::Port, ss::JournalStore {
   bool pass(ss::Supervisor &supervisor) {
     const bool wanted = supervisor.wantsLine(clock(), millisNow());
     const ss::Line now = line();
+    // The port of this pass, as SolarManager::serviceChargerProgramming() makes it.
+    choice = ss::FunctionChoice(supervisor.readFunctionToUse(now.configured, now.pollAnswered ? pollFunction : 0));
     const bool mayTalk = supervisor.mayTalk(*this, now);
     const bool ran = supervisor.service(*this, clock(), now);
     CHECK_MSG(ran == (wanted && mayTalk), "wantsLine() said %s, mayTalk() said %s, and service() %s",
@@ -3879,6 +3907,7 @@ static void testSupervisor() {
         CHECK_EQ(desk.saves[i].answeredId, kRequestId);
         CHECK_EQ(desk.saves[i].waitingId, i == 0 ? kRequestId : 0u);
         CHECK_EQ(desk.saves[i].controller, i == 0 ? 0 : 1);  // the controller the run talked to
+        CHECK_EQ(desk.saves[i].readFunction, i == 0 ? 0 : MB_FC_READ_INPUT);  // and how it read it
       }
       CHECK_EQ(desk.saveAt[0], 0);
       CHECK_EQ(desk.saveAt[1], firstRestart);
@@ -5356,6 +5385,297 @@ static void testLineForDuty() {
   }
 }
 
+// Who has the line in a pass of the client's loop (ss::LineTurns).
+static void testLineTurns() {
+  // After a poll the others have the next pass with the line free, when they want it, and then
+  // the poll has the line again.
+  {
+    ss::LineTurns turns;
+    CHECK(!turns.pollWaits(true));  // nothing has polled yet: the poll comes first
+    turns.afterPoll(true, false);
+    CHECK(turns.pollWaits(true));
+    CHECK(!turns.pollWaits(false));  // they have nothing to do: the poll goes on
+    turns.afterPoll(false, false);   // their pass
+    CHECK(!turns.pollWaits(true));
+    turns.afterPoll(false, false);   // a pass that was not due to poll
+    CHECK(!turns.pollWaits(true));
+  }
+  // They keep their turn while the line rests, however many passes that lasts.
+  {
+    ss::LineTurns turns;
+    turns.afterPoll(true, true);
+    for (int i = 0; i < 100; ++i) {
+      CHECK(turns.pollWaits(true));
+      turns.afterPoll(false, true);
+    }
+    CHECK(turns.pollWaits(true));
+    turns.afterPoll(false, false);
+    CHECK(!turns.pollWaits(true));
+  }
+  // A pass with the line free in which they have nothing to do ends their turn.
+  {
+    ss::LineTurns turns;
+    turns.afterPoll(true, false);
+    CHECK(!turns.pollWaits(false));
+    turns.afterPoll(false, false);
+    CHECK(!turns.pollWaits(true));
+  }
+  // The client's loop, as the third review of PR 335 found it: a poll every 5 s, a Modbus
+  // timeout of 4 s, and a controller the config names that does not answer. Every poll waits
+  // out its timeout, the line rests for one more, and the poll is due again before the rest
+  // ends. A look owed to another controller wants the line all the while. Before LineTurns the
+  // others had only the pass right after a poll, which the rest took from them every time.
+  {
+    const uint64_t intervalMs = 5000, timeoutMs = 4000, passMs = 100, untilMs = 600000;
+    for (int kept = 0; kept < 2; ++kept) {
+      ss::LineTurns turns;
+      bool polledLastPass = false;  // the rule before
+      uint64_t now = 0, lastPoll = 0, restUntil = 0;
+      unsigned polls = 0, theirs = 0, longestWait = 0, wait = 0;
+      bool first = true;
+      while (now < untilMs) {
+        const bool othersWant = true;
+        const bool waits = kept ? turns.pollWaits(othersWant) : polledLastPass && othersWant;
+        bool polled = false;
+        if (!waits && (first || now - lastPoll >= intervalMs) && now >= restUntil) {
+          first = false;
+          lastPoll = now;
+          now += timeoutMs;  // SolarManager::poll(): no reply comes
+          restUntil = now + timeoutMs;
+          polled = true;
+          ++polls;
+        }
+        const bool resting = now < restUntil;
+        if (kept) {
+          turns.afterPoll(polled, resting);
+        } else {
+          polledLastPass = polled;
+        }
+        if (!polled && !resting) {
+          ++theirs;  // serviceChargerProgramming(): allowed, and the line is free
+          wait = 0;
+        } else if (++wait > longestWait) {
+          longestWait = wait;
+        }
+        now += passMs;
+      }
+      CHECK(polls > 50);
+      if (kept) {
+        CHECK_MSG(theirs + 1 >= polls, "%u polls, and the others had %u passes", polls, theirs);
+        CHECK_MSG(longestWait * passMs <= 2 * timeoutMs + passMs, "the others waited %u passes",
+                  longestWait);
+      } else {
+        CHECK_EQ(theirs, 0);  // the rule before starved them
+      }
+    }
+  }
+}
+
+// The Modbus function a port reads a controller with (ss::FunctionChoice,
+// Supervisor::readFunctionToUse()), and a look at a controller that answers one function only.
+struct FunctionDesk : ss::FunctionReader {
+  SimSunSaver sim;
+  ModbusMaster master;
+  std::vector<std::pair<uint8_t, uint16_t> > asked;  // function, register
+
+  FunctionDesk() : master(sim) { sim.configure(9600, MB_8N2); }
+
+  ss::IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) override {
+    asked.push_back(std::make_pair(function, addr));
+    uint16_t word = 0;
+    const MbResult result = master.readRegisters(sim.slaveId, function, addr, 1, &word);
+    if (result.status == MB_OK) {
+      *raw = word;
+      return ss::SSIO_OK;
+    }
+    return result.status == MB_EXCEPTION ? ss::SSIO_REFUSED : ss::SSIO_NO_REPLY;
+  }
+};
+
+// The requests of a function that reached the controller.
+static size_t requestsWith(const SimSunSaver &sim, uint8_t function) {
+  size_t n = 0;
+  for (size_t i = 0; i < sim.requests.size(); ++i) {
+    n += sim.requests[i].size() > 1 && sim.requests[i][1] == function ? 1 : 0;
+  }
+  return n;
+}
+
+static void testReadFunction() {
+  uint16_t raw = 0;
+  // A function that is known is the only one asked, also when the controller refuses it.
+  for (uint8_t known = 3; known <= 4; ++known) {
+    FunctionDesk desk;
+    desk.sim.readHolding = known != 3;
+    desk.sim.readInput = known != 4;
+    ss::FunctionChoice choice(known);
+    CHECK_EQ(choice.function(), known);
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_REFUSED);
+    CHECK_EQ(desk.asked.size(), 1);
+    CHECK_EQ(desk.asked[0].first, known);
+    CHECK_EQ(choice.function(), known);
+  }
+  // Not known, and the controller answers both: function 3, and that is known from then on.
+  {
+    FunctionDesk desk;
+    ss::FunctionChoice choice;
+    CHECK_EQ(choice.function(), 0);
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_OK);
+    CHECK_EQ(raw, desk.sim.regs[0x0008]);
+    CHECK_EQ(choice.function(), 3);
+    CHECK_EQ(choice.read(desk, 0x0009, &raw), ss::SSIO_OK);
+    CHECK_EQ(desk.asked.size(), 2);
+    CHECK(desk.asked[0].first == 3 && desk.asked[1].first == 3);
+  }
+  // Not known, and the controller refuses function 3: the register is asked again with 4 at
+  // once, and 4 is kept. A register it refuses with 4 then is refused: no second try.
+  {
+    FunctionDesk desk;
+    desk.sim.readHolding = false;
+    desk.sim.regs[0x0008] = 0x1234;
+    ss::FunctionChoice choice(0);
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_OK);
+    CHECK_EQ(raw, 0x1234);
+    CHECK_EQ(choice.function(), 4);
+    CHECK_EQ(desk.asked.size(), 2);
+    CHECK(desk.asked[0] == std::make_pair((uint8_t)3, (uint16_t)0x0008));
+    CHECK(desk.asked[1] == std::make_pair((uint8_t)4, (uint16_t)0x0008));
+    CHECK_EQ(choice.read(desk, 0x0009, &raw), ss::SSIO_OK);
+    CHECK_EQ(desk.asked.back().first, 4);
+    desk.sim.regs.erase(0x0009);
+    CHECK_EQ(choice.read(desk, 0x0009, &raw), ss::SSIO_REFUSED);
+    CHECK_EQ(desk.asked.size(), 4);
+    CHECK_EQ(choice.function(), 4);
+  }
+  // Not known, and a register the controller does not have: both refuse it, nothing is known
+  // yet, and the next register finds the function.
+  {
+    FunctionDesk desk;
+    desk.sim.regs.erase(0x0030);
+    ss::FunctionChoice choice;
+    CHECK_EQ(choice.read(desk, 0x0030, &raw), ss::SSIO_REFUSED);
+    CHECK_EQ(desk.asked.size(), 2);
+    CHECK_EQ(choice.function(), 0);
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_OK);
+    CHECK_EQ(choice.function(), 3);
+    CHECK_EQ(desk.asked.size(), 3);
+  }
+  // Not known: function 3 is refused, and the other gets no reply. That is a miss: the run rests
+  // the line after it. A request without a reply is not asked again here.
+  {
+    FunctionDesk desk;
+    desk.sim.readHolding = false;
+    desk.sim.failNext(SimSunSaver::FAULT_NONE);
+    desk.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    ss::FunctionChoice choice;
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_NO_REPLY);
+    CHECK_EQ(desk.asked.size(), 2);
+    CHECK_EQ(choice.function(), 0);
+    desk.sim.powered = false;
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_NO_REPLY);
+    CHECK_EQ(desk.asked.size(), 3);  // silence with function 3 is no refusal
+    desk.sim.powered = true;
+    CHECK_EQ(choice.read(desk, 0x0008, &raw), ss::SSIO_OK);
+    CHECK_EQ(choice.function(), 4);
+  }
+
+  // Which function the Supervisor gives a port.
+  {
+    ss::Supervisor supervisor;
+    supervisor.begin(ss::emptyJournal(), nullptr, 0);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 4), 4);  // a request: what the poll found
+    CHECK_EQ(supervisor.readFunctionToUse(1, 0), 0);
+    ss::Journal owed = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    owed.controller = 7;
+    owed.readFunction = 4;
+    supervisor.begin(owed, nullptr, 0);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 3), 4);  // the duty's controller, as its run read it
+    CHECK_EQ(supervisor.readFunctionToUse(1, 0), 4);
+    CHECK_EQ(supervisor.readFunctionToUse(7, 3), 3);  // the poll reads that very controller now
+    CHECK_EQ(supervisor.readFunctionToUse(7, 0), 4);
+    owed.readFunction = 0;  // a journal that knows none
+    supervisor.begin(owed, nullptr, 0);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 3), 0);  // the poll's is another controller's
+    CHECK_EQ(supervisor.readFunctionToUse(7, 3), 3);
+    CHECK_EQ(supervisor.readFunctionToUse(7, 0), 0);
+    supervisor.begin(ss::cautiousJournal(), nullptr, 0);
+    CHECK_EQ(supervisor.controllerToUse(1), 1);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 3), 3);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 0), 0);
+    // A journal that names no controller: its function speaks for none. And one that owes
+    // nothing: a request reads with what the poll found, and with nothing else.
+    ss::Journal nameless = ss::cautiousJournal();
+    nameless.readFunction = 4;
+    supervisor.begin(nameless, nullptr, 0);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 0), 0);
+    ss::Journal settled = journalOf(kRequestId, ss::JOURNAL_IDLE);
+    settled.readFunction = 4;
+    supervisor.begin(settled, nullptr, 0);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 0), 0);
+    CHECK_EQ(supervisor.readFunctionToUse(1, 3), 3);
+  }
+
+  // A run on a controller that answers function 4 only, the client restarting while it writes,
+  // and then the charger off in the config and another controller named: no poll finds a
+  // function. The look reads with the one in the journal, and settles the duty.
+  {
+    const ss::Profile profile = ss::lifepo4Profile();
+    Desk desk;
+    desk.bus.slave = 7;
+    desk.sim.slaveId = 7;
+    desk.sim.readHolding = false;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.ask(supervisor, kRequestId, profile));
+    desk.dieAtRequest = ss::ITEM_COUNT + 6;  // among the writes
+    bool died = false;
+    try {
+      desk.pass(supervisor);
+    } catch (const PowerLoss &) {
+      died = true;
+    }
+    CHECK(died);
+    CHECK_EQ(desk.flash.phase, ss::JOURNAL_WRITING);
+    CHECK_EQ(desk.flash.controller, 7);
+    CHECK_EQ(desk.flash.readFunction, MB_FC_READ_INPUT);
+    CHECK(editPending(desk.sim));
+    desk.reports.clear();
+    desk.boot(supervisor);
+    desk.configured = 2;
+    desk.polling = false;
+    desk.ready = false;
+    desk.pollFunction = 0;
+    const size_t holdingBefore = requestsWith(desk.sim, MB_FC_READ_HOLDING);
+    CHECK_EQ(holdingBefore, 0);
+    CHECK(desk.pass(supervisor));
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(requestsWith(desk.sim, MB_FC_READ_HOLDING), 0);
+    CHECK(!desk.reports.empty() && desk.reports.back().result.outcome == ss::OUTCOME_INTERRUPTED &&
+          (desk.reports.back().result.notes & ss::NOTE_NOT_ANSWERED) == 0 && !desk.reports.back().result.followUp);
+  }
+  // A journal that could not be read knows no function either, and the charger is off: the look
+  // finds function 4 with its first request.
+  {
+    Desk desk;
+    desk.sim.readHolding = false;
+    desk.flash = ss::cautiousJournal();
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.polling = false;
+    desk.ready = false;
+    desk.pollFunction = 0;
+    CHECK(desk.pass(supervisor));
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.sim.resets, 1);
+    CHECK_EQ(requestsWith(desk.sim, MB_FC_READ_HOLDING), 1);  // the first, refused
+    CHECK(requestsWith(desk.sim, MB_FC_READ_INPUT) >= 4);
+  }
+}
+
 static void testSupervisorSweeps() {
   const ss::Profile profile = ss::lifepo4Profile();
   const SimSunSaver fresh;
@@ -6058,6 +6378,8 @@ int main() {
   testWithdraw();
   testJournalKeeps();
   testLineForDuty();
+  testLineTurns();
+  testReadFunction();
   testSupervisorSweeps();
   testTimeLimit();
   CHECK_EQ(gAllocLive, 0);

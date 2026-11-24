@@ -1485,6 +1485,7 @@ struct Journal {
   uint32_t requestId;    // the request of the last run that reached a commit point
   uint8_t phase;         // JournalPhase: how far that run came
   uint8_t controller;    // the Modbus id of the controller that run talked to, 0 when not known
+  uint8_t readFunction;  // the Modbus function it read that controller with (3 or 4), 0 when not known
   uint32_t answeredId;   // the newest request this client has answered or taken on
   uint32_t waitingId;    // the request that waits, or runs and has not reached a commit point; 0 for none
   bool reportDue;        // `report` has yet to go to the server
@@ -1522,6 +1523,54 @@ class Port : public Bus {
   virtual void rest(uint16_t ms, bool afterMiss) = 0;
   // The Modbus id of the controller this port talks to.
   virtual uint8_t controller() const = 0;
+  // The Modbus function it reads registers with: 3 or 4, or 0 while it has yet to find one that
+  // the controller answers (see FunctionChoice).
+  virtual uint8_t readFunction() const = 0;
+};
+
+// Reads one register in one request, with Modbus function 3 (holding registers) or 4 (input
+// registers): what a FunctionChoice reads through.
+class FunctionReader {
+ public:
+  virtual ~FunctionReader() {}
+  virtual IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) = 0;
+};
+
+// The Modbus function a port reads its controller with. The poll finds the one that the
+// controller the config names answers, and the journal keeps the one that a run's controller
+// answered (Supervisor::readFunctionToUse()). When neither speaks for the controller, the port
+// finds out: it reads with function 3, and a register the controller refuses that way is asked
+// once more with function 4, which is kept from then on when the controller answers it. Once a
+// register has answered, the function is known, and a refusal is the controller's answer.
+class FunctionChoice {
+ public:
+  // `known`: 3 or 4, or 0 when it is to be found out.
+  explicit FunctionChoice(uint8_t known = 0) : function_(known == 4 ? 4 : 3), known_(known == 3 || known == 4) {}
+
+  IoStatus read(FunctionReader &reader, uint16_t addr, uint16_t *raw) {
+    IoStatus status = reader.readWith(function_, addr, raw);
+    if (!known_ && status == SSIO_REFUSED) {
+      // A refusal is a reply, so nothing late can follow it: the other function may ask at once.
+      const IoStatus other = reader.readWith(4, addr, raw);
+      if (other == SSIO_OK) {
+        function_ = 4;
+      }
+      if (other != SSIO_REFUSED) {
+        status = other;  // its answer, or none: then the line rests as after any miss
+      }
+    }
+    if (status == SSIO_OK) {
+      known_ = true;
+    }
+    return status;
+  }
+
+  // 3 or 4, or 0 while no register has answered.
+  uint8_t function() const { return known_ ? function_ : 0; }
+
+ private:
+  uint8_t function_;  // 3 while the function is not known
+  bool known_;
 };
 
 // What the client knows of the line at a pass of its loop: see Supervisor::mayTalk().
@@ -1531,6 +1580,37 @@ struct Line {
   bool polling;        // the client polls the charger: it is on in the config, and its link started
   bool pollAnswered;   // and the controller the config names answered the last poll
   uint8_t configured;  // the Modbus id the config names
+};
+
+// Who has the line in a pass of the client's loop. The poll, the charger check and charger
+// programming all talk to the charger, so a pass talks for one of them only, and the poll comes
+// first. A short poll interval with the long sleep of ECO or LOW_POWER makes every pass due to
+// poll. So after a poll the others have the next pass in which the line is free, when they have
+// something to do (a check under way, programming with something due), and the poll waits for
+// the pass after. They keep that turn while the line rests after a request that got no reply:
+// a poll is due again by the time the rest ends when its interval is short and its controller
+// does not answer, and it would take every free pass. Once per pass of the client's loop:
+//
+//   const bool polled = !turns.pollWaits(othersWant) && poll();
+//   turns.afterPoll(polled, lineResting());
+class LineTurns {
+ public:
+  LineTurns() : othersNext_(false) {}
+  // Whether the poll is to leave this pass to the others. `othersWant`: a check is under way, or
+  // programming has something due (Supervisor::wantsLine()).
+  bool pollWaits(bool othersWant) const { return othersNext_ && othersWant; }
+  // After the poll: `polled`, it talked to the charger in this pass; `lineResting`, the line
+  // rests now.
+  void afterPoll(bool polled, bool lineResting) {
+    if (polled) {
+      othersNext_ = true;
+    } else if (!lineResting) {
+      othersNext_ = false;  // this pass has the line free: it is theirs, if they want it
+    }
+  }
+
+ private:
+  bool othersNext_;
 };
 
 static const uint32_t REQUEST_WAIT_MS = 3600000ul;        // a request waits this long for the clock and the charger
@@ -1752,6 +1832,17 @@ class Supervisor {
   uint8_t controllerToUse(uint8_t configured) const {
     return dutyOwed() && journal_.controller != 0 ? journal_.controller : configured;
   }
+  // The Modbus function to read controllerToUse(configured) with (FunctionChoice). For the
+  // controller the config names, `configuredFunction`: the one its poll found, when the poll
+  // answered (0 otherwise). For the controller a duty is owed to, the one its run read it with.
+  // 0 when neither is known: the port finds out.
+  uint8_t readFunctionToUse(uint8_t configured, uint8_t configuredFunction) const {
+    const uint8_t target = controllerToUse(configured);
+    if (target == configured && configuredFunction != 0) {
+      return configuredFunction;
+    }
+    return dutyOwed() && journal_.controller == target ? journal_.readFunction : (uint8_t)0;
+  }
 
  private:
   Programmer programmer_;
@@ -1820,6 +1911,7 @@ class Supervisor {
       next.requestId = runId_;
       next.phase = commit == COMMIT_RESTART ? (uint8_t)JOURNAL_RESTARTING : (uint8_t)JOURNAL_WRITING;
       next.controller = port.controller();
+      next.readFunction = port.readFunction();
       if (next.waitingId == runId_) {
         next.waitingId = 0;  // from here on the journal speaks for the request
       }

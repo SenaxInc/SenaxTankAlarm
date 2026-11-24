@@ -1035,15 +1035,18 @@ class ChargerCheckBus : public sunsaver::Reader {
 // What a programming run talks through: the reads of the charger check, writes with function 6,
 // the restart coil with function 5, the rest between requests and the clock. A request without a
 // usable reply starts the line rest like any other, so the poll and the charger check leave the
-// line alone after the run as well.
-class ChargerProgramPort : public sunsaver::Port {
+// line alone after the run as well. `functionCode` is the read function the controller answers,
+// or 0 when it is not known: the port finds it out then (sunsaver::FunctionChoice).
+class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionReader {
  public:
   ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs)
-      : _reader(slaveId, functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs) {}
+      : _function(functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs) {}
 
   uint16_t timeoutMs() const override { return _timeoutMs; }
 
-  sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override { return _reader.readRegister(addr, raw); }
+  sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override { return _function.read(*this, addr, raw); }
+
+  uint8_t readFunction() const override { return _function.function(); }
 
   // ArduinoModbus checks that the acknowledgement comes from this slave with this function and a
   // good CRC, not which address and value it names. The run goes by what the register reads
@@ -1094,7 +1097,11 @@ class ChargerProgramPort : public sunsaver::Port {
   uint8_t controller() const override { return _slaveId; }
 
  private:
-  ChargerCheckBus _reader;
+  sunsaver::IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) override {
+    return ChargerCheckBus(_slaveId, function).readRegister(addr, raw);
+  }
+
+  sunsaver::FunctionChoice _function;
   uint8_t _slaveId;
   uint16_t _timeoutMs;
 };
@@ -1186,9 +1193,12 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   line.polling = _config.enabled && _initialized;
   line.pollAnswered = line.polling && _data.lastPollOk && linkKnown;
   line.configured = _config.modbusSlaveId;
-  // A duty goes to the controller its run talked to, should the config name another one now.
+  // A duty goes to the controller its run talked to, should the config name another one now, and
+  // reads it with the function that run read it with. A port that is told no function finds one.
   ChargerProgramPort port(_programming.controllerToUse(_config.modbusSlaveId),
-                          linkKnown ? _cachedHoldingFC : (uint8_t)3, _config.modbusTimeoutMs);
+                          _programming.readFunctionToUse(_config.modbusSlaveId,
+                                                         line.pollAnswered ? _cachedHoldingFC : (uint8_t)0),
+                          _config.modbusTimeoutMs);
   // No poll runs, so the link is down (the charger is off in the config, or the link did not
   // start). It is started for a duty whose turn has come, on the settings the config holds, and
   // stopped again after it.

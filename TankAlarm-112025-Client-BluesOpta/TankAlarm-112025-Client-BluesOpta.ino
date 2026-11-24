@@ -891,7 +891,7 @@ static bool gChargerCheckWanted = false;          // a config change asks for a 
 static bool gChargerReportSyncNow = false;        // and for its report to be sent at once
 static unsigned long gChargerCheckEndMillis = 0;  // when the last pass ended, done or failed
 static uint8_t gChargerCheckFailures = 0;         // passes in a row that the link did not carry
-static bool gSolarPolledLastPass = false;         // the last pass of loop() polled the charger
+static sunsaver::LineTurns gSolarTurns;           // who of the poll, the check and programming has a pass
 static bool gChargerReportSent = false;           // a report has gone out since boot
 static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
 static unsigned long gChargerReportMillis = 0;    // when it went out
@@ -2383,15 +2383,15 @@ void loop() {
   //
   // The poll, the charger check and charger programming all talk to the charger, so a pass of
   // loop() reads for one of them only, and the poll comes first. A short poll interval with the
-  // long sleep of ECO or LOW_POWER makes every pass due to poll: then the pass after one that
-  // polled goes to a check that is under way, or to programming that has something due, and the
-  // poll waits for the next pass.
+  // long sleep of ECO or LOW_POWER makes every pass due to poll: then, after a poll, the next pass
+  // in which the line is free goes to a check that is under way, or to programming that has
+  // something due, and the poll waits for the pass after (see sunsaver::LineTurns).
   bool solarPolled = false;
   if (gSolarManager.isEnabled()) {
-    const bool othersTurn = gSolarPolledLastPass && (gSolarManager.chargerCheckActive() ||
-                                                     gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
-    solarPolled = !othersTurn && gSolarManager.poll(now);
-    gSolarPolledLastPass = solarPolled;
+    const bool othersWant =
+        gSolarManager.chargerCheckActive() || gSolarManager.chargerProgrammingWantsLine(currentEpoch());
+    solarPolled = !gSolarTurns.pollWaits(othersWant) && gSolarManager.poll(now);
+    gSolarTurns.afterPoll(solarPolled, gSolarManager.lineResting());
     if (solarPolled) {
       // A poll was attempted - check alerts using the refreshed communication state
       // (suppress alarm sending in CRITICAL to save power).

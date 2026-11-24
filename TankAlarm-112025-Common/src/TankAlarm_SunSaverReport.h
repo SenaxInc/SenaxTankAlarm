@@ -550,6 +550,7 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
 // The journal as the client keeps it in flash (sunsaver::Journal):
 //   req, ph, ctl   the last run that reached a commit point, its JournalPhase, and the Modbus id
 //                  of its controller (0: not known)
+//   fc             the Modbus function that run read its controller with (3 or 4; 0: not known)
 //   ans            the newest request the client has answered or taken on
 //   wait           the request that waits (left out when none does)
 //   rep            the result that has yet to go to the server (left out when there is none): the
@@ -564,6 +565,7 @@ inline void encodeJournal(const Journal &journal, JsonObject out) {
   out["req"] = journal.requestId;
   out["ph"] = journal.phase;
   out["ctl"] = journal.controller;
+  out["fc"] = journal.readFunction;
   out["ans"] = journal.answeredId;
   if (journal.waitingId != 0) {
     out["wait"] = journal.waitingId;
@@ -588,6 +590,8 @@ inline Journal decodeJournal(JsonObjectConst in) {
   journal.requestId = in["req"].as<uint32_t>();
   journal.phase = (uint8_t)in["ph"].as<uint32_t>();
   journal.controller = reportByte(in, "ctl", 247, 0);  // Modbus ids go from 1 to 247
+  const uint8_t function = reportByte(in, "fc", 4, 0);
+  journal.readFunction = function == 3 || function == 4 ? function : (uint8_t)0;
   journal.answeredId = in["ans"].is<uint32_t>() ? in["ans"].as<uint32_t>() : 0;
   journal.waitingId = in["wait"].is<uint32_t>() ? in["wait"].as<uint32_t>() : 0;
   JsonObjectConst report = in["rep"].as<JsonObjectConst>();
