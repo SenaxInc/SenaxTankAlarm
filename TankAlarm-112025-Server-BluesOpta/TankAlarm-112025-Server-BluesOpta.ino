@@ -12817,10 +12817,10 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
     return;
   }
   // The client's own time of the check orders the reports: one can arrive late (the client
-  // keeps notes in flash while it cannot reach its Notecard), and then an older one must not
-  // replace a newer one. A report without a time, or with one that is plainly wrong, keeps 0
-  // for "not known" and replaces only another such report (see reportCheckTime()). A client of
-  // this firmware sends no report without a time: it waits for its clock.
+  // keeps it while it cannot reach its Notecard, and the Notecard until it syncs), and then an
+  // older one must not replace a newer one. A report without a time, or with one that is plainly
+  // wrong, keeps 0 for "not known" and replaces only another such report (see reportCheckTime()).
+  // A client of this firmware sends no report without a time: it waits for its clock.
   const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
   if (!sunsaver::reportReplaces(meta->chargerReportValid, meta->chargerReportEpoch, checkedAt)) {
     Serial.print(F("Charger check from "));
