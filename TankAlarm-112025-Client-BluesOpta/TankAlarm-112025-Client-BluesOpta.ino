@@ -7660,15 +7660,21 @@ static void sendDueChargerReport(unsigned long now) {
 
 // The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
 // the last run came that reached the charger, and the result that has yet to go out. No file:
-// nothing was ever asked. A file that cannot be read: the charger may wait for a restart, and
-// gets a look (firmware without programming owes it nothing, see beginChargerProgramming()).
+// nothing was ever asked. A file that cannot be read, or no flash to read it from: the charger
+// may wait for a restart, and gets a look (firmware without programming owes it nothing, see
+// beginChargerProgramming()).
 static sunsaver::Journal loadChargerJournal() {
   const sunsaver::Journal none = sunsaver::emptyJournal();
 #if defined(POSIX_FILE_IO_AVAILABLE)
   if (!isStorageAvailable()) {
-    // Without flash nothing can be kept, and so no request is taken on.
-    Serial.println(F("Charger programming: no flash to keep its journal"));
-    return none;
+    // The journal may say that a run was cut short, and nothing can show otherwise. Without flash
+    // nothing can be kept either, so saveChargerJournal() fails and no request is taken on: the
+    // look writes nothing, and only sends the restart a pending edit waits for.
+#if TANKALARM_SUNSAVER_PROGRAMMING
+    Serial.println(F("Charger programming: no flash to read its journal from, so the charger gets a look"));
+    addSerialLog("Charger programming: no flash at start, so the charger gets a look");
+#endif
+    return sunsaver::cautiousJournal();
   }
   errno = 0;
   FILE *file = fopen(CHARGER_JOURNAL_FILE, "r");

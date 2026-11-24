@@ -50,16 +50,18 @@
  *     decides nothing: what the register reads afterwards does.
  *   No repeats. A register that does not take its value is written once more, and then the run
  *     stops. A whole run is never repeated by itself.
- *   The order. What a lithium battery must not get goes first (equalization, temperature
- *     compensation). The limits on the charge voltage (the HVD and the regulation ceiling) come
- *     next where they come down, and after the charge voltages and times of both banks where
- *     they go up, so that no limit is raised while a charge voltage it holds down has yet to
- *     come down. The load thresholds come last, the load current compensation (which pulls the
- *     LVD in effect down under load) before the LVD. Within a pair that has to stay in order
- *     (LVD and LVR, say) the register that keeps the pair in order is written first. So wherever
- *     a run stops, each charge voltage in effect is no higher than the higher of the one the run
- *     found and the one it was to write, and the LVD in effect is no lower than the lower of
- *     the two.
+ *   The order. Equalization goes off first. The limits on the charge voltage (the HVD and the
+ *     regulation ceiling) that come down follow, then the charge voltages of both banks that come
+ *     down, and the times. Temperature compensation goes off only then: on a warm battery it
+ *     holds a charge voltage below its setting, so switched off before a setting came down it
+ *     would let the battery charge to the old setting. The charge voltages that go up come after
+ *     it, since on a cold battery it would add to them, and the limits that go up last of all,
+ *     once every charge voltage holds its new value. The load thresholds come at the end, the
+ *     load current compensation (which pulls the LVD in effect down under load) before the LVD.
+ *     Within a pair that has to stay in order (LVD and LVR, say) the register that keeps the pair
+ *     in order is written first. So wherever a run stops, at any battery temperature, each charge
+ *     voltage in effect is no higher than the higher of the one the run found and the one it was
+ *     to write, and the LVD in effect is no lower than the lower of the two.
  *
  * What it does not do
  * -------------------
@@ -385,34 +387,69 @@ struct PlanStep {
 static const uint8_t PLAN_SINGLE = 0xFF;
 static const uint8_t PLAN_STEPS = 13;
 
-// Steps PLAN_LIMITS_FIRST to PLAN_LIMITS_LAST set the limits on the charge voltage: the HVD with
-// its HVR, and the regulation ceiling. A limit that goes up is written just before step
-// PLAN_RAISED_LIMITS_AT instead, after the charge voltages and times of both banks (buildPlan()).
-static const uint8_t PLAN_LIMITS_FIRST = 3;
-static const uint8_t PLAN_LIMITS_LAST = 4;
-static const uint8_t PLAN_RAISED_LIMITS_AT = 11;
-
 // Both custom banks get the same settings: the battery jumper picks the bank, and it cannot be
 // read over Modbus. The regulation ceiling (Evb_ref_lim) is set to the HVD, so that a ceiling
-// somebody stored below the new absorption voltage cannot hold the charger under it.
+// somebody stored below the new absorption voltage cannot hold the charger under it. The steps
+// are in the order of writing of a run in which nothing goes up; the phases decide (planPhase()).
 inline const PlanStep &planStep(uint8_t index) {
   static const PlanStep kSteps[PLAN_STEPS] = {
-      {I_EV_EQ, PLAN_SINGLE},       {I_EV_EQ2, PLAN_SINGLE},    {I_EV_TEMPCOMP, PLAN_SINGLE},
+      {I_EV_EQ, PLAN_SINGLE},       {I_EV_EQ2, PLAN_SINGLE},
       {I_EV_HVR, I_EV_HVD},         {I_EVB_REF_LIM, PLAN_SINGLE},
       {I_EV_FLOAT, I_EV_REG},       {I_ET_FLOAT, PLAN_SINGLE},  {I_ET_FLOATLB, PLAN_SINGLE},
       {I_EV_FLOAT2, I_EV_REG2},     {I_ET_FLOAT2, PLAN_SINGLE}, {I_ET_FLOATLB2, PLAN_SINGLE},
-      {I_ER_ICOMP, PLAN_SINGLE},    {I_EV_LVD, I_EV_LVR}};
+      {I_EV_TEMPCOMP, PLAN_SINGLE}, {I_ER_ICOMP, PLAN_SINGLE},  {I_EV_LVD, I_EV_LVR}};
   return kSteps[index < PLAN_STEPS ? index : 0];
 }
+
+// The phases of a plan, in the order of writing. The charge voltage in effect is the lowest of
+// the setting plus the temperature compensation, the HVD plus the same, and the ceiling, which
+// is not compensated. The compensation is above 0 on a battery colder than 25 C and below 0 on
+// a warmer one, and every run switches it off. So before it goes off only what comes down is
+// written, and after it what goes up: each charge voltage in effect stays no higher than the one
+// the run found until compensation goes off, and no higher than the one it is to leave from then
+// on, at any temperature.
+enum PlanPhase : uint8_t {
+  PHASE_EQUALIZE = 0,  // equalization off, which takes a stage away
+  PHASE_LIMITS_DOWN,   // the HVD (with its HVR) and the ceiling, where they come down or stay
+  PHASE_BANKS,         // the charge voltages of both banks that come down or stay, and the times
+  PHASE_TEMPCOMP,      // temperature compensation off
+  PHASE_VOLTS_UP,      // the charge voltages that go up
+  PHASE_LIMITS_UP,     // the HVD and the ceiling, where they go up
+  PHASE_LOAD,          // the LVD's load current compensation, then the LVD and LVR
+  PLAN_PHASES
+};
 
 // A limit on the charge voltage as a level to compare: 0 is no limit (the HVD off, no ceiling),
 // above every word.
 inline uint32_t limitLevel(uint16_t word) { return word == 0 ? 0x10000ul : (uint32_t)word; }
 
-// True for a step of limits whose limit goes up: the HVD of the pair, or the ceiling.
-inline bool limitRaised(const PlanStep &step, const Snapshot &before, const Profile &profile, uint8_t scale) {
-  const uint8_t limit = step.second != PLAN_SINGLE ? step.second : step.first;
-  return limitLevel(targetWord(limit, profile, scale)) > limitLevel(before.raw[limit]);
+// The phase of a register of the plan. The HVD decides for its HVR, so the two stay a pair.
+inline uint8_t planPhase(uint8_t index, const Snapshot &before, const Profile &profile, uint8_t scale) {
+  switch (index) {
+    case I_EV_EQ:
+    case I_EV_EQ2:
+      return PHASE_EQUALIZE;
+    case I_EV_HVR:
+    case I_EV_HVD:
+    case I_EVB_REF_LIM: {
+      const uint8_t limit = index == I_EV_HVR ? (uint8_t)I_EV_HVD : index;
+      return limitLevel(targetWord(limit, profile, scale)) > limitLevel(before.raw[limit]) ? (uint8_t)PHASE_LIMITS_UP
+                                                                                          : (uint8_t)PHASE_LIMITS_DOWN;
+    }
+    case I_EV_REG:
+    case I_EV_FLOAT:
+    case I_EV_REG2:
+    case I_EV_FLOAT2:
+      return targetWord(index, profile, scale) > before.raw[index] ? (uint8_t)PHASE_VOLTS_UP : (uint8_t)PHASE_BANKS;
+    case I_EV_TEMPCOMP:
+      return PHASE_TEMPCOMP;
+    case I_ER_ICOMP:
+    case I_EV_LVD:
+    case I_EV_LVR:
+      return PHASE_LOAD;
+    default:
+      return PHASE_BANKS;  // the times
+  }
 }
 
 // True for a register the plan writes.
@@ -428,57 +465,48 @@ inline bool inPlan(uint8_t index) {
   return false;
 }
 
-// Adds the registers of one step to the plan, in the order of writing.
-inline void addPlanStep(const PlanStep &step, const Snapshot &before, const Profile &profile, uint8_t scale,
-                        PlanEntry *entries, uint8_t *count, uint8_t *toWrite) {
-  uint8_t order[2] = {step.first, step.second};
-  uint8_t items = 1;
-  if (step.second != PLAN_SINGLE) {
-    items = 2;
-    // The upper register goes first when its new word is above the word the lower one holds
-    // now: the pair is then in order after either write. Otherwise the lower one goes first.
-    // Its new word is below the new upper one, which is then no higher than the old lower
-    // one, which was below the old upper one.
-    if (targetWord(step.second, profile, scale) > before.raw[step.first]) {
-      order[0] = step.second;
-      order[1] = step.first;
-    }
-  }
-  for (uint8_t i = 0; i < items; ++i) {
-    PlanEntry &entry = entries[(*count)++];
-    entry.item = order[i];
-    entry.before = before.raw[order[i]];
-    entry.target = targetWord(order[i], profile, scale);
-    entry.found = entry.before;
-    entry.status = entry.before == entry.target ? (uint8_t)ENTRY_UNCHANGED : (uint8_t)ENTRY_PENDING;
-    if (entry.status == ENTRY_PENDING) {
-      ++*toWrite;
-    }
+// Adds one register to the plan.
+inline void addPlanEntry(uint8_t index, const Snapshot &before, const Profile &profile, uint8_t scale,
+                         PlanEntry *entries, uint8_t *count, uint8_t *toWrite) {
+  PlanEntry &entry = entries[(*count)++];
+  entry.item = index;
+  entry.before = before.raw[index];
+  entry.target = targetWord(index, profile, scale);
+  entry.found = entry.before;
+  entry.status = entry.before == entry.target ? (uint8_t)ENTRY_UNCHANGED : (uint8_t)ENTRY_PENDING;
+  if (entry.status == ENTRY_PENDING) {
+    ++*toWrite;
   }
 }
 
 // Fills entries[PLAN_ENTRIES] in the order of writing and returns how many of them have to be
 // written. `before` must hold every register of the plan.
 //
-// A limit on the charge voltage that comes down (or stays) is written in its place, before the
-// charge voltages; one that goes up only after the charge voltages and times of both banks. A run
-// that stops in between then leaves each bank's charge voltage held down by the lower of a
-// limit's two values: it charges no higher than it did before, until its own voltages are
-// written, and after that no higher than the run is to leave it.
+// Phase by phase, and within a phase in the order of the steps. When both registers of a pair
+// are in one phase, the upper one goes first when its new word is above the word the lower one
+// holds now: the pair is then in order after either write. Otherwise the lower one goes first.
+// Its new word is below the new upper one, which is then no higher than the old lower one, which
+// was below the old upper one. When a pair's charge voltages are in two phases, the one that
+// comes down goes first, and the pair is in order after either write as well.
 inline uint8_t buildPlan(const Snapshot &before, const Profile &profile, uint8_t scale, PlanEntry *entries) {
   uint8_t count = 0;
   uint8_t toWrite = 0;
-  for (uint8_t s = 0; s < PLAN_STEPS; ++s) {
-    if (s == PLAN_RAISED_LIMITS_AT) {
-      for (uint8_t l = PLAN_LIMITS_FIRST; l <= PLAN_LIMITS_LAST; ++l) {
-        if (limitRaised(planStep(l), before, profile, scale)) {
-          addPlanStep(planStep(l), before, profile, scale, entries, &count, &toWrite);
-        }
+  for (uint8_t phase = 0; phase < PLAN_PHASES; ++phase) {
+    for (uint8_t s = 0; s < PLAN_STEPS; ++s) {
+      const PlanStep &step = planStep(s);
+      const bool first = planPhase(step.first, before, profile, scale) == phase;
+      const bool second = step.second != PLAN_SINGLE && planPhase(step.second, before, profile, scale) == phase;
+      if (first && second && targetWord(step.second, profile, scale) > before.raw[step.first]) {
+        addPlanEntry(step.second, before, profile, scale, entries, &count, &toWrite);
+        addPlanEntry(step.first, before, profile, scale, entries, &count, &toWrite);
+        continue;
       }
-    }
-    const bool limit = s >= PLAN_LIMITS_FIRST && s <= PLAN_LIMITS_LAST;
-    if (!limit || !limitRaised(planStep(s), before, profile, scale)) {
-      addPlanStep(planStep(s), before, profile, scale, entries, &count, &toWrite);
+      if (first) {
+        addPlanEntry(step.first, before, profile, scale, entries, &count, &toWrite);
+      }
+      if (second) {
+        addPlanEntry(step.second, before, profile, scale, entries, &count, &toWrite);
+      }
     }
   }
   return toWrite;
