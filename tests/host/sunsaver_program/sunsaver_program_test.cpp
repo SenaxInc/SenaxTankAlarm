@@ -1526,6 +1526,16 @@ static void testRefusals() {
       CHECK_EQ(result.refusals & ss::REFUSE_BATTERY_LOW, 0);  // one reason for one thing
       checkNothingSent(station, fresh);
     }
+    // A battery voltage that fits a 12 V system with one scale and a 24 V system with the other:
+    // raw 5627 is 16.60 V with x96.667 and 17.17 V with x100. It does not show a 12 V system.
+    Station between;
+    between.sim.regs[0x0008] = 5627;
+    const ss::ProgramResult &result = between.run();
+    CHECK_EQ(result.outcome, ss::OUTCOME_REFUSED);
+    CHECK((result.refusals & ss::REFUSE_NOT_12V) != 0);
+    checkNothingSent(between, fresh);
+    const std::string text = textFrom([&](ss::Text *t) { ss::describeRefusal(ss::REFUSE_NOT_12V, result, t); });
+    CHECK_HAS(text, "does not show a 12 V system");
   }
 
   // The controller reports a fault. The pending edit alone is none (see testPendingBefore).

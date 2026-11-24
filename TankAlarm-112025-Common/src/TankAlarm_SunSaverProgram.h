@@ -573,7 +573,7 @@ inline bool outcomeIsGood(uint8_t outcome) { return outcome == OUTCOME_PROGRAMME
 enum Refusal : uint32_t {
   REFUSE_PROFILE = 1ul << 0,         // the values are outside the limits (see the ProfileError bits)
   REFUSE_SCALE_UNPROVEN = 1ul << 1,  // how the controller encodes stored voltages could not be proven
-  REFUSE_NOT_12V = 1ul << 2,         // not a 12 V system
+  REFUSE_NOT_12V = 1ul << 2,         // the battery voltage does not show a 12 V system (systemVolts())
   REFUSE_NOT_READ = 1ul << 3,        // a register the run needs gave no value
   REFUSE_FAULT = 1ul << 4,           // the controller reports a fault
   REFUSE_BATTERY_LOW = 1ul << 5,     // the battery is below the new LVR
@@ -595,7 +595,7 @@ inline const char *refusalText(uint32_t refusal) {
     case REFUSE_SCALE_UNPROVEN:
       return "How this charger encodes its stored voltages could not be proven from its setpoints, so no "
              "voltage can be written safely.";
-    case REFUSE_NOT_12V: return "This is not a 12 V system. Only 12 V systems are programmed.";
+    case REFUSE_NOT_12V: return "The battery voltage does not show a 12 V system. Only 12 V systems are programmed.";
     case REFUSE_NOT_READ: return "A register that programming needs did not answer.";
     case REFUSE_FAULT: return "The charger reports a fault. Clear it first.";
     case REFUSE_BATTERY_LOW:
