@@ -269,9 +269,15 @@ to the voltage. The server looks it up from the National Weather Service
   traffic no longer holds it up). Each request is logged (source `weather`) with its
   result and duration. Failed requests back off (5 minutes doubling to 6 hours). Up to 90 samples per client (about 14 KB of RAM for 20 clients; the file is
   at most about 33 KB).
-- **API.** `/api/history` returns `temperature: [{client, stations, points: [[epoch, °F], ...]}]`
-  and lists each client's VIN reading once (not once per sensor). `/api/location` also
-  returns `weatherStations`.
+- **API.** `/api/history` returns `temperature: [{client, status, stations, points: [[epoch, °F], ...]}]`
+  for every client; `status` is `ok` (stations known), `finding`, `noLocation` or
+  `uncovered`, so the page can say why a client has no temperature. It lists each
+  client's VIN reading once (not once per sensor). `/api/location` also returns
+  `weatherStations`.
+- **Retries.** When the second request of a step (the station list, or the second
+  station) gets no answer, that step is kept and asked again after the network backoff.
+  A location request counts toward the once-a-day limit only when it was sent; a failed
+  send is retried after 10 minutes, doubling.
 - **Not used for calibration** yet (S-D05): calibration still records no temperature.
 
 ### Archived Clients Manifest
@@ -356,7 +362,9 @@ For Arduino Opta with SD card shield:
 - Color-coded by status
 
 ### 5. VIN Voltage Trends (Line Chart)
-- Battery/power supply voltage over time, one client at a time (site picker)
+- Battery/power supply voltage over time, one client at a time (site picker; clients that
+  share a site name are told apart by the end of their device ID, and the note under the
+  chart names the client)
 - Optional outdoor temperature on a second axis ("Show outdoor temperature"; see
   Outdoor Temperature above)
 - Early warning for power issues

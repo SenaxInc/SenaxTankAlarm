@@ -393,7 +393,7 @@
 #endif
 
 // A request starts only at a quiet moment: within NWS_QUIET_AFTER_POLL_MS of a Notecard
-// poll (incoming alarms were just handled) and with no web connection for
+// poll finishing (incoming alarms were just handled) and with no web connection for
 // NWS_QUIET_WEB_MS. Temperatures can wait (NWS keeps 7 days), but once a request has
 // waited NWS_QUIET_MAX_WAIT_MS, web traffic no longer holds it up.
 #ifndef NWS_QUIET_AFTER_POLL_MS
@@ -1212,7 +1212,8 @@ static double gNextDailyEmailEpoch = 0.0;
 static double gNextViewerSummaryEpoch = 0.0;
 static double gLastViewerSummaryEpoch = 0.0;
 
-static unsigned long gLastPollMillis = 0;
+static unsigned long gLastPollMillis = 0;      // when the last Notecard poll started (sets the 5 s cadence)
+static unsigned long gLastPollDoneMs = 0;      // when the last Notecard poll finished (0 = none yet)
 static unsigned long gLastWebRequestMs = 0;  // when the web server last accepted a connection (0 = none yet)
 static unsigned long gLastLinkCheckMillis = 0;
 static bool gLastLinkState = false;
@@ -2352,9 +2353,9 @@ funct)HTML" R"HTML(ion populateFilters(){const siteSelect=document.getElementByI
 funct)HTML" R"HTML(ion getFilteredData(){const site=document.getElementById('siteFilter').value;const sensorIdx=document.getElementById('sensorFilter').value;const range=document.getElementById('rangeSelect').value;const now=Date.now()/1000;let cutoff=now-30*86400;let cutoffEnd=now;if(range==='24h')cutoff=now-86400;else if(range==='7d')cutoff=now-7*86400;else if(range==='90d')cutoff=now-90*86400;else if(range==='6mo')cutoff=now-180*86400;else if(range==='1yr')cutoff=now-365*86400;else if(range==='2yr')cutoff=now-730*86400;else if(range==='custom'){const sd=document.getElementById('startDate').value;const ed=document.getElementById('endDate').value;if(sd)cutoff=new Date(sd).getTime()/1000;if(ed)cutoffEnd=new Date(ed+'T23:59:59').getTime()/1000;}let sensors=historicalData.sensors;if(site!=='all')sensors=sensors.filter(t=>t.site===site);if(sensorIdx!=='all')sensors=[historicalData.sensors[parseInt(sensorIdx)]];return{sensors,cutoff,cutoffEnd};}
 funct)HTML" R"HTML(ion renderLevelChart(){const ctx=document.getElementById('levelChart').getContext('2d');const{sensors,cutoff,cutoffEnd}=getFilteredData();if(levelChart)levelChart.destroy();const datasets=sensors.slice(0,8).map((tank,i)=>{const data=tank.readings.filter(r=>r.timestamp>=cutoff&&r.timestamp<=cutoffEnd).map(r=>({x:new Date(r.timestamp*1000),y:r.level}));return{label:`${tank.site} - ${tank.label}`,data,borderColor:CHART_COLORS[i%CHART_COLORS.length],backgroundColor:CHART_COLORS[i%CHART_COLORS.length]+'20',fill:false,tension:0.3,pointRadius:0};});levelChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'index'},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a',displayFormats:{hour:'MMM d, HH:mm',day:'MMM d'}},grid:{color:'var(--chart-grid)'}},y:{title:{display:true,text:'Level (inches)'},grid:{color:'var(--chart-grid)'}}},plugins:{legend:{position:'bottom'}}}});}
 funct)HTML" R"HTML(ion renderAlarmChart(){const ctx=document.getElementById('alarmChart').getContext('2d');if(alarmChart)alarmChart.destroy();const sites=Object.keys(historicalData.sites);const highCounts=sites.map(s=>historicalData.alarms.filter(a=>a.site===s&&a.type==='HIGH').length);const lowCounts=sites.map(s=>historicalData.alarms.filter(a=>a.site===s&&a.type==='LOW').length);alarmChart=new Chart(ctx,{type:'bar',data:{labels:sites,datasets:[{label:'High Alarms',data:highCounts,backgroundColor:'#ef4444'},{label:'Low Alarms',data:lowCounts,backgroundColor:'#f59e0b'}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,title:{display:true,text:'Alarm Count'}}},plugins:{legend:{position:'bottom'}}}});}
-funct)HTML" R"HTML(ion voltageClientList(){const names={};(historicalData.sensors||[]).forEach(s=>{if(s.client&&!names[s.client])names[s.client]=s.site||s.client;});const seen={};const ids=[];(historicalData.voltage||[]).concat(historicalData.temperature||[]).forEach(v=>{if(v.client&&!seen[v.client]){seen[v.client]=1;ids.push(v.client);}});return ids.map(id=>({id,name:names[id]||id})).sort((a,b)=>a.name.localeCompare(b.name));}
-funct)HTML" R"HTML(ion populateVoltageClients(){const sel=document.getElementById('voltageClient');const prev=sel.value;const list=voltageClientList();sel.innerHTML='';list.forEach(c=>{const opt=document.createElement('option');opt.value=c.id;opt.textContent=c.name;sel.appendChild(opt);});if(list.some(c=>c.id===prev))sel.value=prev;sel.style.display=list.length>1?'':'none';}
-funct)HTML" R"HTML(ion renderVoltageChart(){const ctx=document.getElementById('voltageChart').getContext('2d');if(voltageChart)voltageChart.destroy();voltageChart=null;const{cutoff,cutoffEnd}=getFilteredData();const client=document.getElementById('voltageClient').value;const inRange=t=>t>=cutoff&&t<=cutoffEnd;const data=(historicalData.voltage||[]).filter(v=>v.client===client&&inRange(v.timestamp)).sort((a,b)=>a.timestamp-b.timestamp).map(v=>({x:new Date(v.timestamp*1000),y:v.voltage}));const wx=(historicalData.temperature||[]).find(t=>t.client===client);const tdata=wx?(wx.points||[]).filter(p=>inRange(p[0])).sort((a,b)=>a[0]-b[0]).map(p=>({x:new Date(p[0]*1000),y:p[1]})):[];const cb=document.getElementById('showTemp');cb.disabled=!tdata.length;const showT=cb.checked&&tdata.length>0;const st=wx&&wx.stations&&wx.stations.length?wx.stations.join(' / '):'';document.getElementById('tempNote').textContent=tdata.length?('Outdoor air temperature from the nearest National Weather Service station'+(st?' ('+st+')':'')+', observed within an hour of each reading.'):(wx?'No outdoor temperature in this range.':'No outdoor temperature recorded for this site yet. The server looks it up from the National Weather Service for new readings once it knows the site location.');if(!data.length&&!tdata.length)return;let yMin,yMax;if(data.length){const vals=data.map(d=>d.y);const vMin=Math.min(...vals);const vMax=Math.max(...vals);if(vMax<=6){yMin=0;yMax=6;}else if(vMax<=15){yMin=10;yMax=15;}else{yMin=Math.floor(vMin-1);yMax=Math.ceil(vMax+1);}}const nearest=(arr,x)=>{let best=null;arr.forEach(p=>{const d=Math.abs(p.x-x);if(d<=3600000&&(!best||d<best.d))best={d,y:p.y};});return best;};const datasets=[{label:'VIN Voltage',data,yAxisID:'y',borderColor:'#10b981',backgroundColor:'#10b98120',fill:true,tension:0.3,pointRadius:0}];if(showT)datasets.push({label:'Outdoor temperature',data:tdata,yAxisID:'y1',borderColor:'#f59e0b',backgroundColor:'#f59e0b',borderDash:[6,4],fill:false,tension:0.3,pointRadius:tdata.length<60?2:0});voltageChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',axis:'x',intersect:false},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{min:yMin,max:yMax,title:{display:true,text:'Voltage (V)'},grid:{color:'var(--chart-grid)'}},y1:{display:showT,position:'right',title:{display:true,text:'Outdoor temperature (°F)'},grid:{drawOnChartArea:false}}},plugins:{legend:{display:showT,position:'bottom'},tooltip:{callbacks:{label:c=>{if(c.dataset.yAxisID==='y1'){const v=nearest(data,c.parsed.x);return ' Outdoor '+c.parsed.y.toFixed(1)+' °F'+(v?', VIN '+v.y.toFixed(2)+' V':'');}const t=showT?nearest(tdata,c.parsed.x):null;return ' VIN '+c.parsed.y.toFixed(2)+' V'+(t?', outdoor '+t.y.toFixed(1)+' °F':'');}}}}}});}
+funct)HTML" R"HTML(ion voltageClientList(){const names={};(historicalData.sensors||[]).forEach(s=>{if(s.client&&!names[s.client])names[s.client]=s.site||s.client;});const seen={};const ids=[];(historicalData.voltage||[]).concat((historicalData.temperature||[]).filter(t=>t.points&&t.points.length)).forEach(v=>{if(v.client&&!seen[v.client]){seen[v.client]=1;ids.push(v.client);}});const list=ids.map(id=>({id,name:names[id]||id}));const count={};list.forEach(c=>{count[c.name]=(count[c.name]||0)+1;});list.forEach(c=>{if(count[c.name]>1&&c.name!==c.id)c.name+=' (…'+c.id.slice(-6)+')';});return list.sort((a,b)=>a.name.localeCompare(b.name));}
+funct)HTML" R"HTML(ion populateVoltageClients(){const sel=document.getElementById('voltageClient');const prev=sel.value;const list=voltageClientList();sel.innerHTML='';list.forEach(c=>{const opt=document.createElement('option');opt.value=c.id;opt.textContent=c.name;opt.title=c.id;sel.appendChild(opt);});if(list.some(c=>c.id===prev))sel.value=prev;sel.style.display=list.length>1?'':'none';}
+funct)HTML" R"HTML(ion renderVoltageChart(){const ctx=document.getElementById('voltageChart').getContext('2d');if(voltageChart)voltageChart.destroy();voltageChart=null;const{cutoff,cutoffEnd}=getFilteredData();const client=document.getElementById('voltageClient').value;const inRange=t=>t>=cutoff&&t<=cutoffEnd;const data=(historicalData.voltage||[]).filter(v=>v.client===client&&inRange(v.timestamp)).sort((a,b)=>a.timestamp-b.timestamp).map(v=>({x:new Date(v.timestamp*1000),y:v.voltage}));const wx=(historicalData.temperature||[]).find(t=>t.client===client);const tdata=wx?(wx.points||[]).filter(p=>inRange(p[0])).sort((a,b)=>a[0]-b[0]).map(p=>({x:new Date(p[0]*1000),y:p[1]})):[];const cb=document.getElementById('showTemp');cb.disabled=!tdata.length;const showT=cb.checked&&tdata.length>0;const st=wx&&wx.stations&&wx.stations.length?wx.stations.join(' / '):'';const wxStatus=wx?wx.status:'';let note;if(tdata.length)note='Outdoor air temperature from the nearest National Weather Service station'+(st?' ('+st+')':'')+', observed within an hour of each reading.';else if(wxStatus==='uncovered')note='No outdoor temperature: the National Weather Service does not cover this client’s location (outside the US?).';else if(wxStatus==='noLocation')note='No outdoor temperature yet: the server is waiting for this client’s location from its Notecard.';else if(wx&&wx.points&&wx.points.length)note='No outdoor temperature in this range.';else if(st)note='No outdoor temperature yet. New readings are matched to National Weather Service station '+st+'.';else if(wx)note='No outdoor temperature yet: the server is finding the nearest National Weather Service station.';else note='No outdoor temperature recorded for this client yet.';if(client)note+=' Client '+client+'.';document.getElementById('tempNote').textContent=note;if(!data.length&&!tdata.length)return;let yMin,yMax;if(data.length){const vals=data.map(d=>d.y);const vMin=Math.min(...vals);const vMax=Math.max(...vals);if(vMax<=6){yMin=0;yMax=6;}else if(vMax<=15){yMin=10;yMax=15;}else{yMin=Math.floor(vMin-1);yMax=Math.ceil(vMax+1);}}const nearest=(arr,x)=>{let best=null;arr.forEach(p=>{const d=Math.abs(p.x-x);if(d<=3600000&&(!best||d<best.d))best={d,y:p.y};});return best;};const datasets=[{label:'VIN Voltage',data,yAxisID:'y',borderColor:'#10b981',backgroundColor:'#10b98120',fill:true,tension:0.3,pointRadius:0}];if(showT)datasets.push({label:'Outdoor temperature',data:tdata,yAxisID:'y1',borderColor:'#f59e0b',backgroundColor:'#f59e0b',borderDash:[6,4],fill:false,tension:0.3,pointRadius:tdata.length<60?2:0});voltageChart=new Chart(ctx,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',axis:'x',intersect:false},scales:{x:{type:'time',time:{unit:'day',tooltipFormat:'MMM d, yyyy, h:mm a'},grid:{color:'var(--chart-grid)'}},y:{min:yMin,max:yMax,title:{display:true,text:'Voltage (V)'},grid:{color:'var(--chart-grid)'}},y1:{display:showT,position:'right',title:{display:true,text:'Outdoor temperature (°F)'},grid:{drawOnChartArea:false}}},plugins:{legend:{display:showT,position:'bottom'},tooltip:{callbacks:{label:c=>{if(c.dataset.yAxisID==='y1'){const v=nearest(data,c.parsed.x);return ' Outdoor '+c.parsed.y.toFixed(1)+' °F'+(v?', VIN '+v.y.toFixed(2)+' V':'');}const t=showT?nearest(tdata,c.parsed.x):null;return ' VIN '+c.parsed.y.toFixed(2)+' V'+(t?', outdoor '+t.y.toFixed(1)+' °F':'');}}}}}});}
 funct)HTML" R"HTML(ion createSparkline(container,data){const width=container.clientWidth||100;const height=40;const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;container.appendChild(canvas);const ctx=canvas.getContext('2d');if(!data||data.length<2)return;const values=data.map(d=>d.level);const min=Math.min(...values);const max=Math.max(...values);const range=max-min||1;ctx.strokeStyle='#2563eb';ctx.lineWidth=1.5;ctx.beginPath();data.forEach((d,i)=>{const x=i/(data.length-1)*width;const y=height-(d.level-min)/range*height;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke();}
 funct)HTML" R"HTML(ion renderSites(){const container=document.getElementById('sitesContainer');container.innerHTML='';Object.keys(historicalData.sites).sort().forEach(siteName=>{const sensors=historicalData.sites[siteName];const alarmCount=historicalData.alarms.filter(a=>a.site===siteName).length;const siteCard=document.createElement('div');siteCard.className='site-card';siteCard.innerHTML=`<div class="site-header" onclick="this.nextElementSibling.classList.toggle('expanded')"><h3>${escapeHtml(siteName)}</h3><div class="site-stats"><span>${sensors.length} Tank${sensors.length!==1?'s':''}</span>${alarmCount>0?`<span class="alarm-badge">${alarmCount} Alarms</span>`:''}</div></div><div class="site-content"><div class="sensor-grid"></div></div>`;const grid=siteCard.querySelector('.sensor-grid');sensors.forEach(tank=>{const change=tank.change24h||0;const changeClass=change>=0?'positive':'negative';const changeSign=change>=0?'+':'';const tankCard=document.createElement('div');tankCard.className='sensor-card';tankCard.innerHTML=`<div class="tank-header"><div><div class="tank-name">${escapeHtml(tank.label)}</div><div class="sensor-level">${formatLevel(tank.currentLevel)}</div></div><div class="tank-change ${changeClass}">${changeSign}${change.toFixed(1)}" 24h</div></div><div class="sparkline"></div><div class="tank-footer"><span>Updated: ${formatEpoch(tank.readings[tank.readings.length-1]?.timestamp)}</span></div>`;grid.appendChild(tankCard);const sparklineEl=tankCard.querySelector('.sparkline');const last24h=tank.readings.slice(-24);setTimeout(()=>createSparkline(sparklineEl,last24h),0);});container.appendChild(siteCard);});}
 async funct)HTML" R"HTML(ion loadHistoricalData(){const sensorIdx=document.getElementById('sensorFilter').value;const range=document.getElementById('rangeSelect').value;let apiDays=90;if(sensorIdx!=='all'){apiDays=0;}else{const rangeDays={'24h':7,'7d':7,'30d':30,'90d':90,'6mo':180,'1yr':365,'2yr':730};apiDays=rangeDays[range]||90;}const url=apiDays>0?'/api/history?days='+apiDays:'/api/history';try{const res=await fetch(url);if(!res.ok)throw new Error('Failed to load historical data');const data=await res.json();if(data.sensors&&data.sensors.length>0){historicalData=data;historicalData.sites={};historicalData.sensors.forEach(s=>{const site=s.site||'Unknown Site';(historicalData.sites[site]=historicalData.sites[site]||[]).push(s);});if(!historicalData.alarms)historicalData.alarms=[];if(!historicalData.voltage)historicalData.voltage=[];if(!historicalData.temperature)historicalData.temperature=[];}else{initEmptyData();}if(data.dataInfo){const banner=document.getElementById('dataSourceBanner');if(banner){let msg='Data: RAM ('+data.settings.hotTierDays+'d)';if(data.dataInfo.warmTierAvailable)msg+=' + Flash ('+data.settings.warmTierMonths+'mo)';if(data.dataInfo.coldTierAvailable){msg+=' + FTP Archive'+(data.settings&&data.settings.lastFtpSync>0?'':' (first sync pending)');}else if(data.dataInfo.ftpConfigured){msg+=' | FTP connected but history archive is OFF (enable in Server Settings)';}else{msg+=' | Enable FTP for full archive';}if(data.dataInfo.rangeNote)msg+=' — '+data.dataInfo.rangeNote;banner.textContent=msg;banner.style.display='';banner.style.background=data.dataInfo.coldTierAvailable?'#d1fae5':'#fef3c7';banner.style.color=data.dataInfo.coldTierAvailable?'#065f46':'#92400e';}}updateStats();populateFilters();renderLevelChart();renderAlarmChart();populateVoltageClients();renderVoltageChart();renderSites();}catch(err){console.warn('No historical data available:',err.message);initEmptyData();updateStats();populateFilters();renderLevelChart();renderAlarmChart();populateVoltageClients();renderVoltageChart();renderSites();}}
@@ -4833,6 +4834,8 @@ void loop() {
     gLastPollMillis = now;
     if (!gPaused) {
       pollNotecard();
+      gLastPollDoneMs = millis();
+      if (gLastPollDoneMs == 0) gLastPollDoneMs = 1;
     }
   }
 
@@ -6854,16 +6857,18 @@ static double gNwsNetRetryAfter = 0.0;  // after a network failure nobody is ask
 
 // The second request of a two-request step, made on a later call so that a call makes
 // at most one request: the station list that /points pointed to, or the next station's
-// observations when the nearest one had none for the reading.
+// observations when the nearest one had none for the reading. A step that got no answer
+// stays pending and is asked again after the network backoff.
 enum NwsNextKind : uint8_t { NWS_NEXT_NONE = 0, NWS_NEXT_STATION_LIST, NWS_NEXT_STATION_OBS };
-static struct {
+struct NwsNextStep {
   uint8_t kind;
   char uid[NWS_UID_MAX];
   char path[NWS_PATH_MAX];  // NWS_NEXT_STATION_LIST: the list path /points gave
   float lat, lon;           // NWS_NEXT_STATION_LIST: the location /points was asked for
   double target;            // NWS_NEXT_STATION_OBS: the reading time
   uint8_t station;          // NWS_NEXT_STATION_OBS: the station to ask
-} gNwsNext;
+};
+static NwsNextStep gNwsNext;
 
 // api.weather.gov did not answer at all: wait for everyone, 5 min doubling to 6 h
 static void nwsNoteNetworkFailure(double now, const char *what) {
@@ -6942,17 +6947,18 @@ static void nwsRequestPoints(const ClientMetadata &meta, NwsClientTemp &wx, doub
   gNwsNext.lon = meta.longitude;
 }
 
-// Finding the stations, request 2: the two nearest stations in the list /points gave
-static void nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat, float lon, double now) {
+// Finding the stations, request 2: the two nearest stations in the list /points gave.
+// Returns the request's status (NWS_GET_NETWORK: no answer).
+static int nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat, float lon, double now) {
   JsonDocument filter;
   JsonDocument doc;
   DeserializationError err;
   nwsStationsFilter(filter);
   const int status = nwsHttpsGetJson(path, filter, doc, err);
-  if (status == NWS_GET_THROTTLED) return;
+  if (status == NWS_GET_THROTTLED) return status;
   if (status == NWS_GET_NETWORK) {
     nwsNoteNetworkFailure(now, "Station list");
-    return;
+    return status;
   }
   gNwsNetFailStreak = 0;
   char ids[NWS_STATIONS][NWS_STATION_ID_MAX];
@@ -6961,7 +6967,7 @@ static void nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat
                         : 0;
   if (n == 0) {
     nwsNoteClientFailure(wx, now, "Station list", status);
-    return;
+    return status;
   }
   nwsSetStations(wx, ids, n, lat, lon, now);
   wx.uncovered = false;
@@ -6969,29 +6975,31 @@ static void nwsRequestStationList(NwsClientTemp &wx, const char *path, float lat
   gNwsTempDirty = true;
   nwsLog("info", "%.32s: nearest NWS station %s%s%s", wx.uid, wx.stations[0], n > 1 ? ", then " : "",
          n > 1 ? wx.stations[1] : "");
+  return status;
 }
 
 // One station's observations around reading time target. When none matches and
-// another station is known, that one is asked on the next call.
-static void nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t station, double now) {
-  if (station >= nwsStationCount(wx)) return;  // the stations changed since: planned again
+// another station is known, that one is asked on the next call. Returns the request's
+// status (NWS_GET_NETWORK: no answer; 0: no request was made).
+static int nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t station, double now) {
+  if (station >= nwsStationCount(wx)) return 0;  // the stations changed since: planned again
   const double start = target - NWS_OBS_MATCH_SEC;
   double end = target + NWS_OBS_MATCH_SEC;
   if (end > now) end = now;
   char path[NWS_PATH_MAX];
   if (!nwsObservationsPath(path, sizeof(path), wx.stations[station], start, end)) {
     nwsNoteClientFailure(wx, now, "Observation request", 0);
-    return;
+    return 0;
   }
   JsonDocument filter;
   JsonDocument doc;
   DeserializationError err;
   nwsObservationsFilter(filter);
   const int status = nwsHttpsGetJson(path, filter, doc, err);
-  if (status == NWS_GET_THROTTLED) return;
+  if (status == NWS_GET_THROTTLED) return status;
   if (status == NWS_GET_NETWORK) {
     nwsNoteNetworkFailure(now, "Observation request");
-    return;
+    return status;
   }
   gNwsNetFailStreak = 0;
   if (status == 404) {  // the station is gone: find the stations again
@@ -6999,11 +7007,11 @@ static void nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t sta
     nwsClearStations(wx);
     nwsNoteFailure(wx, now);
     gNwsTempDirty = true;
-    return;
+    return status;
   }
   if (status != 200 || err != DeserializationError::Ok) {
     nwsNoteClientFailure(wx, now, "Observation request", status);
-    return;
+    return status;
   }
   float tempF = 0.0f;
   double obsEpoch = 0.0;
@@ -7013,16 +7021,17 @@ static void nwsRequestObservations(NwsClientTemp &wx, double target, uint8_t sta
     if (first && wx.count > 0) {
       nwsLog("info", "%.32s: first outdoor temperature %.1f F from %s", wx.uid, (double)tempF, wx.stations[station]);
     }
-    return;
+    return status;
   }
   if (station + 1 < nwsStationCount(wx)) {
     gNwsNext.kind = NWS_NEXT_STATION_OBS;
     snprintf(gNwsNext.uid, sizeof(gNwsNext.uid), "%s", wx.uid);
     gNwsNext.target = target;
     gNwsNext.station = (uint8_t)(station + 1);
-    return;
+    return status;
   }
   if (nwsNoteNoMatch(wx, target, now)) gNwsTempDirty = true;
+  return status;
 }
 
 // At most one api.weather.gov request per call, and per NWS_SERVICE_INTERVAL_MS, and only
@@ -7043,7 +7052,7 @@ static void serviceOutdoorTemperature() {
   if (!(now >= NWS_MIN_VALID_EPOCH) || now < gNwsNetRetryAfter) return;
 
   if (dueSinceMs == 0) dueSinceMs = nowMs ? nowMs : 1;
-  const bool justPolled = gLastPollMillis != 0 && nowMs - gLastPollMillis <= NWS_QUIET_AFTER_POLL_MS;
+  const bool justPolled = gLastPollDoneMs != 0 && nowMs - gLastPollDoneMs <= NWS_QUIET_AFTER_POLL_MS;
   const bool webQuiet = gLastWebRequestMs == 0 || nowMs - gLastWebRequestMs >= NWS_QUIET_WEB_MS;
   const bool waitedLong = nowMs - dueSinceMs >= NWS_QUIET_MAX_WAIT_MS;
   if (!justPolled || (!webQuiet && !waitedLong)) return;
@@ -7051,14 +7060,17 @@ static void serviceOutdoorTemperature() {
   lastRunMs = nowMs;
 
   if (gNwsNext.kind != NWS_NEXT_NONE) {
-    const uint8_t kind = gNwsNext.kind;
-    gNwsNext.kind = NWS_NEXT_NONE;  // asked once; a failure is handled as for any request
-    NwsClientTemp *wx = findClientMetadata(gNwsNext.uid) ? nwsFindClient(gNwsTemp, gNwsNext.uid) : nullptr;
+    const NwsNextStep pending = gNwsNext;  // the request below may queue the step after it
+    gNwsNext.kind = NWS_NEXT_NONE;
+    NwsClientTemp *wx = findClientMetadata(pending.uid) ? nwsFindClient(gNwsTemp, pending.uid) : nullptr;
     if (wx) {
-      if (kind == NWS_NEXT_STATION_LIST) {
-        nwsRequestStationList(*wx, gNwsNext.path, gNwsNext.lat, gNwsNext.lon, now);
-      } else {
-        nwsRequestObservations(*wx, gNwsNext.target, gNwsNext.station, now);
+      const int status = (pending.kind == NWS_NEXT_STATION_LIST)
+                             ? nwsRequestStationList(*wx, pending.path, pending.lat, pending.lon, now)
+                             : nwsRequestObservations(*wx, pending.target, pending.station, now);
+      // No answer: keep the step for after the network backoff. Starting over would repeat
+      // the first request, whose answer resets that backoff.
+      if ((status == NWS_GET_NETWORK || status == NWS_GET_THROTTLED) && gNwsNext.kind == NWS_NEXT_NONE) {
+        gNwsNext = pending;
       }
       return;
     }
@@ -7073,11 +7085,20 @@ static void serviceOutdoorTemperature() {
     const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
     const NwsAction action = nwsPlan(*wx, hasLocation, meta.latitude, meta.longitude, target > 0.0, now);
     if (action == NWS_ACT_NONE) continue;
+    if (action == NWS_ACT_REQUEST_LOCATION && !gNotecardAvailable) continue;  // asked once the Notecard is back
     gNwsCursor = (uint8_t)((i + 1) % gClientMetadataCount);  // the next call starts after this client
     if (action == NWS_ACT_REQUEST_LOCATION) {
-      wx->lastLocationRequest = (uint32_t)now;
-      if (gNotecardAvailable && sendLocationRequest(meta.clientUid)) {
+      // The daily allowance is spent only by a request that was sent; a failed send
+      // backs off like a failed lookup (10 min, doubling)
+      if (sendLocationRequest(meta.clientUid)) {
+        wx->lastLocationRequest = (uint32_t)now;
         nwsLog("info", "Asked %.32s for its location (needed for outdoor temperature)", meta.clientUid);
+      } else {
+        nwsNoteFailure(*wx, now);
+        if (wx->failStreak == 1 || (wx->failStreak % 10) == 0) {
+          nwsLog("warn", "Could not send a location request to %.32s; retry in %u min", meta.clientUid,
+                 (unsigned)(nwsRetryDelay(wx->failStreak) / 60.0));
+        }
       }
     } else if (action == NWS_ACT_FIND_STATIONS) {
       nwsRequestPoints(meta, *wx, now);
@@ -17845,21 +17866,31 @@ static void sendHistoryJson(EthernetClient &client, const String &query) {
   }
 
   // Outdoor temperature per client (NWS observations matched to the client's readings,
-  // at the observation's own time). The VIN chart can draw it on a second axis.
+  // at the observation's own time). The VIN chart can draw it on a second axis. Every
+  // client is listed, with its lookup status, so the page can say why one has none:
+  // "uncovered" (NWS does not cover its location), "noLocation" (still waiting for it),
+  // "finding" (looking up its stations) or "ok" (stations known).
   JsonArray temperatureArray = doc["temperature"].to<JsonArray>();
-  for (uint8_t c = 0; c < gNwsTemp.count; c++) {
-    const NwsClientTemp &wx = gNwsTemp.clients[c];
-    if (wx.count == 0) continue;
+  for (uint8_t c = 0; c < gClientMetadataCount; c++) {
+    const ClientMetadata &meta = gClientMetadata[c];
+    if (meta.clientUid[0] == '\0') continue;
+    const NwsClientTemp *wx = nwsFindClient(gNwsTemp, meta.clientUid);
+    const bool hasLocation = (meta.latitude != 0.0f || meta.longitude != 0.0f);
     JsonObject tObj = temperatureArray.add<JsonObject>();
-    tObj["client"] = wx.uid;
+    tObj["client"] = meta.clientUid;
+    tObj["status"] = (wx && wx->uncovered)                     ? "uncovered"
+                     : !hasLocation                            ? "noLocation"
+                     : (wx && nwsStationCount(*wx) > 0)        ? "ok"
+                                                               : "finding";
     JsonArray st = tObj["stations"].to<JsonArray>();
-    for (uint8_t k = 0; k < nwsStationCount(wx); k++) st.add(wx.stations[k]);
     JsonArray pts = tObj["points"].to<JsonArray>();
-    for (uint16_t k = 0; k < wx.count; k++) {
-      if (cutoffEpoch > 0.0 && (double)wx.sampleEpoch[k] < cutoffEpoch) continue;
+    if (!wx) continue;
+    for (uint8_t k = 0; k < nwsStationCount(*wx); k++) st.add(wx->stations[k]);
+    for (uint16_t k = 0; k < wx->count; k++) {
+      if (cutoffEpoch > 0.0 && (double)wx->sampleEpoch[k] < cutoffEpoch) continue;
       JsonArray p = pts.add<JsonArray>();
-      p.add(wx.sampleEpoch[k]);
-      p.add(roundTo(wx.sampleTenthsF[k] / 10.0f, 1));
+      p.add(wx->sampleEpoch[k]);
+      p.add(roundTo(wx->sampleTenthsF[k] / 10.0f, 1));
     }
   }
   
