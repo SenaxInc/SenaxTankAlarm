@@ -109,8 +109,10 @@ enum FluidType : uint8_t;
   static mbed::MBRBlockDevice *mbedAppPart = nullptr;
   static MbedWatchdogHelper mbedWatchdog;
   static bool gStorageAvailable = false;
-  // This start formatted partition 4 while it held files that could not be mounted: they are
-  // gone (see initializeStorage() and loadChargerJournal()).
+  // This start found that partition 4 lost its files: it formatted the partition while it held
+  // files that could not be mounted, or mounted a file system that holds no file at all (a start
+  // that formatted it stopped before it wrote one). See initializeStorage() and
+  // keepChargerLookAfterLostFiles().
   static bool gStorageLostFiles = false;
   
   // POSIX-compatible file path prefix for Mbed OS VFS (app config store, partition 4).
@@ -1564,6 +1566,7 @@ static void finishChargerCheck(unsigned long now);
 static void sendDueChargerReport(unsigned long now);
 static sunsaver::Journal loadChargerJournal();
 static bool saveChargerJournal(const sunsaver::Journal &journal);
+static void keepChargerLookAfterLostFiles();
 static void handleChargerProgramRequest(JsonObjectConst program);
 static void withdrawUnsuitedChargerProgram();
 static bool serviceChargerProgramming(unsigned long now, bool allowed);
@@ -2802,6 +2805,32 @@ static bool appPartitionBlank(mbed::BlockDevice *part) {
   }
   return true;
 }
+
+// Whether the mounted file system on partition 4 holds no file at all. Every start writes the
+// config when it finds none (ensureConfigLoaded()), so such a file system was formatted at a start
+// that stopped before it wrote one. False when it cannot tell, which includes a listing that does
+// not show ".", as LittleFileSystem's always does: this is asked at every start, and a listing
+// that fails must not have every client look at its charger.
+static bool appFileSystemEmpty() {
+  DIR *dir = opendir(POSIX_FS_PREFIX "/");
+  if (dir == nullptr) {
+    return false;
+  }
+  bool self = false;
+  bool other = false;
+  errno = 0;
+  for (struct dirent *entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+    if (strcmp(entry->d_name, ".") == 0) {
+      self = true;
+    } else if (strcmp(entry->d_name, "..") != 0) {
+      other = true;
+      break;
+    }
+  }
+  const bool listed = errno == 0;  // readdir() sets it only for an error, not at the end
+  closedir(dir);
+  return listed && self && !other;
+}
 #endif
 
 static void initializeStorage() {
@@ -2837,6 +2866,7 @@ static void initializeStorage() {
 
     mbedFS = new LittleFileSystem("cfg");
     int err = mbedFS->mount(mbedAppPart);
+    bool formatted = false;
     if (err) {
       // Format ONLY partition 4 (never the whole device).
       Serial.println(F("Filesystem mount failed, formatting app partition (p4)..."));
@@ -2849,6 +2879,7 @@ static void initializeStorage() {
         mbedFS = nullptr;
         return;
       }
+      formatted = true;
       gStorageLostFiles = !blank;
       if (gStorageLostFiles) {
         Serial.println(F("The app partition held files that could not be read: they are lost"));
@@ -2858,6 +2889,14 @@ static void initializeStorage() {
     Serial.println(F("Mbed OS LittleFileSystem initialized (QSPI partition 4)"));
     // Recover from any interrupted atomic writes (power loss during rename)
     recoverOrphanedTmpFiles();
+    if (!formatted && appFileSystemEmpty()) {
+      // A start formatted it and stopped before it wrote a file: maybe over files, before the
+      // journal could go in. A new board stopped in that moment of its first start reads the same.
+      gStorageLostFiles = true;
+      Serial.println(F("The app partition holds no file: a start that formatted it stopped at once, so its files may be lost"));
+    }
+    // Before anything else writes to it.
+    keepChargerLookAfterLostFiles();
   #else
     // STM32duino LittleFS
     if (!LittleFS.begin()) {
@@ -7700,11 +7739,31 @@ static void sendDueChargerReport(unsigned long now) {
 // PC against a simulated SunSaver; SolarManager talks to the controller. This sketch reads the
 // request, keeps the journal in flash and sends the results to the server.
 
+// A start whose flash lost its files (initializeStorage(), before anything else writes to it):
+// the journal went with them, and may have said that a run was cut short. The format leaves
+// nothing that says so, and Supervisor::begin() keeps the cautious journal only in memory while
+// the look waits for the charger, so it goes into the new file system now: a restart before the
+// look still owes it. Flash that cannot take it is not used at this start, so that it stays empty
+// and the next start reads it the same way.
+static void keepChargerLookAfterLostFiles() {
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  if (!gStorageLostFiles || !isStorageAvailable()) {
+    return;
+  }
+  if (saveChargerJournal(sunsaver::cautiousJournal())) {
+    return;
+  }
+  gStorageAvailable = false;
+  Serial.println(F("The charger journal could not be written to the flash that lost its files: running without persistence"));
+#endif
+}
+
 // The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
 // the last run came that reached the charger, and the result that has yet to go out. No file:
 // nothing was ever asked. A file that cannot be read, no flash to read it from, or flash that
-// lost its files at this start: the charger may wait for a restart, and gets a look (firmware
-// without programming owes it nothing, see beginChargerProgramming()).
+// lost its files at this start (keepChargerLookAfterLostFiles() writes the cautious journal for
+// it): the charger may wait for a restart, and gets a look (firmware without programming owes it
+// nothing, see beginChargerProgramming(), and says nothing of a look).
 static sunsaver::Journal loadChargerJournal() {
   const sunsaver::Journal none = sunsaver::emptyJournal();
 #if defined(POSIX_FILE_IO_AVAILABLE)
@@ -7724,16 +7783,11 @@ static sunsaver::Journal loadChargerJournal() {
     if (errno == ENOENT && !gStorageLostFiles) {
       return none;
     }
-    if (errno == ENOENT) {
-      // initializeStorage() formatted a partition whose files it could not read, and the journal
-      // may have been among them.
+    // A journal that cannot be opened, or none on a flash that lost its files at this start
+    // (keepChargerLookAfterLostFiles() wrote one there, so that is not to be expected).
 #if TANKALARM_SUNSAVER_PROGRAMMING
-      Serial.println(F("Charger programming: the flash lost its files at this start, so the charger gets a look"));
-      addSerialLog("Charger programming: the flash lost its files at start, so the charger gets a look");
-#endif
-      return sunsaver::cautiousJournal();
-    }
     Serial.println(F("Charger programming: the journal could not be opened, so the charger gets a look"));
+#endif
     return sunsaver::cautiousJournal();
   }
   static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
@@ -7743,13 +7797,25 @@ static sunsaver::Journal loadChargerJournal() {
   buf[len] = '\0';
   sunsaver::Journal journal = sunsaver::cautiousJournal();
   JsonDocument doc;
-  if (!failed && deserializeJson(doc, buf) == DeserializationError::Ok) {
+  const bool readable = !failed && deserializeJson(doc, buf) == DeserializationError::Ok;
+  if (readable) {
     journal = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
   }
+#if TANKALARM_SUNSAVER_PROGRAMMING
   if (journal.phase != sunsaver::JOURNAL_IDLE) {
-    Serial.println(F("Charger programming: a run was cut short by this restart, so the charger gets a look"));
-    addSerialLog("Charger programming: a run was cut short by a restart");
+    if (gStorageLostFiles) {
+      Serial.println(F("Charger programming: the flash lost its files at this start, so the charger gets a look"));
+      addSerialLog("Charger programming: the flash lost its files at start, so the charger gets a look");
+    } else if (!readable) {
+      Serial.println(F("Charger programming: the journal could not be read, so the charger gets a look"));
+      addSerialLog("Charger programming: the journal could not be read, so the charger gets a look");
+    } else {
+      // A run that a restart cut short, or a start before this one whose flash lost its files.
+      Serial.println(F("Charger programming: the journal says a run may have been cut short, so the charger gets a look"));
+      addSerialLog("Charger programming: the journal says a run may have been cut short");
+    }
   }
+#endif
   if (journal.waitingId != 0) {
     Serial.println(F("Charger programming: a request waited at this restart, and is answered as interrupted"));
   }
