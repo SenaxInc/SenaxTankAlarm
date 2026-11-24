@@ -109,6 +109,9 @@ enum FluidType : uint8_t;
   static mbed::MBRBlockDevice *mbedAppPart = nullptr;
   static MbedWatchdogHelper mbedWatchdog;
   static bool gStorageAvailable = false;
+  // This start formatted partition 4 while it held files that could not be mounted: they are
+  // gone (see initializeStorage() and loadChargerJournal()).
+  static bool gStorageLostFiles = false;
   
   // POSIX-compatible file path prefix for Mbed OS VFS (app config store, partition 4).
   // Must NOT be "/fs" -- that mount name is reserved by the MCUboot core for the OTA
@@ -2768,6 +2771,39 @@ static void recoverOrphanedTmpFiles() {
 }
 #endif // POSIX_FILE_IO_AVAILABLE
 
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+// Whether partition 4 holds nothing yet: the first two blocks of LittleFileSystem, where it keeps
+// its superblocks, are erased. They never are once the partition was formatted, and they are on
+// a partition that never held a file system (KeyProvisioning makes the partition table and
+// formats only partition 2). False when it cannot tell.
+static bool appPartitionBlank(mbed::BlockDevice *part) {
+  const int erased = part->get_erase_value();
+  const mbed::bd_size_t readSize = part->get_read_size();
+  uint8_t chunk[256];
+  // LittleFileSystem's block is the larger of the erase size and 512 bytes, so two blocks of at
+  // least 4096 bytes hold both superblocks.
+  mbed::bd_size_t block = part->get_erase_size();
+  if (block < 4096) {
+    block = 4096;
+  }
+  const mbed::bd_size_t span = 2 * block;
+  if (erased < 0 || readSize == 0 || sizeof(chunk) % readSize != 0 || span > part->size()) {
+    return false;
+  }
+  for (mbed::bd_addr_t addr = 0; addr < span; addr += sizeof(chunk)) {
+    if (part->read(chunk, addr, sizeof(chunk)) != 0) {
+      return false;
+    }
+    for (size_t i = 0; i < sizeof(chunk); ++i) {
+      if (chunk[i] != (uint8_t)erased) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+#endif
+
 static void initializeStorage() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -2804,12 +2840,18 @@ static void initializeStorage() {
     if (err) {
       // Format ONLY partition 4 (never the whole device).
       Serial.println(F("Filesystem mount failed, formatting app partition (p4)..."));
+      // At a board's first start the partition holds nothing yet. Otherwise its files are lost.
+      const bool blank = appPartitionBlank(mbedAppPart);
       err = mbedFS->reformat(mbedAppPart);
       if (err) {
         Serial.println(F("LittleFS format failed; running without persistence"));
         delete mbedFS;
         mbedFS = nullptr;
         return;
+      }
+      gStorageLostFiles = !blank;
+      if (gStorageLostFiles) {
+        Serial.println(F("The app partition held files that could not be read: they are lost"));
       }
     }
     gStorageAvailable = true;
@@ -7660,9 +7702,9 @@ static void sendDueChargerReport(unsigned long now) {
 
 // The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
 // the last run came that reached the charger, and the result that has yet to go out. No file:
-// nothing was ever asked. A file that cannot be read, or no flash to read it from: the charger
-// may wait for a restart, and gets a look (firmware without programming owes it nothing, see
-// beginChargerProgramming()).
+// nothing was ever asked. A file that cannot be read, no flash to read it from, or flash that
+// lost its files at this start: the charger may wait for a restart, and gets a look (firmware
+// without programming owes it nothing, see beginChargerProgramming()).
 static sunsaver::Journal loadChargerJournal() {
   const sunsaver::Journal none = sunsaver::emptyJournal();
 #if defined(POSIX_FILE_IO_AVAILABLE)
@@ -7679,8 +7721,17 @@ static sunsaver::Journal loadChargerJournal() {
   errno = 0;
   FILE *file = fopen(CHARGER_JOURNAL_FILE, "r");
   if (file == nullptr) {
-    if (errno == ENOENT) {
+    if (errno == ENOENT && !gStorageLostFiles) {
       return none;
+    }
+    if (errno == ENOENT) {
+      // initializeStorage() formatted a partition whose files it could not read, and the journal
+      // may have been among them.
+#if TANKALARM_SUNSAVER_PROGRAMMING
+      Serial.println(F("Charger programming: the flash lost its files at this start, so the charger gets a look"));
+      addSerialLog("Charger programming: the flash lost its files at start, so the charger gets a look");
+#endif
+      return sunsaver::cautiousJournal();
     }
     Serial.println(F("Charger programming: the journal could not be opened, so the charger gets a look"));
     return sunsaver::cautiousJournal();
@@ -7719,6 +7770,9 @@ static bool saveChargerJournal(const sunsaver::Journal &journal) {
   }
   JsonDocument doc;
   sunsaver::encodeJournal(journal, doc.to<JsonObject>());
+  if (doc.overflowed()) {
+    return false;  // out of memory: it would still serialize, without what did not fit
+  }
   static char buf[sunsaver::JOURNAL_JSON_MAX + 2];
   const size_t len = serializeJson(doc, buf, sizeof(buf));
   if (len == 0 || len > sunsaver::JOURNAL_JSON_MAX) {
@@ -7820,6 +7874,12 @@ static void printChargerProgramResult(uint32_t requestId, const sunsaver::Progra
   JsonDocument doc;
   JsonObject out = doc.to<JsonObject>();
   sunsaver::describeProgramResult(result, out);
+  if (doc.overflowed()) {
+    Serial.print(F("Charger programming, request "));
+    Serial.print((unsigned long)requestId);
+    Serial.println(F(": not enough memory to print the result"));
+    return;
+  }
   char line[128];
   snprintf(line, sizeof(line), "Charger programming, request %lu: %s", (unsigned long)requestId,
            out["summary"].as<const char *>());
@@ -9328,6 +9388,14 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   // body only on the live path and was lost for any buffered/flushed note.
   doc["_sv"] = NOTEFILE_SCHEMA_VERSION;
   doc["fv"] = FIRMWARE_VERSION;
+
+  // A document that ran out of memory while it was filled in still serializes, without the members
+  // that did not fit. Such a note would say less than it seems to (a charger programming result
+  // would be dropped as sent), so none is made, and the caller may try again.
+  if (doc.overflowed()) {
+    Serial.println(F("publishNote: out of memory while the note was filled in, dropping it"));
+    return false;
+  }
 
   // Measure JSON first to handle oversized payloads via dynamic allocation
   size_t needed = measureJson(doc);

@@ -2434,7 +2434,7 @@ if(r){
 if(waiting)h+='<h3>Last result, for an earlier request</h3>';
 const name=String(r.outcome||'');const t=when(r.e);
 h+='<p><span class="cc-verdict '+(outcomeBadge[r.o]||'cc-bad')+'">'+esc(name.charAt(0).toUpperCase()+name.slice(1))+'</span>'+esc(r.text)+'</p>';
-h+='<p class="cc-note">'+esc((r.summary&&r.summary!==r.outcome?r.summary+'. ':'')+(r.req?'For the request sent '+when(r.req)+'.':'For a run that a restart of the client cut short.')+(t?' Reported '+t+'.':''))+'</p>';
+h+='<p class="cc-note">'+esc((r.summary&&r.summary!==r.outcome?r.summary+'. ':'')+(r.req?'For the request sent '+when(r.req)+'.':'For a run that a restart of the client may have cut short: the client could not tell from its flash, so it looked at the charger.')+(t?' Reported '+t+'.':''))+'</p>';
 if(r.followUp)h+='<p class="cc-note">The client looks at the charger again once it answers, and sends another result.</p>';
 const facts=[];if(r.restart)facts.push(['Restart',r.restart]);if(r.battery)facts.push(['Battery when the run began',r.battery]);
 if(facts.length)h+=table(null,facts,true);
@@ -13041,6 +13041,12 @@ static void handleChargerGet(EthernetClient &client, const String &query) {
   if (meta && (meta->chargerProgramAsked != 0 || meta->chargerProgramValid)) {
     describeChargerProgram(*meta, out["program"].to<JsonObject>());
   }
+  if (doc.overflowed()) {
+    // The page would show what fitted as if it were all: a result as still to come, for one.
+    Serial.println(F("[ERROR] Charger JSON document overflowed"));
+    respondStatus(client, 500, F("Charger data too large for available memory"));
+    return;
+  }
   respondJson(client, doc);
 }
 
@@ -13063,6 +13069,10 @@ static bool saveChargerReports() {
       obj["c"] = meta.clientUid;
       obj["e"] = (uint32_t)meta.chargerReportEpoch;
       sunsaver::encodeReport(meta.chargerSnapshot, meta.chargerEvaluation, obj);
+    }
+    if (doc.overflowed()) {
+      Serial.println(F("ERROR: Out of memory for the charger report file"));  // as saveChargerPrograms()
+      return false;
     }
     const size_t jsonLen = measureJson(doc);
     char *buf = (char *)malloc(jsonLen + 1);
@@ -13237,12 +13247,21 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
   const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
   const bool loadOk = sunsaver::readLoadAllowed(program);
   const ClientMetadata *meta = findClientMetadata(clientUid);
+  sunsaver::Text text(message, messageSize);
+  // The id is a member the config may have no room for when the server runs out of memory. A
+  // config without it would not make a new request, and would withdraw one that waits.
+  static const char NO_MEMORY[] =
+      "The server ran out of memory while it put the charger request into this config, so the config was not "
+      "sent. Try again in a few minutes.";
 
   if (!apply) {
     if (meta && meta->chargerProgramAsked != 0 && !chargerProgramAnswered(*meta) && profileErrors == 0 &&
         configSuitsChargerProgram(config) && sameChargerProfile(profile, meta->chargerProgramAskedProfile) &&
         loadOk == meta->chargerProgramAskedLoadOk) {
-      program["req"] = meta->chargerProgramAsked;
+      if (!program["req"].set(meta->chargerProgramAsked)) {
+        text.add(NO_MEMORY);
+        return 503;
+      }
       Serial.print(F("Charger programming: request "));
       Serial.print((unsigned long)meta->chargerProgramAsked);
       Serial.print(F(" of "));
@@ -13252,7 +13271,6 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
     return 0;
   }
 
-  sunsaver::Text text(message, messageSize);
   if (profileErrors != 0) {
     text.add("The charger values were not accepted:");
     for (uint8_t bit = 0; bit < sunsaver::PROFILE_ERROR_BITS; ++bit) {
@@ -13281,7 +13299,10 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
     // it has a newer time too (nextConfigDispatchEpoch()).
     requestId = meta->chargerProgramAsked + 1;
   }
-  program["req"] = requestId;
+  if (!program["req"].set(requestId)) {
+    text.add(NO_MEMORY);
+    return 503;
+  }
   return 0;
 }
 
@@ -13417,6 +13438,12 @@ static bool saveChargerPrograms() {
         obj["e"] = (uint32_t)meta.chargerProgramEpoch;
         sunsaver::encodeProgramResult(meta.chargerProgram, obj);
       }
+    }
+    if (doc.overflowed()) {
+      // Out of memory: the document would still serialize, without what did not fit, and take the
+      // place of a whole file. The file stays as it was, and the save is tried again.
+      Serial.println(F("ERROR: Out of memory for the charger programming file"));
+      return false;
     }
     if (arr.size() == 0 && !posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
       return true;  // no client was ever asked: no file is needed

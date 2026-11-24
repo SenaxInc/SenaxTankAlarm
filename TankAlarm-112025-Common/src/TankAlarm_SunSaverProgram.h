@@ -1876,10 +1876,11 @@ class Supervisor {
     begin(emptyJournal(), nullptr, 0);
   }
 
-  // Once, when the client starts, with the journal from its flash (cautiousJournal() when the
-  // file is there and cannot be read, emptyJournal() when there is none) and the store that
-  // keeps it. A request that waited is answered now as interrupted, and a result that had yet
-  // to go out is due again.
+  // Once, when the client starts, with the journal from its flash (emptyJournal() when there is
+  // none, cautiousJournal() when there is no telling what it held: the file cannot be read, there
+  // is no flash, or the flash lost its files at this start) and the store that keeps it. A
+  // request that waited is answered now as interrupted, and a result that had yet to go out is
+  // due again.
   void begin(const Journal &journal, JournalStore *store, uint32_t nowMs) {
     store_ = store;
     programmer_ = Programmer();
