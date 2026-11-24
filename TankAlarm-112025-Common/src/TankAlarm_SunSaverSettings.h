@@ -102,6 +102,8 @@ inline double voltsFromRaw(uint16_t raw, uint8_t scale) {
   return (double)raw * scaleNumerator(scale) / VOLTS_DENOMINATOR;
 }
 
+inline double ohmsFromRaw(uint16_t raw) { return (double)raw * 1.263 / 65536.0; }
+
 // Distance from value to the nearest multiple of grid.
 inline double gridDistance(double value, double grid) {
   const double nearest = floor(value / grid + 0.5) * grid;
@@ -534,6 +536,16 @@ inline uint8_t systemVolts(const Snapshot &snapshot) {
 // profile sets to 15 mV per amp. At the 15 A the controller is rated for that is 0.23 V.
 static const double LVD_COMPENSATION_ROOM_VOLTS = 0.30;
 static const double LVD_READING_ROOM_VOLTS = 0.05;
+static const double LOAD_RATED_AMPS = 15.0;
+
+// With switch 2 ON the compensation is the stored one (ER_icomp), which can be set far higher.
+// The test below then holds only while that stays within the room at the rated load current,
+// which is up to 0.02 ohm: a larger compensation can pull the LVD in effect so far down that
+// the wrong scale reads as right, and one that was not read could be anything.
+inline bool storedCompensationFits(const Snapshot &snapshot) {
+  return have(snapshot, I_ER_ICOMP) &&
+         ohmsFromRaw(snapshot.raw[I_ER_ICOMP]) * LOAD_RATED_AMPS <= LVD_COMPENSATION_ROOM_VOLTS;
+}
 
 // Looks for the one scale that makes V_lvd read as the LVD the controller is known to use.
 // settingsScale is the verdict of judgeSettingsScale(); the stored LVD is only known with it.
@@ -553,7 +565,8 @@ inline void judgeLiveScale(const Snapshot &snapshot, uint8_t settingsScale, uint
   if ((snapshot.raw[I_DIP_SWITCH] & DIP_CUSTOM_LVD) == 0) {
     wanted = PRESET_LVD_VOLTS * times;
     from = LIVE_SOURCE_PRESET_LVD;
-  } else if (settingsScale != SCALE_UNKNOWN && have(snapshot, I_EV_LVD) && snapshot.raw[I_EV_LVD] != 0) {
+  } else if (settingsScale != SCALE_UNKNOWN && have(snapshot, I_EV_LVD) && snapshot.raw[I_EV_LVD] != 0 &&
+             storedCompensationFits(snapshot)) {
     wanted = voltsFromRaw(snapshot.raw[I_EV_LVD], settingsScale) * times;
     from = LIVE_SOURCE_STORED_LVD;
   } else {
@@ -753,16 +766,15 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
 
   uint32_t findings = 0;
 
-  // Notes that hold whatever the battery.
-  if (have(snapshot, I_ARRAY_FAULT) && have(snapshot, I_LOAD_FAULT)) {
-    const uint16_t arrayFault = snapshot.raw[I_ARRAY_FAULT];
-    const uint16_t loadFault = snapshot.raw[I_LOAD_FAULT];
-    if ((arrayFault & ARRAY_FAULT_EEPROM_EDIT) != 0 || (loadFault & LOAD_FAULT_EEPROM_EDIT) != 0) {
-      findings |= FINDING_RESET_PENDING;
-    }
-    if ((arrayFault & (uint16_t)~ARRAY_FAULT_EEPROM_EDIT) != 0 || (loadFault & (uint16_t)~LOAD_FAULT_EEPROM_EDIT) != 0) {
-      findings |= FINDING_CHARGER_FAULT;
-    }
+  // Notes that hold whatever the battery. Each fault word counts by itself: one that did not
+  // answer takes nothing from what the other says.
+  const uint16_t arrayFault = have(snapshot, I_ARRAY_FAULT) ? snapshot.raw[I_ARRAY_FAULT] : (uint16_t)0;
+  const uint16_t loadFault = have(snapshot, I_LOAD_FAULT) ? snapshot.raw[I_LOAD_FAULT] : (uint16_t)0;
+  if ((arrayFault & ARRAY_FAULT_EEPROM_EDIT) != 0 || (loadFault & LOAD_FAULT_EEPROM_EDIT) != 0) {
+    findings |= FINDING_RESET_PENDING;
+  }
+  if ((arrayFault & (uint16_t)~ARRAY_FAULT_EEPROM_EDIT) != 0 || (loadFault & (uint16_t)~LOAD_FAULT_EEPROM_EDIT) != 0) {
+    findings |= FINDING_CHARGER_FAULT;
   }
   if (want.nominalVolts != 0 && out->systemVolts != 0 && want.nominalVolts != out->systemVolts) {
     findings |= FINDING_PACK_VOLTAGE;
@@ -1125,7 +1137,7 @@ inline void describeValue(uint8_t index, uint16_t raw, uint8_t settingsScale, ui
       out->addFixed((double)raw * 100.0 / 65536.0, 4).add(" V/C");
       break;
     case KIND_OHMS:
-      out->addFixed((double)raw * 1.263 / 65536.0, 4).add(" ohm");
+      out->addFixed(ohmsFromRaw(raw), 4).add(" ohm");
       break;
     case KIND_CELSIUS:
       if (index == I_T_RTS && (raw & 0xFF) == RTS_NOT_CONNECTED) {

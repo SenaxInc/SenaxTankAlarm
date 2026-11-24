@@ -902,6 +902,8 @@ static sunsaver::Snapshot gChargerReportSnapshot;      // what it holds
 static sunsaver::Evaluation gChargerReportEvaluation;  // and how that was judged
 static uint32_t gChargerReportDueFingerprint = 0;
 static unsigned long gChargerReportDueMillis = 0;      // when its pass ended
+static uint32_t gChargerReportEpoch = 0;               // that moment as a time, once the clock has one; 0 until then
+static bool gChargerReportWaited = false;              // it could not go out when its pass ended
 static bool gChargerReportTried = false;               // nothing would take it at the last try
 static unsigned long gChargerReportTryMillis = 0;      // which was then
 
@@ -7441,12 +7443,12 @@ static void serviceChargerCheck(unsigned long now) {
     return;  // not time for the next registers yet, or the pass is still under way
   }
 
-  // The pass ended.
+  // The pass ended. `now` is when this loop() began, before the requests that ended it.
   gChargerCheckEndMillis = now;
   if (gSolarManager.chargerCheckDone()) {
     gChargerCheckFailures = 0;
     gChargerCheckWanted = false;
-    finishChargerCheck(now);
+    finishChargerCheck(millis());
     sendDueChargerReport(now);
   } else {
     if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
@@ -7463,8 +7465,9 @@ static void serviceChargerCheck(unsigned long now) {
 }
 
 // A pass is complete: judge it, tell the no-charge alert where the charger holds a full battery,
-// and make its report due when the result is new (sendDueChargerReport() sends it).
-static void finishChargerCheck(unsigned long now) {
+// and make its report due when the result is new (sendDueChargerReport() sends it). `endedAt`
+// is the millis() of the moment the pass ended.
+static void finishChargerCheck(unsigned long endedAt) {
   const sunsaver::Snapshot &snapshot = gSolarManager.chargerSnapshot();
   const sunsaver::Expectation want = {chargerCheckChemistry(), gConfig.batteryMonitor.nominalVoltage,
                                       (uint8_t)SS_VOLTAGE_SCALE_ID};
@@ -7511,14 +7514,16 @@ static void finishChargerCheck(unsigned long now) {
     Serial.println(line);
   }
 
-  if (!changed && !gChargerReportSyncNow && (now - gChargerReportMillis) < CHARGER_REPORT_REFRESH_MS) {
+  if (!changed && !gChargerReportSyncNow && (endedAt - gChargerReportMillis) < CHARGER_REPORT_REFRESH_MS) {
     gChargerReportDue = false;  // the server has this report
     return;
   }
   gChargerReportSnapshot = snapshot;
   gChargerReportEvaluation = evaluation;
   gChargerReportDueFingerprint = fingerprint;
-  gChargerReportDueMillis = now;
+  gChargerReportDueMillis = endedAt;
+  gChargerReportEpoch = 0;
+  gChargerReportWaited = false;
   gChargerReportTried = false;
   gChargerReportDue = true;
   if (currentEpoch() <= 0.0) {
@@ -7533,15 +7538,20 @@ static void sendDueChargerReport(unsigned long now) {
   }
   // The server keeps the newest report by the time of the check, so a report does not go out
   // without one. Waiting for the clock costs nothing: the report cannot reach the server before
-  // the Notecard has been online, and that is what sets the clock.
-  const double nowEpoch = currentEpoch();
-  if (nowEpoch <= 0.0) {
-    return;
+  // the Notecard has been online, and that is what sets the clock. The time is worked out once,
+  // from a clock reading and millis() taken together, and every try sends the same.
+  if (gChargerReportEpoch == 0) {
+    const double nowEpoch = currentEpoch();
+    if (nowEpoch <= 0.0) {
+      gChargerReportWaited = true;
+      return;
+    }
+    const double checkedAt = nowEpoch - (double)(millis() - gChargerReportDueMillis) / 1000.0;
+    gChargerReportEpoch = checkedAt >= 1.0 ? (uint32_t)checkedAt : 1u;  // whole seconds: see below
   }
   if (gChargerReportTried && (now - gChargerReportTryMillis) < CHARGER_REPORT_RETRY_MS) {
     return;
   }
-  const double checkedAt = nowEpoch - (double)(now - gChargerReportDueMillis) / 1000.0;
 
   // The report travels on the config-ack notefile, which is already routed to the server. The
   // server tells it from an ack by the "chg-" status, as it tells the "ota-" reports.
@@ -7549,7 +7559,7 @@ static void sendDueChargerReport(unsigned long now) {
   JsonObject body = doc.to<JsonObject>();
   body["c"] = gDeviceUID;
   body["st"] = "chg-check";
-  body["epoch"] = (uint32_t)checkedAt;  // whole seconds: ArduinoJson writes some doubles with 7 digits
+  body["epoch"] = gChargerReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
   sunsaver::encodeReport(gChargerReportSnapshot, gChargerReportEvaluation, body);
   if (!publishNote(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow)) {
     // Neither the Notecard nor the note buffer took it. It stays due, with everything that
@@ -7561,7 +7571,7 @@ static void sendDueChargerReport(unsigned long now) {
     gChargerReportTryMillis = now;
     return;
   }
-  if (now != gChargerReportDueMillis) {
+  if (gChargerReportWaited || gChargerReportTried) {
     Serial.println(F("Charger check: the report that waited has gone out"));
   }
   gChargerReportDue = false;

@@ -1218,6 +1218,52 @@ static void testLiveScale() {
     CHECK_EQ(scale, ss::SCALE_UNKNOWN);
   }
   {
+    // With switch 2 ON the compensation is the stored one too, and that can be large: 13.10 V
+    // less 0.10 ohm at 6 A is 12.50 V, which a controller that encodes with x96.667 reports as
+    // a word that reads 12.93 V with x100, inside the room the test leaves for x100. Such a
+    // reading decides nothing.
+    SimSunSaver sim(96.667, 96.667);
+    makeLiFePO4(sim);
+    sim.regs[0x001C] = sim.volts(12.50);
+    sim.regs[0xE026] = 5189;  // 0.1000 ohm
+    CHECK_EQ(ss::judgeSettingsScale(snapshotOf(sim)).scale, ss::SCALE_96667);
+    CHECK(ss::voltsFromRaw(sim.regs[0x001C], ss::SCALE_100) > 13.10 - ss::LVD_COMPENSATION_ROOM_VOLTS);
+    scale = source = 99;
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+    // So the page does not call this firmware's scale wrong, and the no-charge alert keeps to the
+    // lower of the two figures.
+    ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4, 12, ss::SCALE_96667);
+    CHECK_EQ(e.liveScale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(e.findings & ss::FINDING_LIVE_SCALE, 0);
+    CHECK_EQ(e.verdict, ss::VERDICT_OK);
+    // Up to 0.02 ohm the room holds at the rated 15 A, and the reading decides.
+    sim.regs[0x001C] = sim.volts(13.10);
+    sim.regs[0xE026] = 1037;  // 0.0200 ohm
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_96667);
+    CHECK_EQ(source, ss::LIVE_SOURCE_STORED_LVD);
+    sim.regs[0xE026] = 1038;
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+    // Not read, it could be anything.
+    sim.regs.erase(0xE026);
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    // With switch 2 OFF the built-in compensation applies, whatever is stored or was not read.
+    sim.regs[0x0025] = 0x0009;
+    sim.regs[0x001C] = sim.volts(11.50);
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_96667);
+    CHECK_EQ(source, ss::LIVE_SOURCE_PRESET_LVD);
+    sim.regs[0xE026] = 5189;
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_96667);
+    CHECK_EQ(source, ss::LIVE_SOURCE_PRESET_LVD);
+  }
+  {
     // A low LVD, where the two scales are closer together than the room the test leaves: a
     // reading that both explain decides nothing.
     SimSunSaver sim;
@@ -1665,9 +1711,42 @@ static void testEvaluate() {
     CHECK_EQ(judge(sim, ss::CHEMISTRY_NOT_JUDGED).findings, ss::FINDING_CHARGER_FAULT);
     CHECK_EQ(judge(sim, ss::CHEMISTRY_NOT_JUDGED).verdict, ss::VERDICT_NOT_JUDGED);
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_FLOODED).verdict, ss::VERDICT_OK);
-    // The faults are looked at only when both registers answered.
+    // Each fault word counts by itself: one that did not answer hides nothing the other says.
     sim.regs.erase(0x001B);
+    e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.findings, ss::FINDING_CHARGER_FAULT);
+    CHECK_EQ(e.verdict, ss::VERDICT_OK);
+    sim.regs[0x0012] = 1u << 5;
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_RESET_PENDING);
+    sim.regs[0x0012] = (1u << 5) | (1u << 3);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_RESET_PENDING | ss::FINDING_CHARGER_FAULT);
+    sim.regs[0x0012] = 0;
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, kNone);
+    sim.regs.erase(0x0012);
+    sim.regs[0x001B] = 1u << 6;
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_RESET_PENDING);
+    sim.regs[0x001B] = 1u << 1;
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_CHARGER_FAULT);
+    sim.regs[0x001B] = 0;
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, kNone);
+    sim.regs.erase(0x001B);
+    e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.findings, kNone);  // neither answered: there is nothing to say, and nothing is open
+    CHECK_EQ(e.verdict, ss::VERDICT_OK);
+    // And only as far as a word was read, whatever it holds.
+    for (int unread = 0; unread < 2; ++unread) {
+      SimSunSaver held;
+      makeLiFePO4(held);
+      held.regs[0x0012] = unread == 0 ? (uint16_t)((1u << 5) | (1u << 3)) : (uint16_t)0;
+      held.regs[0x001B] = unread == 1 ? (uint16_t)((1u << 6) | (1u << 1)) : (uint16_t)0;
+      ss::Snapshot snapshot = snapshotOf(held);
+      snapshot.status[unread == 0 ? ss::I_ARRAY_FAULT : ss::I_LOAD_FAULT] = ss::SSIO_NO_REPLY;
+      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, 12, ss::SCALE_UNKNOWN};
+      ss::Evaluation evaluation;
+      ss::evaluate(snapshot, want, &evaluation);
+      CHECK_MSG(evaluation.findings == kNone, "the unread %s fault word was looked at: findings 0x%lX",
+                unread == 0 ? "array" : "load", (unsigned long)evaluation.findings);
+    }
   }
   {
     // The pack voltage that was configured against the one that is there.
@@ -1942,10 +2021,11 @@ static void testFloatReference() {
 // The report as JSON
 // ============================================================================
 static void testReport() {
-  // From the bus to the server's page, the way the firmware does it.
+  // From the bus to the server's page, the way the firmware does it. One register that no
+  // judgement needs is refused.
   {
     Bare b;
-    b.sim.regs.erase(0xE026);
+    b.sim.regs.erase(0xE027);
     BusReader bus(b.master);
     ss::SnapshotReader reader;
     reader.start();
@@ -1969,7 +2049,7 @@ static void testReport() {
     CHECK_MSG(wire.size() < 420, "the report is %zu bytes", wire.size());
     CHECK(plainAscii(wire.c_str()));
     CHECK_HAS(wire, "\"lay\":1");
-    CHECK_HAS(wire, "\"nr\":[32]");
+    CHECK_HAS(wire, "\"nr\":[33]");
     CHECK_HAS(wire, "\"ch\":3");
     CHECK_HAS(wire, "\"vd\":2");
     CHECK_HAS(wire, "\"ss\":1");
@@ -2049,7 +2129,8 @@ static void testReport() {
     CHECK_EQ(rows, ss::ITEM_COUNT);
     CHECK_HAS(shown, "[\"EV_reg\",\"Absorption voltage at 25 C\",\"14.00 V\",\"0x11EC\"]");
     CHECK_HAS(shown, "[\"EV_eq\",\"Equalize voltage at 25 C\",\"0 (off)\",\"0x0000\"]");
-    CHECK_HAS(shown, "[\"ER_icomp\",\"LVD load current compensation\",\"no answer\",\"\"]");
+    CHECK_HAS(shown, "[\"ER_icomp\",\"LVD load current compensation\",\"0 (off)\",\"0x0000\"]");
+    CHECK_HAS(shown, "[\"Et_lvd_warn\",\"LVD warning time\",\"no answer\",\"\"]");
     CHECK_HAS(shown, "[\"dip_switch\",\"DIP switches\",\"SW1 OFF, SW2 ON, SW3 OFF, SW4 ON\",\"0x000A\"]");
     CHECK_HAS(shown, "\"13.68 V\"");  // the live voltages use the scale the LVD proved
   }

@@ -1357,6 +1357,11 @@ static double gLastDailyEmailSentEpoch = 0.0;
 static bool gSensorRegistryDirty = false;         // True when sensor records need saving
 static bool gClientMetadataDirty = false;        // True when client metadata needs saving
 static unsigned long gLastRegistrySaveMillis = 0;
+// The file of kept charger reports (CHARGER_REPORTS_PATH) holds a report that changed since its
+// last write that worked. See saveChargerReportsIfDirty().
+static bool gChargerReportsDirty = false;
+static unsigned long gChargerReportsTryMillis = 0;  // when it was last written or tried
+#define CHARGER_REPORTS_RETRY_MS 300000UL           // after a write that failed
 static unsigned long gLastStaleCheckMillis = 0;
 
 // ----------------------------------------------------------------------------
@@ -2700,7 +2705,8 @@ static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, doubl
 static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now);
 static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc, double now);
 static void handleChargerGet(EthernetClient &client, const String &query);
-static void saveChargerReports();
+static bool saveChargerReports();
+static void saveChargerReportsIfDirty(bool force);
 static void loadChargerReports();
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
@@ -2736,7 +2742,7 @@ static void saveSensorRegistry();
 static void loadSensorRegistry();
 static uint8_t deduplicateSensorRecordsLinear();
 static void handleDebugSensors(EthernetClient &client, const String &method, const String &body, const String &queryString);
-static void saveClientMetadataCache();
+static bool saveClientMetadataCache();
 static void loadClientMetadataCache();
 // Stale client alerting
 static void checkStaleClients();
@@ -5018,6 +5024,9 @@ void loop() {
     saveClientMetadataCache();
     gClientMetadataDirty = false;
   }
+
+  // The charger reports, when their last write failed
+  saveChargerReportsIfDirty(false);
   
   // Periodic stale client check (every hour)
   if (now - gLastStaleCheckMillis > STALE_CHECK_INTERVAL_MS) {
@@ -9223,6 +9232,7 @@ static void enableDfuMode() {
     saveClientMetadataCache();
     gClientMetadataDirty = false;
   }
+  saveChargerReportsIfDirty(true);
   saveHotTierSnapshot();
   saveClientConfigSnapshots();
   saveHistorySettings();
@@ -12816,7 +12826,15 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   meta->chargerReportEpoch = checkedAt;
   meta->chargerSnapshot = snapshot;
   meta->chargerEvaluation = evaluation;
-  saveChargerReports();
+  // At a start, a report is kept only for a client that the metadata cache holds, so that a
+  // client that was removed does not come back with it (loadChargerReports). A client that is
+  // new here therefore goes into that cache now, not at its next periodic save: the client
+  // does not send an unchanged report again for a week.
+  if (gClientMetadataDirty && saveClientMetadataCache()) {
+    gClientMetadataDirty = false;
+  }
+  gChargerReportsDirty = true;
+  saveChargerReportsIfDirty(true);
 
   char line[160];
   snprintf(line, sizeof(line), "Charger check from %s: %s (battery %s)", clientUid,
@@ -12857,12 +12875,12 @@ static void handleChargerGet(EthernetClient &client, const String &query) {
 }
 
 // One compact report for each client that has sent one. Members "c" (client) and "e" (when the
-// check was made) are added to sunsaver::encodeReport()'s.
-static void saveChargerReports() {
+// check was made) are added to sunsaver::encodeReport()'s. True once the file holds them.
+static bool saveChargerReports() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) {
-      return;
+      return false;
     }
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
@@ -12880,15 +12898,35 @@ static void saveChargerReports() {
     char *buf = (char *)malloc(jsonLen + 1);
     if (!buf) {
       Serial.println(F("ERROR: Cannot allocate charger report save buffer"));
-      return;
+      return false;
     }
     serializeJson(doc, buf, jsonLen + 1);
-    if (!posix_write_file("/fs" CHARGER_REPORTS_PATH, buf, jsonLen)) {
-      Serial.println(F("ERROR: Charger reports not saved"));
-    }
+    const bool written = posix_write_file("/fs" CHARGER_REPORTS_PATH, buf, jsonLen);
     free(buf);
+    return written;
   #endif
 #endif
+  return true;  // no file system in this build: nothing to keep a report in
+}
+
+// Writes the file of kept reports when a report was taken or dropped since its last write that
+// worked: at once when `force` is set, and otherwise (from loop()) every CHARGER_REPORTS_RETRY_MS
+// after a write that failed. The note a report came in is deleted once it has been handled, so
+// until a write works the report is in RAM only and would be lost at a restart.
+static void saveChargerReportsIfDirty(bool force) {
+  if (!gChargerReportsDirty) {
+    return;
+  }
+  const unsigned long nowMs = millis();
+  if (!force && (nowMs - gChargerReportsTryMillis) < CHARGER_REPORTS_RETRY_MS) {
+    return;
+  }
+  gChargerReportsTryMillis = nowMs;
+  if (saveChargerReports()) {
+    gChargerReportsDirty = false;
+  } else {
+    Serial.println(F("ERROR: Charger reports not saved, trying again in 5 minutes"));
+  }
 }
 
 // Call after loadClientMetadataCache(): a report is kept only for a client that has metadata, so
@@ -16432,11 +16470,15 @@ static void loadSensorRegistry() {
 // Client Metadata Persistence (LittleFS JSON)
 // ============================================================================
 
-static void saveClientMetadataCache() {
+// True once the file holds every entry. Only handleChargerReport() looks at the result.
+static bool saveClientMetadataCache() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS || gClientMetadataCount == 0) {
-      return;
+    if (!mbedFS) {
+      return false;
+    }
+    if (gClientMetadataCount == 0) {
+      return true;
     }
     
     JsonDocument doc;
@@ -16494,18 +16536,21 @@ static void saveClientMetadataCache() {
     char *buf = (char *)malloc(jsonLen + 1);
     if (!buf) {
       Serial.println(F("ERROR: Cannot allocate metadata save buffer"));
-      return;
+      return false;
     }
     serializeJson(doc, buf, jsonLen + 1);
     
-    if (posix_write_file("/fs" CLIENT_METADATA_CACHE_PATH, buf, jsonLen)) {
+    const bool written = posix_write_file("/fs" CLIENT_METADATA_CACHE_PATH, buf, jsonLen);
+    if (written) {
       Serial.print(F("Client metadata saved: "));
       Serial.print(gClientMetadataCount);
       Serial.println(F(" entries"));
     }
     free(buf);
+    return written;
   #endif
 #endif
+  return true;  // no file system in this build
 }
 
 static void loadClientMetadataCache() {
@@ -17275,7 +17320,8 @@ static bool removeClientData(const char *clientUid) {
       gClientMetadataDirty = true;
       removedAny = true;
       if (hadChargerReport) {
-        saveChargerReports();  // its charger check goes with it
+        gChargerReportsDirty = true;  // its charger check goes with it
+        saveChargerReportsIfDirty(true);
       }
       break;
     }
