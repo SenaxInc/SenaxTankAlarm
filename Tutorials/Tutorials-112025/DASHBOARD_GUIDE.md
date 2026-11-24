@@ -421,10 +421,10 @@ A client that reads its SunSaver MPPT over RS-485 (**Voltage Monitor** set to **
 **What the verdicts mean:**
 - **Settings suit the battery**: nothing wrong was found.
 - **Settings do not suit the battery**: for example a lithium battery on a charger whose DIP switch 1 is OFF (it then charges with a built-in lead-acid profile), a stored equalize voltage, or temperature compensation switched on.
-- **Could not be judged in full**: a register did not answer, or the charger's voltage encoding could not be told from its setpoints. What could be checked showed nothing wrong.
+- **Could not be judged in full**: a register did not answer, the charger's voltage encoding could not be told from its setpoints, or the stored voltages were left unjudged because this is a 24 V system or the battery voltage the charger reports fits neither a 12 V nor a 24 V system. What could be checked showed nothing wrong: a setting that was read and is wrong gives **Settings do not suit the battery**, whatever else could not be read.
 - **Not judged**: there are no rules for the battery that is configured (none, custom, LiPo).
 
-The client checks after it starts, after a change to its battery or charger settings, and once a day. It sends a new report when something has changed, and once a week otherwise. A page that says no check has arrived means the client has no SunSaver configured, has not reached it yet, or runs firmware from before the charger check.
+The client checks after it starts, after a change to its battery or charger settings, and once a day. It sends a new report when something has changed, and once a week otherwise. A report carries the time of its check and the server keeps the newest, so a report waits for the client's clock: after a power cycle it goes out once the client has been online. A page that says no check has arrived means the client has no SunSaver configured, has not reached it yet, or runs firmware from before the charger check.
 
 ### Saving Configuration
 

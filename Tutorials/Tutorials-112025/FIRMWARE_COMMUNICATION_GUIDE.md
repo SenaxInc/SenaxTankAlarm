@@ -100,7 +100,7 @@ The server adds `_target` (device UID) and `_type` (command type) fields to the 
 |------|------------|
 | `applied`, `failed` | Acknowledgment of a config the server sent (`cv` names the config version) |
 | `ota-applied`, `ota-reverted`, `ota-stage-failed` | Outcome of a firmware update |
-| `chg-check` | Charger check of a client with a SunSaver MPPT: the registers it read and its verdict (see `TankAlarm_SunSaverReport.h`). The client sends it when the charger's stored settings or the verdict have changed, once after it starts, and once a week. |
+| `chg-check` | Charger check of a client with a SunSaver MPPT: the registers it read and its verdict (see `TankAlarm_SunSaverReport.h`). The client sends it when the charger's stored settings or the verdict have changed, once after it starts, and once a week. `epoch` is the time of the check: the client sends no report before its clock is set, and the server keeps the newest report by it (one without a time never replaces one that has a time). |
 
 A server that does not know a status keeps it as the last acknowledgment status of that client and does nothing else with it, so update the server before the clients.
 

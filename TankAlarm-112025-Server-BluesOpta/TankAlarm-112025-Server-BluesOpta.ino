@@ -601,7 +601,7 @@ struct ClientMetadata {
   // a "chg-check" report on the config-ack notefile (handleChargerReport) and is kept in
   // CHARGER_REPORTS_PATH, not in the metadata cache.
   bool chargerReportValid;                 // the three fields below hold a report
-  double chargerReportEpoch;               // when the client made the check
+  double chargerReportEpoch;               // when the client made the check, 0 = not known
   sunsaver::Snapshot chargerSnapshot;      // the registers
   sunsaver::Evaluation chargerEvaluation;  // the client's judgement
 };
@@ -2379,7 +2379,7 @@ el('ccWho').textContent=(d.site?d.site+', ':'')+'client '+uid+(d.fv?', firmware 
 if(!d.have){el('ccSummary').className='empty-state';el('ccSummary').textContent='No charger check has arrived from this client yet. A client sends one when it has a SunSaver MPPT on RS-485 (Voltage Monitor set to RS485) and firmware that includes the charger check.';return;}
 const v=verdicts[d.vd]||verdicts[0];const t=when(d.e);
 el('ccSummary').className='';
-el('ccSummary').innerHTML='<span class="cc-verdict '+v[1]+'">'+esc(v[0])+'</span>Battery: <strong>'+esc(d.battery)+'</strong>'+(d.system?', measured as a '+esc(d.system)+' V system':'')+(t?' <span class="cc-note">(checked '+esc(t)+')</span>':'')+(v[2]?'<p class="cc-note" style="margin:8px 0 0;">'+esc(v[2])+'</p>':'');
+el('ccSummary').innerHTML='<span class="cc-verdict '+v[1]+'">'+esc(v[0])+'</span>Battery: <strong>'+esc(d.battery)+'</strong>'+(d.system?', measured as a '+esc(d.system)+' V system':'')+' <span class="cc-note">('+(t?'checked '+esc(t):'the time of this check is not known')+')</span>'+(v[2]?'<p class="cc-note" style="margin:8px 0 0;">'+esc(v[2])+'</p>':'');
 el('ccFindings').innerHTML=(d.findings||[]).map(f=>'<li'+(f.p?' class="p"':'')+'>'+esc(f.t)+'</li>').join('');
 el('ccScales').innerHTML='<div>How the stored voltages are encoded: '+esc(d.settingsScale)+'</div><div>How the live voltages are encoded: '+esc(d.liveScale)+'</div>';
 el('ccGroups').innerHTML=(d.groups||[]).map(g=>'<h3>'+esc(g.title)+'</h3><table><thead><tr><th>Register</th><th>What it is</th><th>Value</th><th>Raw</th></tr></thead><tbody>'+(g.rows||[]).map(r=>'<tr><td class="cc-name">'+esc(r[0])+'</td><td>'+esc(r[1])+'</td><td>'+esc(r[2])+'</td><td class="cc-raw">'+esc(r[3])+'</td></tr>').join('')+'</tbody></table>').join('');
@@ -12796,14 +12796,17 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   if (!meta) {
     return;
   }
-  // The client's own time of the check, unless its clock is plainly wrong. A report can arrive
-  // late (the client keeps notes in flash while it has no signal), and then an older one must
-  // not replace a newer one.
-  double checkedAt = doc["epoch"] | 0.0;
-  if (checkedAt < 1600000000.0 || checkedAt > now + 86400.0) {
-    checkedAt = now;
-  }
-  if (meta->chargerReportValid && checkedAt < meta->chargerReportEpoch) {
+  // The client's own time of the check orders the reports: one can arrive late (the client
+  // keeps notes in flash while it cannot reach its Notecard), and then an older one must not
+  // replace a newer one. A report without a time, or with one that is plainly wrong, keeps 0
+  // for "not known" and replaces only another such report (see reportCheckTime()). A client of
+  // this firmware sends no report without a time: it waits for its clock.
+  const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
+  if (!sunsaver::reportReplaces(meta->chargerReportValid, meta->chargerReportEpoch, checkedAt)) {
+    Serial.print(F("Charger check from "));
+    Serial.print(clientUid);
+    Serial.println(checkedAt > 0.0 ? F(" is older than the one this server holds: not kept")
+                                   : F(" carries no time and this server holds one that does: not kept"));
     return;
   }
   const bool verdictChanged = !meta->chargerReportValid || meta->chargerEvaluation.verdict != evaluation.verdict ||

@@ -886,6 +886,7 @@ static SolarAlertType gLastSolarAlert = SOLAR_ALERT_NONE;
 #define CHARGER_CHECK_RETRY_MS      (10UL * 60UL * 1000UL)               // after a pass the link did not carry
 #define CHARGER_CHECK_MAX_FAILURES  3                                    // such passes in a row, then wait a day
 #define CHARGER_REPORT_REFRESH_MS   (7UL * 24UL * 60UL * 60UL * 1000UL)  // an unchanged report is sent again weekly
+#define CHARGER_REPORT_RETRY_MS     (10UL * 60UL * 1000UL)               // after a report nothing would take
 static bool gChargerCheckWanted = false;          // a config change asks for a pass now
 static bool gChargerReportSyncNow = false;        // and for its report to be sent at once
 static unsigned long gChargerCheckEndMillis = 0;  // when the last pass ended, done or failed
@@ -893,6 +894,16 @@ static uint8_t gChargerCheckFailures = 0;         // passes in a row that the li
 static bool gChargerReportSent = false;           // a report has gone out since boot
 static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
 static unsigned long gChargerReportMillis = 0;    // when it went out
+// The report that still has to go out, kept apart from the pass that made it so that it can
+// wait: for the clock (the server keeps the newest report by the time of the check), or for a
+// Notecard and a note buffer that would not take it. See sendDueChargerReport().
+static bool gChargerReportDue = false;
+static sunsaver::Snapshot gChargerReportSnapshot;      // what it holds
+static sunsaver::Evaluation gChargerReportEvaluation;  // and how that was judged
+static uint32_t gChargerReportDueFingerprint = 0;
+static unsigned long gChargerReportDueMillis = 0;      // when its pass ended
+static bool gChargerReportTried = false;               // nothing would take it at the last try
+static unsigned long gChargerReportTryMillis = 0;      // which was then
 
 // Battery voltage monitoring via Notecard (when wired directly to battery)
 static BatteryData gBatteryData;
@@ -1483,8 +1494,8 @@ static const char *alarmPendingName(uint8_t code);
 static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
-static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
-static void bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow);
+static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
+static bool bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow);
 static void flushBufferedNotes();
 static void pruneNoteBufferIfNeeded();
 static void trimTelemetryOutbox();
@@ -1525,6 +1536,7 @@ static bool appendSolarDataToDaily(JsonDocument &doc);
 static void requestChargerCheck();
 static void serviceChargerCheck(unsigned long now);
 static void finishChargerCheck(unsigned long now);
+static void sendDueChargerReport(unsigned long now);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
 // Battery voltage monitoring (sourced from SunSaver MPPT or Vin divider via
@@ -7392,6 +7404,7 @@ static void requestChargerCheck() {
   gChargerReportSyncNow = true;
   gChargerCheckFailures = 0;
   gSolarManager.cancelChargerCheck();  // a pass under way would be judged against the old config
+  gChargerReportDue = false;           // so was a report that still waits to go out
 }
 
 // Call from loop() while the charger is enabled. Starts a pass when one is due and reads a few
@@ -7402,6 +7415,8 @@ static void serviceChargerCheck(unsigned long now) {
     gSolarManager.cancelChargerCheck();
     return;
   }
+
+  sendDueChargerReport(now);  // one that had to wait
 
   if (!gSolarManager.chargerCheckActive()) {
     const unsigned long sinceLast = now - gChargerCheckEndMillis;
@@ -7432,6 +7447,7 @@ static void serviceChargerCheck(unsigned long now) {
     gChargerCheckFailures = 0;
     gChargerCheckWanted = false;
     finishChargerCheck(now);
+    sendDueChargerReport(now);
   } else {
     if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
       gChargerCheckFailures = 0;  // the daily try after a run of failures
@@ -7447,7 +7463,7 @@ static void serviceChargerCheck(unsigned long now) {
 }
 
 // A pass is complete: judge it, tell the no-charge alert where the charger holds a full battery,
-// and report to the server when the result is new.
+// and make its report due when the result is new (sendDueChargerReport() sends it).
 static void finishChargerCheck(unsigned long now) {
   const sunsaver::Snapshot &snapshot = gSolarManager.chargerSnapshot();
   const sunsaver::Expectation want = {chargerCheckChemistry(), gConfig.batteryMonitor.nominalVoltage,
@@ -7496,8 +7512,36 @@ static void finishChargerCheck(unsigned long now) {
   }
 
   if (!changed && !gChargerReportSyncNow && (now - gChargerReportMillis) < CHARGER_REPORT_REFRESH_MS) {
-    return;  // the server has this report
+    gChargerReportDue = false;  // the server has this report
+    return;
   }
+  gChargerReportSnapshot = snapshot;
+  gChargerReportEvaluation = evaluation;
+  gChargerReportDueFingerprint = fingerprint;
+  gChargerReportDueMillis = now;
+  gChargerReportTried = false;
+  gChargerReportDue = true;
+  if (currentEpoch() <= 0.0) {
+    Serial.println(F("Charger check: the report goes out once the clock is set"));
+  }
+}
+
+// Hands the report that is due to the Notecard, and keeps it due until that has worked.
+static void sendDueChargerReport(unsigned long now) {
+  if (!gChargerReportDue) {
+    return;
+  }
+  // The server keeps the newest report by the time of the check, so a report does not go out
+  // without one. Waiting for the clock costs nothing: the report cannot reach the server before
+  // the Notecard has been online, and that is what sets the clock.
+  const double nowEpoch = currentEpoch();
+  if (nowEpoch <= 0.0) {
+    return;
+  }
+  if (gChargerReportTried && (now - gChargerReportTryMillis) < CHARGER_REPORT_RETRY_MS) {
+    return;
+  }
+  const double checkedAt = nowEpoch - (double)(now - gChargerReportDueMillis) / 1000.0;
 
   // The report travels on the config-ack notefile, which is already routed to the server. The
   // server tells it from an ack by the "chg-" status, as it tells the "ota-" reports.
@@ -7505,11 +7549,24 @@ static void finishChargerCheck(unsigned long now) {
   JsonObject body = doc.to<JsonObject>();
   body["c"] = gDeviceUID;
   body["st"] = "chg-check";
-  body["epoch"] = (uint32_t)currentEpoch();  // whole seconds: ArduinoJson writes some doubles with 7 digits
-  sunsaver::encodeReport(snapshot, evaluation, body);
-  publishNote(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow);
+  body["epoch"] = (uint32_t)checkedAt;  // whole seconds: ArduinoJson writes some doubles with 7 digits
+  sunsaver::encodeReport(gChargerReportSnapshot, gChargerReportEvaluation, body);
+  if (!publishNote(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow)) {
+    // Neither the Notecard nor the note buffer took it. It stays due, with everything that
+    // keeps a report from being sent twice left as it was.
+    if (!gChargerReportTried) {
+      Serial.println(F("Charger check: the report could not be sent or stored, trying again every 10 minutes"));
+    }
+    gChargerReportTried = true;
+    gChargerReportTryMillis = now;
+    return;
+  }
+  if (now != gChargerReportDueMillis) {
+    Serial.println(F("Charger check: the report that waited has gone out"));
+  }
+  gChargerReportDue = false;
   gChargerReportSent = true;
-  gChargerReportFingerprint = fingerprint;
+  gChargerReportFingerprint = gChargerReportDueFingerprint;
   gChargerReportMillis = now;
   gChargerReportSyncNow = false;
 }
@@ -8906,7 +8963,10 @@ static void trimTelemetryOutbox() {
   }
 }
 
-static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
+// Returns true when the note is with the Notecard or in the note buffer (bufferNoteForRetry),
+// from where flushBufferedNotes() sends it later. False means the note is lost: a caller that
+// must not lose it has to keep it and try again.
+static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   // Build serialized payload once for both live send and buffering
   // fileName is already a plain .qo notefile name (e.g., "telemetry.qo")
   // Cross-device routing is handled by Notehub Routes — no fleet: prefix needed
@@ -8922,7 +8982,7 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   size_t needed = measureJson(doc);
   if (needed == 0) {
     Serial.println(F("publishNote: empty JSON document"));
-    return;
+    return false;
   }
 
   // Static buffer for typical payloads; heap fallback for oversized ones
@@ -8940,7 +9000,7 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
       Serial.print(F("publishNote: payload needs "));
       Serial.print(needed);
       Serial.println(F(" bytes, heap alloc failed — dropping"));
-      return;
+      return false;
     }
   }
 
@@ -8948,24 +9008,24 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   if (len == 0 || len >= bufSize) {
     Serial.println(F("publishNote: JSON serialization failed"));
     if (dynamicBuf) free(dynamicBuf);
-    return;
+    return false;
   }
   buffer[len] = '\0';
 
   if (!gNotecardAvailable) {
     Serial.println(F("publishNote: Notecard unavailable — buffering"));
-    bufferNoteForRetry(fileName, buffer, syncNow);
+    const bool kept = bufferNoteForRetry(fileName, buffer, syncNow);
     if (dynamicBuf) free(dynamicBuf);
-    return;
+    return kept;
   }
 
   J *req = notecard.newRequest("note.add");
   if (!req) {
     Serial.println(F("publishNote: newRequest(note.add) returned null"));
     gNotecardFailureCount++;
-    bufferNoteForRetry(fileName, buffer, syncNow);
+    const bool kept = bufferNoteForRetry(fileName, buffer, syncNow);
     if (dynamicBuf) free(dynamicBuf);
-    return;
+    return kept;
   }
 
   JAddStringToObject(req, "file", fileName);
@@ -8977,9 +9037,9 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
   if (!body) {
     Serial.println(F("publishNote: JParse failed on serialized JSON"));
     JDelete(req);
-    bufferNoteForRetry(fileName, buffer, syncNow);
+    const bool kept = bufferNoteForRetry(fileName, buffer, syncNow);
     if (dynamicBuf) free(dynamicBuf);
-    return;
+    return kept;
   }
 
   // _sv is already present in the serialized payload (stamped into doc above), so no
@@ -8998,6 +9058,7 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
 #endif
 
   // Use requestAndResponse to capture the Notecard's error message (if any)
+  bool kept;
   J *rsp = notecard.requestAndResponse(req);
   if (rsp) {
     const char *err = JGetString(rsp, "err");
@@ -9006,53 +9067,66 @@ static void publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
       Serial.println(err);
       notecard.deleteResponse(rsp);
       gNotecardFailureCount++;
-      bufferNoteForRetry(fileName, buffer, syncNow);
+      kept = bufferNoteForRetry(fileName, buffer, syncNow);
     } else {
       notecard.deleteResponse(rsp);
       gLastSuccessfulNotecardComm = millis();
       gLastSuccessfulNoteSend = millis();
       gNotecardFailureCount = 0;
       flushBufferedNotes();
+      kept = true;
     }
   } else {
     Serial.println(F("publishNote: requestAndResponse returned null (I2C failure?)"));
     gNotecardFailureCount++;
-    bufferNoteForRetry(fileName, buffer, syncNow);
+    kept = bufferNoteForRetry(fileName, buffer, syncNow);
   }
   if (dynamicBuf) free(dynamicBuf);
+  return kept;
 }
 
-static void bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow) {
+// Returns true when the note was written to the buffer, false when it is lost.
+static bool bufferNoteForRetry(const char *fileName, const char *payload, bool syncNow) {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) {
       Serial.println(F("Warning: Filesystem not available; note dropped"));
-      return;
+      return false;
     }
     FILE *file = fopen("/cfg/pending_notes.log", "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
-      return;
+      return false;
     }
-    fprintf(file, "%s\t%c\t%s\n", fileName, syncNow ? '1' : '0', payload);
-    fclose(file);
+    const bool written = fprintf(file, "%s\t%c\t%s\n", fileName, syncNow ? '1' : '0', payload) > 0;
+    const bool closed = fclose(file) == 0;  // the write reaches the flash here at the latest
+    if (!written || !closed) {
+      Serial.println(F("Failed to write note buffer; dropping payload"));
+      return false;
+    }
   #else
     File file = LittleFS.open(NOTE_BUFFER_PATH, "a");
     if (!file) {
       Serial.println(F("Failed to open note buffer; dropping payload"));
-      return;
+      return false;
     }
-    file.print(fileName);
-    file.print('\t');
-    file.print(syncNow ? '1' : '0');
-    file.print('\t');
-    file.println(payload);
+    size_t written = file.print(fileName);
+    written += file.print('\t');
+    written += file.print(syncNow ? '1' : '0');
+    written += file.print('\t');
+    written += file.println(payload);
     file.close();
+    if (written < strlen(fileName) + 3 + strlen(payload)) {
+      Serial.println(F("Failed to write note buffer; dropping payload"));
+      return false;
+    }
   #endif
   Serial.println(F("Note buffered for retry"));
   pruneNoteBufferIfNeeded();
+  return true;
 #else
   Serial.println(F("Warning: Filesystem not available; note dropped"));
+  return false;
 #endif
 }
 
