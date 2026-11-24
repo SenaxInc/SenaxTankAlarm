@@ -100,7 +100,10 @@ class OvWebHost {
   // A connection that has just come in, or nullptr. The server calls its close() when done.
   virtual OvConn *accept() = 0;
   // Fills `out` with bytes that nobody can predict: session tokens and question ids are made of
-  // them. Returns false when the source could not give all of them. Nothing is handed out then.
+  // them. Returns false when the board's random number generator did not give them, and they
+  // come from a weaker source instead (on the Opta, the timing of key presses and connections).
+  // They are used all the same, because OptaView is meant for a network that is trusted, where a
+  // page that nobody can log in to helps nobody; the USB console says so ('web', 'status').
   virtual bool random(uint8_t *out, size_t len) = 0;
   // "192.168.1.57", or false while the network is down. For the USB console's 'web'.
   virtual bool address(char *out, size_t cap) = 0;
@@ -133,7 +136,8 @@ class OvWeb : public OvConsoleExtra {
         heartbeat_(false),
         commandStartMs_(0),
         lastSendMs_(0),
-        served_(0) {
+        served_(0),
+        randomFailures_(0) {
     pin_[0] = '\0';
     token_[0] = '\0';
     question_[0] = '\0';
@@ -267,6 +271,13 @@ class OvWeb : public OvConsoleExtra {
       out.print(", nobody logged in");
     }
     out.println();
+    if (randomFailures_ > 0) {
+      out.print("          The random number generator failed ");
+      out.printU(randomFailures_);
+      out.println(randomFailures_ == 1 ? " time, so a session cookie or question id was made from timing"
+                                       : " times, so session cookies or question ids were made from timing");
+      out.println("          alone. That is easier to guess: keep the Opta on a network you trust.");
+    }
     const uint32_t wait = waitSeconds();
     if (wait > 0) {
       out.print("          Logins are refused for another ");
@@ -355,6 +366,7 @@ class OvWeb : public OvConsoleExtra {
   uint32_t commandStartMs_;
   uint32_t lastSendMs_;
   uint32_t served_;
+  uint32_t randomFailures_;  // times the board's random number generator did not give its bytes
 
   // -------------------------------------------------------------------------------------------
   // Small helpers
@@ -390,17 +402,21 @@ class OvWeb : public OvConsoleExtra {
     return true;
   }
 
-  // `bytes` random bytes as hex digits. Returns false, and leaves `out` empty, when the source of
-  // random bytes failed: a guessable token or question id is never handed out.
-  bool makeHex(char *out, size_t bytes) {
+  // `bytes` random bytes as hex digits. When the board's generator failed, the bytes the host gave
+  // in its place are used with the count of failures mixed in: two ids made one after the other
+  // then still differ, even from a source that gives the same bytes every time, so a yes for an
+  // older question cannot pass for one for the question that is open.
+  void makeHex(char *out, size_t bytes) {
     uint8_t raw[16];
     if (bytes > sizeof(raw)) {
       bytes = sizeof(raw);
     }
     memset(raw, 0, sizeof(raw));
     if (!host_.random(raw, bytes)) {
-      out[0] = '\0';
-      return false;
+      ++randomFailures_;
+      for (size_t i = 0; i < bytes && i < sizeof(randomFailures_); ++i) {
+        raw[i] ^= (uint8_t)(randomFailures_ >> (8 * i));
+      }
     }
     for (size_t i = 0; i < bytes; ++i) {
       ovFormatHex(raw[i], 2, out + 2 * i, 3);
@@ -409,7 +425,6 @@ class OvWeb : public OvConsoleExtra {
     for (char *p = out; *p != '\0'; ++p) {
       *p = (char)tolower((unsigned char)*p);
     }
-    return true;
   }
 
   bool sessionValid() const { return sessionOpen_ && ovSameSecret(token_, request_.cookie); }
@@ -421,24 +436,12 @@ class OvWeb : public OvConsoleExtra {
     console_.newVisitor();
   }
 
-  // A new session in place of the one there was. Returns false, and leaves the one there was as
-  // it is, when no token can be made.
-  bool openSession() {
-    char token[sizeof(token_)];
-    if (!makeHex(token, 16)) {
-      return false;
-    }
+  // A new session in place of the one there was.
+  void openSession() {
     endSession();
-    ovCopy(token_, sizeof(token_), token);
+    makeHex(token_, 16);
     sessionOpen_ = true;
     sessionUsedMs_ = clock_.nowMs();
-    return true;
-  }
-
-  void refuseWithoutRandom() {
-    jsonError(503, "random",
-              "The Opta's random number generator did not answer, so no safe session can be made. "
-              "Nothing was changed. The USB console still works.");
   }
 
   // Seconds until a PIN is looked at again, or 0.
@@ -707,15 +710,10 @@ class OvWeb : public OvConsoleExtra {
       jsonError(400, "pin-format", "A PIN is 4 to 8 digits.");
       return;
     }
-    // The PIN is kept only together with a session for it: a PIN chosen with nobody logged in
-    // would leave the next visitor a PIN to guess.
-    if (!openSession()) {
-      refuseWithoutRandom();
-      return;
-    }
     ovCopy(pin_, sizeof(pin_), pin);
     failures_ = 0;
     blocked_ = false;
+    openSession();
     answerLoggedIn();
   }
 
@@ -738,10 +736,7 @@ class OvWeb : public OvConsoleExtra {
     }
     failures_ = 0;
     blocked_ = false;
-    if (!openSession()) {
-      refuseWithoutRandom();
-      return;
-    }
+    openSession();
     answerLoggedIn();
   }
 
@@ -1144,12 +1139,8 @@ class OvWeb : public OvConsoleExtra {
         console_.handleLine(line);
         asked = console_.awaitingConfirmation();
       }
-      if (asked && !makeHex(question_, 4)) {  // a new question, a new id
-        // Without an id nobody can answer it, and one that could be guessed is not given out.
-        console_.cancelPending();
-        asked = false;
-        response_.println("The Opta's random number generator did not answer, so this question cannot be asked.");
-        response_.println("Nothing was sent.");
+      if (asked) {
+        makeHex(question_, 4);  // a new question, a new id
       }
     }
 

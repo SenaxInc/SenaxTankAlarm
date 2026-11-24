@@ -1029,6 +1029,11 @@ class OvProfile {
         if (!namedRegister(live["meter"], &check.meter)) {
           return fail(error, errorCap, "scaleCheck.live.meter names no register");
         }
+        if (check.meter == nullptr) {
+          // The regulation test only points (ovJudgeLive), so without a multimeter comparison
+          // nothing could ever confirm this scale.
+          return fail(error, errorCap, "scaleCheck.live.meter is needed: only a multimeter reading settles this scale");
+        }
         if (!namedRegister(live["battery"], &check.battery)) {
           return fail(error, errorCap, "scaleCheck.live.battery names no register");
         }

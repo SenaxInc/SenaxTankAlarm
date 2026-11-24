@@ -326,21 +326,16 @@ async function firstVisit(win) {
   await page.reload();
   await page.waitForSelector('#view-login:not(.hidden)');
 
-  // Without the Opta's random number generator no session is made, because one that could be
-  // guessed is no session. The login is refused and says why.
+  // Without the Opta's random number generator the login works all the same, because OptaView is
+  // meant for a network that is trusted. The USB console says that it happened.
   await win.preview.line('sim random off', /sim: the random number generator fails/);
-  win.allow = /status of 503/;
-  await page.fill('#pin', PIN);
-  await page.click('#loginBtn');
-  await page.waitForFunction(() => document.querySelector('#loginMessage').textContent.includes('random'));
-  checkEq(await win.text('#loginMessage'),
-          'The Opta\'s random number generator did not answer, so no safe session can be made. Nothing was ' +
-          'changed. The USB console still works.', 'a login without a random number generator is refused');
-  checkEq((await win.context.cookies()).length, 0, 'and gets no cookie');
-  check(await page.isHidden('#nav'), 'and no views');
-  await win.preview.line('sim random on', /sim: the random number generator works/);
-  win.allow = null;
   await logIn(win, PIN);
+  check(await page.isVisible('#nav'), 'a login while the random number generator fails is let in');
+  const weak = await win.context.cookies();
+  check(weak.length === 1 && /^[0-9a-f]{32}$/.test(weak[0].value), 'with a cookie of 32 hex digits');
+  check(weak.length === 1 && weak[0].value !== cookies[0].value, 'that is not the one before');
+  await win.preview.line('web', /The random number generator failed 1 time, so a session cookie or question id was made/);
+  await win.preview.line('sim random on', /sim: the random number generator works/);
   await win.settle();
 }
 
@@ -725,18 +720,6 @@ async function toolsView(win, profile) {
   await page.click('#dialogNo');
   await dialogHidden(win);
   checkEq(await win.preview.writes(), before, 'and Cancel sends nothing');
-  // Without the Opta's random number generator a question gets no id, so nobody can answer it:
-  // the console says so and the page offers no Yes.
-  await win.preview.line('sim random off', /sim: the random number generator fails/);
-  await page.fill('#consoleLine', 'set EV_lvr 13.30');
-  await page.press('#consoleLine', 'Enter');
-  const unasked = await result(win);
-  checkHas(unasked, 'The Opta\'s random number generator did not answer, so this question cannot be asked.',
-           'a question without a random number generator');
-  checkHas(unasked, 'Nothing was sent.', 'is not asked');
-  await close(win);
-  await win.preview.line('sim random on', /sim: the random number generator works/);
-  checkEq(await win.preview.writes(), before, 'and nothing is written');
   // "yes" typed as a command finds nothing to agree to.
   await page.fill('#consoleLine', 'yes');
   await page.press('#consoleLine', 'Enter');

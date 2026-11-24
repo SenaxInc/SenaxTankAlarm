@@ -21,7 +21,8 @@
 //   sim drop <n>           its next n replies are lost on the way (it does what was asked)
 //   sim skip <seconds>     this much time passes at once (a session ends after 30 minutes)
 //   sim writes             how many requests that change something it has received
-//   sim random off|on      the Opta's random number generator fails, or works again
+//   sim random off|on      the Opta's random number generator fails (the clock stands in for it),
+//                          or works again
 //   sim quit
 //
 // Options: --port <n> (default 8080; 0 takes any free port and prints it), --pin <digits>
@@ -229,6 +230,14 @@ class PcWebHost : public OvWebHost {
 
   bool random(uint8_t *out, size_t len) override {
     if (!gRandomWorks) {
+      // What the Opta falls back on is the timing of events; here the clock stands in for it.
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      uint64_t mix = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+      for (size_t i = 0; i < len; ++i) {
+        mix = mix * 6364136223846793005ULL + 1442695040888963407ULL;
+        out[i] = (uint8_t)(mix >> 56);
+      }
       return false;
     }
     FILE *source = fopen("/dev/urandom", "rb");

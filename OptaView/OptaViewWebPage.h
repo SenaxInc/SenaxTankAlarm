@@ -12,7 +12,7 @@
 
 namespace optaview {
 
-// The page: 52852 bytes, its lines ending in LF.
+// The page: 52890 bytes, its lines ending in LF.
 static const char OV_WEB_PAGE[] =
     R"OVWEB(<!DOCTYPE html>)OVWEB" "\n"
     R"OVWEB(<html lang="en">)OVWEB" "\n"
@@ -242,8 +242,8 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(</div>)OVWEB" "\n"
     R"OVWEB(<div class="card">)OVWEB" "\n"
     R"OVWEB(<h2>Voltage scale check</h2>)OVWEB" "\n"
-    R"OVWEB(<p>Tests whether the controller uses the voltage scales that this register map assumes. A multimeter reading t)OVWEB"
-    R"OVWEB(aken at the battery terminals makes the test stronger.</p>)OVWEB" "\n"
+    R"OVWEB(<p>Tests whether the controller uses the voltage scales that this register map assumes. The stored settings ne)OVWEB"
+    R"OVWEB(ed nothing more. The live readings need a multimeter reading taken at the battery terminals.</p>)OVWEB" "\n"
     R"OVWEB(<p id="scaleText" class="muted small"></p>)OVWEB" "\n"
     R"OVWEB(<form id="scaleForm" class="row">)OVWEB" "\n"
     R"OVWEB(<label for="meterVolts">Multimeter reading, in volts (optional)</label>)OVWEB" "\n"

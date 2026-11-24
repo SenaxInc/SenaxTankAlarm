@@ -1904,7 +1904,8 @@ struct FakeWebHost : OvWebHost {
   bool random(uint8_t *out, size_t len) override {
     ++randomCalls;
     if (!randomWorks) {
-      memset(out, 0xA5, len);  // what a failed source left behind must not become a token
+      // The weakest stand-in there is: the same bytes every time.
+      memset(out, 0xA5, len);
       return false;
     }
     for (size_t i = 0; i < len; ++i) {
@@ -2837,42 +2838,44 @@ static void testWebLogin() {
     CHECK_EQ(w.host.randomCalls, 20);
   }
   {
-    // A board whose random number generator fails hands out no session. No token is made of
-    // what the failed source left behind, a PIN is not kept without a session for it, and a
-    // browser that was logged in stays logged in.
+    // A board whose random number generator fails still lets a browser in: OptaView is meant for
+    // a network that is trusted. The bytes the host gives in its place are used, and even from a
+    // source that gives the same bytes every time no two tokens are the same.
     WebRig w;
     w.host.randomWorks = false;
     const Reply chosen = w.post("/api/pin", "{\"pin\":\"2468\"}");
-    CHECK_ERROR(chosen, 503, "random");
-    CHECK_HAS(str(chosen.json["message"]), "random number generator did not answer");
-    CHECK(chosen.header("Set-Cookie").empty());
-    CHECK(w.cookie.empty());
-    CHECK(!w.web.sessionOpen());
-    CHECK(w.get("/api/session").json["pinSet"] == false);
-    w.host.randomWorks = true;
-    CHECK_EQ(w.post("/api/pin", "{\"pin\":\"2468\"}").status, 200);
-    const std::string first = w.cookie;
-    CHECK(!first.empty());
-    w.host.randomWorks = false;
-    w.cookie.clear();
-    const Reply login = w.post("/api/login", "{\"pin\":\"2468\"}");
-    CHECK_ERROR(login, 503, "random");
-    CHECK(login.header("Set-Cookie").empty());
-    CHECK(w.cookie.empty());
-    w.cookie = first;
-    CHECK_EQ(w.get("/api/state").status, 200);  // the first browser keeps its session
-    // A wrong PIN is still a wrong PIN, and costs its wait.
+    CHECK_EQ(chosen.status, 200);
+    CHECK(!chosen.header("Set-Cookie").empty());
+    CHECK(w.web.pinSet());
+    CHECK(w.web.sessionOpen());
+    CHECK_EQ(w.get("/api/state").status, 200);
+    std::vector<std::string> seen;
+    seen.push_back(w.cookie);
+    for (int i = 0; i < 5; ++i) {
+      w.cookie.clear();
+      CHECK_EQ(w.post("/api/login", "{\"pin\":\"2468\"}").status, 200);
+      CHECK_EQ(w.cookie.size(), 32);
+      for (size_t k = 0; k < seen.size(); ++k) {
+        CHECK(seen[k] != w.cookie);
+      }
+      seen.push_back(w.cookie);
+    }
+    CHECK_EQ(w.host.randomCalls, 6);
+    // One browser at a time, and a wrong PIN is still a wrong PIN.
+    const std::string last = w.cookie;
+    w.cookie = seen[0];
+    CHECK_ERROR(w.get("/api/state"), 401, "login");
     w.cookie.clear();
     CHECK_ERROR(w.post("/api/login", "{\"pin\":\"1111\"}"), 401, "wrong-pin");
-    // Once the generator answers again, logging in works as before.
+    w.cookie = last;
+    CHECK_EQ(w.get("/api/state").status, 200);
+    // Once the generator answers again, its bytes are used as they come.
     w.host.randomWorks = true;
     w.idle(1100);
+    w.cookie.clear();
     CHECK_EQ(w.post("/api/login", "{\"pin\":\"2468\"}").status, 200);
-    CHECK(!w.cookie.empty());
-    CHECK(w.cookie != first);
-    CHECK(w.cookie.find("a5a5a5a5") == std::string::npos);  // nothing of what the failed source left
-    w.cookie = first;
-    CHECK_ERROR(w.get("/api/state"), 401, "login");  // one browser at a time
+    CHECK_EQ(w.cookie.size(), 32);
+    CHECK(w.cookie.find("a5a5a5a5") == std::string::npos);
   }
 }
 
@@ -3373,28 +3376,26 @@ static void testWebConsole() {
     CHECK_EQ(w.rig.sim.regs[0xE022], w.rig.sim.setVolts(12.10));
   }
   {
-    // A question needs an id that nobody can guess. When the board's random number generator
-    // fails, the question is not asked at all: nothing waits for a yes, and nothing is written.
+    // When the board's random number generator fails, a question still gets an id, from the bytes
+    // the host gives in its place with a count mixed in. Two questions in a row get different ids
+    // even from a source that gives the same bytes every time, so only the newer one can be
+    // answered.
     const unsigned writes = w.rig.sent(0x06);
     w.host.randomWorks = false;
-    const Reply ask = w.console("set EV_lvd 12.40");
-    CHECK_HAS(ask.text, "  new  12.40 V");
-    CHECK_HAS(ask.text,
-              "Type yes to write it. Anything else cancels.\r\n"
-              "The Opta's random number generator did not answer, so this question cannot be asked.\r\n"
-              "Nothing was sent.\r\n");
-    CHECK(ask.json["awaiting"] == false);
-    CHECK(ask.json["question"].isNull());
+    const Reply first = w.console("set EV_lvd 12.40");
+    CHECK(first.json["awaiting"] == true);
+    const std::string older = str(first.json["question"]);
+    const Reply second = w.console("set EV_lvd 12.30");
+    CHECK_HAS(second.text, "  new  12.30 V");
+    CHECK(second.json["awaiting"] == true);
+    const std::string newer = str(second.json["question"]);
+    CHECK_EQ(older.size(), 8);
+    CHECK_EQ(newer.size(), 8);
+    CHECK(older != newer);
+    CHECK(w.console("yes", older).text == kNotOpen);
+    CHECK(w.console("no", newer).text == "Cancelled. Nothing was sent.\r\n");
+    CHECK_EQ(w.rig.sent(0x06), writes);
     w.host.randomWorks = true;
-    CHECK(w.console("yes", "00000000").text == kNotOpen);
-    CHECK_HAS(w.console("yes").text, "Nothing is waiting for a yes or a no.");
-    CHECK_EQ(w.rig.sent(0x06), writes);
-    // With the generator back, the same change is asked about as usual.
-    const Reply again = w.console("set EV_lvd 12.40");
-    CHECK(again.json["awaiting"] == true);
-    CHECK_EQ(str(again.json["question"]).size(), 8);
-    CHECK(w.console("no", str(again.json["question"])).text == "Cancelled. Nothing was sent.\r\n");
-    CHECK_EQ(w.rig.sent(0x06), writes);
   }
   {
     // Only "yes" is a yes.
@@ -3489,6 +3490,23 @@ static void testWebConsole() {
     CHECK_HAS(switched.text, "Sent, but the controller did not acknowledge it (no reply).\r\n"
                              "load_disconnect now reads on: it was switched.\r\n");
     CHECK(switched.json["state"]["resetMaybe"] == false);
+  }
+  {
+    // A restart that the controller acknowledges and does not make. It answered all along, so
+    // the page is still told that the restart is due.
+    WebRig stuck;
+    stuck.login();
+    stuck.rig.sim.resetWorks = false;
+    const Reply ask = stuck.console("set EV_lvr 13.25");
+    CHECK_HAS(stuck.console("yes", str(ask.json["question"])).text, "Written and read back");
+    const Reply reset = stuck.console("reset");
+    const Reply done = stuck.console("yes", str(reset.json["question"]));
+    CHECK_EQ(stuck.rig.sim.resets, 0);
+    CHECK_HAS(done.text, "so it was not seen to restart.\r\n");
+    CHECK_HASNT(done.text, "answers again");
+    CHECK(done.json["state"]["resetNeeded"] == true);
+    CHECK(stuck.get("/api/state").json["resetNeeded"] == true);
+    CHECK(plainConsoleText(done.text));
   }
   {
     // A coil, and the restart.
@@ -3652,7 +3670,7 @@ static void testWebLongCommands() {
     const uint64_t start = w.now();
     const Reply done = w.console("yes", str(ask.json["question"]));
     CHECK_HAS(done.text, "The controller answers again after");
-    CHECK(done.heartbeats >= 4 && done.heartbeats <= 8);
+    CHECK(done.heartbeats >= 3 && done.heartbeats <= 8);  // a request missed takes two seconds
     CHECK(done.json["cut"] == false);
     CHECK(w.now() - start >= 6000);
     CHECK(plainConsoleText(done.text));
@@ -3873,6 +3891,24 @@ static void testWebUsbCommands() {
     CHECK_HASNT(w.get(everything[i]).body, "97531246");
   }
   CHECK_HASNT(w.console("status").body, "97531246");
+  // A random number generator that fails keeps nobody out, and the USB console says how often.
+  CHECK_HASNT(w.rig.run("status"), "random number generator");
+  w.host.randomWorks = false;
+  w.cookie.clear();
+  CHECK_EQ(w.post("/api/login", "{\"pin\":\"97531246\"}").status, 200);
+  CHECK_HAS(w.rig.run("web"),
+            "          The random number generator failed 1 time, so a session cookie or question id was made from timing\r\n"
+            "          alone. That is easier to guess: keep the Opta on a network you trust.\r\n");
+  const Reply asked = w.console("set EV_lvd 12.40");
+  CHECK(asked.json["awaiting"] == true);
+  CHECK_HAS(w.rig.run("status"),
+            "          The random number generator failed 2 times, so session cookies or question ids were made from timing\r\n"
+            "          alone. That is easier to guess: keep the Opta on a network you trust.\r\n");
+  w.host.randomWorks = true;
+  CHECK(w.console("no", str(asked.json["question"])).text == "Cancelled. Nothing was sent.\r\n");
+  w.cookie.clear();
+  CHECK_EQ(w.post("/api/login", "{\"pin\":\"97531246\"}").status, 200);
+  CHECK_HAS(w.rig.run("web"), "          The random number generator failed 2 times,");
 }
 
 int main() {

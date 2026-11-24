@@ -94,6 +94,7 @@ static const uint16_t OV_MAX_SPAN_WORDS = MB_MAX_READ_REGISTERS;
 static const uint8_t OV_LINK_DOWN_AFTER = 3;      // failed requests in a row that end a batch
 static const uint16_t OV_PROBE_TIMEOUT_MS = 400;  // reply wait during the probe sweep and scans
 static const uint32_t OV_RESET_GIVE_UP_MS = 20000;
+static const uint32_t OV_RESET_POLL_MS = 250;     // at most one request this often while a restart is awaited
 
 // A run of registers at consecutive addresses.
 struct OvSpan {
@@ -147,9 +148,11 @@ struct OvWriteOutcome {
 struct OvResetOutcome {
   bool sent;             // the profile has a reset coil and the command went out
   MbResult command;      // a missing reply is normal here: the controller may restart first
-  bool cameBack;         // the controller answered again afterwards
+  bool wentAway;         // a request after the command went unanswered: the sign of a restart
+  bool cameBack;         // ...and the controller answered again after that
+  bool neverAway;        // it answered every request for the whole of the profile's resetWaitMs
   bool aborted;
-  uint32_t backAfterMs;  // from the command to that answer
+  uint32_t backAfterMs;  // from the command to the answer that ended the wait
 };
 
 enum OvCheckResult : uint8_t {
@@ -172,10 +175,13 @@ enum OvCheckResult : uint8_t {
 //        the right scale the setpoints land on a 0.05 V grid; with the wrong one they do not.
 //
 //   Live readings
-//     2. Regulation. In absorption, float or equalize the battery sits at the regulation target.
-//        The two registers only agree if the battery's scale is right relative to the target's.
-//        So this test can confirm the scale in use, but it cannot overturn it: when it points
-//        elsewhere, the target's own scale may be the one that is wrong.
+//     2. Regulation. In absorption, float or equalize the controller works to hold the battery at
+//        its regulation target, and the two registers agree only if the battery's scale is right
+//        relative to the target's. This test only points, and decides nothing: the battery need
+//        not be at the target in those states (with too little sun for the load it stays below
+//        it, and float goes on for a while below it, see Et_float_exit_cum), and a battery 3.3 %
+//        below its target reads as on target at the other scale. When it points away from the
+//        scale in use, the target's own scale may also be the one that is wrong.
 //     3. A multimeter reading typed in by the user. It decides.
 //
 // Neither verdict is borrowed for the other scale: a multimeter says nothing about how settings
@@ -339,9 +345,8 @@ inline void ovJudgeMeter(OvLiveScaleReport *report, double den) {
   }
 }
 
-// The verdict for live readings. A multimeter comparison decides, also when it fits no
-// candidate: then the scale stays open, whatever the regulation test says. Without one, the
-// regulation test counts only when it confirms the scale in use (candidate 0).
+// The verdict for live readings: a multimeter comparison decides, also when it fits no candidate
+// (then the scale stays open). Without one there is no verdict, whatever the regulation test says.
 inline void ovJudgeLive(OvLiveScaleReport *report) {
   report->verdict = -1;
   report->conflict = false;
@@ -349,8 +354,6 @@ inline void ovJudgeLive(OvLiveScaleReport *report) {
     report->verdict = report->meterVerdict;
     report->conflict = report->meterVerdict >= 0 && report->regulationVerdict >= 0 &&
                        report->regulationVerdict != report->meterVerdict;
-  } else if (report->regulationVerdict == 0) {
-    report->verdict = 0;
   }
 }
 
@@ -833,7 +836,11 @@ class OvDevice {
     return master_.writeCoil(link.slave, coil.addr, on);
   }
 
-  // Restarts the controller through the profile's reset coil, waits, then asks until it answers.
+  // Restarts the controller through the profile's reset coil and waits for it to come back. A
+  // restart shows as a silence: asked all along, the controller misses a request and then answers
+  // again. Only then do the settings written count as in use. A controller that answers every
+  // request for the profile's resetWaitMs was not seen to restart (the command may not have
+  // reached it, or it may not act on it), so whatever said that a restart is due still says so.
   OvResetOutcome resetController(OvAbortCheck *abort) {
     OvResetOutcome out;
     memset(&out, 0, sizeof(out));
@@ -849,28 +856,35 @@ class OvDevice {
       return out;  // refused: it did not restart
     }
     const uint32_t start = transport.nowMs();
-    while ((uint32_t)(transport.nowMs() - start) < defaults.resetWaitMs) {
+    uint32_t askedAt = start;
+    bool asked = false;
+    for (;;) {
       if (abort != nullptr && abort->aborted()) {
         out.aborted = true;
-        return out;
+        break;
       }
-      transport.idle();
-    }
-    for (;;) {
+      if (asked && (uint32_t)(transport.nowMs() - askedAt) < OV_RESET_POLL_MS) {
+        transport.idle();  // a controller that answers at once is not asked without a pause
+        continue;
+      }
+      asked = true;
+      askedAt = transport.nowMs();
       uint16_t raw = 0;
       const MbResult r = master_.readRegisters(link.slave, link.readFunction, defaults.probeRegister->addr, 1, &raw);
-      if (r.status == MB_OK || r.status == MB_EXCEPTION) {
+      const uint32_t elapsed = (uint32_t)(transport.nowMs() - start);
+      if (r.status != MB_OK && r.status != MB_EXCEPTION) {
+        out.wentAway = true;
+        if (elapsed >= OV_RESET_GIVE_UP_MS) {
+          break;  // it has not come back
+        }
+      } else if (out.wentAway) {
         out.cameBack = true;
         resetNeeded_ = false;  // whatever was written, the controller uses it now
         writeUnsettled_ = false;
         unknownOpen_ = false;
         break;
-      }
-      if ((uint32_t)(transport.nowMs() - start) >= OV_RESET_GIVE_UP_MS) {
-        break;
-      }
-      if (abort != nullptr && abort->aborted()) {
-        out.aborted = true;
+      } else if (elapsed >= defaults.resetWaitMs) {
+        out.neverAway = true;
         break;
       }
     }

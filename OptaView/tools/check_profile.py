@@ -238,6 +238,9 @@ def check_scale_check(scale_check, scales, register):
         if settings is not None and scale == settings.get("scale"):
             errors.append("scaleCheck.live.scale and scaleCheck.settings.scale must be two scales: "
                           "a multimeter reading must not decide how settings are written")
+        if "meter" not in live:
+            # The regulation test only points, so without it nothing could confirm the scale.
+            errors.append("scaleCheck.live.meter: needed, because only a multimeter reading settles the live scale")
         for key in ("meter", "battery"):
             if key in live:
                 reg = register(live[key], "scaleCheck.live.%s" % key)

@@ -189,7 +189,8 @@ Controller view (7).
    for `yes`. Raising the reconnect voltage first keeps it above the disconnect voltage at
    every step.
 7. `reset` restarts the controller so that it uses the new settings, waits for it to come
-   back and shows the status again. `dump load` then shows what is stored.
+   back and shows the status again. `dump load` then shows what is stored. If it says that the
+   controller answered all the time and was not seen to restart, the restart is still due.
 
 While you change settings, power the Opta from the battery and not from the SunSaver's LOAD
 terminals: the specification does not say whether the load output stays on between an EEPROM
@@ -241,7 +242,7 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 | `get <address> [count]` | Raw registers from an address |
 | `coils` | Coil states |
 | `snapshot` | Every raw value as JSON |
-| `scalecheck [volts]` | Test the voltage scales, with a multimeter reading if you have one |
+| `scalecheck [volts]` | Test the voltage scales. The live readings need a multimeter reading |
 | `set <name> <value>` | Write a setting, for example `set EV_lvd 13.10` |
 | `set <name> raw <n>` | The same with a raw register value |
 | `coil <name> on\|off` | Switch a coil |
@@ -284,6 +285,11 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   been read again.
 - Pairs that must stay in order (reconnect above disconnect) are checked when you `set` one of
   them and again before `reset`.
+- A restart counts only when it shows: after the reset command the controller misses a request
+  and then answers again. One that answers every request for the profile's `resetWaitMs`
+  (3 s) was not seen to restart, and OptaView keeps saying that a restart is due. A single
+  reply lost on a poor link looks like a restart too, so check that the "EEPROM setting edit"
+  fault is gone afterwards.
 - `raw` sends functions 1 to 4, which only read, as they are typed. Every other request needs
   `expert on` first and still asks for `yes`, because OptaView cannot tell what it would change.
 - Stored settings and live readings have a voltage scale each. `set` warns until the scale of
@@ -300,9 +306,10 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   a page from another site cannot send. The page itself is served with a policy that lets the
   browser run its one script and nothing else.
 - The session cookie and the id of each question come from the processor's random number
-  generator. When it does not answer, nobody gets a session and no question is asked on the
-  page, because a cookie or an id that could be guessed protects nothing. The USB console still
-  works then.
+  generator, mixed with the timing of key presses and connections. If the generator does not
+  answer, they come from that timing alone, which is easier to guess. The page works all the
+  same, because it is meant for a network you trust, and `web` and `status` on the USB console
+  say how often it happened. Two questions in a row never get the same id.
 
 ## The voltage scales
 
@@ -331,8 +338,11 @@ them. It tests the first two separately, each on its own evidence:
 - **Stored settings.** The setpoints in the controller are round numbers (14.40 V, 11.50 V)
   only at the right scale. This needs no multimeter.
 - **Live readings.** A multimeter reading at the controller's battery terminals, given as
-  `scalecheck 13.42`, decides. Without one the check can still confirm the scale in use while
-  the controller is in absorption or float, because it then holds the battery at `Vb_ref`.
+  `scalecheck 13.42`, decides, and nothing else does. In absorption and float the check also
+  compares the battery with `Vb_ref`, the target the controller works towards, but that only
+  points: the battery is not always at its target (float goes on until `Et_float_exit_cum` runs
+  out, and the sun may be too weak to get there), and a battery 3.3 % below its target reads
+  as right on it at the other scale.
 
 A multimeter says nothing about how settings are stored, and round setpoints say nothing about
 the readings, so neither verdict is taken from the other's evidence. This is the simulator
@@ -346,7 +356,9 @@ Stored settings (scale vset, now x100/32768). Candidates: x100, x96.667.
        at x96.667, 1 of 13 is a multiple of 0.05 V
      -> x100
 Live readings (scale vlive, now x100/32768). Candidates: x100, x96.667.
-  2. Regulation: the controller is holding the battery at its target (Vb_ref = 13.70 V).
+  2. Regulation: in FLOAT (7) the controller works to hold the battery at Vb_ref = 13.70 V.
+     This only points: the battery is not always at its target in this state (too little sun
+     for the load), and one that is below it can read as on it at another scale.
        Vb_f reads 13.70 V at x100, 13.24 V at x96.667
      -> x100
   3. Multimeter: 13.68 V measured, which with the register value works out to x99.99.
@@ -375,7 +387,8 @@ Not confirmed yet, and so the first things to try:
   tested with stand-ins for it, so all of this waits for an Opta: getting an address by DHCP,
   falling back to the fixed address, the listener on port 80, how quickly pages load (the
   library starts a thread for each connection), and the processor's random number generator
-  behind the session tokens (if it does not answer, the page refuses every login and says so).
+  behind the session tokens (if it does not answer, the page works all the same and `web` on
+  the USB console says so).
 - Every register marked `~`, including all the EEPROM settings.
 - Reading several registers in one request. OptaView tries it, and if the adapter does not
   answer blocks it falls back to single registers and says so.
@@ -444,7 +457,7 @@ SunSaver behind them, and serves the page at <http://127.0.0.1:8080/>. Its termi
 console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
 `sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
 next three replies are lost on the way), `sim random off` (the Opta's random number generator
-fails). Add
+fails and the clock stands in for it). Add
 `PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
 simulated controller answers as the specification says, so the preview shows the page and not
 how a real SunSaver behaves.
@@ -456,7 +469,7 @@ NODE_PATH=<that folder>/node_modules make -C tests/host/optaview browser-test AR
 
 This drives the page of the preview in Chromium: choosing a PIN, the readings, a change with
 Cancel and with Yes, a value outside its limits, the restart, the switches, the snapshot
-(whole, broken off and with registers missing), a random number generator that fails, wrong
+(whole, broken off and with registers missing), a login while the random number generator fails, wrong
 PINs, sessions that end, a window the size of a phone, and an Opta that goes away. It also
 fails if the browser blocks anything under the page's policy or if the page asks anything of
 another server. `BROWSER_TEST_ARGS="--shots <folder>"` saves the screenshots this README uses.

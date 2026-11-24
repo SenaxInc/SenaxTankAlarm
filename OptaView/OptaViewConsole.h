@@ -951,7 +951,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         "                          one register by name, or raw registers from an address",
         "  coils                   coil states",
         "  snapshot                every raw value as JSON, to keep",
-        "  scalecheck [volts]      test the voltage scales; add a multimeter reading if you have one",
+        "  scalecheck [volts]      test the voltage scales; the live readings need a multimeter reading",
         "Changing settings (each one asks for 'yes' first)",
         "  set <name> <value>      write a setting, for example: set EV_lvd 13.10",
         "  set <name> raw <n>      the same with a raw register value",
@@ -1041,7 +1041,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
                                                 : "Voltage   live readings: scale ");
       printScaleState(*check.liveScale, device_.liveScaleConfirmed(), device_.liveScaleFound());
     }
-    if (settingsScaleOpen() || liveScaleOpen()) {
+    if (liveScaleOpen()) {
+      // Only a multimeter reading settles the live readings (see ovJudgeLive).
+      out_.println("          'scalecheck <volts>', with a multimeter reading at the battery, tests what is not confirmed.");
+    } else if (settingsScaleOpen()) {
       out_.println("          'scalecheck' tests what is not confirmed.");
     }
     out_.print("Modes     expert ");
@@ -1498,11 +1501,18 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.println("the battery or the target register reads 0.");
       out_.println("     -> cannot tell");
     } else {
-      out_.print("the controller is holding the battery at its target (");
+      char text[OV_VALUE_TEXT];
+      const uint16_t words[2] = {report.stateRaw, 0};
+      ovFormatValue(*check.state, words, text, sizeof(text));
+      out_.print("in ");
+      out_.print(text);
+      out_.print(" the controller works to hold the battery at ");
       out_.print(check.reference->name);
       out_.print(" = ");
       out_.printFixed(report.referenceVolts, 2);
-      out_.println(" V).");
+      out_.println(" V.");
+      out_.println("     This only points: the battery is not always at its target in this state (too little sun");
+      out_.println("     for the load), and one that is below it can read as on it at another scale.");
       printReadings(*check.battery, report.batteryVolts, report.candidates);
       printTestResult(report.candidates, report.regulationVerdict,
                       report.regulationMatches == 0 ? "no candidate matches the target"
@@ -1567,9 +1577,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   }
 
   // The multimeter and the regulation test point at different candidates. If the multimeter is
-  // right, the battery register is right too, and it is the target that is read with a wrong
-  // scale. While the controller regulates, the target equals the battery voltage, which says
-  // what the target's scale would have to be.
+  // right, the battery register is right too: either the battery is not at its target just now,
+  // or the target is read with a wrong scale. If it is at its target, the target equals the
+  // battery voltage, which says what the target's scale would have to be.
   void printTargetScaleHint(const OvScaleCheck &check, const OvLiveScaleReport &live) {
     const OvScale &target = *check.reference->scale;
     const double batteryVolts = live.batteryVolts[live.verdict];
@@ -1583,10 +1593,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         break;
       }
     }
-    out_.print("     The regulation test disagrees. If the multimeter is right, the target's own scale (");
+    out_.println("     The regulation test disagrees. If the multimeter is right, either the battery is not at its");
+    out_.print("     target just now, or the target's own scale (");
     out_.print(target.name);
-    out_.println(")");
-    out_.print("     is the one that is off: 'scale ");
+    out_.print(") is off: 'scale ");
     out_.print(target.name);
     out_.printChar(' ');
     if (exact) {
@@ -1595,8 +1605,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.printFixed(wanted, 2);
     }
     out_.print("' would put ");
-    out_.print(check.reference->name);
-    out_.println(" at the battery voltage.");
+    out_.println(check.reference->name);
+    out_.println("     at the battery voltage.");
   }
 
 
@@ -1676,6 +1686,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       } else if (live.meterCompared) {
         out_.print(kLabel);
         out_.println("the multimeter cannot separate candidates this close together.");
+      } else if (live.meterGiven) {
+        out_.print(kLabel);
+        out_.println("cannot tell: test 3 could not compare the multimeter reading.");
       } else {
         out_.print(kLabel);
         out_.println("cannot tell yet. A multimeter reading settles it: scalecheck <volts>");
@@ -2107,6 +2120,18 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     if (outcome.aborted) {
       out_.println("Stopped waiting.");
+      return;
+    }
+    if (outcome.neverAway) {
+      // A restart shows as a pause in its answers. Without one, what was written may not be in
+      // use yet, and the device still says that a restart is due.
+      out_.print("The controller answered all the time for ");
+      out_.printFixed((double)outcome.backAfterMs / 1000.0, 1);
+      out_.println(" s, so it was not seen to restart.");
+      printLiveGroups();
+      out_.println("If a fault above still asks for a reset, it did not restart: try 'reset' again or");
+      out_.println("power-cycle it.");
+      afterReads();
       return;
     }
     if (!outcome.cameBack) {
