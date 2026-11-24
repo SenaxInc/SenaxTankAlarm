@@ -541,7 +541,7 @@ static void testText() {
         !ss::chemistryIsLithium(ss::CHEMISTRY_NOT_JUDGED));
 
   // Every finding has a sentence of its own.
-  CHECK_EQ(ss::FINDING_BITS, 14);
+  CHECK_EQ(ss::FINDING_BITS, 15);
   const char *fallback = ss::findingText(0);
   for (uint8_t bit = 0; bit < 32; ++bit) {
     const char *sentence = ss::findingText((uint32_t)1 << bit);
@@ -1481,6 +1481,147 @@ static void testEvaluate() {
     CHECK_EQ(e.systemVolts, 0);
   }
   {
+    // What was read is judged by itself: a register that did not answer leaves the judgement
+    // open, and takes nothing from one that did answer and is wrong.
+    const uint16_t setpoints[4] = {0xE000, 0xE00D, 0xE001, 0xE00E};  // EV_reg, EV_reg2, EV_float, EV_float2
+    for (int missing = 0; missing < 4; ++missing) {
+      for (int wrong = 0; wrong < 4; ++wrong) {
+        if (wrong == missing) {
+          continue;
+        }
+        SimSunSaver sim;
+        makeLiFePO4(sim);
+        sim.regs.erase(setpoints[missing]);
+        sim.regs[setpoints[wrong]] = sim.setVolts(16.00);
+        const ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+        const uint32_t expected =
+            ss::FINDING_NOT_READ | (wrong < 2 ? ss::FINDING_ABSORB_RANGE : ss::FINDING_FLOAT_RANGE);
+        CHECK_EQ(e.settingsScale.scale, ss::SCALE_100);
+        CHECK_MSG(e.findings == expected && e.verdict == ss::VERDICT_MISMATCH,
+                  "without 0x%04X, 0x%04X wrong: findings 0x%lX, verdict %d", (unsigned)setpoints[missing],
+                  (unsigned)setpoints[wrong], (unsigned long)e.findings, (int)e.verdict);
+      }
+    }
+    // The same for the two equalize voltages, for a lithium battery and for a sealed one whose
+    // custom settings are in use.
+    const uint16_t equalize[2] = {0xE007, 0xE014};
+    const uint8_t batteries[2] = {ss::CHEMISTRY_LIFEPO4, ss::CHEMISTRY_LEAD_SEALED};
+    for (int missing = 0; missing < 2; ++missing) {
+      for (int battery = 0; battery < 2; ++battery) {
+        SimSunSaver sim;
+        makeLiFePO4(sim);
+        sim.regs.erase(equalize[missing]);
+        ss::Evaluation e = judge(sim, batteries[battery]);
+        CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+        CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+        sim.regs[equalize[1 - missing]] = sim.setVolts(14.60);
+        e = judge(sim, batteries[battery]);
+        CHECK_MSG(e.findings == (ss::FINDING_NOT_READ | ss::FINDING_EQUALIZE_STORED) &&
+                      e.verdict == ss::VERDICT_MISMATCH,
+                  "without 0x%04X, battery %d: findings 0x%lX, verdict %d", (unsigned)equalize[missing],
+                  (int)batteries[battery], (unsigned long)e.findings, (int)e.verdict);
+      }
+    }
+    // The DIP switches did not answer. For a lithium battery what is stored is judged whatever
+    // they say. For a sealed one it counts only while it is known to be in use.
+    {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs.erase(0x0025);
+      sim.regs[0xE014] = sim.setVolts(14.60);
+      sim.regs[0xE001] = sim.setVolts(14.10);
+      ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ | ss::FINDING_EQUALIZE_STORED | ss::FINDING_FLOAT_RANGE);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      e = judge(sim, ss::CHEMISTRY_LEAD_SEALED);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+      // A word that was not read is not looked at, whatever its place in the snapshot holds.
+      ss::Snapshot snapshot = snapshotOf(sim);
+      snapshot.raw[ss::I_DIP_SWITCH] = 0x000B;
+      const ss::Expectation want = {ss::CHEMISTRY_LEAD_SEALED, 12, ss::SCALE_UNKNOWN};
+      ss::evaluate(snapshot, want, &e);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+    }
+    // Everything that can be wrong together with everything that can be missing.
+    {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs[0x0025] = 0x000C;               // SW1 OFF, SW3 ON
+      sim.regs[0x001C] = sim.volts(11.50);
+      sim.regs[0xE007] = sim.setVolts(14.60);  // EV_eq
+      sim.regs.erase(0xE014);                  // EV_eq2
+      sim.regs.erase(0xE01A);                  // EV_tempcomp
+      sim.regs[0xE000] = sim.setVolts(14.80);  // EV_reg
+      sim.regs.erase(0xE00D);                  // EV_reg2
+      sim.regs.erase(0xE001);                  // EV_float
+      sim.regs[0xE00E] = sim.setVolts(13.00);  // EV_float2
+      const ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ | ss::FINDING_PRESET_IN_USE | ss::FINDING_PRESET_LVD |
+                               ss::FINDING_EQUALIZE_SWITCH | ss::FINDING_EQUALIZE_STORED |
+                               ss::FINDING_ABSORB_RANGE | ss::FINDING_FLOAT_RANGE);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+    }
+  }
+  {
+    // The battery voltage says which system this is. Without it nobody can say that this is not
+    // a 24 V system, whose stored voltages are not judged: the judgement stays open.
+    SimSunSaver sim;
+    makeLiFePO4(sim);
+    sim.regs.erase(0x0008);
+    ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.systemVolts, 0);
+    CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+    CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+    sim.regs[0xE000] = sim.setVolts(16.00);  // not judged
+    e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+    CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+    sim.regs[0xE01A] = 20;                   // judged: it needs no voltage
+    e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.findings, ss::FINDING_NOT_READ | ss::FINDING_TEMPCOMP);
+    CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+    // A sealed battery's judgement needs no voltage at all.
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).findings, kNone);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
+  }
+  {
+    // A battery voltage that fits neither system: the same, under its own name.
+    const double odd[] = {0.0, 5.00, 7.99, 34.02, 60.00};
+    for (size_t i = 0; i < sizeof(odd) / sizeof(odd[0]); ++i) {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs[0x0008] = sim.volts(odd[i]);
+      ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.systemVolts, 0);
+      CHECK_MSG(e.findings == ss::FINDING_SYSTEM_UNKNOWN && e.verdict == ss::VERDICT_CANNOT_TELL,
+                "battery at %.2f V: findings 0x%lX, verdict %d", odd[i], (unsigned long)e.findings, (int)e.verdict);
+      sim.regs[0xE000] = sim.setVolts(16.00);  // not judged
+      sim.regs.erase(0xE00E);                  // and still counted as missing
+      e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_SYSTEM_UNKNOWN | ss::FINDING_NOT_READ);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+      sim.regs[0xE007] = sim.setVolts(14.60);  // judged: it needs no voltage
+      e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_SYSTEM_UNKNOWN | ss::FINDING_NOT_READ | ss::FINDING_EQUALIZE_STORED);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_FLOODED).findings, kNone);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_NOT_JUDGED).findings, kNone);
+    }
+    // Just inside the ends of the two systems.
+    const double fits[] = {8.01, 13.30, 16.99, 17.02, 26.60, 33.99};
+    for (size_t i = 0; i < sizeof(fits) / sizeof(fits[0]); ++i) {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs[0x0008] = sim.volts(fits[i]);
+      const ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4, 0);
+      CHECK_EQ(e.systemVolts, fits[i] > 17.00 ? 24 : 12);
+      CHECK_MSG((e.findings & ss::FINDING_SYSTEM_UNKNOWN) == 0, "battery at %.2f V", fits[i]);
+      CHECK_EQ(e.findings & ss::FINDING_SYSTEM_24V, fits[i] > 17.00 ? ss::FINDING_SYSTEM_24V : kNone);
+    }
+  }
+  {
     // A 24 V system: the stored voltages are left alone, the rest is judged.
     SimSunSaver sim;
     makeLiFePO4(sim);
@@ -1496,6 +1637,11 @@ static void testEvaluate() {
     e = judge(sim, ss::CHEMISTRY_LIFEPO4, 24);
     CHECK_EQ(e.findings, ss::FINDING_SYSTEM_24V | ss::FINDING_TEMPCOMP);
     CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+    sim.regs[0xE01A] = 0;
+    sim.regs.erase(0xE00D);  // a voltage that did not answer is missing all the same
+    e = judge(sim, ss::CHEMISTRY_LIFEPO4, 24);
+    CHECK_EQ(e.findings, ss::FINDING_SYSTEM_24V | ss::FINDING_NOT_READ);
+    CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
   }
 
   // Notes: they are reported and change no verdict.
@@ -1534,8 +1680,11 @@ static void testEvaluate() {
     sim.regs[0x0008] = sim.volts(26.60);
     sim.regs[0x001C] = sim.volts(26.20);
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4, 12).findings, ss::FINDING_PACK_VOLTAGE | ss::FINDING_SYSTEM_24V);
+    // Not measured: not compared. (Without it a lithium battery's judgement stays open.)
     sim.regs.erase(0x0008);
-    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4, 24).findings, kNone);  // not measured: not compared
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED, 24).findings, kNone);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_NOT_JUDGED, 24).findings, kNone);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4, 24).findings, ss::FINDING_NOT_READ);
   }
   {
     // The charger's own LVD against the scale this firmware decodes voltages with.
@@ -1563,7 +1712,11 @@ static void testEvaluate() {
   CHECK_EQ(ss::problemFindings(ss::CHEMISTRY_LEAD_SEALED), ss::FINDING_EQUALIZE_SWITCH | ss::FINDING_EQUALIZE_STORED);
   CHECK_EQ(ss::problemFindings(ss::CHEMISTRY_LEAD_FLOODED), kNone);
   CHECK_EQ(ss::problemFindings(ss::CHEMISTRY_NOT_JUDGED), kNone);
-  CHECK_EQ(ss::OPEN_FINDINGS, ss::FINDING_SCALE_UNPROVEN | ss::FINDING_NOT_READ | ss::FINDING_SYSTEM_24V);
+  CHECK_EQ(ss::OPEN_FINDINGS, ss::FINDING_SCALE_UNPROVEN | ss::FINDING_NOT_READ | ss::FINDING_SYSTEM_24V |
+                                  ss::FINDING_SYSTEM_UNKNOWN);
+  for (uint8_t c = 0; c <= ss::CHEMISTRY_LI_ION; ++c) {
+    CHECK_EQ(ss::problemFindings(c) & ss::OPEN_FINDINGS, kNone);  // a finding is one or the other
+  }
   ss::VoltRange absorb = {1.0, 1.0};
   ss::VoltRange floating = {1.0, 1.0};
   CHECK(ss::chargeRanges(ss::CHEMISTRY_LIFEPO4, &absorb, &floating));
@@ -2039,6 +2192,55 @@ static void testReport() {
       CHECK(!ss::decodeReport(doc.as<JsonObjectConst>(), &back, &decoded));
       CHECK_EQ(back.status[0], ss::SSIO_NOT_READ);
     }
+    // The server reads its file of kept reports into a buffer, parses that and frees it before
+    // it reads the reports out of the document (loadChargerReports). That is sound because a
+    // document owns a copy of every string: ArduinoJson 7 has no zero-copy mode, also for a
+    // buffer it may write to. Should that ever change, the address sanitizer build of this test
+    // reads freed memory here.
+    {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs.erase(0xE026);
+      const ss::Snapshot kept = snapshotOf(sim);
+      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, 12, ss::SCALE_96667};
+      ss::Evaluation keptEvaluation;
+      ss::evaluate(kept, want, &keptEvaluation);
+      JsonDocument file;
+      JsonArray array = file.to<JsonArray>();
+      for (int i = 0; i < 3; ++i) {
+        JsonObject entry = array.add<JsonObject>();
+        entry["c"] = i == 0 ? "dev:860322068012345" : i == 1 ? "dev:860322068099999" : "dev:1";
+        entry["e"] = 1795000000u + (unsigned)i;
+        ss::encodeReport(kept, keptEvaluation, entry);
+      }
+      std::string text;
+      serializeJson(file, text);
+      char *buffer = (char *)malloc(text.size() + 1);
+      CHECK(buffer != nullptr);
+      if (buffer != nullptr) {
+        memcpy(buffer, text.c_str(), text.size() + 1);
+        JsonDocument doc;
+        const DeserializationError error = deserializeJson(doc, buffer);  // a char *, as in the server
+        memset(buffer, '#', text.size());
+        free(buffer);
+        CHECK(error == DeserializationError::Ok);
+        int read = 0;
+        for (JsonObjectConst entry : doc.as<JsonArrayConst>()) {
+          const char *client = entry["c"] | "";
+          CHECK(startsWith(client, "dev:"));
+          CHECK_EQ(strlen(client), read == 2 ? 5 : 19);
+          CHECK_EQ(entry["e"] | 0u, 1795000000u + (unsigned)read);
+          ss::Snapshot loaded;
+          ss::Evaluation loadedEvaluation;
+          CHECK(ss::decodeReport(entry, &loaded, &loadedEvaluation));
+          CHECK(sameSnapshot(loaded, kept));
+          CHECK_EQ(loadedEvaluation.findings, keptEvaluation.findings);
+          CHECK_EQ(ss::settingsFingerprint(loaded, loadedEvaluation), ss::settingsFingerprint(kept, keptEvaluation));
+          ++read;
+        }
+        CHECK_EQ(read, 3);
+      }
+    }
     // A report whose other members are odd is read for what it holds.
     {
       JsonDocument doc;
@@ -2090,6 +2292,70 @@ static void testReport() {
   }
 }
 
+// ============================================================================
+// Which report the server keeps
+// ============================================================================
+static void testReportOrder() {
+  const double now = 1795478400.0;  // 2026-11-24
+  // The client's time is taken as it is, to the second.
+  CHECK(ss::reportCheckTime(now - 3600.0, now) == now - 3600.0);
+  CHECK(ss::reportCheckTime(now, now) == now);
+  CHECK(ss::reportCheckTime(now - 400.0 * 86400.0, now) == now - 400.0 * 86400.0);  // a year in flash
+  CHECK(ss::reportCheckTime(ss::REPORT_EARLIEST_EPOCH, now) == ss::REPORT_EARLIEST_EPOCH);
+  CHECK(ss::reportCheckTime(1600000000.0, now) == 1600000000.0);  // 2020-09-13, written out
+  CHECK(ss::reportCheckTime(1599999999.0, now) == 0.0);
+  // A clock that was never set, or a value that is no time at all: not known.
+  CHECK(ss::reportCheckTime(0.0, now) == 0.0);
+  CHECK(ss::reportCheckTime(-5.0, now) == 0.0);
+  CHECK(ss::reportCheckTime(86400.0, now) == 0.0);
+  CHECK(ss::reportCheckTime(ss::REPORT_EARLIEST_EPOCH - 1.0, now) == 0.0);
+  CHECK(ss::reportCheckTime(std::nan(""), now) == 0.0);
+  // A clock that runs ahead of the server's: up to a day is taken, more is not known.
+  CHECK(ss::reportCheckTime(now + 86400.0, now) == now + 86400.0);
+  CHECK(ss::reportCheckTime(now + 86401.0, now) == 0.0);
+  CHECK(ss::reportCheckTime(4102444800.0, now) == 0.0);  // 2100
+  // The time a report arrived at never stands in for the time of its check.
+  CHECK(ss::reportCheckTime(0.0, now) != now);
+  // A server that does not know the time cannot call a client's clock wrong.
+  CHECK(ss::reportCheckTime(now, 0.0) == now);
+  CHECK(ss::reportCheckTime(now + 10.0 * 86400.0, 0.0) == now + 10.0 * 86400.0);
+  CHECK(ss::reportCheckTime(now, 1000.0) == now);
+  CHECK(ss::reportCheckTime(0.0, 0.0) == 0.0);
+
+  // The first report is kept whatever its time.
+  CHECK(ss::reportReplaces(false, 0.0, 0.0));
+  CHECK(ss::reportReplaces(false, 0.0, now));
+  CHECK(ss::reportReplaces(false, now, 0.0));  // the time of a report that is not there means nothing
+  // A newer one replaces an older one, and not the other way round.
+  CHECK(ss::reportReplaces(true, now - 60.0, now));
+  CHECK(!ss::reportReplaces(true, now, now - 60.0));
+  CHECK(!ss::reportReplaces(true, now, now - 1.0));
+  CHECK(ss::reportReplaces(true, now, now));  // the same report again: nothing is lost by it
+  // One without a time never replaces one that has a time, and is replaced by it.
+  CHECK(!ss::reportReplaces(true, now, 0.0));
+  CHECK(!ss::reportReplaces(true, ss::REPORT_EARLIEST_EPOCH, 0.0));
+  CHECK(ss::reportReplaces(true, 0.0, now));
+  CHECK(ss::reportReplaces(true, 0.0, 0.0));  // of two without a time, the one that arrived last
+
+  // The case the rule is for. The client checks at 10:00 while its Notecard does not answer:
+  // the report goes into the flash buffer. At 10:20 it checks again after a config change, and
+  // that report gets through. The buffer is sent after it, so the 10:00 report arrives last.
+  {
+    const double first = ss::reportCheckTime(now, now + 1800.0);            // arrives at 10:30
+    const double second = ss::reportCheckTime(now + 1200.0, now + 1205.0);  // arrives at 10:20
+    bool have = false;
+    double kept = 0.0;
+    if (ss::reportReplaces(have, kept, second)) {
+      have = true;
+      kept = second;
+    }
+    CHECK(!ss::reportReplaces(have, kept, first));
+    // In the order they were made, each is kept in turn.
+    CHECK(ss::reportReplaces(false, 0.0, first));
+    CHECK(ss::reportReplaces(true, first, second));
+  }
+}
+
 int main() {
   startTestTimeLimit();
   testTableAgainstProfile();
@@ -2102,6 +2368,7 @@ int main() {
   testFingerprint();
   testFloatReference();
   testReport();
+  testReportOrder();
   CHECK_EQ(gAllocLive, 0);
 
   if (gFailures != 0) {

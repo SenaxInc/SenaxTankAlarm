@@ -167,6 +167,44 @@ inline bool decodeReport(JsonObjectConst in, Snapshot *snapshot, Evaluation *eva
   return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Which report the server keeps
+// ---------------------------------------------------------------------------------------------
+//
+// A client's report can arrive late: the client keeps notes in flash while it cannot reach its
+// Notecard, and sends them after the next note that got through. The server therefore orders
+// the reports of a client by the time of the check, which the client sends as "epoch", and not
+// by their arrival.
+
+// 2020-09-13. A clock that reads less was never set.
+static const double REPORT_EARLIEST_EPOCH = 1600000000.0;
+// A client's clock may run ahead of the server's by this much.
+static const double REPORT_CLOCK_AHEAD_SECONDS = 86400.0;
+
+// The time of a check as the server takes it: the client's own, or 0 for "not known" when the
+// client sent none or one that is plainly wrong. `serverNow` is the server's time, or anything
+// below REPORT_EARLIEST_EPOCH when the server does not know the time either.
+//
+// "Not known" is never replaced by the time of arrival: that would let an old report that was
+// held back pass for the newest one.
+inline double reportCheckTime(double clientEpoch, double serverNow) {
+  if (!(clientEpoch >= REPORT_EARLIEST_EPOCH)) {
+    return 0.0;  // also for a value that is not a number
+  }
+  if (serverNow >= REPORT_EARLIEST_EPOCH && clientEpoch > serverNow + REPORT_CLOCK_AHEAD_SECONDS) {
+    return 0.0;
+  }
+  return clientEpoch;
+}
+
+// Whether a report that arrives takes the place of the one the server keeps. Both times are
+// reportCheckTime()s. An older report does not replace a newer one, and one whose time is not
+// known replaces only another one whose time is not known. The same report arriving twice
+// replaces itself.
+inline bool reportReplaces(bool haveKept, double keptCheckTime, double newCheckTime) {
+  return !haveKept || newCheckTime >= keptCheckTime;
+}
+
 // The report for a person: what was found, and every register with its value as text.
 //
 //   vd, verdict     the Verdict and its name

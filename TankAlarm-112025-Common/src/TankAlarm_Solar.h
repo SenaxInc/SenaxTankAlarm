@@ -313,6 +313,12 @@ public:
   // Polling (call periodically from main loop)
   // Returns true when a poll attempt was performed, regardless of read success.
   bool poll(unsigned long nowMillis);
+
+  // True for one Modbus timeout after a request that got no usable reply. Its reply may still
+  // be on its way, and the next request would take it for its own answer, so the poll and the
+  // charger check both keep off the line meanwhile: a poll that is due waits (poll() returns
+  // false) and so does the next step of a charger check.
+  bool lineResting() const;
   
   // Data access
   const SolarData& getData() const { return _data; }
@@ -409,7 +415,7 @@ private:
   // Charger check
   sunsaver::SnapshotReader _chargerCheck;
   unsigned long _chargerCheckStepMillis;  // when the last step ran
-  unsigned long _chargerCheckGapMs;       // how long to leave the line alone before the next one
+  unsigned long _chargerCheckGapMs;       // the pause before the next one (0 before the first)
   bool _chargerSettingsRead;
   
   // Modbus communication

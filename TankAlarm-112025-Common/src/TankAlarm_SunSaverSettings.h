@@ -614,10 +614,11 @@ enum Finding : uint32_t {
   FINDING_PACK_VOLTAGE = 1ul << 10,     // the battery is not the 12 V or 24 V pack that was configured
   FINDING_PRESET_LVD = 1ul << 11,       // SW2 OFF: the load disconnects at the built-in 11.50 V
   FINDING_LIVE_SCALE = 1ul << 12,       // the charger's own LVD reads wrong with this firmware's scale
-  FINDING_SYSTEM_24V = 1ul << 13        // a 24 V system: the stored voltages were not judged
+  FINDING_SYSTEM_24V = 1ul << 13,       // a 24 V system: the stored voltages were not judged
+  FINDING_SYSTEM_UNKNOWN = 1ul << 14    // the battery voltage fits neither system: not judged either
 };
 
-static const uint8_t FINDING_BITS = 14;
+static const uint8_t FINDING_BITS = 15;
 
 inline const char *findingText(uint32_t finding) {
   switch (finding) {
@@ -653,6 +654,9 @@ inline const char *findingText(uint32_t finding) {
              "battery voltage it reports is off by 3.3 %.";
     case FINDING_SYSTEM_24V:
       return "This is a 24 V system: the stored voltages were not judged.";
+    case FINDING_SYSTEM_UNKNOWN:
+      return "The battery voltage the charger reports fits neither a 12 V nor a 24 V system: the stored "
+             "voltages were not judged.";
     default:
       return "A finding this firmware has no text for.";
   }
@@ -689,7 +693,8 @@ inline uint32_t problemFindings(uint8_t chemistry) {
 }
 
 // The findings that leave part of the judgement open.
-static const uint32_t OPEN_FINDINGS = FINDING_SCALE_UNPROVEN | FINDING_NOT_READ | FINDING_SYSTEM_24V;
+static const uint32_t OPEN_FINDINGS =
+    FINDING_SCALE_UNPROVEN | FINDING_NOT_READ | FINDING_SYSTEM_24V | FINDING_SYSTEM_UNKNOWN;
 
 struct VoltRange {
   double low;
@@ -768,12 +773,15 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
 
   const bool lithium = chemistryIsLithium(want.chemistry);
   const bool sealed = want.chemistry == CHEMISTRY_LEAD_SEALED;
+  // What was read is judged by itself. A register that did not answer leaves the judgement open
+  // (FINDING_NOT_READ), and takes nothing from one that did answer and is wrong.
   if (lithium || sealed) {
-    if (!have(snapshot, I_DIP_SWITCH)) {
+    const bool haveDip = have(snapshot, I_DIP_SWITCH);
+    const uint16_t dip = haveDip ? snapshot.raw[I_DIP_SWITCH] : (uint16_t)0;
+    const bool custom = (dip & DIP_CUSTOM_CHARGE) != 0;
+    if (!haveDip) {
       findings |= FINDING_NOT_READ;
     } else {
-      const uint16_t dip = snapshot.raw[I_DIP_SWITCH];
-      const bool custom = (dip & DIP_CUSTOM_CHARGE) != 0;
       if ((dip & DIP_EQUALIZE) != 0) {
         findings |= FINDING_EQUALIZE_SWITCH;
       }
@@ -785,13 +793,17 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
           findings |= FINDING_PRESET_LVD;
         }
       }
-      // The battery jumper picks the bank and cannot be read, so both banks have to be right.
-      // For a lithium battery the stored settings are judged even while switch 1 is OFF: they
-      // are what the charger will use once the switch is set.
-      if (lithium || custom) {
-        if (!have(snapshot, I_EV_EQ) || !have(snapshot, I_EV_EQ2)) {
+    }
+    // The battery jumper picks the bank and cannot be read, so both banks have to be right.
+    // For a lithium battery the stored settings are judged whatever switch 1 says: they are
+    // what the charger will use once the switch is set. For a sealed battery they count only
+    // while they are known to be in use.
+    if (lithium || custom) {
+      const uint8_t equalize[2] = {I_EV_EQ, I_EV_EQ2};
+      for (uint8_t bank = 0; bank < 2; ++bank) {
+        if (!have(snapshot, equalize[bank])) {
           findings |= FINDING_NOT_READ;
-        } else if (snapshot.raw[I_EV_EQ] != 0 || snapshot.raw[I_EV_EQ2] != 0) {
+        } else if (snapshot.raw[equalize[bank]] != 0) {
           findings |= FINDING_EQUALIZE_STORED;
         }
       }
@@ -806,22 +818,29 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
     VoltRange absorb = {0.0, 0.0};
     VoltRange floating = {0.0, 0.0};
     chargeRanges(want.chemistry, &absorb, &floating);
-    if (!have(snapshot, I_EV_REG) || !have(snapshot, I_EV_REG2) || !have(snapshot, I_EV_FLOAT) ||
-        !have(snapshot, I_EV_FLOAT2)) {
+    // The stored voltages are judged as those of a 12 V system whose encoding is proven. Where
+    // that cannot be said of this controller, they are not judged and the judgement stays open.
+    bool judged = false;
+    if (!have(snapshot, I_ADC_VB_F)) {
       findings |= FINDING_NOT_READ;
     } else if (out->systemVolts == 24) {
       findings |= FINDING_SYSTEM_24V;
+    } else if (out->systemVolts != 12) {
+      findings |= FINDING_SYSTEM_UNKNOWN;
     } else if (out->settingsScale.scale == SCALE_UNKNOWN) {
       findings |= FINDING_SCALE_UNPROVEN;
     } else {
-      const uint8_t scale = out->settingsScale.scale;
-      if (outsideRange(snapshot.raw[I_EV_REG], scale, absorb) || outsideRange(snapshot.raw[I_EV_REG2], scale, absorb)) {
-        findings |= FINDING_ABSORB_RANGE;
-      }
-      // A float voltage of 0 means "no float": the charger then stays at the absorption voltage.
-      if (outsideRange(snapshot.raw[I_EV_FLOAT], scale, floating) ||
-          outsideRange(snapshot.raw[I_EV_FLOAT2], scale, floating)) {
-        findings |= FINDING_FLOAT_RANGE;
+      judged = true;
+    }
+    const uint8_t setpoints[4] = {I_EV_REG, I_EV_REG2, I_EV_FLOAT, I_EV_FLOAT2};
+    for (uint8_t i = 0; i < 4; ++i) {
+      const bool isAbsorb = i < 2;
+      if (!have(snapshot, setpoints[i])) {
+        findings |= FINDING_NOT_READ;
+      } else if (judged &&
+                 outsideRange(snapshot.raw[setpoints[i]], out->settingsScale.scale, isAbsorb ? absorb : floating)) {
+        // A float voltage of 0 means "no float": the charger then stays at the absorption voltage.
+        findings |= isAbsorb ? FINDING_ABSORB_RANGE : FINDING_FLOAT_RANGE;
       }
     }
   }

@@ -84,6 +84,22 @@ static void incrementSolarErrorBucket() {
   else                                          ++sSolarErrOther;
 }
 
+// The line rest. A request that got no usable reply may still be answered: late, after this
+// side gave up. A Modbus reply does not say which register it answers, so a request sent into
+// that silence would take the stray reply for its own. After such a request everything that
+// sends on this link (the poll, the charger check, the startup probe) therefore leaves the line
+// alone for one Modbus timeout: SolarManager::lineResting(). A request the controller refused
+// with a Modbus exception has had its answer and needs no rest.
+static unsigned long sSolarLastMissMillis = 0;
+static bool          sSolarMissSeen = false;
+
+// True for the text of a Modbus exception a SunSaver answers with: the controller is there and
+// said no. Anything else that ModbusRTUClient.lastError() gives means that no usable reply came.
+static bool solarErrorIsRefusal(const char *text) {
+  return strcmp(text, "Illegal data address") == 0 || strcmp(text, "Illegal function") == 0 ||
+         strcmp(text, "Illegal data value") == 0 || strcmp(text, "Slave device or server failure") == 0;
+}
+
 // Drain any stale bytes left in the RS-485 UART RX buffer before a new Modbus
 // transaction. ArduinoModbus enables MODBUS_ERROR_RECOVERY_PROTOCOL (flush on CRC/FC
 // error) but NOT _LINK (no flush on timeout), so a late/garbage reply can linger and
@@ -112,6 +128,10 @@ static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
   // (incremented once per logical failure in readRegistersWithFallback) picks the
   // right bucket, and so the client can emit "scErr" without re-running the classifier.
   classifyModbusErrorTag(sSolarLastModbusError);
+  if (!solarErrorIsRefusal(sSolarLastModbusError)) {
+    sSolarLastMissMillis = millis();  // the line rests from now (see lineResting())
+    sSolarMissSeen = true;
+  }
 }
 
 static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
@@ -334,6 +354,18 @@ bool SolarManager::begin(const SolarConfig& config) {
   _data.communicationOk = false;
   _data.consecutiveErrors = 0;
   
+  // A request of the link as it was may have gone unanswered a moment ago (a config update
+  // restarts the link at any time): the probe waits like every other request. At most one
+  // Modbus timeout, and not at all at boot.
+  while (lineResting()) {
+#if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+#elif defined(ARDUINO_ARCH_STM32)
+    IWatchdog.reload();
+#endif
+    delay(10);
+  }
+
   // Probe both holding and input register models before first full poll.
   uint16_t startupProbe = 0;
   bool startupHolding = readHoldingRegisters(_config.modbusSlaveId, SS_REG_BATTERY_VOLTAGE, 1, &startupProbe);
@@ -383,10 +415,26 @@ bool SolarManager::poll(unsigned long nowMillis) {
   if (nowMillis - _lastPollMillis < intervalMs) {
     return false;  // Not due yet — use isCommunicationOk() to distinguish from failure
   }
+  // A request went unanswered a moment ago (one of the charger check, say): the poll stays due
+  // and runs once the line has rested.
+  if (lineResting()) {
+    return false;
+  }
   
   _lastPollMillis = nowMillis;
   readRegisters();
   return true;
+}
+
+bool SolarManager::lineResting() const {
+  if (!sSolarMissSeen) {
+    return false;
+  }
+  if ((unsigned long)(millis() - sSolarLastMissMillis) < (unsigned long)_config.modbusTimeoutMs) {
+    return true;
+  }
+  sSolarMissSeen = false;  // over: millis() may wrap before the next miss
+  return false;
 }
 
 bool SolarManager::readRegisters() {
@@ -944,11 +992,7 @@ class ChargerCheckBus : public sunsaver::Reader {
       *raw = word;
     } else {
       // The controller answered with a Modbus exception, or nothing usable came back.
-      const bool refused = strcmp(sSolarLastModbusError, "Illegal data address") == 0 ||
-                           strcmp(sSolarLastModbusError, "Illegal function") == 0 ||
-                           strcmp(sSolarLastModbusError, "Illegal data value") == 0 ||
-                           strcmp(sSolarLastModbusError, "Slave device or server failure") == 0;
-      status = refused ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
+      status = solarErrorIsRefusal(sSolarLastModbusError) ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
     }
 
     memcpy(sSolarLastModbusError, keptError, sizeof(keptError));
@@ -989,16 +1033,15 @@ bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
     _chargerCheck.cancel();
     return false;
   }
-  if (nowMillis - _chargerCheckStepMillis < _chargerCheckGapMs) {
+  // Not into the silence after a request that got no reply, whether it was one of this pass
+  // or of a poll. A step ends at such a request, so the rest begins with the step's end.
+  if (lineResting() || nowMillis - _chargerCheckStepMillis < _chargerCheckGapMs) {
     return false;
   }
   ChargerCheckBus bus(_config.modbusSlaveId, _cachedHoldingFC);
   const bool ended = _chargerCheck.step(bus, SOLAR_CHARGER_CHECK_REGISTERS_PER_STEP);
   _chargerCheckStepMillis = millis();
-  // After a request that got no reply, its reply may still be on the way: leave the line alone
-  // for one Modbus timeout, so that it is not taken for the answer to the next request.
-  _chargerCheckGapMs = _chargerCheck.missed() ? (unsigned long)_config.modbusTimeoutMs
-                                              : (unsigned long)SOLAR_CHARGER_CHECK_STEP_GAP_MS;
+  _chargerCheckGapMs = SOLAR_CHARGER_CHECK_STEP_GAP_MS;
   if (ended && _chargerCheck.done()) {
     _chargerSettingsRead = true;
   }
@@ -1024,6 +1067,7 @@ bool SolarManager::begin(const SolarConfig& config) {
 void SolarManager::end() {}
 void SolarManager::setConfig(const SolarConfig& config) { _config = config; }
 bool SolarManager::poll(unsigned long nowMillis) { (void)nowMillis; return false; }
+bool SolarManager::lineResting() const { return false; }
 SolarAlertType SolarManager::checkAlerts() const { return SOLAR_ALERT_NONE; }
 const char* SolarManager::getAlertDescription(SolarAlertType alert) const { (void)alert; return "N/A"; }
 const char* SolarManager::getChargeStateDescription() const { return "N/A"; }

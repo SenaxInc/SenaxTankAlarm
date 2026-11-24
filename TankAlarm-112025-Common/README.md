@@ -81,6 +81,7 @@ SunSaver MPPT solar charger monitoring via Modbus RTU over RS-485:
 - `SolarConfig` - Configuration structure (slave ID, baud rate, thresholds)
 - `SolarData` - Data structure with all readings and status
 - `SolarManager` - Main class for polling and health assessment
+- `SolarManager::lineResting()` - True for one Modbus timeout after a request that got no usable reply: the poll, the charger check and the startup probe all keep off the line meanwhile, so that a late reply is not taken for the answer to the next request
 - Modbus register definitions for SunSaver MPPT
 - Battery voltage thresholds for 12V AGM systems
 - Fault and alarm bitfield parsing
@@ -97,7 +98,7 @@ The charger check: what a SunSaver MPPT has stored, and whether it suits the bat
 - The registers the check reads, in a fixed order: the custom charge settings of both banks, LVD and LVR, the LED thresholds, and the status words that say how they are used (DIP switches, faults, the LVD in effect)
 - `SnapshotReader` - Reads them a few at a time through a `Reader`, so that `loop()` keeps running
 - `judgeSettingsScale()`, `judgeLiveScale()` - How the controller encodes its voltages (x100 or x96.667), told from the stored setpoints and from the controller's own LVD
-- `evaluate()` - Findings and a verdict for a battery chemistry
+- `evaluate()` - Findings and a verdict for a battery chemistry. Each register is judged by itself: one that did not answer leaves the judgement open, and takes nothing from one that did answer and is wrong
 - `floatReferenceVolts()` - Where the charger holds a full battery, for the no-charge alert
 - `SolarManager::startChargerCheck()` and `serviceChargerCheck()` in `TankAlarm_Solar.h` run it on the Opta. It only reads.
 
@@ -105,6 +106,7 @@ The charger check: what a SunSaver MPPT has stored, and whether it suits the bat
 The charger check as JSON. It needs ArduinoJson, so the sketches include it themselves (`TankAlarm_Common.h` does not).
 - `encodeReport()` - The compact report a client sends to the server (`chg-check` on `config_ack.qo`)
 - `decodeReport()` - Reads it back; a report from a newer or an older client still decodes
+- `reportCheckTime()`, `reportReplaces()` - Which report the server keeps: the newest by the time of the check, since a report can arrive late
 - `describeReport()` - Verdict, findings and every register with its value as text, for the server's `/charger` page
 
 ### TankAlarm_Battery.h
