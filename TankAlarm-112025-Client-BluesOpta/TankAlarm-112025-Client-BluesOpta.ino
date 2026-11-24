@@ -922,6 +922,12 @@ static unsigned long gChargerReportTryMillis = 0;      // which was then
 // waits and the result that has yet to go out, and lets a run that a restart of this client cut
 // short be settled when it starts again. Every result goes to the server.
 #define CHARGER_JOURNAL_FILE "/cfg/charger_journal.json"
+#define CHARGER_JOURNAL_TMP_FILE CHARGER_JOURNAL_FILE ".tmp"  // where tankalarm_posix_write_file_atomic() writes it first
+#if defined(POSIX_FILE_IO_AVAILABLE)
+// loadChargerJournal() read the journal from its .tmp, which holds its only copy until
+// saveChargerJournal() renames it into place.
+static bool gChargerJournalInTmp = false;
+#endif
 #define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result nothing would take
 // The result that waits to go out (SolarManager::chargerProgramming()), as this sketch has seen
 // it. See sendDueChargerProgramReport().
@@ -2737,6 +2743,8 @@ static float getEffectiveSpecificGravity(const MonitorConfig &cfg) {
  * If a .tmp file exists but the target does NOT, the rename failed
  * after a write completed — complete the rename now.
  * If BOTH exist, the original is still valid — delete stale .tmp.
+ * (A charger journal whose rename fails here too is read from its .tmp:
+ * see loadChargerJournal().)
  */
 #ifdef POSIX_FILE_IO_AVAILABLE
 static void recoverOrphanedTmpFiles() {
@@ -7764,14 +7772,18 @@ static void keepChargerLookAfterLostFiles() {
 }
 
 // The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
-// the last run came that reached the charger, and the result that has yet to go out. No file:
-// nothing was ever asked. A file that cannot be read, no flash to read it from, or flash that
-// lost its files at this start (keepChargerLookAfterLostFiles() writes the cautious journal for
-// it): the charger may wait for a restart, and gets a look (firmware without programming owes it
-// nothing, see beginChargerProgramming(), and says nothing of a look).
+// the last run came that reached the charger, and the result that has yet to go out. No file, and
+// no .tmp of one: nothing was ever asked. Only its .tmp: a save whose rename failed, and failed
+// again in this start's recoverOrphanedTmpFiles(), which is read as the journal that rename would
+// have made it (saveChargerJournal() puts it in place before it writes another). A file that
+// cannot be read, no flash to read it from, or flash that lost its files at this start
+// (keepChargerLookAfterLostFiles() writes the cautious journal for it): the charger may wait for
+// a restart, and gets a look (firmware without programming owes it nothing, see
+// beginChargerProgramming(), and says nothing of a look).
 static sunsaver::Journal loadChargerJournal() {
   const sunsaver::Journal none = sunsaver::emptyJournal();
 #if defined(POSIX_FILE_IO_AVAILABLE)
+  gChargerJournalInTmp = false;
   if (!isStorageAvailable()) {
     // The journal may say that a run was cut short, and nothing can show otherwise. Without flash
     // nothing can be kept either, so saveChargerJournal() fails and no request is taken on: the
@@ -7784,6 +7796,16 @@ static sunsaver::Journal loadChargerJournal() {
   }
   errno = 0;
   FILE *file = fopen(CHARGER_JOURNAL_FILE, "r");
+  if (file == nullptr && errno == ENOENT) {
+    // Its .tmp alone is the journal, not a sign that none was ever written: reading none would
+    // drop what it says, such as the look owed after a run cut short or a flash that lost its
+    // files. A .tmp beside the journal is a save that never took its place, and is not read.
+    file = fopen(CHARGER_JOURNAL_TMP_FILE, "r");
+    if (file != nullptr) {
+      gChargerJournalInTmp = true;
+      Serial.println(F("Charger programming: the journal is only in its .tmp, which could not be renamed, and is read from there"));
+    }
+  }
   if (file == nullptr) {
     if (errno == ENOENT && !gStorageLostFiles) {
       return none;
@@ -7834,6 +7856,8 @@ static sunsaver::Journal loadChargerJournal() {
 }
 
 // The journal's writer (SolarManager::ChargerJournalWriter): true only once the file holds it.
+// A journal that was read from its .tmp is renamed into place first, or nothing is written: the
+// write goes to that .tmp, and would take its only copy away before it took the journal's place.
 static bool saveChargerJournal(const sunsaver::Journal &journal) {
 #if defined(POSIX_FILE_IO_AVAILABLE)
   if (!isStorageAvailable()) {
@@ -7848,6 +7872,12 @@ static bool saveChargerJournal(const sunsaver::Journal &journal) {
   const size_t len = serializeJson(doc, buf, sizeof(buf));
   if (len == 0 || len > sunsaver::JOURNAL_JSON_MAX) {
     return false;
+  }
+  if (gChargerJournalInTmp) {
+    if (rename(CHARGER_JOURNAL_TMP_FILE, CHARGER_JOURNAL_FILE) != 0) {
+      return false;  // the .tmp stays as it is, and the next start reads it again
+    }
+    gChargerJournalInTmp = false;
   }
   return tankalarm_posix_write_file_atomic(CHARGER_JOURNAL_FILE, buf, len);
 #else
