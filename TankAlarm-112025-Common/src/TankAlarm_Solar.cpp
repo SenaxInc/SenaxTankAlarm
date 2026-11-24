@@ -261,7 +261,8 @@ static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, ui
 
 SolarManager::SolarManager() 
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
+    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false),
+    _journalWriter(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -964,6 +965,38 @@ void SolarManager::resetDailyStats() {
 
 namespace {
 
+// The poll's diagnostics (scErr, scMaddr, scResMs in the telemetry) describe the polls. A request
+// of the charger check or of charger programming puts them back as it found them: a register
+// that an older controller refuses there is no failing link. The line rest that a request
+// without a usable reply starts (captureSolarModbusError()) is not put back: it holds for
+// everything that sends on the link.
+class KeptPollDiagnostics {
+ public:
+  KeptPollDiagnostics() : _address(sSolarLastFailAddress), _responseMs(sSolarLastResponseMs) {
+    memcpy(_error, sSolarLastModbusError, sizeof(_error));
+    memcpy(_tag, sSolarLastErrorTag, sizeof(_tag));
+    sSolarLastModbusError[0] = '\0';
+  }
+  ~KeptPollDiagnostics() {
+    memcpy(sSolarLastModbusError, _error, sizeof(_error));
+    memcpy(sSolarLastErrorTag, _tag, sizeof(_tag));
+    sSolarLastFailAddress = _address;
+    sSolarLastResponseMs = _responseMs;
+  }
+
+ private:
+  char _error[sizeof(sSolarLastModbusError)];
+  char _tag[sizeof(sSolarLastErrorTag)];
+  uint16_t _address;
+  uint16_t _responseMs;
+};
+
+// The status of a request that failed: the controller answered with a Modbus exception, or
+// nothing usable came back. Read while the request's own error text is in place.
+sunsaver::IoStatus failedRequestStatus() {
+  return solarErrorIsRefusal(sSolarLastModbusError) ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
+}
+
 // How the charger check reads: one register per request, with the function code the poll found
 // to work. The other function code is not tried, so a register this controller does not have
 // costs one request and no more.
@@ -973,39 +1006,93 @@ class ChargerCheckBus : public sunsaver::Reader {
 
   sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
-
-    // The poll's diagnostics (scErr, scMaddr, scResMs in the telemetry) describe the polls. A
-    // register that an older controller refuses here is no failing link, so they are put back.
-    char keptError[sizeof(sSolarLastModbusError)];
-    char keptTag[sizeof(sSolarLastErrorTag)];
-    memcpy(keptError, sSolarLastModbusError, sizeof(keptError));
-    memcpy(keptTag, sSolarLastErrorTag, sizeof(keptTag));
-    const uint16_t keptAddress = sSolarLastFailAddress;
-    const uint16_t keptResponseMs = sSolarLastResponseMs;
-
-    sSolarLastModbusError[0] = '\0';
+    KeptPollDiagnostics kept;
     uint16_t word = 0;
     const bool ok = (_functionCode == 4) ? readInputRegisters(_slaveId, addr, 1, &word)
                                          : readHoldingRegisters(_slaveId, addr, 1, &word);
-    sunsaver::IoStatus status = sunsaver::SSIO_OK;
-    if (ok) {
-      *raw = word;
-    } else {
-      // The controller answered with a Modbus exception, or nothing usable came back.
-      status = solarErrorIsRefusal(sSolarLastModbusError) ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
+    if (!ok) {
+      return failedRequestStatus();
     }
-
-    memcpy(sSolarLastModbusError, keptError, sizeof(keptError));
-    memcpy(sSolarLastErrorTag, keptTag, sizeof(keptTag));
-    sSolarLastFailAddress = keptAddress;
-    sSolarLastResponseMs = keptResponseMs;
-    return status;
+    *raw = word;
+    return sunsaver::SSIO_OK;
   }
 
  private:
   uint8_t _slaveId;
   uint8_t _functionCode;
 };
+
+#if TANKALARM_SUNSAVER_PROGRAMMING
+// What a programming run talks through: the reads of the charger check, writes with function 6,
+// the restart coil with function 5, the rest between requests, and the client's flash for the
+// journal. A request without a usable reply starts the line rest like any other, so the poll
+// and the charger check leave the line alone after the run as well.
+class ChargerProgramPort : public sunsaver::Port {
+ public:
+  ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs,
+                     SolarManager::ChargerJournalWriter writer)
+      : _reader(slaveId, functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs), _writer(writer) {}
+
+  sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override { return _reader.readRegister(addr, raw); }
+
+  // ArduinoModbus checks that the acknowledgement comes from this slave with this function and a
+  // good CRC, not which address and value it names. The run goes by what the register reads
+  // back, not by the acknowledgement (see sunsaver::Bus).
+  sunsaver::IoStatus writeRegister(uint16_t addr, uint16_t raw) override {
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    KeptPollDiagnostics kept;
+    drainRS485Rx();
+    const unsigned long t0 = millis();
+    if (ModbusRTUClient.holdingRegisterWrite(_slaveId, addr, raw) == 1) {
+      return sunsaver::SSIO_OK;
+    }
+    captureSolarModbusError(addr, (uint16_t)(millis() - t0));
+    return failedRequestStatus();
+  }
+
+  sunsaver::IoStatus writeCoil(uint16_t addr) override {
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    KeptPollDiagnostics kept;
+    drainRS485Rx();
+    const unsigned long t0 = millis();
+    if (ModbusRTUClient.coilWrite(_slaveId, addr, 1) == 1) {
+      return sunsaver::SSIO_OK;
+    }
+    captureSolarModbusError(addr, (uint16_t)(millis() - t0));
+    return failedRequestStatus();
+  }
+
+  bool saveJournal(const sunsaver::Journal &journal) override {
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    return _writer != nullptr && _writer(journal);
+  }
+
+  void rest(uint16_t ms, bool afterMiss) override {
+    unsigned long wait = ms;
+    if (afterMiss && wait < _timeoutMs) {
+      wait = _timeoutMs;
+    }
+    const unsigned long start = millis();
+    for (;;) {
+      TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+      const unsigned long waited = (unsigned long)(millis() - start);
+      if (waited >= wait) {
+        break;
+      }
+      const unsigned long left = wait - waited;
+      delay(left > 100UL ? 100UL : left);
+    }
+  }
+
+  uint32_t millisNow() override { return (uint32_t)millis(); }
+
+ private:
+  ChargerCheckBus _reader;
+  uint8_t _slaveId;
+  uint16_t _timeoutMs;
+  SolarManager::ChargerJournalWriter _writer;
+};
+#endif  // TANKALARM_SUNSAVER_PROGRAMMING
 
 }  // namespace
 
@@ -1048,12 +1135,72 @@ bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
   return ended;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Charger programming
+// ---------------------------------------------------------------------------------------------
+
+void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer) {
+  _journalWriter = writer;
+#if TANKALARM_SUNSAVER_PROGRAMMING
+  _programming.begin(journal, (uint32_t)millis());
+#else
+  // A build without programming owes the controller nothing, whatever an earlier build left.
+  (void)journal;
+  const sunsaver::Journal none = {0, sunsaver::JOURNAL_IDLE};
+  _programming.begin(none, (uint32_t)millis());
+#endif
+}
+
+bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
+                                         uint32_t clientRefusals, bool loadCurrentAllowed) {
+#if !TANKALARM_SUNSAVER_PROGRAMMING
+  clientRefusals |= sunsaver::REFUSE_NOT_BUILT;  // whatever the caller says: such a request never waits
+#endif
+  return _programming.request(requestId, profile, profileErrors, clientRefusals, loadCurrentAllowed,
+                              (uint32_t)millis());
+}
+
+bool SolarManager::withdrawChargerProgram(uint32_t refusals) {
+  // Without programming no request ever waits, and this does nothing.
+  return _programming.withdraw(refusals, (uint32_t)millis());
+}
+
+bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
+#if TANKALARM_SUNSAVER_PROGRAMMING
+  // The poll comes first here too: it finds the function code and shows that the link works.
+  const bool linkKnown = _cachedHoldingFC == 3 || _cachedHoldingFC == 4;
+  const bool ready = allowed && _config.enabled && _initialized && _data.lastPollOk && linkKnown && !lineResting();
+  ChargerProgramPort port(_config.modbusSlaveId, linkKnown ? _cachedHoldingFC : (uint8_t)3, _config.modbusTimeoutMs,
+                          _journalWriter);
+  const bool talked = _programming.service(port, epochNow, ready);
+  if (talked) {
+    _chargerCheck.cancel();  // it read the controller as it was before
+    _lastPollMillis = 0;     // and the poll reads it as it is now
+  }
+  return talked;
+#else
+  (void)epochNow;
+  (void)allowed;
+  return false;
+#endif
+}
+
+bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
+#if TANKALARM_SUNSAVER_PROGRAMMING
+  return _config.enabled && _initialized && _programming.wantsLine(epochNow, (uint32_t)millis());
+#else
+  (void)epochNow;
+  return false;
+#endif
+}
+
 #else // Platform not supported
 
 // Stub implementation for non-RS485 platforms
 SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
+    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false),
+    _journalWriter(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }
@@ -1094,5 +1241,27 @@ uint32_t SolarManager::getModbusErrOther()        const { return 0; }
 bool SolarManager::startChargerCheck() { return false; }
 void SolarManager::cancelChargerCheck() {}
 bool SolarManager::serviceChargerCheck(unsigned long nowMillis) { (void)nowMillis; return false; }
+void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer) {
+  (void)journal;
+  _journalWriter = writer;
+}
+bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
+                                         uint32_t clientRefusals, bool loadCurrentAllowed) {
+  // No RS-485 here: refused as a charger that is not there.
+  return _programming.request(requestId, profile, profileErrors, clientRefusals | sunsaver::REFUSE_NO_CHARGER,
+                              loadCurrentAllowed, (uint32_t)millis());
+}
+bool SolarManager::withdrawChargerProgram(uint32_t refusals) {
+  return _programming.withdraw(refusals, (uint32_t)millis());
+}
+bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
+  (void)epochNow;
+  (void)allowed;
+  return false;
+}
+bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
+  (void)epochNow;
+  return false;
+}
 
 #endif // Platform check

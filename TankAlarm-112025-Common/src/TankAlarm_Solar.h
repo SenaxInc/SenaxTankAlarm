@@ -76,6 +76,17 @@
 // 0x0036, which this file used to read as "setpoints", are the controller's
 // lowest and highest battery voltage and a reserved word (SunSaver MPPT MODBUS
 // Specification v11).
+//
+// Charger programming writes a LiFePO4 charging profile and the LVD and LVR into
+// that block when the client's config asks for it (TankAlarm_SunSaverProgram.h
+// has the limits and the procedure, SolarManager::serviceChargerProgramming()
+// below runs it). It is compiled in only with TANKALARM_SUNSAVER_PROGRAMMING set
+// to 1, which stays 0 until a bench run has shown how a real SunSaver takes the
+// writes and the restart. A client built with 0 never writes to the controller:
+// it answers each request with "not built" and does nothing else.
+#ifndef TANKALARM_SUNSAVER_PROGRAMMING
+#define TANKALARM_SUNSAVER_PROGRAMMING 0
+#endif
 
 // ============================================================================
 // Scaling Factors for 12V System
@@ -221,11 +232,11 @@ enum SolarAlertType : uint8_t {
 // voltage readings already attached to telemetry (`v`) and the daily report
 // (`v`/`vs`, plus the solar block's `bv`), all emitted only when a voltage
 // source has data. No alert/SMS fires on this today (user decision
-// 2026-07-02), and firmware does not write charger setpoints over Modbus
-// (the EEPROM custom block is unverified on our bench, wears, needs a
-// controller reset, and temp compensation would defeat a cap anyway). The
-// charger check only reads that block. The constants below are retained for
-// future logic.
+// 2026-07-02), and firmware does not write a charge voltage cap over Modbus
+// (temperature compensation would defeat a cap anyway). The only writes are
+// those of charger programming (see "Stored charge settings" above), which a
+// config has to ask for and which refuses anything but a 12 V system. The
+// constants below are retained for future logic.
 #ifndef OPTA_SUPPLY_ABS_MAX_V
 #define OPTA_SUPPLY_ABS_MAX_V  28.8f  // Opta datasheet: 12-24 VDC +/-20%
 #endif
@@ -296,10 +307,14 @@ struct SolarConfig {
 // ============================================================================
 #ifdef __cplusplus
 
-#include "TankAlarm_SunSaverSettings.h"
+#include "TankAlarm_SunSaverProgram.h"
 
 class SolarManager {
 public:
+  // Writes the journal of charger programming to the client's flash. True only once the file
+  // holds it whole. See beginChargerProgramming().
+  typedef bool (*ChargerJournalWriter)(const sunsaver::Journal &journal);
+
   SolarManager();
   
   // Initialization
@@ -403,6 +418,50 @@ public:
   void setFloatReference(float volts) { _floatReferenceV = volts; }
   float getFloatReference() const { return _floatReferenceV; }
 
+  // ---------------------------------------------------------------------------------------
+  // Charger programming: writes a LiFePO4 charging profile and the LVD and LVR into the
+  // controller when the client's config asks for it (sunsaver::Supervisor in
+  // TankAlarm_SunSaverProgram.h decides what is done and when). The client keeps the journal in
+  // its flash and sends the results to the server. None of it is touched by begin() and end(),
+  // which a config change calls to restart the link.
+  //
+  // With TANKALARM_SUNSAVER_PROGRAMMING 0 nothing here sends to the controller: the caller
+  // refuses every request with REFUSE_NOT_BUILT, the journal is not looked at, and
+  // serviceChargerProgramming() does nothing.
+  // ---------------------------------------------------------------------------------------
+
+  // Once at start, with the journal from flash: sunsaver::cautiousJournal() when the file is
+  // there and cannot be read, {0, JOURNAL_IDLE} when there is none.
+  void beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer);
+
+  // A config carried a request. See sunsaver::Supervisor::request(): false for a request that
+  // this client has dealt with already.
+  bool requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
+                             uint32_t clientRefusals, bool loadCurrentAllowed);
+
+  // A request that waits is given up (see sunsaver::Supervisor::withdraw()). False when none
+  // waits.
+  bool withdrawChargerProgram(uint32_t refusals);
+
+  // Call from every pass of loop(), whether the charger is enabled or not: a request that waits
+  // runs out of time here too. `allowed` is false while the client must not talk to the
+  // controller (a firmware update is being staged, or a poll has just talked to it). The
+  // controller is talked to only once a poll has succeeded and the line is not resting. Returns
+  // true when a run talked to it: that held loop() for the whole run (about 20 seconds, a minute
+  // at most, with the watchdog fed), and the controller may hold other settings now. A charger
+  // check under way is dropped then, and the next poll is due at once.
+  bool serviceChargerProgramming(double epochNow, bool allowed);
+
+  // Whether programming would talk to the controller now if the line were free: a run or a look
+  // at the controller is due (see sunsaver::Supervisor::wantsLine()). The client's loop then lets
+  // it have the pass after a poll, when every pass is due to poll. False without programming.
+  bool chargerProgrammingWantsLine(double epochNow) const;
+
+  // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis()),
+  // the journal, and whether a request or a duty is open.
+  const sunsaver::Supervisor& chargerProgramming() const { return _programming; }
+  void chargerProgramReportTaken() { _programming.reportTaken(); }
+
 private:
   SolarConfig _config;
   SolarData _data;
@@ -417,6 +476,10 @@ private:
   unsigned long _chargerCheckStepMillis;  // when the last step ran
   unsigned long _chargerCheckGapMs;       // the pause before the next one (0 before the first)
   bool _chargerSettingsRead;
+
+  // Charger programming
+  sunsaver::Supervisor _programming;
+  ChargerJournalWriter _journalWriter;
   
   // Modbus communication
   bool readRegisters();

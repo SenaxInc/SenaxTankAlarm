@@ -161,6 +161,12 @@
 #define CHARGER_REPORTS_PATH "/charger_reports.json"
 #endif
 
+// The charger programming of each client: the newest request and the last result (see
+// ClientMetadata::chargerProgramAsked). Written together with the charger reports.
+#ifndef CHARGER_PROGRAMS_PATH
+#define CHARGER_PROGRAMS_PATH "/charger_programs.json"
+#endif
+
 // Stale client alerting threshold (49 hours in seconds)
 // The daily report is the de-facto heartbeat; 49h allows one missed
 // daily before flagging stale, avoiding false positives.
@@ -604,6 +610,18 @@ struct ClientMetadata {
   double chargerReportEpoch;               // when the client made the check, 0 = not known
   sunsaver::Snapshot chargerSnapshot;      // the registers
   sunsaver::Evaluation chargerEvaluation;  // the client's judgement
+
+  // Charger programming: a LiFePO4 charging profile, the LVD and the LVR, which the client
+  // writes into its SunSaver MPPT when a config asks for it (stampChargerProgramRequest()), and
+  // the client's result, a "chg-prog" report on the config-ack notefile
+  // (handleChargerProgramResult()). Kept in CHARGER_PROGRAMS_PATH, not in the metadata cache.
+  uint32_t chargerProgramAsked;                  // the id of the newest request sent, 0 = none
+  sunsaver::Profile chargerProgramAskedProfile;  // the values it asked for
+  bool chargerProgramAskedLoadOk;                // and whether it allowed current from the LOAD terminals
+  bool chargerProgramValid;                      // the three fields below hold a result
+  uint32_t chargerProgramRequestId;              // the request it answers
+  double chargerProgramEpoch;                    // when the client made it, 0 = not known
+  sunsaver::ProgramResult chargerProgram;
 };
 
 struct SerialLogEntry {
@@ -1357,8 +1375,9 @@ static double gLastDailyEmailSentEpoch = 0.0;
 static bool gSensorRegistryDirty = false;         // True when sensor records need saving
 static bool gClientMetadataDirty = false;        // True when client metadata needs saving
 static unsigned long gLastRegistrySaveMillis = 0;
-// The file of kept charger reports (CHARGER_REPORTS_PATH) holds a report that changed since its
-// last write that worked. See saveChargerReportsIfDirty().
+// The files of kept charger reports (CHARGER_REPORTS_PATH) and charger programming
+// (CHARGER_PROGRAMS_PATH) hold something that changed since their last write that worked. See
+// saveChargerReportsIfDirty().
 static bool gChargerReportsDirty = false;
 static unsigned long gChargerReportsTryMillis = 0;  // when it was last written or tried
 #define CHARGER_REPORTS_RETRY_MS 300000UL           // after a write that failed
@@ -2117,7 +2136,7 @@ static const char CONFIG_GENERATOR_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html 
   <div style="display:flex;gap:8px;"><button type="submit" form="generatorForm">Save to Device</button>
   <button type="button" id="downloadBtn" class="secondary">Download JSON</button></div>
 </div>
-<div id="configStatus" style="display:none;padding:12px;margin-bottom:16px;border-radius:var(--radius);background:#e6f2ff;border:1px solid #b3d9ff;color:#0066cc;"></div><form id="generatorForm"><div class="form-grid"><label class="field"><span>Product UID <span class="tooltip-icon" tabindex="0" data-tooltip="Blues Notehub Product UID. Must match the server's Product UID for client-server communication.">?</span></span><input id="productUid" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>Device UID</span><input id="clientUid" type="text" placeholder="dev:xxxxxxxx"></label><label class="field"><span>Site Name</span><input id="siteName" type="text" placeholder="Site Name" required></label><label class="field"><span>Device Label</span><input id="deviceLabel" type="text" placeholder="Device Label" required></label><label class="field"><span>Client Fleet</span><input id="clientFleet" type="text" placeholder="Client Fleet"></label><label class="field"><span>Server Fleet</span><input id="serverFleet" type="text" value="tankalarm-server"></label><label class="field"><span>Sample Minutes</span><input id="sampleMinutes" type="number" value="30" min="1" max="1092"></label></div><h3>Daily Report Contacts</h3><p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Contacts who receive the fleet-wide daily summary email — this edits the same master list as the <a href="/contacts">Contacts</a> page, where the email send time and time zone are set. This client publishes its daily telemetry ahead of the email by the offset below; if you later change the email time, re-save this config so the client's send time follows it.</p><div class="form-grid" style="margin-bottom:8px;"><label class="field"><span>Client Data Send Time<span class="tooltip-icon" tabindex="0" data-tooltip="When this client takes and publishes its daily telemetry reading, expressed as time BEFORE the daily email. Ensures fresh data is on the server when the email is compiled.">?</span></span><select id="dailyOffsetSelect"><option value="0">T-0:00 (with the email)</option><option value="30">T-0:30</option><option value="60">T-1:00</option><option value="90">T-1:30</option><option value="120" selected>T-2:00 (default)</option><option value="150">T-2:30</option><option value="180">T-3:00</option><option value="210">T-3:30</option><option value="240">T-4:00</option><option value="270">T-4:30</option><option value="300">T-5:00</option><option value="330">T-5:30</option><option value="360">T-6:00</option><option value="390">T-6:30</option><option value="420">T-7:00</option><option value="450">T-7:30</option><option value="480">T-8:00</option></select></label><div class="field"><span>Daily Email Time</span><div id="dailyEmailTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border);">Loading...</div></div></div><p id="dailyOffsetHint" style="color:var(--muted);font-size:0.85rem;margin:0 0 12px;"></p><div id="dailyContactsList" style="display:flex;flex-direction:column;gap:4px;margin-bottom:16px;"></div><h3>Power Configuration</h3><div class="form-grid"><label class="field"><span>Power Source<span class="tooltip-icon" tabindex="0" data-tooltip="Primary power supply feeding the device. Battery selection is configured separately below.">?</span></span><select id="powerSource" onchange="updatePowerConfigInfo()"><option value="grid">Grid AC</option><option value="solar">Solar (Passive Charger)</option><option value="solar_mppt">Solar + Non-Monitored MPPT</option><option value="solar_modbus_mppt">Solar + Modbus MPPT (RS-485)</option></select></label><label class="field"><span>Battery<span class="tooltip-icon" tabindex="0" data-tooltip="Battery chemistry. Lead-acid variants share thresholds; Flooded uses a higher equalization ceiling. Select None for grid-only or solar-direct installs.">?</span></span><select id="batteryType" onchange="updatePowerConfigInfo()"><option value="none">None (no battery)</option><option value="agm" selected>AGM (Sealed)</option><option value="sla">SLA (Sealed Lead-Acid)</option><option value="flooded">Flooded (Wet Cell)</option><option value="gel">Gel</option><option value="lifepo4">LiFePO4</option><option value="li_ion">Li-ion (NMC)</option><option value="lipo">LiPo (single cell)</option><option value="custom">Custom (manual thresholds)</option></select></label><label class="field" id="batteryVoltageField"><span>Battery Pack Voltage<span class="tooltip-icon" tabindex="0" data-tooltip="Nominal pack voltage. 24V scales all thresholds 2x from the 12V baseline. 24V support is experimental — verify Vin divider headroom.">?</span></span><select id="batteryVoltage"><option value="12" selected>12V</option><option value="24">24V (experimental)</option></select></label><label class="field"><span>Voltage Monitor<span class="tooltip-icon" tabindex="0" data-tooltip="Selects which hardware reports the battery voltage. None: no voltage monitoring; Voltage Divider: external resistor divider on an Opta analog input; RS485: SunSaver MPPT read over Modbus RS-485. Voltage Divider is required for accurate solar-only sunset detection.">?</span></span><select id="voltageMonitor" onchange="updatePowerConfigInfo()"><option value="none">None</option><option value="vin-divider">Voltage Divider</option><option value="rs485">RS485 (SunSaver Modbus)</option></select></label></div><div id="powerCombinationWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:10px 12px;margin-bottom:12px;border-radius:var(--radius);font-size:0.88rem;"></div><div id="powerConfigInfo" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;font-size:0.9rem;color:var(--muted);"><strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.</div><div id="vinConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Vin Monitor — Voltage Divider Configuration</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">Wire a voltage divider from the battery to an Opta analog input: Battery+ → R1 → Pin → R2 → GND</p><div class="form-grid"><label class="field"><span>Analog Pin</span><select id="vinPin"><option value="0">A0</option><option value="1">A1</option><option value="2">A2</option><option value="3">A3</option><option value="4">A4</option><option value="5">A5</option><option value="6">A6</option><option value="7">A7</option></select></label><label class="field"><span>R1 High-side (kΩ)</span><input id="vinR1" type="number" value="22" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label><label class="field"><span>R2 Low-side (kΩ)</span><input id="vinR2" type="number" value="47" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label></div><div id="vinCalcInfo" style="margin-top:8px;font-size:0.85rem;color:var(--muted);"></div></div><div id="solarOnlyConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Solar-Only (No Battery) Settings</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">This device is powered directly by a solar panel without battery backup. It will only operate during daylight hours.</p><div class="form-grid"><label class="field" id="solarOnlyDebounceVField"><span>Startup Debounce Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage before the system considers power stable enough to start. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlyDebounceSField"><span>Debounce Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of seconds the voltage must remain above the debounce threshold. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceSec" type="number" value="30" min="5" max="300"></label><label class="field" id="solarOnlyWarmupField"><span>Startup Warmup (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Fixed warmup timer used when no Vin divider is installed. The device waits this long after boot before reading sensors.">?</span></span><input id="solarOnlyWarmupSec" type="number" value="60" min="10" max="600"></label><label class="field" id="solarOnlySensorGateField"><span>Sensor Gate Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage required before sensor readings are taken. 4-20mA sensors typically need at least 11V excitation. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySensorGateV" type="number" value="11" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlySunsetVField"><span>Sunset Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="When Vin drops below this and continues declining, the device saves state and prepares for power loss. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySunsetV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field"><span>Sunset Confirm Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="How long voltage must be declining below sunset threshold before triggering shutdown save.">?</span></span><input id="solarOnlySunsetSec" type="number" value="120" min="30" max="600"></label><label class="field"><span>Opportunistic Report (hours)<span class="tooltip-icon" tabindex="0" data-tooltip="If more than this many hours have passed since the last daily report, send one immediately on startup. For solar-only, reports cannot be scheduled at a fixed time.">?</span></span><input id="solarOnlyReportHours" type="number" value="20" min="6" max="48"></label></div><div id="solarOnlyBatFailSection" style="display:none;margin-top:12px;border-top:1px solid var(--card-border);padding-top:12px;"><label class="check-box" style="margin-bottom:8px;"><input type="checkbox" id="solarOnlyBatFail"> Enable battery failure fallback<span class="tooltip-icon" tabindex="0" data-tooltip="For solar+battery setups: if the battery voltage stays critically low for extended time, automatically switch to solar-only behaviors (opportunistic reporting, sunset protocol).">?</span></label><label class="field"><span>Failure Threshold (readings)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of consecutive critical-voltage readings before declaring battery failure.">?</span></span><input id="solarOnlyBatFailCount" type="number" value="10" min="3" max="50"></label></div></div><h3>Sensors</h3><div id="sensorsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addSensorBtn" class="secondary">+ Add Sensor</button></div><h3>Inputs (Buttons &amp; Switches)</h3><p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Configure physical inputs for actions like clearing relay alarms.</p><div id="inputsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addInputBtn" class="secondary">+ Add Input</button></div><div class="actions"><button type="submit" id="sendConfigBtn">Save Configuration to Device</button><button type="button" id="retryConfigBtn" class="secondary" style="display:none">Retry Send to Notecard</button><button type="button" id="syncRequestBtn" class="secondary" style="display:none" title="Force the client Notecard to sync inbound notes (useful for weak signal)">Request Client Sync</button></div></form></div></main><div id="toast"></div><div id="selectClientModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2>Load Configuration</h2><button class="modal-close" onclick="closeSelectClientModal()">&times;</button></div><div id="clientList" class="client-list"><div class="empty-state">Loading clients...</div></div></div></div><datalist id="relayTargetSuggestions"></datalist><input type="file" id="importFileInput" accept=".json" style="display:none" />
+<div id="configStatus" style="display:none;padding:12px;margin-bottom:16px;border-radius:var(--radius);background:#e6f2ff;border:1px solid #b3d9ff;color:#0066cc;"></div><form id="generatorForm"><div class="form-grid"><label class="field"><span>Product UID <span class="tooltip-icon" tabindex="0" data-tooltip="Blues Notehub Product UID. Must match the server's Product UID for client-server communication.">?</span></span><input id="productUid" type="text" placeholder="com.company.product:project" required></label><label class="field"><span>Device UID</span><input id="clientUid" type="text" placeholder="dev:xxxxxxxx"></label><label class="field"><span>Site Name</span><input id="siteName" type="text" placeholder="Site Name" required></label><label class="field"><span>Device Label</span><input id="deviceLabel" type="text" placeholder="Device Label" required></label><label class="field"><span>Client Fleet</span><input id="clientFleet" type="text" placeholder="Client Fleet"></label><label class="field"><span>Server Fleet</span><input id="serverFleet" type="text" value="tankalarm-server"></label><label class="field"><span>Sample Minutes</span><input id="sampleMinutes" type="number" value="30" min="1" max="1092"></label></div><h3>Daily Report Contacts</h3><p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Contacts who receive the fleet-wide daily summary email — this edits the same master list as the <a href="/contacts">Contacts</a> page, where the email send time and time zone are set. This client publishes its daily telemetry ahead of the email by the offset below; if you later change the email time, re-save this config so the client's send time follows it.</p><div class="form-grid" style="margin-bottom:8px;"><label class="field"><span>Client Data Send Time<span class="tooltip-icon" tabindex="0" data-tooltip="When this client takes and publishes its daily telemetry reading, expressed as time BEFORE the daily email. Ensures fresh data is on the server when the email is compiled.">?</span></span><select id="dailyOffsetSelect"><option value="0">T-0:00 (with the email)</option><option value="30">T-0:30</option><option value="60">T-1:00</option><option value="90">T-1:30</option><option value="120" selected>T-2:00 (default)</option><option value="150">T-2:30</option><option value="180">T-3:00</option><option value="210">T-3:30</option><option value="240">T-4:00</option><option value="270">T-4:30</option><option value="300">T-5:00</option><option value="330">T-5:30</option><option value="360">T-6:00</option><option value="390">T-6:30</option><option value="420">T-7:00</option><option value="450">T-7:30</option><option value="480">T-8:00</option></select></label><div class="field"><span>Daily Email Time</span><div id="dailyEmailTimeDisplay" style="padding:10px 12px;background:var(--chip);border:1px solid var(--card-border);">Loading...</div></div></div><p id="dailyOffsetHint" style="color:var(--muted);font-size:0.85rem;margin:0 0 12px;"></p><div id="dailyContactsList" style="display:flex;flex-direction:column;gap:4px;margin-bottom:16px;"></div><h3>Power Configuration</h3><div class="form-grid"><label class="field"><span>Power Source<span class="tooltip-icon" tabindex="0" data-tooltip="Primary power supply feeding the device. Battery selection is configured separately below.">?</span></span><select id="powerSource" onchange="updatePowerConfigInfo()"><option value="grid">Grid AC</option><option value="solar">Solar (Passive Charger)</option><option value="solar_mppt">Solar + Non-Monitored MPPT</option><option value="solar_modbus_mppt">Solar + Modbus MPPT (RS-485)</option></select></label><label class="field"><span>Battery<span class="tooltip-icon" tabindex="0" data-tooltip="Battery chemistry. Lead-acid variants share thresholds; Flooded uses a higher equalization ceiling. Select None for grid-only or solar-direct installs.">?</span></span><select id="batteryType" onchange="updatePowerConfigInfo()"><option value="none">None (no battery)</option><option value="agm" selected>AGM (Sealed)</option><option value="sla">SLA (Sealed Lead-Acid)</option><option value="flooded">Flooded (Wet Cell)</option><option value="gel">Gel</option><option value="lifepo4">LiFePO4</option><option value="li_ion">Li-ion (NMC)</option><option value="lipo">LiPo (single cell)</option><option value="custom">Custom (manual thresholds)</option></select></label><label class="field" id="batteryVoltageField"><span>Battery Pack Voltage<span class="tooltip-icon" tabindex="0" data-tooltip="Nominal pack voltage. 24V scales all thresholds 2x from the 12V baseline. 24V support is experimental — verify Vin divider headroom.">?</span></span><select id="batteryVoltage" onchange="updatePowerConfigInfo()"><option value="12" selected>12V</option><option value="24">24V (experimental)</option></select></label><label class="field"><span>Voltage Monitor<span class="tooltip-icon" tabindex="0" data-tooltip="Selects which hardware reports the battery voltage. None: no voltage monitoring; Voltage Divider: external resistor divider on an Opta analog input; RS485: SunSaver MPPT read over Modbus RS-485. Voltage Divider is required for accurate solar-only sunset detection.">?</span></span><select id="voltageMonitor" onchange="updatePowerConfigInfo()"><option value="none">None</option><option value="vin-divider">Voltage Divider</option><option value="rs485">RS485 (SunSaver Modbus)</option></select></label></div><div id="powerCombinationWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:10px 12px;margin-bottom:12px;border-radius:var(--radius);font-size:0.88rem;"></div><div id="powerConfigInfo" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;font-size:0.9rem;color:var(--muted);"><strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.</div><div id="chargerProgramSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">SunSaver Charging Profile (12 V LiFePO4)</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">The SunSaver MPPT has no lithium preset. The client can write these values into the memory of the charger, and it does so only when <strong>Write these values to the charger</strong> is ticked as this config is saved. The defaults suit a 12 V LiFePO4 battery such as the Optima ORANGETOP, which switches itself off above 14.8 V. The charger uses the stored charge values with DIP switch 1 ON and the stored LVD and LVR with DIP switch 2 ON. Set DIP switch 3 (equalization) OFF.<span id="cpCheckLink"></span></p><div class="form-grid"><label class="field"><span>Absorption Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="The charger holds the battery at this voltage until the absorption time is over. 13.80 to 14.60 V, in steps of 0.05 V.">?</span></span><input id="cpAbsorbV" type="number" value="14.20" min="13.80" max="14.60" step="0.05"></label><label class="field"><span>Absorption Time (min)<span class="tooltip-icon" tabindex="0" data-tooltip="Time at the absorption voltage before the charger drops to float. 1 to 240 minutes.">?</span></span><input id="cpAbsorbMin" type="number" value="15" min="1" max="240" step="1"></label><label class="field"><span>Float Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="The charger holds a full battery at this voltage. 13.20 to 13.90 V, below the absorption voltage.">?</span></span><input id="cpFloatV" type="number" value="13.50" min="13.20" max="13.90" step="0.05"></label><label class="field"><span>High Voltage Disconnect (V)<span class="tooltip-icon" tabindex="0" data-tooltip="The charger stops charging above this. At least 0.10 V above the absorption voltage, 15.00 V at most. The ORANGETOP switches itself off above 14.8 V.">?</span></span><input id="cpHvdV" type="number" value="14.45" min="13.90" max="15.00" step="0.05"></label><label class="field"><span>High Voltage Reconnect (V)<span class="tooltip-icon" tabindex="0" data-tooltip="And charges again below this. 13.20 to 14.40 V, at least 0.20 V below the disconnect.">?</span></span><input id="cpHvrV" type="number" value="13.60" min="13.20" max="14.40" step="0.05"></label><label class="field"><span>Low Voltage Disconnect (V)<span class="tooltip-icon" tabindex="0" data-tooltip="The charger switches its LOAD output off below this. 10.00 to 13.30 V.">?</span></span><input id="cpLvdV" type="number" value="13.10" min="10.00" max="13.30" step="0.05"></label><label class="field"><span>Low Voltage Reconnect (V)<span class="tooltip-icon" tabindex="0" data-tooltip="And on again above this. At least 0.10 V above the LVD, 13.60 V at most.">?</span></span><input id="cpLvrV" type="number" value="13.25" min="10.10" max="13.60" step="0.05"></label></div><label class="check-box" style="margin-bottom:8px;"><input type="checkbox" id="cpLoadOk"> This Opta is not powered from the LOAD terminals of the charger<span class="tooltip-icon" tabindex="0" data-tooltip="While the charger waits for its restart after a write it may switch its LOAD output off: the specification does not say. An Opta powered from the LOAD terminals could lose power before it sends the restart, so the client refuses to begin while current flows from them, unless this is ticked.">?</span></label><label class="check-box"><input type="checkbox" id="cpApply"> <span><strong>Write these values to the charger</strong> with this save</span><span class="tooltip-icon" tabindex="0" data-tooltip="The values are sent with every save of this config, but the client writes them into the charger only when this is ticked. It is unticked again after each save.">?</span></label></div><div id="vinConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Vin Monitor — Voltage Divider Configuration</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">Wire a voltage divider from the battery to an Opta analog input: Battery+ → R1 → Pin → R2 → GND</p><div class="form-grid"><label class="field"><span>Analog Pin</span><select id="vinPin"><option value="0">A0</option><option value="1">A1</option><option value="2">A2</option><option value="3">A3</option><option value="4">A4</option><option value="5">A5</option><option value="6">A6</option><option value="7">A7</option></select></label><label class="field"><span>R1 High-side (kΩ)</span><input id="vinR1" type="number" value="22" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label><label class="field"><span>R2 Low-side (kΩ)</span><input id="vinR2" type="number" value="47" min="1" max="1000" step="0.1" onchange="updateVinCalc()"></label></div><div id="vinCalcInfo" style="margin-top:8px;font-size:0.85rem;color:var(--muted);"></div></div><div id="solarOnlyConfigSection" style="display:none;background:var(--chip);border:1px solid var(--card-border);padding:12px;margin-bottom:16px;border-radius:var(--radius);"><strong style="display:block;margin-bottom:8px;">Solar-Only (No Battery) Settings</strong><p style="font-size:0.85rem;color:var(--muted);margin:0 0 12px;">This device is powered directly by a solar panel without battery backup. It will only operate during daylight hours.</p><div class="form-grid"><label class="field" id="solarOnlyDebounceVField"><span>Startup Debounce Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage before the system considers power stable enough to start. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlyDebounceSField"><span>Debounce Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of seconds the voltage must remain above the debounce threshold. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlyDebounceSec" type="number" value="30" min="5" max="300"></label><label class="field" id="solarOnlyWarmupField"><span>Startup Warmup (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="Fixed warmup timer used when no Vin divider is installed. The device waits this long after boot before reading sensors.">?</span></span><input id="solarOnlyWarmupSec" type="number" value="60" min="10" max="600"></label><label class="field" id="solarOnlySensorGateField"><span>Sensor Gate Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="Minimum Vin voltage required before sensor readings are taken. 4-20mA sensors typically need at least 11V excitation. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySensorGateV" type="number" value="11" min="5" max="20" step="0.5"></label><label class="field" id="solarOnlySunsetVField"><span>Sunset Voltage (V)<span class="tooltip-icon" tabindex="0" data-tooltip="When Vin drops below this and continues declining, the device saves state and prepares for power loss. Only applies when Vin divider is connected.">?</span></span><input id="solarOnlySunsetV" type="number" value="10" min="5" max="20" step="0.5"></label><label class="field"><span>Sunset Confirm Duration (sec)<span class="tooltip-icon" tabindex="0" data-tooltip="How long voltage must be declining below sunset threshold before triggering shutdown save.">?</span></span><input id="solarOnlySunsetSec" type="number" value="120" min="30" max="600"></label><label class="field"><span>Opportunistic Report (hours)<span class="tooltip-icon" tabindex="0" data-tooltip="If more than this many hours have passed since the last daily report, send one immediately on startup. For solar-only, reports cannot be scheduled at a fixed time.">?</span></span><input id="solarOnlyReportHours" type="number" value="20" min="6" max="48"></label></div><div id="solarOnlyBatFailSection" style="display:none;margin-top:12px;border-top:1px solid var(--card-border);padding-top:12px;"><label class="check-box" style="margin-bottom:8px;"><input type="checkbox" id="solarOnlyBatFail"> Enable battery failure fallback<span class="tooltip-icon" tabindex="0" data-tooltip="For solar+battery setups: if the battery voltage stays critically low for extended time, automatically switch to solar-only behaviors (opportunistic reporting, sunset protocol).">?</span></label><label class="field"><span>Failure Threshold (readings)<span class="tooltip-icon" tabindex="0" data-tooltip="Number of consecutive critical-voltage readings before declaring battery failure.">?</span></span><input id="solarOnlyBatFailCount" type="number" value="10" min="3" max="50"></label></div></div><h3>Sensors</h3><div id="sensorsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addSensorBtn" class="secondary">+ Add Sensor</button></div><h3>Inputs (Buttons &amp; Switches)</h3><p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 12px;">Configure physical inputs for actions like clearing relay alarms.</p><div id="inputsContainer"></div><div class="actions" style="margin-bottom: 24px;"><button type="button" id="addInputBtn" class="secondary">+ Add Input</button></div><div class="actions"><button type="submit" id="sendConfigBtn">Save Configuration to Device</button><button type="button" id="retryConfigBtn" class="secondary" style="display:none">Retry Send to Notecard</button><button type="button" id="syncRequestBtn" class="secondary" style="display:none" title="Force the client Notecard to sync inbound notes (useful for weak signal)">Request Client Sync</button></div></form></div></main><div id="toast"></div><div id="selectClientModal" class="modal hidden"><div class="modal-content"><div class="modal-header"><h2>Load Configuration</h2><button class="modal-close" onclick="closeSelectClientModal()">&times;</button></div><div id="clientList" class="client-list"><div class="empty-state">Loading clients...</div></div></div></div><datalist id="relayTargetSuggestions"></datalist><input type="file" id="importFileInput" accept=".json" style="display:none" />
 <script>
 (async () => {
 const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
@@ -2156,8 +2175,10 @@ window.validatePowerCombination=function(){
     msg='Solar-direct without any voltage monitoring cannot detect sunset. Strongly recommended to enable Voltage Divider or RS485.';
   }else if(ps==='grid'&&bt==='none'&&vin){
     msg='Voltage Divider on a grid-only install with no battery has nothing useful to read.';
+  }else if(ps==='solar_modbus_mppt'&&bt==='lifepo4'&&bv===12){
+    msg='SunSaver MPPT has no lithium DIP preset. Before a lithium battery is connected, the charger needs a lithium charge profile in its memory and DIP switch 1 ON so that it uses it, and DIP switch 2 ON for the stored LVD and LVR. The client can write the profile: see SunSaver Charging Profile below. The built-in lead-acid presets adjust the voltage for temperature and can equalize, which harms a lithium battery.'+chargerCheckLink(' See the ','charger check for this client','.');
   }else if(ps==='solar_modbus_mppt'&&(bt==='lifepo4'||bt==='li_ion')){
-    msg='SunSaver MPPT has no lithium DIP preset. Before a lithium battery is connected, the charger needs a custom lithium charge profile in its memory and DIP switch 1 ON so that it uses it. Until this firmware can write that profile, load it with Morningstar MSView (USB MeterBus adapter) or OptaView. The built-in lead-acid presets adjust the voltage for temperature and can equalize, which harms a lithium battery. The client reads what the charger has stored and reports whether it suits this battery.'+chargerCheckLink(' See the ','charger check for this client','.');
+    msg='SunSaver MPPT has no lithium DIP preset. Before a lithium battery is connected, the charger needs a custom lithium charge profile in its memory and DIP switch 1 ON so that it uses it. This firmware writes a profile only for a 12 V LiFePO4 battery, so for this one load it with Morningstar MSView (USB MeterBus adapter) or OptaView. The built-in lead-acid presets adjust the voltage for temperature and can equalize, which harms a lithium battery. The client reads what the charger has stored and reports whether it suits this battery.'+chargerCheckLink(' See the ','charger check for this client','.');
   }
   if(bv===24&&vin){
     const r1=parseFloat(document.getElementById('vinR1').value)||22;
@@ -2185,6 +2206,14 @@ window.updatePowerConfigInfo=function(){
     if(ps==='solar_modbus_mppt'){i.style.display='block';i.innerHTML='<strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.'+chargerCheckLink(' The client checks what the charger has stored against the battery selected here: ','charger check','.');}
     else if(ps==='solar_mppt'){i.style.display='block';i.innerHTML='<strong>Hardware Requirement:</strong> Use this for higher-quality non-monitored solar chargers. For basic PWM chargers (for example SunKeeper-6), use Solar (Passive Charger). This mode does not require RS485 and uses battery/vin telemetry only.';}
     else{i.style.display='none';}
+  }
+  /* SunSaver charging profile: only for a 12 V LiFePO4 battery on a SunSaver read over RS-485 */
+  const cp=document.getElementById('chargerProgramSection');
+  if(cp){
+    const bvNow=parseInt(document.getElementById('batteryVoltage').value,10)||12;
+    const on=vmon==='rs485'&&bt==='lifepo4'&&bvNow===12;
+    cp.style.display=on?'block':'none';
+    const cl=document.getElementById('cpCheckLink');if(cl)cl.innerHTML=on?chargerCheckLink(' The result of each write shows on the ','charger page of this client','.'):'';
   }
   /* Vin divider config section */
   const v=document.getElementById('vinConfigSection');if(v)v.style.display=vin?'block':'none';if(vin)updateVinCalc();
@@ -2261,19 +2290,20 @@ const addInputBtn=document.getElementById('addInputBtn');if(addInputBtn)addInput
 /* CONFIG COLLECTION */
 function sensorKeyFromValue(value){switch(value){case 0:return 'digital';case 2:return 'current';case 3:return 'rpm';default:return 'analog';}}
 function collectConfig(){if(!validatePowerCombination()){showToast('Invalid power/battery combination — see warning above',true);return null;}if(!dirLoaded){showToast('The contacts directory has not loaded, so the daily report time cannot be computed yet. Reloading it; try again in a moment.',true);loadContactsDirectory();return null;}const sMinutes=Math.max(1,Math.min(1092,Math.trunc(Number(document.getElementById('sampleMinutes').value))||30));const dailyOffsetMinutes=parseInt(document.getElementById('dailyOffsetSelect').value,10)||0;const _cU=((emailUtcMinutes()-dailyOffsetMinutes)%1440+1440)%1440;const reportHour=Math.floor(_cU/60);const reportMinute=_cU%60;const psRaw=document.getElementById('powerSource').value||'grid';const btStr=document.getElementById('batteryType').value||'agm';const bvNominal=parseInt(document.getElementById('batteryVoltage').value,10)||12;const vmon=document.getElementById('voltageMonitor').value||'none';const hasVin=vmon==='vin-divider';const hasRs485=vmon==='rs485';const isSolarOnly=(btStr==='none'&&psRaw.startsWith('solar'));/* battery type enum value matching TankAlarm_Battery.h (chemistry only) */const btEnumMap={'none':0,'agm':1,'flooded':2,'gel':3,'sla':4,'lifepo4':5,'li_ion':6,'lipo':7,'custom':8};const btEnum=btEnumMap[btStr]!==undefined?btEnumMap[btStr]:1;const cfg={productUid:document.getElementById('productUid').value.trim(),deviceUid:(document.getElementById('clientUid').value||'').trim(),site:document.getElementById('siteName').value.trim(),deviceLabel:document.getElementById('deviceLabel').value.trim()||'Unconfigured Client',clientFleet:(document.getElementById('clientFleet').value||'').trim(),serverFleet:document.getElementById('serverFleet').value.trim()||'tankalarm-server',sampleSeconds:sMinutes*60,reportHour:reportHour,reportMinute:reportMinute,dailyEmail:'',dailyReportOffsetMinutes:dailyOffsetMinutes,powerSupply:psRaw,solarPowered:psRaw.startsWith('solar'),mpptEnabled:psRaw.includes('mppt'),solarCharger:{enabled:hasRs485},voltageMonitor:vmon,batteryConfig:{enabled:btStr!=='none',batteryType:btEnum,batteryTypeName:btStr,nominalVoltage:(btStr==='none'||btStr==='lipo')?0:bvNominal},vinMonitor:{enabled:hasVin,pin:hasVin?parseInt(document.getElementById('vinPin').value)||0:0,r1Kohm:hasVin?parseFloat(document.getElementById('vinR1').value)||22:22,r2Kohm:hasVin?parseFloat(document.getElementById('vinR2').value)||47:47},solarOnlyConfig:{enabled:isSolarOnly,startupDebounceVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlyDebounceV').value)||10:10,startupDebounceSec:(isSolarOnly&&hasVin)?parseInt(document.getElementById('solarOnlyDebounceSec').value)||30:30,startupWarmupSec:(isSolarOnly&&!hasVin)?parseInt(document.getElementById('solarOnlyWarmupSec').value)||60:60,sensorGateVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySensorGateV').value)||11:11,sunsetVoltage:(isSolarOnly&&hasVin)?parseFloat(document.getElementById('solarOnlySunsetV').value)||10:10,sunsetConfirmSec:isSolarOnly?parseInt(document.getElementById('solarOnlySunsetSec').value)||120:120,opportunisticReportHours:isSolarOnly?parseInt(document.getElementById('solarOnlyReportHours').value)||20:20,batteryFailureFallback:(!isSolarOnly&&psRaw.startsWith('solar')&&btStr!=='none')?!!document.getElementById('solarOnlyBatFail').checked:false,batteryFailureThreshold:parseInt(document.getElementById('solarOnlyBatFailCount').value)||10},sensors:[],clearButtonPin:-1,clearButtonActiveHigh:false};
+if(hasRs485&&btStr==='lifepo4'&&bvNominal===12){const num=id=>Number(document.getElementById(id).value);const program={absorbV:num('cpAbsorbV'),floatV:num('cpFloatV'),absorbMin:num('cpAbsorbMin'),hvdV:num('cpHvdV'),hvrV:num('cpHvrV'),lvdV:num('cpLvdV'),lvrV:num('cpLvrV'),loadOk:!!document.getElementById('cpLoadOk').checked};if(document.getElementById('cpApply').checked)program.apply=true;cfg.solarCharger.program=program;}
 const sensorCards=document.querySelectorAll('#sensorsContainer .sensor-card');if(!sensorCards.length){showToast('Add at least one sensor',true);return null;}
 sensorCards.forEach((card,index)=>{const monitorType=card.querySelector('.monitor-type').value;const type=parseInt(card.querySelector('.sensor-type').value);const pin=parseInt(card.querySelector('.sensor-pin').value);let userNum=parseInt(card.querySelector('.tank-num').value)||0;let name=card.querySelector('.tank-name').value;const contents=card.querySelector('.tank-contents')?.value||'';if(monitorType==='gas'){if(!name)name=`Gas System ${userNum||index+1}`;}else if(monitorType==='rpm'){if(!name)name=`Engine ${userNum||index+1}`;}else{if(!name)name=`Tank ${userNum||index+1}`;}const sensor=sensorKeyFromValue(type);const pulsesPerRev=Math.max(1,Math.min(255,parseInt(card.querySelector('.pulses-per-rev').value)||1));const switchMode=card.querySelector('.switch-mode').value;const alarmSectionVisible=card.querySelector('.alarm-section').classList.contains('visible');const highAlarmEnabled=card.querySelector('.high-alarm-enabled').checked;const lowAlarmEnabled=card.querySelector('.low-alarm-enabled').checked;const highAlarmValue=card.querySelector('.high-alarm').value;const lowAlarmValue=card.querySelector('.low-alarm').value;const tank={id:String.fromCharCode(65+index),monitorType:monitorType,name:name,contents:contents,number:index+1,userNumber:userNum,sensor:sensor,primaryPin:sensor==='current'?0:pin,secondaryPin:-1,loopChannel:sensor==='current'?pin:-1,rpmPin:sensor==='rpm'?pin:-1,hysteresis:sensor==='digital'?0:2.0,daily:true,upload:true,reportThreshold:parseFloat(card.querySelector('.report-threshold')?.value)||0,stuckDetection:card.querySelector('.stuck-detection').checked,calibrationEnabled:card.querySelector('.calibration-enabled').checked};if(sensor==='digital'){tank.digitalSwitchMode=switchMode;}let sUnit='';if(sensor==='current'){const currentLoopType=card.querySelector('.current-loop-type').value;const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';tank.currentLoopType=currentLoopType;tank.sensorMountHeight=sensorMountHeight;tank.sensorRangeMin=sMin;tank.sensorRangeMax=sMax;tank.sensorRangeUnit=sUnit;const lpVal=card.querySelector('.loop-power-enabled').value;tank.loopPowerEnabled=lpVal!=='false';tank.loopPowerMode=(lpVal==='pwm')?'pwm':'dac';tank.loopPowerPwmChannel=parseInt(card.querySelector('.loop-power-pwm-channel').value,10)||0;tank.loopPowerWarmup=parseInt(card.querySelector('.loop-power-warmup').value,10)||3000;tank.loopPowerSampleDelay=parseInt(card.querySelector('.loop-power-sample-delay').value,10)||300;tank.sensorMinVoltage=parseFloat(card.querySelector('.sensor-min-voltage').value)||10;}else if(sensor==='analog'){const sensorMountHeight=parseFloat(card.querySelector('.sensor-mount-height').value)||0;const sMin=parseFloat(card.querySelector('.sensor-range-min').value)||0;const sMax=parseFloat(card.querySelector('.sensor-range-max').value)||5;sUnit=card.querySelector('.sensor-range-unit').value||'PSI';tank.sensorMountHeight=sensorMountHeight;tank.sensorRangeMin=sMin;tank.sensorRangeMax=sMax;tank.sensorRangeUnit=sUnit;tank.analogVoltageMin=parseFloat(card.querySelector('.analog-voltage-min').value)||0;tank.analogVoltageMax=parseFloat(card.querySelector('.analog-voltage-max').value)||10;}if(monitorType==='tank'){const fluidSel=card.querySelector('.fluid-type');if(fluidSel){const fluidType=fluidSel.value;tank.fluidType=fluidType;if(fluidType==='custom'){const customSg=parseFloat(card.querySelector('.fluid-sg-custom').value);if(!isNaN(customSg)&&customSg>=0.3&&customSg<=2.0){tank.fluidSpecificGravity=customSg;}}}}if(monitorType==='gas'){tank.measurementUnit=sUnit?sUnit.toLowerCase():'psi';}else if(monitorType==='rpm'){tank.measurementUnit='rpm';}else if(monitorType==='flow'){tank.measurementUnit='gpm';}if(alarmSectionVisible){if(sensor==='digital'){const digitalTriggerState=card.querySelector('.digital-trigger-state').value;tank.digitalTrigger=digitalTriggerState;if(digitalTriggerState==='activated'){tank.highAlarm=1;}else{tank.lowAlarm=0;}tank.alarmsEnabled=true;tank.alarmSms=card.querySelector('.alarm-sms-enabled').checked;}else if(highAlarmEnabled||lowAlarmEnabled){if(highAlarmEnabled&&highAlarmValue!==''){const v=parseFloat(highAlarmValue);if(!isNaN(v))tank.highAlarm=v;}if(lowAlarmEnabled&&lowAlarmValue!==''){const v=parseFloat(lowAlarmValue);if(!isNaN(v))tank.lowAlarm=v;}tank.alarmsEnabled=true;tank.alarmSms=card.querySelector('.alarm-sms-enabled').checked;}else{tank.alarmsEnabled=false;tank.alarmSms=false;}}else{tank.alarmsEnabled=false;tank.alarmSms=false;}if(sensor==='rpm'){tank.pulsesPerRev=pulsesPerRev;}const relaySectionVisible=card.querySelector('.relay-section').classList.contains('visible');if(relaySectionVisible){let relayMask=0;['relay-1','relay-2','relay-3','relay-4'].forEach(cls=>{const cb=card.querySelector('.'+cls);if(cb.checked)relayMask|=parseInt(cb.value);});const relayTarget=card.querySelector('.relay-target').value.trim();const relayTrigger=card.querySelector('.relay-trigger').value;const relayMode=card.querySelector('.relay-mode').value;if(relayTarget){tank.relayTargetClient=relayTarget;tank.relayMask=relayMask;tank.relayTrigger=relayTrigger;tank.relayMode=relayMode;if(relayMode==='momentary'){tank.relayMomentaryDurations=[1,2,3,4].map(n=>Math.max(0,Math.min(65535,Math.trunc(Number(card.querySelector('.relay-duration-'+n).value))||0)));}if(relayMode==='manual_reset'){const maxOn=parseInt(card.querySelector('.relay-max-on').value)||0;if(maxOn>0)tank.relayMaxOnSeconds=Math.min(maxOn,604800);}}}const smsSectionVisible=false;if(smsSectionVisible){/* v2.2.5: legacy per-config SMS numbers removed - alarm messaging is contact-directory driven (alarmAssociations + channel lists); see Alarm Message Contacts picker */}cfg.sensors.push(tank);});if(cfg.sensors.length>CLIENT_MAX_MONITORS){showToast('A client supports at most '+CLIENT_MAX_MONITORS+' sensors; this configuration has '+cfg.sensors.length,true);return null;}
 const inputCards=document.querySelectorAll('#inputsContainer .sensor-card');let clearButtonConfigured=false;inputCards.forEach(card=>{const inputAction=card.querySelector('.input-action').value;if(inputAction==='clear_relays'&&!clearButtonConfigured){cfg.clearButtonPin=parseInt(card.querySelector('.input-pin').value)||0;cfg.clearButtonActiveHigh=(card.querySelector('.input-mode').value==='active_high');clearButtonConfigured=true;}});return cfg;}
 /* SUBMIT & DOWNLOAD */
 const retryBtn=document.getElementById('retryConfigBtn');
-async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast('Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}}catch(err){showToast('Error: '+err.message,true);}}
+async function submitConfig(e){e.preventDefault();try{const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID is required to send config',true);return;}const cfg=collectConfig();if(!cfg)return;const askedWrite=!!(cfg.solarCharger&&cfg.solarCharger.program&&cfg.solarCharger.program.apply);const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid,config:cfg})});const resText=await res.text();if(res.status===200){if(resText&&resText.includes('WARNING')){showToast(resText,'warn',6000);}else{showToast(askedWrite?'Configuration saved and queued for device. The client writes the charger values when it gets it: its charger page shows the result.':'Configuration saved and queued for device');}retryBtn.style.display='none';if(syncBtn)syncBtn.style.display='inline-block';}else if(res.status===202){showToast(resText||'Config saved locally — Notecard send failed');retryBtn.style.display='inline-block';if(syncBtn)syncBtn.style.display='inline-block';}else{showToast('Error: '+(resText||res.statusText),true);}if(askedWrite&&(res.status===200||res.status===202)){const ap=document.getElementById('cpApply');if(ap)ap.checked=false;}}catch(err){showToast('Error: '+err.message,true);}}
 async function retryConfig(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();try{const res=await fetch('/api/config/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid||undefined})});const t=await res.text();if(res.ok){showToast(t||'Config dispatched');retryBtn.style.display='none';}else{showToast(t||'Retry failed — check serial monitor',true);}}catch(err){showToast('Error: '+err.message,true);}}
 if(retryBtn)retryBtn.addEventListener('click',retryConfig);
 const syncBtn=document.getElementById('syncRequestBtn');
 async function requestSync(){const clientUid=(els.clientUid&&els.clientUid.value?els.clientUid.value:'').trim();if(!clientUid){showToast('Device UID required',true);return;}try{const res=await fetch('/api/sync-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});const t=await res.text();if(res.ok){showToast(t||'Sync request sent');syncBtn.style.display='none';}else{showToast(t||'Sync request failed',true);}}catch(err){showToast('Error: '+err.message,true);}}
 if(syncBtn)syncBtn.addEventListener('click',requestSync);
 if(els.form)els.form.addEventListener('submit',submitConfig);
-const downloadBtn=document.getElementById('downloadBtn');if(downloadBtn)downloadBtn.addEventListener('click',()=>{const cfg=collectConfig();if(!cfg)return;const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='client_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);});
+const downloadBtn=document.getElementById('downloadBtn');if(downloadBtn)downloadBtn.addEventListener('click',()=>{const cfg=collectConfig();if(!cfg)return;if(cfg.solarCharger&&cfg.solarCharger.program)delete cfg.solarCharger.program.apply;const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='client_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);});
 /* LOAD CONFIG */
 window.loadConfig=function(c){if(els.siteName)els.siteName.value=c.site||'';if(els.clientUid)els.clientUid.value=c.deviceUid||'';if(els.deviceLabel)els.deviceLabel.value=c.deviceLabel||'';if(els.clientFleet)els.clientFleet.value=c.clientFleet||'';if(els.productUid)els.productUid.value=c.productUid||'';if(els.sampleMinutes)els.sampleMinutes.value=(c.sampleSeconds||1800)/60;{const sel=document.getElementById('dailyOffsetSelect');if(sel){let off=120;if(typeof c.dailyReportOffsetMinutes==='number'){off=c.dailyReportOffsetMinutes;}else if(typeof c.reportHour==='number'){let d=emailUtcMinutes()-(c.reportHour*60+(c.reportMinute||0));d=((d%1440)+1440)%1440;if(d%30===0&&d<=480)off=d;}if(off%30!==0||off<0||off>480)off=120;sel.value=String(off);if(sel.selectedIndex<0)sel.value='120';renderDailyTimeInfo();}}
 /* Power model: powerSupply + batteryConfig.batteryType + batteryConfig.nominalVoltage + vinMonitor.enabled */
@@ -2286,6 +2316,7 @@ const btEl=document.getElementById('batteryType');if(btEl)btEl.value=btSel;
 const bvEl=document.getElementById('batteryVoltage');if(bvEl)bvEl.value=String(bvSel||12);
 const vmonEl=document.getElementById('voltageMonitor');if(vmonEl)vmonEl.value=vmonSel;
 updatePowerConfigInfo();
+{const pr=(c.solarCharger&&c.solarCharger.program)||{};const keys={cpAbsorbV:['absorbV','14.20'],cpFloatV:['floatV','13.50'],cpAbsorbMin:['absorbMin','15'],cpHvdV:['hvdV','14.45'],cpHvrV:['hvrV','13.60'],cpLvdV:['lvdV','13.10'],cpLvrV:['lvrV','13.25']};Object.keys(keys).forEach(id=>{const e=document.getElementById(id);if(!e)return;const v=pr[keys[id][0]];e.value=(typeof v==='number'&&isFinite(v))?(id==='cpAbsorbMin'?String(v):v.toFixed(2)):keys[id][1];});const lo=document.getElementById('cpLoadOk');if(lo)lo.checked=pr.loadOk===true;const ap=document.getElementById('cpApply');if(ap)ap.checked=false;}
 if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin').value=c.vinMonitor.pin;if(c.vinMonitor.r1Kohm!==undefined)document.getElementById('vinR1').value=c.vinMonitor.r1Kohm;if(c.vinMonitor.r2Kohm!==undefined)document.getElementById('vinR2').value=c.vinMonitor.r2Kohm;updateVinCalc();}if(c.solarOnlyConfig){const so=c.solarOnlyConfig;if(so.startupDebounceVoltage!==undefined)document.getElementById('solarOnlyDebounceV').value=so.startupDebounceVoltage;if(so.startupDebounceSec!==undefined)document.getElementById('solarOnlyDebounceSec').value=so.startupDebounceSec;if(so.startupWarmupSec!==undefined)document.getElementById('solarOnlyWarmupSec').value=so.startupWarmupSec;if(so.sensorGateVoltage!==undefined)document.getElementById('solarOnlySensorGateV').value=so.sensorGateVoltage;if(so.sunsetVoltage!==undefined)document.getElementById('solarOnlySunsetV').value=so.sunsetVoltage;if(so.sunsetConfirmSec!==undefined)document.getElementById('solarOnlySunsetSec').value=so.sunsetConfirmSec;if(so.opportunisticReportHours!==undefined)document.getElementById('solarOnlyReportHours').value=so.opportunisticReportHours;if(so.batteryFailureFallback!==undefined)document.getElementById('solarOnlyBatFail').checked=so.batteryFailureFallback;if(so.batteryFailureThreshold!==undefined)document.getElementById('solarOnlyBatFailCount').value=so.batteryFailureThreshold;}document.getElementById('sensorsContainer').innerHTML='';sensorCount=0;if(c.sensors)c.sensors.forEach(t=>{addSensor();const card=document.getElementById(`sensor-${sensorCount-1}`);if(card){const monitorSel=card.querySelector('.monitor-type');if(t.monitorType){monitorSel.value=t.monitorType;}else if(t.name&&t.name.match(/gas/i)){monitorSel.value='gas';}else if(t.sensor==='rpm'){monitorSel.value='rpm';}else{monitorSel.value='tank';}updateMonitorFields(sensorCount-1);card.querySelector('.tank-num').value=t.userNumber||'';card.querySelector('.tank-name').value=t.name||'';card.querySelector('.tank-contents').value=t.contents||'';const sensorVal=t.sensor==='digital'?0:(t.sensor==='current'?2:(t.sensor==='rpm'?3:1));card.querySelector('.sensor-type').value=sensorVal;updatePinOptions(sensorCount-1);if(t.sensor==='current'){card.querySelector('.sensor-pin').value=t.loopChannel||0;const lpEn=(t.loopPowerEnabled!==undefined)?t.loopPowerEnabled:t.pwmGatingEnabled;const lpMode=(t.loopPowerMode!==undefined)?t.loopPowerMode:((t.loopPowerEnabled===undefined&&t.pwmGatingEnabled!==undefined)?'pwm':'dac');if(lpEn!==undefined){card.querySelector('.loop-power-enabled').value=lpEn?(lpMode==='pwm'?'pwm':'dac'):'false';}const lpCh=(t.loopPowerPwmChannel!==undefined)?t.loopPowerPwmChannel:t.pwmGatingChannel;if(lpCh!==undefined){card.querySelector('.loop-power-pwm-channel').value=lpCh;}const lpWu=(t.loopPowerWarmup!==undefined)?t.loopPowerWarmup:t.pwmGatingWarmup;if(lpWu!==undefined){card.querySelector('.loop-power-warmup').value=lpWu;}const lpSd=(t.loopPowerSampleDelay!==undefined)?t.loopPowerSampleDelay:t.pwmGatingSampleDelay;if(lpSd!==undefined){card.querySelector('.loop-power-sample-delay').value=lpSd;}if(t.sensorMinVoltage!==undefined){card.querySelector('.sensor-min-voltage').value=t.sensorMinVoltage;}updateLoopPowerVisibility(sensorCount-1);}else if(t.sensor==='rpm'){card.querySelector('.sensor-pin').value=t.rpmPin||0;}else{card.querySelector('.sensor-pin').value=t.primaryPin||0;}if(t.digitalSwitchMode)card.querySelector('.switch-mode').value=t.digitalSwitchMode;if(t.pulsesPerRev)card.querySelector('.pulses-per-rev').value=t.pulsesPerRev;if(t.reportThreshold!==undefined)card.querySelector('.report-threshold').value=t.reportThreshold;const wantAlarm=t.alarmsEnabled===true||(t.alarmsEnabled===undefined&&(t.highAlarm!==undefined||t.lowAlarm!==undefined||t.alarmSms===true||t.digitalTrigger!==undefined));if(wantAlarm){toggleAlarmSection(sensorCount-1);const smsCb=card.querySelector('.alarm-sms-enabled');if(smsCb)smsCb.checked=t.alarmSms!==false;const hasHigh=t.highAlarm!==undefined,hasLow=t.lowAlarm!==undefined;if(hasHigh)card.querySelector('.high-alarm').value=t.highAlarm;if(hasLow)card.querySelector('.low-alarm').value=t.lowAlarm;card.querySelector('.high-alarm-enabled').checked=hasHigh;card.querySelector('.low-alarm-enabled').checked=hasLow;if(t.sensor==='digital'){const dts=card.querySelector('.digital-trigger-state');const trig=t.digitalTrigger||(hasHigh?'activated':(hasLow?'not_activated':''));if(dts&&trig)dts.value=trig;}}if(t.relayTargetClient){toggleRelaySection(sensorCount-1);card.querySelector('.relay-target').value=t.relayTargetClient;if(t.relayTrigger)card.querySelector('.relay-trigger').value=t.relayTrigger;if(t.relayMode)card.querySelector('.relay-mode').value=t.relayMode;if(t.relayMask){if(t.relayMask&1)card.querySelector('.relay-1').checked=true;if(t.relayMask&2)card.querySelector('.relay-2').checked=true;if(t.relayMask&4)card.querySelector('.relay-3').checked=true;if(t.relayMask&8)card.querySelector('.relay-4').checked=true;}if(t.relayMomentaryDurations){card.querySelector('.relay-duration-1').value=t.relayMomentaryDurations[0]||0;card.querySelector('.relay-duration-2').value=t.relayMomentaryDurations[1]||0;card.querySelector('.relay-duration-3').value=t.relayMomentaryDurations[2]||0;card.querySelector('.relay-duration-4').value=t.relayMomentaryDurations[3]||0;}if(t.relayMaxOnSeconds){card.querySelector('.relay-max-on').value=t.relayMaxOnSeconds;}toggleRelayDurations(sensorCount-1);}updateSensorTypeFields(sensorCount-1);if(t.currentLoopType){const clt=card.querySelector('.current-loop-type');if(clt&&Array.from(clt.options).some(o=>o.value===t.currentLoopType)){clt.value=t.currentLoopType;updateCurrentLoopFields(sensorCount-1);}}if(t.sensorMountHeight!==undefined)card.querySelector('.sensor-mount-height').value=t.sensorMountHeight;if(t.sensorRangeMin!==undefined)card.querySelector('.sensor-range-min').value=t.sensorRangeMin;if(t.sensorRangeMax!==undefined)card.querySelector('.sensor-range-max').value=t.sensorRangeMax;if(t.sensorRangeUnit)card.querySelector('.sensor-range-unit').value=t.sensorRangeUnit;if(t.analogVoltageMin!==undefined)card.querySelector('.analog-voltage-min').value=t.analogVoltageMin;if(t.analogVoltageMax!==undefined)card.querySelector('.analog-voltage-max').value=t.analogVoltageMax;if(t.stuckDetection!==undefined)card.querySelector('.stuck-detection').checked=t.stuckDetection;if(t.calibrationEnabled!==undefined)card.querySelector('.calibration-enabled').checked=t.calibrationEnabled;if(t.fluidType){const fSel=card.querySelector('.fluid-type');if(fSel){fSel.value=t.fluidType;updateFluidTypeFields(sensorCount-1);}}if(t.fluidSpecificGravity!==undefined&&t.fluidSpecificGravity>0){const fSel=card.querySelector('.fluid-type');const fIn=card.querySelector('.fluid-sg-custom');if(fSel&&fIn){fSel.value='custom';fIn.value=t.fluidSpecificGravity;updateFluidTypeFields(sensorCount-1);}}updateFluidVisibility(sensorCount-1);}});if(dirLoaded)autoOpenMsgSections();showToast('Configuration loaded');};
 /* CLOUD & IMPORT */
 function closeSelectClientModal(){els.selectClientModal.classList.add('hidden');}window.closeSelectClientModal=closeSelectClientModal;
@@ -2371,16 +2402,47 @@ R"HTML(document.getElementById('exportBtn').addEventListener('click',()=>{let cs
 R"HTML(async function cancelPendingConfig(clientUid){if(!confirm('Cancel pending config dispatch for '+clientUid+'? This will stop auto-retries and purge unsent notes from the Notecard outbox.'))return;try{const res=await fetch('/api/config/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});const text=await res.text();if(res.ok){showToast(text||'Config dispatch cancelled');}else{showToast(text||'Cancel failed',true);}await loadLog();}catch(err){showToast('Error: '+err.message,true);}}async function cancelAllPendingConfigs(){if(!confirm('Cancel ALL pending config dispatches? This will stop all auto-retries.'))return;try{const res=await fetch('/api/config/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});const text=await res.text();if(res.ok){showToast(text||'All pending configs cancelled');}else{showToast(text||'Cancel failed',true);}await loadLog();}catch(err){showToast('Error: '+err.message,true);}}loadLog();setInterval(loadLog,15000);})();</script></body></html>)HTML";
 
 // The charger check of one client (SunSaver MPPT): /charger?uid=<client>. Reads /api/charger.
-static const char CHARGER_CHECK_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Charger Check - TankAlarm</title><link rel="stylesheet" href="/style.css"><style>.cc-verdict{display:inline-block;padding:4px 10px;margin-right:10px;font-weight:600;border:1px solid}.cc-ok{color:var(--ok);background:var(--ok-bg);border-color:var(--ok)}.cc-bad{color:var(--bad);background:var(--bad-bg);border-color:var(--bad)}.cc-warn{color:var(--warn);background:var(--warn-bg);border-color:var(--warn)}.cc-none{color:var(--muted);background:var(--chip);border-color:var(--card-border)}.cc-findings{list-style:none;padding:0;margin:16px 0}.cc-findings li{padding:8px 12px;margin-bottom:6px;border-left:4px solid var(--card-border);background:var(--chip)}.cc-findings li.p{border-left-color:var(--bad);background:var(--bad-bg);color:var(--bad)}.cc-name,.cc-raw{font-family:monospace;white-space:nowrap}.cc-raw{color:var(--muted)}.cc-note{color:var(--muted);font-size:0.9rem}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" id="logoutBtn">Logout</button></div></div></header><main><div class="card"><h2>Charger Check</h2><p id="ccWho" class="cc-note" style="margin-bottom:16px;"></p><div id="ccSummary" class="empty-state">Loading...</div><ul id="ccFindings" class="cc-findings"></ul><div id="ccScales" class="cc-note"></div><div id="ccGroups"></div><p class="cc-note" style="margin-top:24px;">The client reads these registers from its SunSaver MPPT over RS-485 and changes nothing in the charger. It reads them after it starts, after a change to its battery or charger settings, and once a day, and it sends a report when something in them has changed.</p></div></main>)HTML"
+static const char CHARGER_CHECK_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Charger Check - TankAlarm</title><link rel="stylesheet" href="/style.css"><style>.cc-verdict{display:inline-block;padding:4px 10px;margin-right:10px;font-weight:600;border:1px solid}.cc-ok{color:var(--ok);background:var(--ok-bg);border-color:var(--ok)}.cc-bad{color:var(--bad);background:var(--bad-bg);border-color:var(--bad)}.cc-warn{color:var(--warn);background:var(--warn-bg);border-color:var(--warn)}.cc-none{color:var(--muted);background:var(--chip);border-color:var(--card-border)}.cc-findings{list-style:none;padding:0;margin:16px 0}.cc-findings li{padding:8px 12px;margin-bottom:6px;border-left:4px solid var(--card-border);background:var(--chip)}.cc-findings li.p{border-left-color:var(--bad);background:var(--bad-bg);color:var(--bad)}.cc-name,.cc-raw{font-family:monospace;white-space:nowrap}.cc-raw{color:var(--muted)}.cc-note{color:var(--muted);font-size:0.9rem}.cc-kv td:first-child{white-space:nowrap;width:1%}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" id="logoutBtn">Logout</button></div></div></header><main><div class="card" id="ccCheckCard"><h2>Charger Check</h2><p id="ccWho" class="cc-note" style="margin-bottom:16px;"></p><div id="ccSummary" class="empty-state">Loading...</div><ul id="ccFindings" class="cc-findings"></ul><div id="ccScales" class="cc-note"></div><div id="ccGroups"></div><p class="cc-note" style="margin-top:24px;">The client reads these registers from its SunSaver MPPT over RS-485, and the check changes nothing in the charger. It reads them after it starts, after a change to its battery or charger settings, after it has programmed the charger, and once a day, and it sends a report when something in them has changed.</p></div><div class="card" id="ccProgramCard"><h2>Charger Programming</h2><div id="ccProgram" class="empty-state">Loading...</div></div></main>)HTML"
 R"HTML(<script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname+window.location.search);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
 document.getElementById('logoutBtn').addEventListener('click',()=>{fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login';});});
 const uid=new URLSearchParams(window.location.search).get('uid')||'';
 const el=id=>document.getElementById(id);
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function when(e){if(!e)return'';const d=new Date(e*1000);if(isNaN(d.getTime()))return'';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}
+const outcomeBadge={1:'cc-ok',2:'cc-ok',3:'cc-warn',4:'cc-warn',8:'cc-warn'};
+function table(head,rows,kv){return '<table'+(kv?' class="cc-kv"':'')+'>'+(head?'<thead><tr>'+head.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead>':'')+'<tbody>'+(rows||[]).map(r=>'<tr>'+r.map((c,i)=>'<td'+(head&&i===0?' class="cc-name"':'')+'>'+esc(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
+function renderProgram(p){
+const box=el('ccProgram');const gen='/config-generator?uid='+encodeURIComponent(uid);
+if(!p){box.className='empty-state';box.innerHTML='This client has not been asked to program its charger. To ask, open its config in the <a href="'+gen+'">Config Generator</a>, set Battery to LiFePO4 at 12V and Voltage Monitor to RS485, check the values under SunSaver Charging Profile, tick <strong>Write these values to the charger</strong> and save.';return;}
+box.className='';let h='';
+const waiting=!!(p.asked&&!p.answered);
+if(waiting){
+h+='<p><span class="cc-verdict cc-none">Waiting</span>Request sent '+esc(when(p.asked))+'. '+esc(p.fresh?'The client writes the values once it has the config, its clock is set and the charger answers. Its result shows here.':'It is more than a day old now, so the client refuses it if it gets it. To ask again, save the config with "Write these values to the charger" ticked.')+'</p>';
+h+='<h3>Values asked for</h3>'+table(null,p.values,true)+'<p class="cc-note">'+esc(p.loadOk?'The request allows current to flow from the LOAD terminals during the run.':'The client refuses to begin while current flows from the LOAD terminals: the request does not allow it.')+'</p>';
+}
+const r=p.result;
+if(r){
+if(waiting)h+='<h3>Last result, for an earlier request</h3>';
+const name=String(r.outcome||'');const t=when(r.e);
+h+='<p><span class="cc-verdict '+(outcomeBadge[r.o]||'cc-bad')+'">'+esc(name.charAt(0).toUpperCase()+name.slice(1))+'</span>'+esc(r.text)+'</p>';
+h+='<p class="cc-note">'+esc((r.summary&&r.summary!==r.outcome?r.summary+'. ':'')+(r.req?'For the request sent '+when(r.req)+'.':'For a run that a restart of the client cut short.')+(t?' Reported '+t+'.':''))+'</p>';
+if(r.followUp)h+='<p class="cc-note">The client looks at the charger again once it answers, and sends another result.</p>';
+const facts=[];if(r.restart)facts.push(['Restart',r.restart]);if(r.battery)facts.push(['Battery when the run began',r.battery]);
+if(facts.length)h+=table(null,facts,true);
+if(r.load)h+='<p class="cc-note">'+esc(r.load)+'</p>';
+if((r.reasons||[]).length)h+='<ul class="cc-findings">'+r.reasons.map(x=>'<li class="p">'+esc(x)+'</li>').join('')+'</ul>';
+if((r.notes||[]).length)h+='<ul class="cc-findings">'+r.notes.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+if(r.asked)h+='<h3>'+(waiting?'Values that request asked for':'Values asked for')+'</h3>'+table(null,r.asked,true);
+if((r.registers||[]).length)h+='<h3>Registers, in the order of writing</h3>'+table(['Register','What it is','Before','Wanted','How it went'],r.registers);
+}
+h+='<p class="cc-note" style="margin-top:24px;">The client writes these values into the charger only when a person asks for it in the config of this client, once for each request. It checks the values and the charger first, writes one register at a time, reads each one back, and restarts the charger so that it uses them. The charger uses the stored charge values with DIP switch 1 ON, and the stored LVD and LVR with DIP switch 2 ON. <a href="'+gen+'">Change the values</a></p>';
+box.innerHTML=h;
+}
 const verdicts={0:['Not judged','cc-none','The client has no rules for the battery that is configured, so it shows the settings without judging them.'],1:['Settings suit the battery','cc-ok',''],2:['Settings do not suit the battery','cc-bad',''],3:['Could not be judged in full','cc-warn','Part of the judgement could not be made. What could be checked showed nothing wrong.']};
 function render(d){
 el('ccWho').textContent=(d.site?d.site+', ':'')+'client '+uid+(d.fv?', firmware v'+d.fv:'');
+renderProgram(d.program);
+if(d.program)el('ccCheckCard').before(el('ccProgramCard'));/* a client with programming: its card first */
 if(!d.have){el('ccSummary').className='empty-state';el('ccSummary').textContent='No charger check has arrived from this client yet. A client sends one when it has a SunSaver MPPT on RS-485 (Voltage Monitor set to RS485) and firmware that includes the charger check.';return;}
 const v=verdicts[d.vd]||verdicts[0];const t=when(d.e);
 el('ccSummary').className='';
@@ -2390,9 +2452,9 @@ el('ccScales').innerHTML='<div>How the stored voltages are encoded: '+esc(d.sett
 el('ccGroups').innerHTML=(d.groups||[]).map(g=>'<h3>'+esc(g.title)+'</h3><table><thead><tr><th>Register</th><th>What it is</th><th>Value</th><th>Raw</th></tr></thead><tbody>'+(g.rows||[]).map(r=>'<tr><td class="cc-name">'+esc(r[0])+'</td><td>'+esc(r[1])+'</td><td>'+esc(r[2])+'</td><td class="cc-raw">'+esc(r[3])+'</td></tr>').join('')+'</tbody></table>').join('');
 }
 async function load(){
-if(!uid){el('ccSummary').textContent='No client was given. Open this page from a client on its site page.';return;}
+if(!uid){el('ccSummary').textContent='No client was given. Open this page from a client on its site page.';el('ccProgramCard').style.display='none';return;}
 try{const r=await fetch('/api/charger?client='+encodeURIComponent(uid));if(!r.ok)throw new Error((await r.text())||('HTTP '+r.status));render(await r.json());}
-catch(e){el('ccSummary').className='empty-state';el('ccSummary').textContent='The charger check could not be loaded: '+e.message;}
+catch(e){el('ccSummary').className='empty-state';el('ccSummary').textContent='The charger check could not be loaded: '+e.message;el('ccProgram').className='empty-state';el('ccProgram').textContent='The charger programming could not be loaded either.';}
 }
 load();})();</script></body></html>)HTML";
 
@@ -2708,6 +2770,12 @@ static void handleChargerGet(EthernetClient &client, const String &query);
 static bool saveChargerReports();
 static void saveChargerReportsIfDirty(bool force);
 static void loadChargerReports();
+static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc, double now);
+static bool chargerProgramAnswered(const ClientMetadata &meta);
+static int stampChargerProgramRequest(const char *clientUid, JsonVariant config, char *message, size_t messageSize);
+static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantConst config);
+static bool saveChargerPrograms();
+static void loadChargerPrograms();
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static void handleTelemetryRequestPost(EthernetClient &client, const String &body);
@@ -4597,6 +4665,7 @@ void setup() {
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
   loadChargerReports();       // and each client's last charger check
+  loadChargerPrograms();      // and its charger programming
   printHardwareRequirements();
 
   Wire.begin();
@@ -5100,6 +5169,7 @@ static void recoverOrphanedTmpFiles() {
     "/fs/sensor_registry.json",
     "/fs/client_metadata.json",
     "/fs" CHARGER_REPORTS_PATH,
+    "/fs" CHARGER_PROGRAMS_PATH,
     "/fs/client_config_cache.txt",
     "/fs/calibration_data.txt",
     "/fs/email_format.json",
@@ -11085,6 +11155,15 @@ static void handleConfigPost(EthernetClient &client, const String &body) {
         respondStatus(client, 400, F("Too many sensors: a client supports at most 8"));
         return;
       }
+      // A request to program the charger is checked and given its id here, and the page's
+      // "apply" goes no further.
+      char programMessage[640];  // every limit broken at once is 479 bytes
+      const int programStatus =
+          stampChargerProgramRequest(clientUid, doc["config"], programMessage, sizeof(programMessage));
+      if (programStatus != 0) {
+        respondStatus(client, programStatus, programMessage);
+        return;
+      }
       ConfigDispatchStatus status = dispatchClientConfig(clientUid, doc["config"]);
       if (status == ConfigDispatchStatus::PayloadTooLarge) {
         respondStatus(client, 413, F("Config payload too large"));
@@ -11094,6 +11173,8 @@ static void handleConfigPost(EthernetClient &client, const String &body) {
         respondStatus(client, 500, F("Failed to queue config"));
         return;
       }
+      // Cached at least, and sent or to be sent again: a request in it counts as sent.
+      noteChargerProgramRequestSent(clientUid, doc["config"]);
       if (status == ConfigDispatchStatus::CachedOnly) {
         respondStatus(client, 202, F("Config saved locally — Notecard send failed (auto-retry every 60 min). Check serial monitor for details."));
         return;
@@ -12791,6 +12872,10 @@ static void handleOtaResult(const char *clientUid, const char *status, JsonDocum
 // shared with the client and tested in tests/host/sunsaver_settings.
 
 static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc, double now) {
+  if (strcmp(status, "chg-prog") == 0) {
+    handleChargerProgramResult(clientUid, doc, now);
+    return;
+  }
   if (strcmp(status, "chg-check") != 0) {
     return;  // a report of a newer client, which this server has no use for
   }
@@ -12841,8 +12926,41 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   }
 }
 
+// The charger programming of a client for /api/charger, when it has any:
+//   asked     the id of the newest request sent (the server's time when it was asked for), 0 = none
+//   answered  the client has sent a result for it
+//   fresh     a client could still act on it now: under a day old (sunsaver::requestIsFresh())
+//   loadOk    it allowed current from the LOAD terminals during the run
+//   values    [[label, value], ...]: what it asked for
+//   result    the last result: "req" the request it answers, "e" when the client made it (0 = not
+//             known), and the members of sunsaver::describeProgramResult()
+static void describeChargerProgram(const ClientMetadata &meta, JsonObject out) {
+  if (meta.chargerProgramAsked != 0) {
+    out["asked"] = meta.chargerProgramAsked;
+    out["answered"] = chargerProgramAnswered(meta);
+    out["fresh"] = sunsaver::requestIsFresh(meta.chargerProgramAsked, currentEpoch());
+    out["loadOk"] = meta.chargerProgramAskedLoadOk;
+    JsonArray values = out["values"].to<JsonArray>();
+    for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
+      JsonArray row = values.add<JsonArray>();
+      row.add(sunsaver::profileFieldLabel(field));
+      char value[24];
+      sunsaver::Text text(value, sizeof(value));
+      sunsaver::describeProfileField(meta.chargerProgramAskedProfile, field, &text);
+      row.add(value);
+    }
+  }
+  if (meta.chargerProgramValid) {
+    JsonObject result = out["result"].to<JsonObject>();
+    result["req"] = meta.chargerProgramRequestId;
+    result["e"] = (uint32_t)meta.chargerProgramEpoch;
+    sunsaver::describeProgramResult(meta.chargerProgram, result);
+  }
+}
+
 // GET /api/charger?client=<uid>: the client's last charger check, readable. "have" is false
-// when none has arrived. See sunsaver::describeReport() for the members.
+// when none has arrived. See sunsaver::describeReport() for the members. "program" is there when
+// the client was asked to program its charger, or sent a result: see describeChargerProgram().
 static void handleChargerGet(EthernetClient &client, const String &query) {
   const String uid = getQueryParam(query, "client");
   if (uid.length() == 0) {
@@ -12866,6 +12984,9 @@ static void handleChargerGet(EthernetClient &client, const String &query) {
     out["have"] = true;
     out["e"] = (uint32_t)meta->chargerReportEpoch;
     sunsaver::describeReport(meta->chargerSnapshot, meta->chargerEvaluation, out);
+  }
+  if (meta && (meta->chargerProgramAsked != 0 || meta->chargerProgramValid)) {
+    describeChargerProgram(*meta, out["program"].to<JsonObject>());
   }
   respondJson(client, doc);
 }
@@ -12905,15 +13026,16 @@ static bool saveChargerReports() {
   return true;  // no file system in this build: nothing to keep a report in
 }
 
-// Writes the file of kept reports when a report was taken or dropped since its last write that
-// worked: at once when `force` is set, and otherwise (from loop()) every CHARGER_REPORTS_RETRY_MS
-// after a write that failed. The note a report came in is deleted once it has been handled, so
-// until a write works the report is in RAM only and would be lost at a restart.
+// Writes the files of kept reports and of charger programming when a report, a request or a
+// result was taken or dropped since their last write that worked: at once when `force` is set,
+// and otherwise (from loop()) every CHARGER_REPORTS_RETRY_MS after a write that failed. The note
+// a report or a result came in is deleted once it has been handled, so until a write works it is
+// in RAM only and would be lost at a restart.
 //
-// At a start a report is kept only for a client that the metadata cache holds (see
+// At a start a report or a result is kept only for a client that the metadata cache holds (see
 // loadChargerReports()), and a client that is new here is in that cache only once it has been
-// written. So the cache is written first, every time, and the reports count as kept only when
-// both writes worked. gClientMetadataDirty cannot tell: other savers clear it after a write
+// written. So the cache is written first, every time, and the rest counts as kept only when all
+// three writes worked. gClientMetadataDirty cannot tell: other savers clear it after a write
 // that failed.
 static void saveChargerReportsIfDirty(bool force) {
   if (!gChargerReportsDirty) {
@@ -12928,13 +13050,14 @@ static void saveChargerReportsIfDirty(bool force) {
   if (ownersSaved) {
     gClientMetadataDirty = false;
   }
-  // The reports are written even when the cache was not: those of clients it already held on
+  // The others are written even when the cache was not: those of clients it already held on
   // flash are then kept.
   const bool reportsSaved = saveChargerReports();
-  if (ownersSaved && reportsSaved) {
+  const bool programsSaved = saveChargerPrograms();
+  if (ownersSaved && reportsSaved && programsSaved) {
     gChargerReportsDirty = false;
   } else {
-    Serial.println(ownersSaved ? F("ERROR: Charger reports not saved, trying again in 5 minutes")
+    Serial.println(ownersSaved ? F("ERROR: Charger reports or programming not saved, trying again in 5 minutes")
                                : F("ERROR: Client metadata not saved with the charger reports, trying again in 5 minutes"));
   }
 }
@@ -12993,6 +13116,316 @@ static void loadChargerReports() {
       ++loaded;
     }
     Serial.print(F("Charger reports loaded: "));
+    Serial.println(loaded);
+  #endif
+#endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Charger programming (SunSaver MPPT)
+// ---------------------------------------------------------------------------------------------
+// A person asks on the config page for a LiFePO4 charging profile, the LVD and the LVR to be
+// written into a client's SunSaver MPPT. The config's "solarCharger.program" holds the values
+// (see TankAlarm_SunSaverReport.h), and the page's "apply" asks for them to be written with this
+// save. The server checks the values and the config, gives the request its id ("req": the
+// server's time) and sends it with the config. The client writes the values
+// (sunsaver::Supervisor in TankAlarm_SunSaverProgram.h) and sends the result as a "chg-prog"
+// report on the config-ack notefile. For each client the server keeps the newest request it
+// sent and the last result, and shows them at /charger beside the charger check.
+
+static bool sameChargerProfile(const sunsaver::Profile &a, const sunsaver::Profile &b) {
+  for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
+    if (sunsaver::profileField(a, field) != sunsaver::profileField(b, field)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The client has sent a result for the newest request sent to it.
+static bool chargerProgramAnswered(const ClientMetadata &meta) {
+  return meta.chargerProgramValid && meta.chargerProgramRequestId >= meta.chargerProgramAsked;
+}
+
+// A config for which the charger may be programmed: a 12 V LiFePO4 battery, and a SunSaver MPPT
+// read over RS-485. The client checks the same against the config it has applied.
+static bool configSuitsChargerProgram(JsonVariantConst config) {
+  JsonVariantConst battery = config["batteryConfig"];
+  const bool batteryOn = !battery["enabled"].is<bool>() || battery["enabled"].as<bool>();
+  return batteryOn && battery["batteryType"].is<int>() &&
+         battery["batteryType"].as<int>() == (int)BATTERY_TYPE_LIFEPO4 && battery["nominalVoltage"].is<int>() &&
+         battery["nominalVoltage"].as<int>() == 12 && config["solarCharger"]["enabled"].is<bool>() &&
+         config["solarCharger"]["enabled"].as<bool>();
+}
+
+// Called for each config a person saves for a client, before it is cached and sent. A config
+// without "solarCharger.program" is left alone. From one that holds it, "apply" and any "req"
+// that came with it are taken out, and then:
+//   - with "apply" true, the values and the config are checked, and the request is given its id:
+//     the server's time, and more than the id of the request sent to this client before;
+//   - without it, the request that was sent last and has no result yet goes on with this config,
+//     when the config asks for the same values. A client withdraws a request that waits when a
+//     config comes without it, so saving the config for another reason does not withdraw it, and
+//     changing the values or the battery does.
+// Returns 0, or the HTTP status to answer with and the reason in `message`: the config is then
+// not sent.
+static int stampChargerProgramRequest(const char *clientUid, JsonVariant config, char *message, size_t messageSize) {
+  if (messageSize > 0) {
+    message[0] = '\0';
+  }
+  JsonObject program = config["solarCharger"]["program"].as<JsonObject>();
+  if (program.isNull()) {
+    return 0;
+  }
+  const bool apply = program["apply"].is<bool>() && program["apply"].as<bool>();
+  program.remove("apply");
+  program.remove("req");
+  sunsaver::Profile profile;
+  const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
+  const bool loadOk = sunsaver::readLoadAllowed(program);
+  const ClientMetadata *meta = findClientMetadata(clientUid);
+
+  if (!apply) {
+    if (meta && meta->chargerProgramAsked != 0 && !chargerProgramAnswered(*meta) && profileErrors == 0 &&
+        configSuitsChargerProgram(config) && sameChargerProfile(profile, meta->chargerProgramAskedProfile) &&
+        loadOk == meta->chargerProgramAskedLoadOk) {
+      program["req"] = meta->chargerProgramAsked;
+      Serial.print(F("Charger programming: request "));
+      Serial.print((unsigned long)meta->chargerProgramAsked);
+      Serial.print(F(" of "));
+      Serial.print(clientUid);
+      Serial.println(F(" has no result yet and goes on with this config"));
+    }
+    return 0;
+  }
+
+  sunsaver::Text text(message, messageSize);
+  if (profileErrors != 0) {
+    text.add("The charger values were not accepted:");
+    for (uint8_t bit = 0; bit < sunsaver::PROFILE_ERROR_BITS; ++bit) {
+      const uint16_t error = (uint16_t)(1u << bit);
+      if ((profileErrors & error) != 0) {
+        text.add(" ").add(sunsaver::profileErrorText(error));
+      }
+    }
+    return 400;
+  }
+  if (!configSuitsChargerProgram(config)) {
+    text.add("The charger can be programmed only for a 12 V LiFePO4 battery on a SunSaver MPPT read over RS-485. "
+             "Set the battery and the voltage monitoring in this config, or untick \"Write these values to the "
+             "charger\".");
+    return 400;
+  }
+  const double now = currentEpoch();
+  if (!(now >= sunsaver::CLOCK_SET_EPOCH)) {
+    text.add("The server's clock is not set yet, and a request to program the charger needs it. Try again in a "
+             "few minutes.");
+    return 503;
+  }
+  uint32_t requestId = (uint32_t)now;
+  if (meta && requestId <= meta->chargerProgramAsked) {
+    requestId = meta->chargerProgramAsked + 1;  // the server's clock went back: the client takes only a newer id
+  }
+  program["req"] = requestId;
+  return 0;
+}
+
+// After the config was cached, and sent or due to be sent again: a request in it counts as sent.
+static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantConst config) {
+  JsonObjectConst program = config["solarCharger"]["program"].as<JsonObjectConst>();
+  const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
+  if (requestId == 0) {
+    return;
+  }
+  ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
+  if (!meta || meta->chargerProgramAsked == requestId) {
+    return;  // carried over from an earlier config
+  }
+  sunsaver::readProfile(program, &meta->chargerProgramAskedProfile);
+  meta->chargerProgramAskedLoadOk = sunsaver::readLoadAllowed(program);
+  meta->chargerProgramAsked = requestId;
+  gChargerReportsDirty = true;
+  saveChargerReportsIfDirty(true);
+
+  char line[128];
+  snprintf(line, sizeof(line), "Charger programming asked of %s (request %lu)", clientUid, (unsigned long)requestId);
+  Serial.println(line);
+  addServerSerialLog(line, "info", "charger");
+}
+
+// A "chg-prog" report: the result of a request, or of the look at the controller that a client
+// owes it after a run that was cut short (request 0 when the client could not read its journal).
+static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc, double now) {
+  sunsaver::ProgramResult result;
+  if (!sunsaver::decodeProgramResult(doc.as<JsonObjectConst>(), &result)) {
+    Serial.print(F("Charger programming result from "));
+    Serial.print(clientUid);
+    Serial.println(F(" is not in a layout this server reads"));
+    return;
+  }
+  ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
+  if (!meta) {
+    return;
+  }
+  const uint32_t requestId = doc["req"].is<uint32_t>() ? doc["req"].as<uint32_t>() : 0;
+  // Ordered by request, and within one request by the client's time of the result, which is
+  // read as the time of a charger check is (see handleChargerReport()).
+  const double madeAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
+  if (!sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId,
+                                       meta->chargerProgramEpoch, requestId, madeAt)) {
+    Serial.print(F("Charger programming result from "));
+    Serial.print(clientUid);
+    Serial.println(F(" is older than the one this server holds: not kept"));
+    return;
+  }
+  meta->chargerProgramValid = true;
+  meta->chargerProgramRequestId = requestId;
+  meta->chargerProgramEpoch = madeAt;
+  meta->chargerProgram = result;
+  gChargerReportsDirty = true;
+  saveChargerReportsIfDirty(true);  // the note is deleted once it has been handled
+
+  char summary[96];
+  {
+    sunsaver::Text text(summary, sizeof(summary));
+    sunsaver::describeRun(result, &text);
+  }
+  char line[176];
+  snprintf(line, sizeof(line), "Charger programming of %s, request %lu: %s", clientUid, (unsigned long)requestId,
+           summary);
+  Serial.println(line);
+  addServerSerialLog(line, sunsaver::outcomeIsGood(result.outcome) ? "info" : "warn", "charger");
+}
+
+// The charger programming of each client that has any: the newest request sent ("a", its values
+// "ap" in the order of sunsaver::profileField(), "al" when it allowed current from the LOAD
+// terminals) and the last result ("r" the request it answers, "e" when the client made it, and
+// the members of sunsaver::encodeProgramResult()). True once the file holds them.
+static bool saveChargerPrograms() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!mbedFS) {
+      return false;
+    }
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+      const ClientMetadata &meta = gClientMetadata[i];
+      if (meta.clientUid[0] == '\0' || (meta.chargerProgramAsked == 0 && !meta.chargerProgramValid)) {
+        continue;
+      }
+      JsonObject obj = arr.add<JsonObject>();
+      obj["c"] = meta.clientUid;
+      if (meta.chargerProgramAsked != 0) {
+        obj["a"] = meta.chargerProgramAsked;
+        JsonArray values = obj["ap"].to<JsonArray>();
+        for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
+          values.add(sunsaver::profileField(meta.chargerProgramAskedProfile, field));
+        }
+        if (meta.chargerProgramAskedLoadOk) {
+          obj["al"] = true;
+        }
+      }
+      if (meta.chargerProgramValid) {
+        obj["r"] = meta.chargerProgramRequestId;
+        obj["e"] = (uint32_t)meta.chargerProgramEpoch;
+        sunsaver::encodeProgramResult(meta.chargerProgram, obj);
+      }
+    }
+    if (arr.size() == 0 && !posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
+      return true;  // no client was ever asked: no file is needed
+    }
+    const size_t jsonLen = measureJson(doc);
+    char *buf = (char *)malloc(jsonLen + 1);
+    if (!buf) {
+      Serial.println(F("ERROR: Cannot allocate charger programming save buffer"));
+      return false;
+    }
+    serializeJson(doc, buf, jsonLen + 1);
+    const bool written = posix_write_file("/fs" CHARGER_PROGRAMS_PATH, buf, jsonLen);
+    free(buf);
+    return written;
+  #endif
+#endif
+  return true;  // no file system in this build: nothing to keep it in
+}
+
+// Call after loadClientMetadataCache(), as loadChargerReports().
+static void loadChargerPrograms() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!mbedFS || !posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
+      return;
+    }
+    FILE *fp = fopen("/fs" CHARGER_PROGRAMS_PATH, "r");
+    if (!fp) {
+      posix_log_error("fopen", "/fs" CHARGER_PROGRAMS_PATH);
+      return;
+    }
+    // An entry is under 800 bytes of JSON with a full plan of registers and the longest client id.
+    const long fileSize = posix_file_size(fp);
+    if (fileSize <= 0 || fileSize > (long)MAX_CLIENT_METADATA * 800L + 64L) {
+      fclose(fp);
+      Serial.println(F("Charger programming file size invalid"));
+      return;
+    }
+    fseek(fp, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)fileSize + 1);
+    if (!buf) {
+      fclose(fp);
+      Serial.println(F("ERROR: Cannot allocate charger programming load buffer"));
+      return;
+    }
+    const size_t bytesRead = fread(buf, 1, (size_t)fileSize, fp);
+    fclose(fp);
+    buf[bytesRead] = '\0';
+
+    JsonDocument doc;
+    const DeserializationError err = deserializeJson(doc, buf);
+    free(buf);
+    if (err) {
+      Serial.print(F("ERROR: Charger programming parse failed: "));
+      Serial.println(err.c_str());
+      return;
+    }
+    uint8_t loaded = 0;
+    for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
+      ClientMetadata *meta = findClientMetadata(obj["c"] | "");
+      if (!meta) {
+        continue;
+      }
+      bool any = false;
+      const uint32_t asked = obj["a"].is<uint32_t>() ? obj["a"].as<uint32_t>() : 0;
+      JsonArrayConst values = obj["ap"].as<JsonArrayConst>();
+      if (asked != 0 && values.size() == sunsaver::PROFILE_FIELDS) {
+        uint16_t fields[sunsaver::PROFILE_FIELDS];
+        bool whole = true;
+        for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
+          whole = whole && values[field].is<uint32_t>() && values[field].as<uint32_t>() <= 0xFFFFu;
+          fields[field] = whole ? (uint16_t)values[field].as<uint32_t>() : (uint16_t)0;
+        }
+        if (whole) {
+          const sunsaver::Profile profile = {fields[0], fields[1], fields[2], fields[3],
+                                             fields[4], fields[5], fields[6]};
+          meta->chargerProgramAsked = asked;
+          meta->chargerProgramAskedProfile = profile;
+          meta->chargerProgramAskedLoadOk = obj["al"].is<bool>() && obj["al"].as<bool>();
+          any = true;
+        }
+      }
+      sunsaver::ProgramResult result;
+      if (!obj["play"].isNull() && sunsaver::decodeProgramResult(obj, &result)) {
+        meta->chargerProgramValid = true;
+        meta->chargerProgramRequestId = obj["r"].is<uint32_t>() ? obj["r"].as<uint32_t>() : 0;
+        meta->chargerProgramEpoch = obj["e"] | 0.0;
+        meta->chargerProgram = result;
+        any = true;
+      }
+      if (any) {
+        ++loaded;
+      }
+    }
+    Serial.print(F("Charger programming loaded: "));
     Serial.println(loaded);
   #endif
 #endif
@@ -17325,7 +17758,8 @@ static bool removeClientData(const char *clientUid) {
   // Remove client metadata
   for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
     if (strcmp(gClientMetadata[i].clientUid, clientUid) == 0) {
-      const bool hadChargerReport = gClientMetadata[i].chargerReportValid;
+      const bool hadChargerReport = gClientMetadata[i].chargerReportValid || gClientMetadata[i].chargerProgramValid ||
+                                    gClientMetadata[i].chargerProgramAsked != 0;
       for (uint8_t j = i; j < gClientMetadataCount - 1; ++j) {
         memcpy(&gClientMetadata[j], &gClientMetadata[j + 1], sizeof(ClientMetadata));
       }
@@ -17333,7 +17767,7 @@ static bool removeClientData(const char *clientUid) {
       gClientMetadataDirty = true;
       removedAny = true;
       if (hadChargerReport) {
-        gChargerReportsDirty = true;  // its charger check goes with it
+        gChargerReportsDirty = true;  // its charger check and programming go with it
         saveChargerReportsIfDirty(true);
       }
       break;

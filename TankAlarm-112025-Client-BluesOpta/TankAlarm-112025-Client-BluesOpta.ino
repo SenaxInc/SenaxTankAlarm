@@ -908,6 +908,24 @@ static bool gChargerReportWaited = false;              // it could not go out wh
 static bool gChargerReportTried = false;               // nothing would take it at the last try
 static unsigned long gChargerReportTryMillis = 0;      // which was then
 
+// Charger programming: a config can ask the client to write a LiFePO4 charging profile and the
+// LVD and LVR into the SunSaver ("solarCharger.program", with the id the server gives a
+// request). The procedure, its limits and its journal are in TankAlarm_SunSaverProgram.h
+// (Common library); SolarManager runs it, and only in firmware built with
+// TANKALARM_SUNSAVER_PROGRAMMING set to 1 in TankAlarm_Solar.h. Other firmware answers every
+// request with "not built". The journal in flash lets a run that a restart of this client cut
+// short be settled when it starts again. Every result goes to the server.
+#define CHARGER_JOURNAL_FILE "/cfg/charger_journal.json"
+#define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result nothing would take
+// The result that waits to go out (SolarManager::chargerProgramming()), as this sketch has seen
+// it. See sendDueChargerProgramReport().
+static bool gChargerProgramReportSeen = false;          // it has been shown on the serial console
+static uint32_t gChargerProgramReportId = 0;            // the request it answers
+static uint32_t gChargerProgramReportAt = 0;            // the millis() it came about
+static uint32_t gChargerProgramReportEpoch = 0;         // that moment as a time, once the clock has one
+static bool gChargerProgramReportTried = false;         // nothing would take it at the last try
+static unsigned long gChargerProgramReportTryMillis = 0;
+
 // Battery voltage monitoring via Notecard (when wired directly to battery)
 static BatteryData gBatteryData;
 static unsigned long gLastBatteryPollMillis = 0;
@@ -1540,6 +1558,12 @@ static void requestChargerCheck();
 static void serviceChargerCheck(unsigned long now, bool lineFree);
 static void finishChargerCheck(unsigned long now);
 static void sendDueChargerReport(unsigned long now);
+static sunsaver::Journal loadChargerJournal();
+static bool saveChargerJournal(const sunsaver::Journal &journal);
+static void handleChargerProgramRequest(JsonObjectConst program);
+static void withdrawUnsuitedChargerProgram();
+static bool serviceChargerProgramming(unsigned long now, bool allowed);
+static void sendDueChargerProgramReport(unsigned long now);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
 // Battery voltage monitoring (sourced from SunSaver MPPT or Vin divider via
@@ -1875,6 +1899,10 @@ void setup() {
       addSerialLog("Solar charger init failed");
     }
   }
+
+  // Charger programming: whether a run that a restart of this client cut short left the charger
+  // owed a look. That is settled, and a request is run, only once a poll in loop() has worked.
+  gSolarManager.beginChargerProgramming(loadChargerJournal(), saveChargerJournal);
 
   // Initialize battery voltage monitoring
   // Fix 11: source is auto-picked by getEffectiveBatteryVoltage() (SunSaver MPPT preferred,
@@ -2346,15 +2374,19 @@ void loop() {
   // Poll solar charger for battery health data (SunSaver MPPT via RS-485)
   // In CRITICAL_HIBERNATE we still poll the solar charger (if enabled) to detect
   // battery recovery, but at reduced frequency (controlled by sleep duration).
+  //
+  // The poll, the charger check and charger programming all talk to the charger, so a pass of
+  // loop() reads for one of them only, and the poll comes first. A short poll interval with the
+  // long sleep of ECO or LOW_POWER makes every pass due to poll: then the pass after one that
+  // polled goes to a check that is under way, or to programming that has something due, and the
+  // poll waits for the next pass.
+  bool solarPolled = false;
   if (gSolarManager.isEnabled()) {
-    // The poll and the charger check both talk to the charger, so a pass of loop() reads for one
-    // of them only. A short poll interval with the long sleep of ECO or LOW_POWER makes every
-    // pass due to poll: then a check that is under way takes the pass after one that polled, and
-    // the poll waits for the next pass.
-    const bool checkTurn = gSolarPolledLastPass && gSolarManager.chargerCheckActive();
-    const bool polled = !checkTurn && gSolarManager.poll(now);
-    gSolarPolledLastPass = polled;
-    if (polled) {
+    const bool othersTurn = gSolarPolledLastPass && (gSolarManager.chargerCheckActive() ||
+                                                     gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
+    solarPolled = !othersTurn && gSolarManager.poll(now);
+    gSolarPolledLastPass = solarPolled;
+    if (solarPolled) {
       // A poll was attempted - check alerts using the refreshed communication state
       // (suppress alarm sending in CRITICAL to save power).
       SolarAlertType alert = gSolarManager.checkAlerts();
@@ -2374,10 +2406,18 @@ void loop() {
       // Optional serial output for hardware bring-up.
       logSolarPollSnapshot(now, alert);
     }
+  }
+
+  // Charger programming: a request from a config, or a look that a run cut short by a restart
+  // of this client left owed. It comes before the check, and runs in every pass whether the
+  // charger is enabled or not, so that a request that waits runs out of time.
+  const bool programmed = serviceChargerProgramming(now, !solarPolled);
+
+  if (gSolarManager.isEnabled()) {
     // In every pass: a check that is due is set up and a report that waits is sent, which talk
-    // to nobody. A few registers of a check that is under way are read only in a pass without a
-    // poll.
-    serviceChargerCheck(now, !polled);
+    // to nobody. A few registers of a check that is under way are read only in a pass in which
+    // nothing else talked to the charger.
+    serviceChargerCheck(now, !solarPolled && !programmed);
   }
   
   // Poll battery voltage (sourced from MPPT/Vin divider — never the Notecard)
@@ -2690,6 +2730,7 @@ static void recoverOrphanedTmpFiles() {
   static const char * const criticalFiles[] = {
     "/cfg/client_config.json",
     "/cfg/pending_notes.log",
+    CHARGER_JOURNAL_FILE,
     nullptr
   };
 
@@ -5115,7 +5156,14 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       }
       Serial.println(F("Solar: runtime config refreshed (no transport restart)"));
     }
+
+    // Charger programming. The battery block above has been applied, and the link restarted
+    // if the transport changed, so the client's own refusals go by the new config. A config
+    // without "program" withdraws a request that waits.
+    handleChargerProgramRequest(solarCfg["program"].as<JsonObjectConst>());
   }
+  // A request that waits goes on only while the client could still take it on.
+  withdrawUnsuitedChargerProgram();
 
   // Handle Vin voltage divider configuration
   if (!doc["vinMonitor"].isNull()) {
@@ -7589,6 +7637,265 @@ static void sendDueChargerReport(unsigned long now) {
   gChargerReportFingerprint = gChargerReportDueFingerprint;
   gChargerReportMillis = now;
   gChargerReportSyncNow = false;
+}
+
+// ============================================================================
+// Charger programming (SunSaver MPPT)
+// ============================================================================
+// A config asks for a LiFePO4 charging profile, the LVD and the LVR to be written into the
+// controller. What may be asked for, the order of the writes, the restarts and the journal are
+// in TankAlarm_SunSaverProgram.h (Common library), which tests/host/sunsaver_program runs on a
+// PC against a simulated SunSaver; SolarManager talks to the controller. This sketch reads the
+// request, keeps the journal in flash and sends the results to the server.
+
+// The journal in flash: how far the last run came (sunsaver::Journal). No file: no run was ever
+// taken on. A file that cannot be read: the controller may wait for a restart, and gets a look.
+// Only firmware built with programming reads it.
+static sunsaver::Journal loadChargerJournal() {
+  const sunsaver::Journal none = {0, sunsaver::JOURNAL_IDLE};
+#if TANKALARM_SUNSAVER_PROGRAMMING && defined(POSIX_FILE_IO_AVAILABLE)
+  if (!isStorageAvailable()) {
+    // Without flash no run can be recorded, and so none is taken on.
+    Serial.println(F("Charger programming: built in, but no flash to keep its journal"));
+    return none;
+  }
+  errno = 0;
+  FILE *file = fopen(CHARGER_JOURNAL_FILE, "r");
+  if (file == nullptr) {
+    if (errno == ENOENT) {
+      Serial.println(F("Charger programming: built in, nothing owed to the charger"));
+      return none;
+    }
+    Serial.println(F("Charger programming: the journal could not be opened, so the charger gets a look"));
+    return sunsaver::cautiousJournal();
+  }
+  char buf[96];
+  const size_t len = fread(buf, 1, sizeof(buf) - 1, file);
+  const bool failed = ferror(file) != 0;
+  fclose(file);
+  buf[len] = '\0';
+  sunsaver::Journal journal = sunsaver::cautiousJournal();
+  JsonDocument doc;
+  if (!failed && deserializeJson(doc, buf) == DeserializationError::Ok) {
+    journal = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
+  }
+  switch (journal.phase) {
+    case sunsaver::JOURNAL_IDLE:
+      Serial.println(F("Charger programming: built in, nothing owed to the charger"));
+      break;
+    case sunsaver::JOURNAL_TAKEN:
+      Serial.println(F("Charger programming: a request was taken on before this restart, and nothing was sent"));
+      break;
+    default:
+      Serial.println(F("Charger programming: a run was cut short by this restart, so the charger gets a look"));
+      addSerialLog("Charger programming: a run was cut short by a restart");
+      break;
+  }
+  return journal;
+#else
+  return none;
+#endif
+}
+
+// The journal's writer (SolarManager::ChargerJournalWriter): true only once the file holds it.
+static bool saveChargerJournal(const sunsaver::Journal &journal) {
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  if (!isStorageAvailable()) {
+    return false;
+  }
+  JsonDocument doc;
+  sunsaver::encodeJournal(journal, doc.to<JsonObject>());
+  char buf[64];
+  const size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len == 0 || len >= sizeof(buf) - 1) {
+    return false;
+  }
+  return tankalarm_posix_write_file_atomic(CHARGER_JOURNAL_FILE, buf, len);
+#else
+  (void)journal;
+  return false;
+#endif
+}
+
+// What keeps this client from taking a request on, as far as it can tell without the
+// controller: Refusal bits, 0 when nothing does.
+static uint32_t chargerProgramClientRefusals() {
+  uint32_t refusals = 0;
+  if (chargerCheckChemistry() != sunsaver::CHEMISTRY_LIFEPO4 || gConfig.batteryMonitor.nominalVoltage != 12) {
+    refusals |= sunsaver::REFUSE_NOT_LIFEPO4;
+  }
+  if (!gConfig.solarCharger.enabled || !gSolarManager.isInitialized()) {
+    refusals |= sunsaver::REFUSE_NO_CHARGER;
+  }
+  return refusals;
+}
+
+static void logChargerProgramWithdrawn(uint32_t requestId) {
+  char line[96];
+  snprintf(line, sizeof(line), "Charger programming: request %lu withdrawn after a config change",
+           (unsigned long)requestId);
+  Serial.println(line);
+  addSerialLog(line);
+}
+
+// A config's "solarCharger.program", or a null object for a config with a "solarCharger" block
+// but no program. Only a request with an id is acted on: the server adds one when a person asks
+// for the values to be written, and the client answers each id once. The server also puts the
+// id of a request that has no result yet into each later config that asks for the same values,
+// so a config without that id (the values changed, or none are asked for) withdraws a request
+// that waits. The client refuses by itself what it can tell without the controller.
+static void handleChargerProgramRequest(JsonObjectConst program) {
+  const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
+  const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
+  if (waitingId != 0 && requestId < waitingId) {
+    if (gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_WITHDRAWN | chargerProgramClientRefusals())) {
+      logChargerProgramWithdrawn(waitingId);
+    }
+    return;
+  }
+  if (requestId == 0) {
+    return;  // the values only travel with the config: nothing is to be written
+  }
+  sunsaver::Profile profile;
+  const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
+  const uint32_t refusals = chargerProgramClientRefusals();
+  if (!gSolarManager.requestChargerProgram(requestId, profile, profileErrors, refusals,
+                                           sunsaver::readLoadAllowed(program))) {
+    return;  // the config again: this request has had its answer, or waits already
+  }
+  Serial.print(F("Charger programming: request "));
+  Serial.print(requestId);
+  Serial.println(gSolarManager.chargerProgramming().requestWaiting()
+                     ? F(" waits for the clock and the charger")
+                     : F(" refused"));
+}
+
+// After each config: a request that waits is withdrawn once the client could no longer take it
+// on (the battery is no longer 12 V LiFePO4, or the charger is off). A config that carries the
+// request again does not change that.
+static void withdrawUnsuitedChargerProgram() {
+  const uint32_t refusals = chargerProgramClientRefusals();
+  const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
+  if (refusals != 0 && gSolarManager.withdrawChargerProgram(refusals)) {
+    logChargerProgramWithdrawn(waitingId);
+  }
+}
+
+// Call from every pass of loop(). `allowed` is false in a pass in which a poll talked to the
+// charger. A firmware update that is being staged holds programming back too, hibernation does
+// not: a run reads the battery first and refuses one below the new LVR, and a charger that
+// waits for its restart after a run that was cut short should not wait any longer. Returns true
+// when it talked to the charger.
+static bool serviceChargerProgramming(unsigned long now, bool allowed) {
+  const bool talked = gSolarManager.serviceChargerProgramming(currentEpoch(), allowed && !gDfuInProgress);
+  if (talked) {
+    // The charger may hold other settings now: check them again, and send that report at once.
+    requestChargerCheck();
+  }
+  sendDueChargerProgramReport(now);
+  return talked;
+}
+
+// A result on the serial console, once, as it comes about: what describeProgramResult() gives
+// the server's charger page.
+static void printChargerProgramResult(uint32_t requestId, const sunsaver::ProgramResult &result) {
+  JsonDocument doc;
+  JsonObject out = doc.to<JsonObject>();
+  sunsaver::describeProgramResult(result, out);
+  char line[128];
+  snprintf(line, sizeof(line), "Charger programming, request %lu: %s", (unsigned long)requestId,
+           out["summary"].as<const char *>());
+  Serial.println(line);
+  addSerialLog(line);
+  Serial.print(F("  "));
+  Serial.println(out["text"].as<const char *>());
+  if (out["restart"].is<const char *>()) {
+    Serial.print(F("  Restart: "));
+    Serial.println(out["restart"].as<const char *>());
+  }
+  if (out["battery"].is<const char *>()) {
+    Serial.print(F("  Battery when it began: "));
+    Serial.println(out["battery"].as<const char *>());
+  }
+  if (out["load"].is<const char *>()) {
+    Serial.print(F("  "));
+    Serial.println(out["load"].as<const char *>());
+  }
+  for (JsonVariantConst reason : out["reasons"].as<JsonArrayConst>()) {
+    Serial.print(F("  - "));
+    Serial.println(reason.as<const char *>());
+  }
+  for (JsonVariantConst note : out["notes"].as<JsonArrayConst>()) {
+    Serial.print(F("  Note: "));
+    Serial.println(note.as<const char *>());
+  }
+  for (JsonArrayConst row : out["registers"].as<JsonArrayConst>()) {
+    // [name, label, before, wanted, how it went]
+    Serial.print(F("    "));
+    Serial.print(row[0].as<const char *>());
+    Serial.print(F(": "));
+    Serial.print(row[2].as<const char *>());
+    Serial.print(F(" -> "));
+    Serial.print(row[3].as<const char *>());
+    Serial.print(F(", "));
+    Serial.println(row[4].as<const char *>());
+  }
+  if (result.followUp) {
+    Serial.println(F("  The charger gets another look once it answers, and the server another result."));
+  }
+}
+
+// Hands the result that is due to the Notecard, and keeps it due until that has worked. A newer
+// result takes the place of one that has not gone out yet (sunsaver::Supervisor).
+static void sendDueChargerProgramReport(unsigned long now) {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  if (!programming.reportDue()) {
+    return;
+  }
+  const uint32_t requestId = programming.reportRequestId();
+  const uint32_t resultAt = programming.reportMillis();
+  if (!gChargerProgramReportSeen || requestId != gChargerProgramReportId || resultAt != gChargerProgramReportAt) {
+    gChargerProgramReportSeen = true;
+    gChargerProgramReportId = requestId;
+    gChargerProgramReportAt = resultAt;
+    gChargerProgramReportEpoch = 0;
+    gChargerProgramReportTried = false;
+    printChargerProgramResult(requestId, programming.report());
+  }
+  // The server keeps the newest result of a request by its time, as it keeps charger reports
+  // (see sendDueChargerReport()): the time is worked out once, when the clock has one.
+  if (gChargerProgramReportEpoch == 0) {
+    const double nowEpoch = currentEpoch();
+    if (nowEpoch <= 0.0) {
+      return;
+    }
+    const double at = nowEpoch - (double)(uint32_t)((uint32_t)millis() - resultAt) / 1000.0;
+    gChargerProgramReportEpoch = at >= 1.0 ? (uint32_t)at : 1u;
+  }
+  if (gChargerProgramReportTried && (now - gChargerProgramReportTryMillis) < CHARGER_PROGRAM_REPORT_RETRY_MS) {
+    return;
+  }
+
+  // On the config-ack notefile, as the charger report: the server tells it by the "chg-" status.
+  JsonDocument doc;
+  JsonObject body = doc.to<JsonObject>();
+  body["c"] = gDeviceUID;
+  body["st"] = "chg-prog";
+  body["req"] = requestId;
+  body["epoch"] = gChargerProgramReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
+  sunsaver::encodeProgramResult(programming.report(), body);
+  if (!publishNote(CONFIG_ACK_OUTBOX_FILE, doc, true)) {  // a person waits for it at the charger page
+    if (!gChargerProgramReportTried) {
+      Serial.println(F("Charger programming: the result could not be sent or stored, trying again every 10 minutes"));
+    }
+    gChargerProgramReportTried = true;
+    gChargerProgramReportTryMillis = now;
+    return;
+  }
+  if (gChargerProgramReportTried) {
+    Serial.println(F("Charger programming: the result that waited has gone out"));
+  }
+  gSolarManager.chargerProgramReportTaken();
 }
 
 // Append solar charger data to daily report (called from sendDailyReport)

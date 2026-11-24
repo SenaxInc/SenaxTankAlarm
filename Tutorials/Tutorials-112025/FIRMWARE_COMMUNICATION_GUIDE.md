@@ -101,8 +101,11 @@ The server adds `_target` (device UID) and `_type` (command type) fields to the 
 | `applied`, `failed` | Acknowledgment of a config the server sent (`cv` names the config version) |
 | `ota-applied`, `ota-reverted`, `ota-stage-failed` | Outcome of a firmware update |
 | `chg-check` | Charger check of a client with a SunSaver MPPT: the registers it read and its verdict (see `TankAlarm_SunSaverReport.h`). The client sends it when the charger's stored settings or the verdict have changed, once after it starts, and once a week. `epoch` is the time of the check: the client sends no report before its clock is set, and the server keeps the newest report by it (one without a time never replaces one that has a time). |
+| `chg-prog` | Result of charger programming (see `TankAlarm_SunSaverProgram.h`): how the run went, why nothing was written, and each register it set, before and after. `req` is the request it answers, 0 when a client that restarted during a run could not read which request that was, and `epoch` is when the result came about. The client sends a result for each new request, also for one it refuses or that a newer config withdraws before it runs, and one when it starts again after a restart cut a run short. A run that could not tell whether the charger restarted sends a second result once the client has looked again. The server keeps the result of the newest request, and of that request the latest result. |
 
 A server that does not know a status keeps it as the last acknowledgment status of that client and does nothing else with it, so update the server before the clients.
+
+A config can carry `solarCharger.program`: the charger values from the server's config generator (`absorbV`, `floatV`, `absorbMin`, `hvdV`, `hvrV`, `lvdV`, `lvrV`, and `loadOk`). The client writes them into its SunSaver only when the block also holds `req`, which the server adds when a person asks for the values to be written. `req` is the server's time when that was asked, and the client acts on each `req` once. The server puts the `req` of a request that has no result yet into the later configs that ask for the same values, so a config whose block lacks that `req` withdraws a request that is still waiting on the client.
 
 ### Viewer Summary
 

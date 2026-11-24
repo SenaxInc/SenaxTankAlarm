@@ -31,6 +31,7 @@ OPT_FLAGS := -O2 -Werror
 SRC  := $(SUITE_DIR)/sunsaver_settings_test.cpp
 DEPS := $(SRC) \
         $(COMMON_DIR)/TankAlarm_SunSaverSettings.h \
+        $(COMMON_DIR)/TankAlarm_SunSaverProgram.h \
         $(COMMON_DIR)/TankAlarm_SunSaverReport.h \
         $(SIM_DIR)/sim_sunsaver.h \
         $(SIM_DIR)/test_support.h \

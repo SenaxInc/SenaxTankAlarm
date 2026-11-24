@@ -102,12 +102,26 @@ The charger check: what a SunSaver MPPT has stored, and whether it suits the bat
 - `floatReferenceVolts()` - Where the charger holds a full battery, for the no-charge alert
 - `SolarManager::startChargerCheck()` and `serviceChargerCheck()` in `TankAlarm_Solar.h` run it on the Opta. It only reads.
 
+### TankAlarm_SunSaverProgram.h
+Charger programming: writes a LiFePO4 charging profile, the LVD and the LVR into a SunSaver MPPT when a client's config asks for it. It builds on `TankAlarm_SunSaverSettings.h`, is included by `TankAlarm_Solar.h`, and has no Arduino dependency either, so `tests/host/sunsaver_program` runs it on a PC against a simulated SunSaver.
+- `Profile`, `lifepo4Profile()`, `validateProfile()` - What can be asked for: absorption and float voltage, absorption time, HVD and HVR, LVD and LVR, for a 12 V battery. Each value is held to a fixed range and the values to their order (LVD below LVR, float below absorption, absorption below HVD), and voltages to steps of 0.05 V. The limits are in this file and nowhere else, so no config can widen them
+- `buildPlan()` - The 17 registers a run sets, each with the word it has to hold, in an order that leaves a run that is cut short no worse for the battery than the settings it found. A register that already holds its word is not written
+- `Programmer` - One run. It reads the charger check's registers and refuses to write on anything it relies on being missing or wrong (the `Refusal` bits: a voltage encoding it cannot prove, a fault, a battery below the new LVR, current on the LOAD terminals that the request did not allow, and more). Then it restarts the controller before it writes anything, writes one register at a time with function 6 and reads each one back, restarts the controller again so that the settings take effect, and reads them once more (the `Outcome`)
+- `Supervisor` - When a run may begin. A request waits up to an hour for the client's clock and the charger, is refused when it is more than a day old by then, and each request runs once. A journal in the client's flash records how far a run came, so a client that restarts part way gives the controller the restart it may still owe
+- `SolarManager::beginChargerProgramming()`, `requestChargerProgram()`, `withdrawChargerProgram()` and `serviceChargerProgramming()` in `TankAlarm_Solar.h` run it on the Opta
+- The procedure is compiled in only with `TANKALARM_SUNSAVER_PROGRAMMING` set to 1 (default 0, in `TankAlarm_Solar.h`). A client built with 0 answers every request with "not built" and never writes to the controller
+
 ### TankAlarm_SunSaverReport.h
-The charger check as JSON. It needs ArduinoJson, so the sketches include it themselves (`TankAlarm_Common.h` does not).
+The charger check and charger programming as JSON. It needs ArduinoJson, so the sketches include it themselves (`TankAlarm_Common.h` does not).
 - `encodeReport()` - The compact report a client sends to the server (`chg-check` on `config_ack.qo`)
 - `decodeReport()` - Reads it back; a report from a newer or an older client still decodes
 - `reportCheckTime()`, `reportReplaces()` - Which report the server keeps: the newest by the time of the check, since a report can arrive late
 - `describeReport()` - Verdict, findings and every register with its value as text, for the server's `/charger` page
+- `readProfile()`, `readLoadAllowed()`, `readRequestId()` - A programming request as a config carries it (`solarCharger.program`)
+- `encodeProgramResult()`, `decodeProgramResult()` - The result of a run, as the client sends it (`chg-prog` on `config_ack.qo`) and the server keeps it
+- `programResultReplaces()` - Which result the server keeps: that of the newest request, and the latest result of that request
+- `describeProgramResult()` - How a run went, why nothing was written, and every register before and after, for the server's `/charger` page
+- `encodeJournal()`, `decodeJournal()` - The client's journal of a run, in its flash
 
 ### TankAlarm_Battery.h
 Battery voltage monitoring sourced from the SunSaver MPPT (Modbus RS-485) or an external analog Vin voltage divider — auto-selected by the client's `getEffectiveBatteryVoltage()` with strict MPPT > Vin-divider priority. The Notecard `card.voltage` API is **not** used on the Blues "Wireless for Opta" carrier (the Notecard V+ is the regulated ~5V DC-DC rail, not the battery).

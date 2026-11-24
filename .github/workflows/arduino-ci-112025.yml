@@ -74,6 +74,13 @@ jobs:
             --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT" \
             --library TankAlarm-112025-Common \
             TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
+          # Charger programming is compiled in only with TANKALARM_SUNSAVER_PROGRAMMING set to 1
+          # (TankAlarm_Solar.h), which stays 0 until it has been tried on a real SunSaver. The
+          # client is built that way too, so that the code stays buildable meanwhile.
+          arduino-cli compile --fqbn arduino:mbed_opta:opta \
+            --build-property "build.extra_flags=-DTANKALARM_DFU_MCUBOOT -DTANKALARM_SUNSAVER_PROGRAMMING=1" \
+            --library TankAlarm-112025-Common \
+            TankAlarm-112025-Client-BluesOpta/TankAlarm-112025-Client-BluesOpta.ino
 
       - name: Compile TankAlarm-112025-Server-BluesOpta
         id: compile-112025-server

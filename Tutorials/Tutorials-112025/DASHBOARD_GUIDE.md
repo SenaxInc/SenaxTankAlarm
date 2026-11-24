@@ -411,7 +411,7 @@ Each client supports up to 8 tanks (A-H):
 
 ### Charger Check (SunSaver MPPT)
 
-A client that reads its SunSaver MPPT over RS-485 (**Voltage Monitor** set to **RS485**) also reads what the charger has stored: the charging profile of both banks, the low voltage disconnect and reconnect, and the DIP switches. It compares that with the **Battery** selected in its configuration and sends the result to the server. The client only reads; it changes nothing in the charger.
+A client that reads its SunSaver MPPT over RS-485 (**Voltage Monitor** set to **RS485**) also reads what the charger has stored: the charging profile of both banks, the low voltage disconnect and reconnect, and the DIP switches. It compares that with the **Battery** selected in its configuration and sends the result to the server. The check only reads; to have the client write a LiFePO4 profile into the charger, see [Charger Programming](#charger-programming-sunsaver-mppt) below.
 
 **Where to find it:**
 - On a site page (`/site-config?site=...`), each client shows a badge next to its RS-485 badge: **Charger settings OK**, **Charger settings WRONG**, **Charger: cannot tell** or **Charger: not judged**. Click it for the details.
@@ -424,7 +424,33 @@ A client that reads its SunSaver MPPT over RS-485 (**Voltage Monitor** set to **
 - **Could not be judged in full**: a register did not answer, the charger's voltage encoding could not be told from its setpoints, or the stored voltages were left unjudged because this is a 24 V system or the battery voltage the charger reports fits neither a 12 V nor a 24 V system. What could be checked showed nothing wrong: a setting that was read and is wrong gives **Settings do not suit the battery**, whatever else could not be read.
 - **Not judged**: there are no rules for the battery that is configured (none, custom, LiPo).
 
-The client checks after it starts, after a change to its battery or charger settings, and once a day. It sends a new report when something has changed, and once a week otherwise. A report carries the time of its check and the server keeps the newest, so a report waits for the client's clock: after a power cycle it goes out once the client has been online. A page that says no check has arrived means the client has no SunSaver configured, has not reached it yet, or runs firmware from before the charger check.
+The client checks after it starts, after a change to its battery or charger settings, after it has programmed the charger, and once a day. It sends a new report when something has changed, and once a week otherwise. A report carries the time of its check and the server keeps the newest, so a report waits for the client's clock: after a power cycle it goes out once the client has been online. A page that says no check has arrived means the client has no SunSaver configured, has not reached it yet, or runs firmware from before the charger check.
+
+### Charger Programming (SunSaver MPPT)
+
+The SunSaver MPPT has no lithium preset: with DIP switch 1 OFF it charges with a built-in lead-acid profile. A client that reads its SunSaver over RS-485 can write a charging profile for a 12 V LiFePO4 battery, and the low voltage disconnect (LVD) and reconnect (LVR), into the charger's memory. It does so only when a person asks for it in the client's config, once for each request.
+
+> **Firmware:** Charger programming is in client firmware built with `TANKALARM_SUNSAVER_PROGRAMMING` set to 1 (in `TankAlarm-112025-Common/src/TankAlarm_Solar.h`). It stays 0 until a run on a real SunSaver has shown how the charger takes the writes and the restart. A client built with 0 writes nothing, and its charger page says "This client's firmware was built without charger programming."
+
+**To program a charger:**
+1. Open the client's config in the configuration console.
+2. Set **Battery** to **LiFePO4**, **Battery Pack Voltage** to **12V** and **Voltage Monitor** to **RS485**. The section **SunSaver Charging Profile (12 V LiFePO4)** appears under **Power Configuration**.
+3. Check the values. The defaults suit a battery such as the Optima ORANGETOP, which switches itself off above 14.8 V: absorption 14.20 V for 15 minutes, float 13.50 V, high voltage disconnect 14.45 V and reconnect 13.60 V, LVD 13.10 V and LVR 13.25 V. Each field shows its limits; the server and the client refuse values outside them, and voltages that are not in steps of 0.05 V.
+4. Tick **This Opta is not powered from the LOAD terminals of the charger** if that is so. The charger may switch its LOAD output off while it waits for its restart, so without the tick the client refuses to begin while current flows from the LOAD terminals.
+5. Tick **Write these values to the charger** and save. The server refuses the save when the config is not for a 12 V LiFePO4 battery on RS-485, or when its own clock is not set yet. The box is unticked after each save: saving the config again later, for another reason, writes nothing.
+6. At the charger, set DIP switch 1 ON (the charger then uses the stored charge values), switch 2 ON (the stored LVD and LVR) and switch 3 OFF (no equalization). The client cannot change the switches; the result says when one of them is set otherwise.
+
+**What the client does:** It waits up to an hour for its clock and for the charger to answer, and refuses a request that is more than a day old by then. It reads the charger first and writes nothing when the charger reports a fault, when this is not a 12 V system, when the battery is below the new LVR, when current flows from the LOAD terminals and the request does not allow it, or when the way the charger encodes its voltages cannot be proven from its settings. Otherwise it restarts the charger before it writes anything, to be sure that the restart command works; writes the registers that differ, one at a time, and reads each one back; restarts the charger again, which puts the new settings to work; and reads them all once more. The run takes about 20 seconds, and the client does nothing else meanwhile. It is never repeated by itself.
+
+**Where to see the result:** on the client's charger page (`/charger?uid=<device UID>`), in the **Charger Programming** card, which comes first once a client has been asked. It says **Waiting** until the result arrives, and then:
+- **Programmed**: the charger holds the values and has restarted. **Unchanged**: it held them already, and nothing was written.
+- **Refused** or **No link**: nothing was written. The reasons say why.
+- **Interrupted**: the client restarted during the run. When it starts again it looks at the charger and restarts it if it waits for a restart. The charger check that follows shows what the charger holds.
+- **Stopped**, **Restart failed** or **Verify failed**: values were written, but the run could not end as asked. The register table shows each register as it was before, the value wanted, and what it holds now.
+
+The writes go in an order that leaves the charger no worse for the battery than it was found, wherever a run stops, and the client does not put the old values back. After every run the client checks the charger again and sends that report at once, so the charger check on the same page judges what the charger holds now.
+
+**A request that waits:** a client may take a while to get its config or to reach its charger, and until it has answered, the card shows the request as waiting. Saving the config again with the same values keeps the request. Saving it with other values, with another battery, or with the voltage monitor off withdraws it, and the client reports it as refused. To write the values again, tick the box again and save.
 
 ### Saving Configuration
 
@@ -1143,6 +1169,7 @@ See [Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md) for detailed network diagn
 
 **`GET /api/charger?client=<device UID>`**
 - Returns the client's last charger check (JSON): `have` (false when none has arrived), `vd` and `verdict`, `battery`, `system` (12 or 24 as measured), `findings` (text `t`, and `p` true when it makes the settings wrong for the battery) and `groups` of registers as `[name, description, value, raw]`
+- `program` is there once the client was asked to program its charger, or has sent a result: `asked` (the id of the last request, the server's time when it was made), `answered`, `fresh` (false once it is more than a day old), `loadOk` and `values` as `[label, value]`, and the last `result`: `req` (the request it answers, 0 when the client could not tell), `e` (when the run ended), `o` and `outcome`, `good`, `text`, `summary`, `followUp` (true when the client looks at the charger again and sends another result), `restart`, `battery`, `load`, `reasons`, `notes`, `asked` and `registers` as `[name, description, before, wanted, how it went]`
 - Needs a session, like every `/api/` route
 
 ### POST Endpoints
@@ -1150,6 +1177,7 @@ See [Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md) for detailed network diagn
 **`POST /api/config`**
 - Send configuration to client
 - Requires admin PIN
+- `config.solarCharger.program` holds the charger values (see [Charger Programming](#charger-programming-sunsaver-mppt)). With `"apply": true` in it the server makes them a request: it adds the request id `req` and leaves `apply` out of the config it sends. It answers 400 when the values are outside the limits, or the config is not for a 12 V LiFePO4 battery read over RS-485, and 503 when its clock is not set; the config is then not saved or sent
 - Request body:
   ```json
   {
