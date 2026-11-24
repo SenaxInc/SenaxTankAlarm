@@ -1427,7 +1427,7 @@ class Supervisor {
 
   // Once per pass of the client's loop. `epochNow` is the client's clock, or anything below
   // CLOCK_SET_EPOCH while it is not set. `ready` says that the controller can be talked to now:
-  // it answered its last poll, and nothing forbids it (a firmware update, hibernation).
+  // it answered its last poll, and nothing forbids it (a firmware update that is being staged).
   // Returns true when it talked to the controller: that held the caller for a whole run.
   bool service(Port &port, double epochNow, bool ready) {
     const uint32_t nowMs = port.millisNow();
