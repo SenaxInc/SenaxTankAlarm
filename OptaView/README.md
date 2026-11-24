@@ -113,7 +113,7 @@ What to know before you rely on it:
   that takes longer than a minute is stopped, and so is one whose browser has gone.
 - **No connection can hold the Opta up.** A request has 6 seconds to arrive. A browser that
   takes nothing of an answer for 5 seconds is taken to be gone, and an answer that is still
-  not delivered after 30 seconds of sending is given up. The page is 49 KB and the Opta's
+  not delivered after 30 seconds of sending is given up. The page is 53 KB and the Opta's
   network stack sends about 1 KB per round trip, so the page needs a link whose round trip is
   well under half a second.
 - **Open it by its address.** A request that names the Opta in any other way than by its IP
