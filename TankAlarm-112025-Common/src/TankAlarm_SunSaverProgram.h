@@ -818,20 +818,19 @@ class Programmer {
   // (controllerUnknown()), once the link works again. It keeps what the run found and did, asks
   // the controller whether it still waits for a restart, sends the command if it does, reads the
   // registers once more and ends with the outcome the run would have had. Its time limit starts
-  // again. Returns false, and does nothing, when the last run is not such a run.
+  // again. A look that cannot read the controller's fault words settles nothing: the result
+  // stays as the run left it, a restart command the time limit left unsent is still owed, and so
+  // is the look. Returns false, and does nothing, when the last run is not such a run.
   bool resume() {
     if (recovery_ || !controllerUnknown()) {
       return false;
     }
-    result_.notes = (uint16_t)(result_.notes & ~(uint16_t)NOTE_VERIFY_INCOMPLETE);
-    result_.loadStateAfter = LOAD_STATE_NOT_READ;
     missed_ = false;
     pauseMs_ = 0;
     stage_ = 0;
     readTries_ = 0;
     timed_ = false;
     overdue_ = false;
-    restartCut_ = false;
     phase_ = PHASE_RECOVER;
     return true;
   }
@@ -1278,6 +1277,9 @@ class Programmer {
         result_.notes |= NOTE_WAS_PENDING;
       }
     }
+    if (!recovery_) {
+      restartCut_ = false;  // the look settles it: the command goes out now, or is not needed
+    }
     if (pending) {
       beginRestart(false, true);
     } else {
@@ -1517,10 +1519,14 @@ class Programmer {
     return true;
   }
 
+  // The registers are read again from here, so what a run before this one could not read again,
+  // and the load state it saw, give way to what this reading finds (a run taken up again).
   void beginVerify() {
     entry_ = 0;
     readTries_ = 0;
     verifyMisses_ = 0;
+    result_.notes = (uint16_t)(result_.notes & ~(uint16_t)NOTE_VERIFY_INCOMPLETE);
+    result_.loadStateAfter = LOAD_STATE_NOT_READ;
     phase_ = PHASE_VERIFY;
   }
 

@@ -1141,6 +1141,7 @@ struct ClientConfigSnapshot {
   char lastAckStatus[16];    // Last ACK status: "applied", "rejected", "parse_error"
   uint8_t dispatchAttempts;  // Number of times this config has been dispatched/retried
   double lastDispatchEpoch;  // When the most recent dispatch attempt occurred
+  double savedDispatchEpoch; // The lastDispatchEpoch the cache file holds (RAM only): see sendConfigViaNotecard()
 };
 
 // Sensor display fields resolved from a client's cached config snapshot. Used so the
@@ -1168,6 +1169,10 @@ enum class ConfigDispatchStatus {
   NotecardFailure,
   CachedOnly          // Config saved locally but Notecard unavailable
 };
+
+// The last sendConfigViaNotecard() did not send because the time the config would go out with
+// could not be saved to flash: for the messages the pages get.
+static bool gConfigSendUnsaved = false;
 
 // Tracks how many stale config notes were purged from the outbox during last dispatch
 static uint8_t gLastConfigPurgeCount = 0;
@@ -2754,7 +2759,7 @@ static uint8_t sendEmailAlert(const char *subject, const char *message, const ch
 static void checkAlarmReminders();
 static void sendDailyEmail();
 static void loadClientConfigSnapshots();
-static void saveClientConfigSnapshots();
+static bool saveClientConfigSnapshots();
 static bool cacheClientConfigFromBuffer(const char *clientUid, const char *buffer);
 static ClientConfigSnapshot *findClientConfigSnapshot(const char *clientUid);
 static void getConfiguredSensorDisplay(const char *clientUid, uint8_t sensorIndex, ConfiguredSensorDisplay &out);
@@ -11182,7 +11187,11 @@ static void handleConfigPost(EthernetClient &client, const String &body) {
       // Cached at least, and sent or to be sent again: a request in it counts as sent.
       noteChargerProgramRequestSent(clientUid, doc["config"]);
       if (status == ConfigDispatchStatus::CachedOnly) {
-        respondStatus(client, 202, F("Config saved locally — Notecard send failed (auto-retry every 60 min). Check serial monitor for details."));
+        if (gConfigSendUnsaved) {
+          respondStatus(client, 202, F("Config kept, but the server could not write it to its flash, so it was not sent yet (auto-retry every 60 min). Check serial monitor for details."));
+        } else {
+          respondStatus(client, 202, F("Config saved locally — Notecard send failed (auto-retry every 60 min). Check serial monitor for details."));
+        }
         return;
       }
       if (status == ConfigDispatchStatus::OkWithPurge) {
@@ -11229,6 +11238,8 @@ static void handleConfigRetryPost(EthernetClient &client, const String &body) {
       snap->pendingDispatch = true;
       snap->dispatchAttempts = 1;  // Reset so auto-retry quota restarts
       respondStatus(client, 200, F("Config dispatched to Notecard (pending ACK)"));
+    } else if (gConfigSendUnsaved) {
+      respondStatus(client, 503, F("Not sent: the server could not write its config cache to flash — check serial monitor for details"));
     } else {
       respondStatus(client, 502, F("Notecard send failed — check serial monitor for details"));
     }
@@ -12339,10 +12350,31 @@ static double nextConfigDispatchEpoch(double previous) {
 // Returns true on success, false on failure (with error logged to Serial).
 // Automatically purges any stale pending config notes for the same client first.
 static bool sendConfigViaNotecard(const char *clientUid, const char *jsonPayload) {
+  gConfigSendUnsaved = false;
   // Pre-flight: check that Product UID is configured (required for Notehub routing)
   if (gConfig.productUid[0] == '\0') {
     Serial.println(F("ERROR: Cannot dispatch config - Product UID not set in Server Settings"));
     return false;
+  }
+
+  // The time this config goes out with ("_ts") is in flash before it goes. A server that
+  // restarts with its clock not set gives the next config the second after the time it stored
+  // (nextConfigDispatchEpoch()), and a client sets aside a config whose second is not later than
+  // that of the one it holds, and with it any request to program the charger. So a time that went
+  // out and was not stored would make the next config look old. Checked before the purge below, so
+  // that a config that does not go now leaves the one before it in the outbox.
+  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
+  if (snap) {
+    if (!(snap->lastDispatchEpoch > 0.0)) {
+      snap->lastDispatchEpoch = currentEpoch();  // 0 while the clock is not set: no time then
+    }
+    if (snap->lastDispatchEpoch != snap->savedDispatchEpoch && !saveClientConfigSnapshots()) {
+      gConfigSendUnsaved = true;
+      Serial.print(F("ERROR: Config for "));
+      Serial.print(clientUid);
+      Serial.println(F(" not sent: the time it would go out with could not be saved to flash"));
+      return false;
+    }
   }
 
   // Purge any older pending config notes for this client before adding the new one
@@ -12375,12 +12407,11 @@ static bool sendConfigViaNotecard(const char *clientUid, const char *jsonPayload
   JAddStringToObject(body, "_type", "config");
   // Inject config version hash so client can echo it back in ACK
   // Inject config creation timestamp so client can reject old out-of-order configs
-  ClientConfigSnapshot *snap = findClientConfigSnapshot(clientUid);
   if (snap) {
     if (snap->configVersion[0] != '\0') {
       JAddStringToObject(body, "_cv", snap->configVersion);
     }
-    JAddNumberToObject(body, "_ts", snap->lastDispatchEpoch > 0.0 ? snap->lastDispatchEpoch : currentEpoch());
+    JAddNumberToObject(body, "_ts", snap->lastDispatchEpoch);
   }
   stampSchemaVersion(body);
   JAddItemToObject(req, "body", body);
@@ -12568,6 +12599,7 @@ static void dispatchPendingConfigs() {
 
     // Increment attempt counter BEFORE sending so it advances even on failure.
     // This ensures auto-cancel triggers even if the Notecard I2C is down.
+    // The new time is saved before the config goes (sendConfigViaNotecard()).
     gClientConfigs[i].dispatchAttempts++;
     gClientConfigs[i].lastDispatchEpoch = nextConfigDispatchEpoch(gClientConfigs[i].lastDispatchEpoch);
 
@@ -17994,6 +18026,7 @@ static void loadClientConfigSnapshots() {
                 if (s5 >= 0) {
                   snap.dispatchAttempts = (uint8_t)rest4.substring(0, s5).toInt();
                   snap.lastDispatchEpoch = rest4.substring(s5 + 1).toDouble();
+                  snap.savedDispatchEpoch = snap.lastDispatchEpoch;
                 } else {
                   snap.dispatchAttempts = (uint8_t)rest4.toInt();
                 }
@@ -18082,6 +18115,7 @@ static void loadClientConfigSnapshots() {
                 if (s5 >= 0) {
                   snap.dispatchAttempts = (uint8_t)rest4.substring(0, s5).toInt();
                   snap.lastDispatchEpoch = rest4.substring(s5 + 1).toDouble();
+                  snap.savedDispatchEpoch = snap.lastDispatchEpoch;
                 } else {
                   snap.dispatchAttempts = (uint8_t)rest4.toInt();
                 }
@@ -18100,11 +18134,14 @@ static void loadClientConfigSnapshots() {
 #endif
 }
 
-static void saveClientConfigSnapshots() {
+// Returns false when the cache file could not be written. With no filesystem nothing is kept
+// across a restart, and nothing is loaded at boot either: that counts as saved.
+static bool saveClientConfigSnapshots() {
+  bool saved = true;
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) {
-      return;
+      return true;
     }
     
     // Accumulate output into a buffer first, then write atomically.
@@ -18116,7 +18153,7 @@ static void saveClientConfigSnapshots() {
     char *buf = (char *)malloc(bufSize);
     if (!buf) {
       Serial.println(F("ERROR: Cannot allocate config cache buffer"));
-      return;
+      return false;
     }
 
     size_t pos = 0;
@@ -18133,6 +18170,7 @@ static void saveClientConfigSnapshots() {
                        gClientConfigs[i].lastDispatchEpoch);
       if (n < 0 || pos + (size_t)n >= bufSize) {
         Serial.println(F("Config cache buffer overflow"));
+        saved = false;  // the file would not hold every client
         break;
       }
       pos += (size_t)n;
@@ -18140,6 +18178,7 @@ static void saveClientConfigSnapshots() {
 
     if (!serverWriteFileAtomic("/fs/client_config_cache.txt", buf, pos)) {
       Serial.println(F("Failed to write client config cache"));
+      saved = false;
     }
     free(buf);
   #else
@@ -18160,10 +18199,16 @@ static void saveClientConfigSnapshots() {
                gClientConfigs[i].lastDispatchEpoch);
       output += line;
     }
-    tankalarm_littlefs_write_file_atomic(CLIENT_CONFIG_CACHE_PATH,
+    saved = tankalarm_littlefs_write_file_atomic(CLIENT_CONFIG_CACHE_PATH,
             (const uint8_t *)output.c_str(), output.length());
   #endif
 #endif
+  if (saved) {
+    for (uint8_t i = 0; i < gClientConfigCount; ++i) {
+      gClientConfigs[i].savedDispatchEpoch = gClientConfigs[i].lastDispatchEpoch;
+    }
+  }
+  return saved;
 }
 
 static bool cacheClientConfigFromBuffer(const char *clientUid, const char *buffer) {

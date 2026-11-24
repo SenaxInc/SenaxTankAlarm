@@ -2078,18 +2078,25 @@ static void testFinalRestart() {
       CHECK_EQ(result.loadStateAfter, 1);
       CHECK_EQ(result.notes & ss::NOTE_VERIFY_INCOMPLETE, 0);
       CHECK(station.programmer.controllerUnknown());
-      // Still unreadable: the same again.
+      // Still unreadable: the same again, with what the run read after the restart.
       CHECK(station.programmer.resume());
       station.drive();
       CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
       CHECK_EQ(result.restart, ss::RESTART_UNCONFIRMED);
+      CHECK_EQ(result.loadStateAfter, 1);
       CHECK(station.programmer.controllerUnknown());
       station.bus.before = nullptr;
       station.sim.regs[gone[which]] = 0;
+      // The second time the load state cannot be read then: the run does not give the one it
+      // read before its look as this reading's.
+      if (which == 1) {
+        station.sim.regs.erase(A_LOAD_STATE);
+      }
       CHECK(station.programmer.resume());
       station.drive();
       CHECK_EQ(result.outcome, ss::OUTCOME_PROGRAMMED);
       CHECK_EQ(result.restart, ss::RESTART_DONE);
+      CHECK_EQ(result.loadStateAfter, which == 1 ? ss::LOAD_STATE_NOT_READ : 1);
       CHECK(!station.programmer.controllerUnknown());
     }
   }
@@ -5836,6 +5843,32 @@ static void cutAt(Station &station, size_t at) {
   };
 }
 
+// The look a run left owed, taken up while the controller does not answer: it settles nothing.
+// The result stays as the run left it, and the controller is still owed a look: it may still
+// wait for its restart.
+static void lookWhileDead(Station &station) {
+  const ss::ProgramResult before = station.programmer.result();
+  const size_t had = station.bus.log.size();
+  station.sim.powered = false;
+  CHECK(station.programmer.resume());
+  station.drive();
+  station.sim.powered = true;
+  const ss::ProgramResult &after = station.programmer.result();
+  CHECK_EQ(station.bus.log.size() - had, ss::READ_ATTEMPTS);  // the first fault word, and no more
+  for (size_t i = had; i < station.bus.log.size(); ++i) {
+    CHECK_EQ(station.bus.log[i].kind, 'r');
+  }
+  CHECK_EQ(after.outcome, before.outcome);
+  CHECK_EQ(after.restart, before.restart);
+  CHECK_EQ(after.notes, before.notes);
+  CHECK_EQ(after.loadStateAfter, before.loadStateAfter);
+  for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
+    CHECK_EQ(after.entries[i].status, before.entries[i].status);
+  }
+  CHECK(after.followUp);
+  CHECK(station.programmer.controllerUnknown());
+}
+
 // A run that wrote sends a restart command after its last write.
 static bool restartFollowsWrites(const std::vector<Asked> &log) {
   bool owed = false;
@@ -6132,8 +6165,9 @@ static void testTimeLimit() {
   // The same timeout, and the request before the last restart command takes far longer than the
   // bus says one may (a line that sends a byte at a time): the read-back of the third register,
   // past the cut, holds the client 16 s. No time is left for the restart command then, so the
-  // run ends without it and owes the controller the look that sends it.
-  {
+  // run ends without it and owes the controller the look that sends it. The second time the
+  // controller restarts by itself before that look (it was switched off and on).
+  for (const bool restartsByItself : {false, true}) {
     const size_t thirdWrite = ss::ITEM_COUNT + 4 + 4;
     Station station;
     station.master.responseTimeoutMs = 4000;
@@ -6172,16 +6206,26 @@ static void testTimeLimit() {
     CHECK(station.programmer.controllerUnknown());
     CHECK(editPending(station.sim));  // the controller waits for its restart
     checkPauses(station);
-    // The look sends the restart command, and settles it.
+    // A look while the line is dead leaves the command owed.
     station.bus.stretchFrom = (size_t)-1;
     station.bus.before = nullptr;
     station.sim.advance(5000);
+    lookWhileDead(station);
+    CHECK_EQ(station.bus.count('c'), 1);
+    station.sim.advance(5000);
+    if (restartsByItself) {
+      station.sim.regs[A_ARRAY_FAULT] = (uint16_t)(reg(station.sim, A_ARRAY_FAULT) & ~EDIT_ARRAY);
+      station.sim.regs[A_LOAD_FAULT] = (uint16_t)(reg(station.sim, A_LOAD_FAULT) & ~EDIT_LOAD);
+    }
+    // The next look sends the restart command, and settles it; or finds that the controller no
+    // longer waits, sends nothing, and settles it all the same.
     CHECK(station.programmer.resume());
     station.drive();
-    CHECK_EQ(station.bus.count('c'), 2);
+    CHECK_EQ(station.bus.count('c'), restartsByItself ? 1 : 2);
     CHECK_EQ(result.outcome, ss::OUTCOME_STOPPED);
     CHECK_EQ(result.restart, ss::RESTART_DONE);
     CHECK(!result.followUp);
+    CHECK(!station.programmer.controllerUnknown());
     CHECK(!editPending(station.sim));
   }
 
@@ -6218,6 +6262,11 @@ static void testTimeLimit() {
     CHECK(editPending(station.sim));
     station.bus.stretchFrom = (size_t)-1;
     station.bus.before = nullptr;
+    station.sim.advance(5000);
+    // A look while the line is dead does not make it programming: the command is still owed.
+    lookWhileDead(station);
+    CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+    CHECK_EQ(station.bus.count('c'), 1);
     station.sim.advance(5000);
     CHECK(station.programmer.resume());
     station.drive();
@@ -6265,6 +6314,11 @@ static void testTimeLimit() {
     station.bus.stretchFrom = (size_t)-1;
     station.bus.overrunMs = 0;
     station.bus.before = nullptr;
+    station.sim.advance(5000);
+    // A look while the line is dead keeps the registers unread, and says so.
+    lookWhileDead(station);
+    CHECK_EQ(ss::countEntries(result, ss::ENTRY_UNREAD), ss::PLAN_ENTRIES);
+    CHECK((result.notes & ss::NOTE_VERIFY_INCOMPLETE) != 0);
     station.sim.advance(5000);
     CHECK(station.programmer.resume());
     station.drive();
@@ -6382,9 +6436,13 @@ static void testTimeLimit() {
     // Past the cut the controller that answers is not asked ten times more: one look at each of
     // its fault words, and the run ends.
     CHECK_EQ(station.bus.log.size(), station.bus.nth('c', 1) + 3);
-    // The later look sends the command it could not send then, and leaves nothing owed.
+    // A look while the line is dead leaves the command owed.
     station.bus.before = nullptr;
     station.sim.resetWorks = true;
+    lookWhileDead(station);
+    CHECK_EQ(result.restart, ss::RESTART_NOT_DONE);
+    CHECK_EQ(station.bus.count('c'), 2);
+    // The later look sends the command it could not send then, and leaves nothing owed.
     CHECK(station.programmer.resume());
     station.drive();
     CHECK_EQ(result.restart, ss::RESTART_DONE);
