@@ -1645,7 +1645,7 @@ static sunsaver::Journal loadChargerJournal();
 static bool saveChargerJournal(const sunsaver::Journal &journal);
 #if defined(POSIX_FILE_IO_AVAILABLE)
 static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size);
-static void keepUnreadChargerJournal(const char *path);
+static bool keepUnreadChargerJournal(const char *path);
 static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent);
 static uint32_t keptChargerJournalCheck(const char *text);
 static void removeKeptChargerJournal();
@@ -1656,6 +1656,7 @@ static void handleChargerProgramRequest(JsonObjectConst program);
 static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId);
 static void retakeChargerProgramRequest(JsonObjectConst program);
 static void withdrawUnsuitedChargerProgram();
+static void withdrawChargerProgramForOtherCharger(uint8_t before);
 static unsigned long sampleIntervalMs();
 static bool chargerRunWouldHoldSample();
 static void takeSampleDueAfterChargerRun();
@@ -5402,6 +5403,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   // runtime instead of being silently dropped and overwritten on next save.
   // If the enabled flag or transport parameters change, restart the
   // SolarManager so the RS-485 transport picks up the new settings.
+  const uint8_t chargerBefore = gConfig.solarCharger.modbusSlaveId;  // see withdrawChargerProgramForOtherCharger()
   if (!doc["solarCharger"].isNull()) {
     JsonObjectConst solarCfg = doc["solarCharger"].as<JsonObjectConst>();
     bool prevEnabled  = gConfig.solarCharger.enabled;
@@ -5460,7 +5462,9 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   // Charger programming, for every config this client applies: one without "program", and so
   // one without a "solarCharger" block, withdraws a request that waits. The battery block and
   // the charger block above have been applied, and the link restarted if the transport changed,
-  // so the client's own refusals go by the new config.
+  // so the client's own refusals go by the new config. A config that names another charger
+  // withdraws it first, also when it carries the request again.
+  withdrawChargerProgramForOtherCharger(chargerBefore);
   handleChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
   // A request that waits goes on only while the client could still take it on.
   withdrawUnsuitedChargerProgram();
@@ -8078,7 +8082,8 @@ static void keepChargerLookAfterLostFiles() {
 // writes the cautious journal for it). The cautious journal also says that the record of the
 // requests answered was lost at this start, so that a request asked for before it is refused,
 // now and at later starts (sunsaver::cautiousJournal()). A journal kept aside at an earlier start
-// gives what it says is owed once it reads (takeKeptChargerJournal()). Firmware without
+// gives what it says is owed once it reads (takeKeptChargerJournal()), also at a start whose own
+// journal does not read. Firmware without
 // programming keeps what is owed for firmware that has it (see beginChargerProgramming()), and
 // says nothing of a look.
 static sunsaver::Journal loadChargerJournal() {
@@ -8137,8 +8142,18 @@ static sunsaver::Journal loadChargerJournal() {
     addSerialLog("Charger programming: the journal could not be read, so the charger gets a look");
 #endif
     doc.clear();  // the memory it took goes to the save of the cautious journal
-    keepUnreadChargerJournal(path);
-    return sunsaver::cautiousJournal();
+    if (!keepUnreadChargerJournal(path)) {
+      return sunsaver::cautiousJournal();
+    }
+    // A journal kept aside at an earlier start holds the place, and may read now: it may say
+    // that a controller other than the one the config names waits for its restart. It is taken
+    // in as at a start whose journal reads. The cautious look stands for the journal that did not
+    // read now, so it is owed to the controller the config names: a duty the kept journal owes
+    // another controller follows it (sunsaver::keptDutyLeftOut(), takeKeptChargerDuty()). Nothing
+    // is written at this start, so the kept file stays, and the next start takes it in again.
+    sunsaver::Journal cautious = sunsaver::cautiousJournal();
+    cautious.controller = gConfig.solarCharger.modbusSlaveId;
+    return takeKeptChargerJournal(cautious, false);
   }
   sunsaver::Journal journal = sunsaver::cautiousJournal();
   const bool readable = parsed == DeserializationError::Ok;
@@ -8207,8 +8222,9 @@ static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size) 
 // it reads (takeKeptChargerJournal()). The cautious journal goes to flash at once, so that a
 // restart before the look still owes it. A file that cannot be moved, or a journal kept aside
 // before that is still there, is not written over at this start: no journal is
-// (saveChargerJournal()).
-static void keepUnreadChargerJournal(const char *path) {
+// (saveChargerJournal()). Returns true when a journal kept aside at an earlier start holds the
+// place (or a file there that does not open): the caller takes it in (takeKeptChargerJournal()).
+static bool keepUnreadChargerJournal(const char *path) {
   errno = 0;
   FILE *kept = fopen(CHARGER_JOURNAL_KEPT_FILE, "r");
   const bool keptFree = kept == nullptr && errno == ENOENT;
@@ -8222,14 +8238,15 @@ static void keepUnreadChargerJournal(const char *path) {
     Serial.print(F("Charger programming: the journal that could not be read is kept as "));
     Serial.println(CHARGER_JOURNAL_KEPT_FILE);
     saveChargerJournal(sunsaver::cautiousJournal());
-    return;
+    return false;
   }
   if (keptFree && errno == ENOENT) {
-    return;  // nothing is there after all, to be kept or written over
+    return false;  // nothing is there after all, to be kept or written over
   }
   gChargerJournalHeld = true;
   Serial.println(F("Charger programming: the journal could not be read or kept aside, so no journal is written at this start"));
   addSerialLog("Charger programming: the journal could not be read or kept aside");
+  return !keptFree;
 }
 
 // A journal kept aside at an earlier start because it could not be read then
@@ -8462,6 +8479,29 @@ static void withdrawUnsuitedChargerProgram() {
   const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
   if (refusals != 0 && gSolarManager.withdrawChargerProgram(refusals, currentEpoch())) {
     logChargerProgramWithdrawn(waitingId);
+  }
+}
+
+// Before a config's request is looked at: a request that waits was asked for the charger the
+// config named then (`before`, its Modbus id), and its run would talk to the one the config names
+// now (SolarManager::serviceChargerProgramming()). A config that names another charger withdraws
+// it, also when it carries the request again: the server carries a request on with each config
+// that asks for the same values, whatever charger it names (the config page sends no Modbus id,
+// so such a config was made another way). The request is then answered, so the same id does not
+// wait again, and a new request, asked for with the new charger in the config, can write to that
+// one. A duty that is owed stays with the charger its run talked to.
+static void withdrawChargerProgramForOtherCharger(uint8_t before) {
+  if (gConfig.solarCharger.modbusSlaveId == before) {
+    return;
+  }
+  const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
+  if (gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_WITHDRAWN | chargerProgramClientRefusals(),
+                                           currentEpoch())) {
+    char line[128];
+    snprintf(line, sizeof(line), "Charger programming: request %lu withdrawn, the config names charger %u in place of %u",
+             (unsigned long)waitingId, (unsigned)gConfig.solarCharger.modbusSlaveId, (unsigned)before);
+    Serial.println(line);
+    addSerialLog(line);
   }
 }
 

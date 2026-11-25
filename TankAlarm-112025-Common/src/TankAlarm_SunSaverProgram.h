@@ -584,7 +584,7 @@ enum Refusal : uint32_t {
   REFUSE_NOT_LIFEPO4 = 1ul << 10,    // the client's battery is not configured as 12 V LiFePO4
   REFUSE_NO_CHARGER = 1ul << 11,     // the charger is not enabled, or did not answer in time
   REFUSE_JOURNAL = 1ul << 12,        // the client could not record the run in its flash
-  REFUSE_WITHDRAWN = 1ul << 13,      // a newer config no longer asked for it while it waited
+  REFUSE_WITHDRAWN = 1ul << 13,      // a newer config no longer asked for it while it waited, or named another controller
   REFUSE_CONFIG_UNSAVED = 1ul << 14,  // the client could not save the config that carried it in its flash
   REFUSE_HISTORY_LOST = 1ul << 15     // asked for before a start that lost the record of the requests answered (cautiousJournal())
 };
@@ -618,8 +618,8 @@ inline const char *refusalText(uint32_t refusal) {
       return "The charger is not enabled on RS-485 for this client, or it did not answer within an hour.";
     case REFUSE_JOURNAL: return "The client could not record the run in its flash memory, so it did not go on.";
     case REFUSE_WITHDRAWN:
-      return "A newer config for this client no longer asked for these values while the request waited, so "
-             "they were not written.";
+      return "A newer config for this client no longer asked for these values while the request waited, or "
+             "named another charger, so they were not written.";
     case REFUSE_CONFIG_UNSAVED:
       return "The client could not save the config that asked for these values in its flash memory, so they "
              "were not written: after a restart it would go by the config it had before.";
@@ -2269,11 +2269,11 @@ class Supervisor {
     saveJournal(nowMs);
   }
 
-  // The client gives up the request that waits: a newer config no longer asks for it
-  // (REFUSE_WITHDRAWN), or the client can no longer take it on (REFUSE_NOT_LIFEPO4,
-  // REFUSE_NO_CHARGER). It is refused with `refusals` as it stands, and its result goes to the
-  // server. A duty that is owed stays owed. Returns false, and does nothing, when no request
-  // waits or `refusals` holds no bit.
+  // The client gives up the request that waits: a newer config no longer asks for it, or names
+  // another controller (REFUSE_WITHDRAWN), or the client can no longer take it on
+  // (REFUSE_NOT_LIFEPO4, REFUSE_NO_CHARGER). It is refused with `refusals` as it stands, and its
+  // result goes to the server. A duty that is owed stays owed. Returns false, and does nothing,
+  // when no request waits or `refusals` holds no bit.
   bool withdraw(uint32_t refusals, double epochNow, uint32_t nowMs) {
     if (journal_.waitingId == 0 || refusals == 0) {
       return false;
