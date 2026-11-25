@@ -80,6 +80,9 @@
 // Forward-declare FluidType so Arduino's auto-generated function prototypes
 // (inserted near the top of the .ino) can reference it before its definition below.
 enum FluidType : uint8_t;
+// The same for the types of this sketch that a function takes by reference: its prototype comes
+// before the type is defined (ageChargerProgramResult()).
+struct ChargerResultAge;
 
 // POSIX file I/O types (for platforms that support it)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -109,6 +112,11 @@ enum FluidType : uint8_t;
   static mbed::MBRBlockDevice *mbedAppPart = nullptr;
   static MbedWatchdogHelper mbedWatchdog;
   static bool gStorageAvailable = false;
+  // This start found that partition 4 lost its files: it formatted the partition while it held
+  // files that could not be mounted, or mounted a file system that holds no file at all (a start
+  // that formatted it stopped before it wrote one). See initializeStorage() and
+  // keepChargerLookAfterLostFiles().
+  static bool gStorageLostFiles = false;
   
   // POSIX-compatible file path prefix for Mbed OS VFS (app config store, partition 4).
   // Must NOT be "/fs" -- that mount name is reserved by the MCUboot core for the OTA
@@ -191,6 +199,12 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 
 #ifndef CLIENT_CONFIG_PATH
 #define CLIENT_CONFIG_PATH "/client_config.json"
+#endif
+// The largest config file a start loads (loadConfigFromFlash()), and so the largest one
+// saveConfigToFlash() writes. Each monitor takes about 1 KB of it, with every text at its
+// longest about 1.2 KB: MAX_MONITORS of them and the rest take under 11 KB.
+#ifndef CLIENT_CONFIG_MAX_BYTES
+#define CLIENT_CONFIG_MAX_BYTES 16384
 #endif
 
 // Persisted record of the firmware build sequence that last booted on this device.
@@ -835,7 +849,14 @@ struct MonitorRuntime {
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
-  bool lastLoopPowerOk;         // result of the last loop power-up (v2.1.0: DAC loop-power config)
+  bool sampleBeforeRun;         // True when this cycle's reading is a pulse monitor's from before a
+                                // charger programming run, or its placeholder before a count of it
+                                // has ended: not taken for an unload (readPulseSensor(),
+                                // sampleMonitors())
+  bool sampleStandsIn;          // And neither a measurement nor a failed read: not validated either,
+                                // until a count that started after the run, or the first count, has
+                                // ended
+  bool lastLoopPowerOk;        // result of the last loop power-up (v2.1.0: DAC loop-power config)
   bool clipSuspected;           // v2.1.3: last mA reading may be supply-voltage clipped (see assessLoopClipping)
   float lastSupplyVoltage;      // v2.1.3: loop supply voltage used for the clip assessment (0 = unknown)
   float lastReportedValue;   // Last value pushed via change-based telemetry (monitor's own unit)
@@ -898,7 +919,7 @@ static bool gChargerReportSyncNow = false;        // and for its report to be se
 static unsigned long gChargerCheckEndMillis = 0;  // when the last pass ended, done or failed
 static uint8_t gChargerCheckFailures = 0;         // passes in a row that the link did not carry
 static bool gChargerCheckOverdue = false;         // the wait after it is over: see serviceChargerCheck()
-static bool gSolarPolledLastPass = false;         // the last pass of loop() polled the charger
+static sunsaver::LineTurns gSolarTurns;           // who of the poll, the check and programming has a pass
 static bool gChargerReportSent = false;           // a report has gone out since boot
 static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
 static unsigned long gChargerReportMillis = 0;    // when it went out
@@ -920,6 +941,81 @@ static unsigned long gChargerReportTryMillis = 0;      // which was then
 static uint32_t gChargerReportLastEpoch = 0;           // the time of the last report tried, also before a restart, 0 for none
 static uint32_t gChargerReportEpochKept = 0;           // the one flash holds, as far as this start knows
 static bool gChargerReportUnsure = false;              // a try has failed since a report last went out
+
+// Charger programming: a config can ask the client to write a LiFePO4 charging profile and the
+// LVD and LVR into the SunSaver ("solarCharger.program", with the id the server gives a
+// request). The procedure, its limits and its journal are in TankAlarm_SunSaverProgram.h
+// (Common library); SolarManager runs it, and only in firmware built with
+// TANKALARM_SUNSAVER_PROGRAMMING set to 1 in TankAlarm_Solar.h. Other firmware answers every
+// request with "not built". The journal in flash keeps the requests answered, a request that
+// waits and the result that has yet to go out, and lets a run that a restart of this client cut
+// short be settled when it starts again. Every result goes to the server.
+#define CHARGER_JOURNAL_FILE "/cfg/charger_journal.json"
+#define CHARGER_JOURNAL_TMP_FILE CHARGER_JOURNAL_FILE ".tmp"  // where tankalarm_posix_write_file_atomic() writes it first
+#define CHARGER_JOURNAL_KEPT_FILE CHARGER_JOURNAL_FILE ".bad"  // one that could not be read, kept aside
+// The newest request this client had answered or taken on when it last saved its config
+// (sunsaver::Journal::answeredId), as the config file keeps it ("chargerAnswered"). Every request
+// comes with a config, which is saved after its request was answered: where flash took the
+// config but not the journal, and the result went out to the Notecard all the same (it may be
+// the refusal that says flash failed), a start would read a journal without that answer, and the
+// same request, in a config the server sent again or one left in the inbox, would be taken on
+// again although its answer had gone. A start takes this into the journal it reads
+// (beginChargerProgramming() in setup()), so that such a request is not answered twice.
+static uint32_t gChargerAnsweredKept = 0;
+// A config named another charger, or turned the charger off, while the journal owed a look to
+// none that it names, and the look was bound to the charger named before
+// (bindChargerDutyBeforeOtherCharger()), but flash has not taken the journal that says so yet.
+// Until it has, no config is saved (persistConfigIfDirty()).
+static bool gChargerDutyBindingUnsaved = false;
+#if defined(POSIX_FILE_IO_AVAILABLE)
+// loadChargerJournal() read the journal from its .tmp, which holds its only copy until
+// saveChargerJournal() renames it into place.
+static bool gChargerJournalInTmp = false;
+// The journal could not be read at this start, nor kept aside (keepUnreadChargerJournal()):
+// nothing is written over it until the next start.
+static bool gChargerJournalHeld = false;
+// The journal kept aside was taken in (takeKeptChargerJournal()) and its file is still there:
+// saveChargerJournal() removes it once flash holds a journal that says so.
+static bool gChargerKeptToRemove = false;
+// The journal kept aside was taken in without the duty it owes a controller, because the journal
+// owed one to another controller (sunsaver::keptDutyLeftOut()): its file stays, and the duty is
+// taken up once none is owed (takeKeptChargerDuty()), from the journal this start read from that
+// file and the check value of its text, held here until then. Read again then, a file that did
+// not read, or a parse that ran out of memory, would lose the duty for the rest of this run, and
+// a request could run before it.
+static bool gChargerKeptDutyWaits = false;
+static sunsaver::Journal gChargerKeptJournal;
+static uint32_t gChargerKeptCheck = 0;
+// What readChargerJournalFile() found.
+static const uint8_t CHARGER_JOURNAL_READ = 0;    // the file's text
+static const uint8_t CHARGER_JOURNAL_ABSENT = 1;  // no such file
+static const uint8_t CHARGER_JOURNAL_UNREAD = 2;  // there, or maybe there, and it does not open or read
+#define CHARGER_JOURNAL_READ_TRIES 3
+#define CHARGER_JOURNAL_RETRY_PAUSE_MS 100UL
+#endif
+#define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result the Notecard did not take
+// The result that waits to go out (SolarManager::chargerProgramming()), as this sketch has seen
+// it. See sendDueChargerProgramReport().
+static bool gChargerProgramReportSeen = false;          // it has been shown on the serial console
+static uint32_t gChargerProgramReportId = 0;            // the request it answers
+static uint32_t gChargerProgramReportAt = 0;            // the millis() it came about
+static uint32_t gChargerProgramReportEpoch = 0;         // that moment as a time, once the clock has one
+// The age of each result that waits without a time of its own, counted in every pass as a
+// charger report's is (see ageChargerReport()): whole seconds, and the millis() they run to. The
+// journal keeps two that may both wait, the result of a request and a look (sunsaver::Supervisor),
+// and both are counted, the one that waits behind the other too: counted only once its turn
+// came, its age would be one millis() difference, short by 49.7 days for each turn of millis()
+// it waited. See ageChargerProgramResults().
+struct ChargerResultAge {
+  bool counted;        // a result is counted: the one of `requestId` that came about at `at`
+  uint32_t requestId;  // 0 for the look
+  uint32_t at;         // the supervisor's millis() of it (resultMillis(), lookMillis())
+  uint32_t seconds;
+  uint32_t agedMillis;
+};
+static ChargerResultAge gChargerResultAges[2];          // [0] the result of a request, [1] the look
+static bool gChargerProgramReportTried = false;         // the Notecard did not take it at the last try
+static unsigned long gChargerProgramReportTryMillis = 0;
 
 // Battery voltage monitoring via Notecard (when wired directly to battery)
 static BatteryData gBatteryData;
@@ -1014,6 +1110,9 @@ static bool gPendingConfigAckSuccess = true;
 static char gPendingConfigAckMessage[48] = "Config applied and persisted";
 static unsigned long gPendingConfigAckRetryAt = 0;
 static unsigned long gPendingConfigAckRetryDelayMs = 5000UL;
+// The acknowledgement that waits answers a config that was set aside (answerRepeatedConfig()), not
+// one that was applied: it keeps its message, and a failed save does not make it a failed one.
+static bool gPendingConfigAckRepeated = false;
 static bool gHardwareSummaryPrinted = false;
 
 // Network failure handling
@@ -1147,6 +1246,27 @@ static unsigned long gRpmPulsePeriodMs[MAX_MONITORS] = {0};
 static volatile uint32_t gRpmAccumulatedPulses[MAX_MONITORS] = {0};
 static unsigned long gRpmAccumulatedStartMillis[MAX_MONITORS] = {0};
 static bool gRpmAccumulatedInitialized[MAX_MONITORS] = {false};
+// An accumulated count gives no result once a charger programming run has held up one of its
+// samples: the time it divides by then takes in the run, and its pulses do not
+// (restartPulseCountsAfterChargerRun()).
+static bool gRpmAccumulatedCutByRun[MAX_MONITORS] = {false};
+// From a charger programming run that cut into a monitor's count until a count that started after
+// the run measures something: the monitor reads as before the run, and that reading is not a new
+// measurement (readPulseSensor()).
+static bool gRpmReadingBeforeRun[MAX_MONITORS] = {false};
+// While that mark holds, a count of the time between two pulses that started after the run saw no
+// second one. The reading is still the one from before the run, but it is validated from here on,
+// as such a count's reading is without a run (readPulseSensor()).
+static bool gRpmTimedOutAfterRun[MAX_MONITORS] = {false};
+// A count of the monitor has ended since boot, or since a config started its count again
+// (resetPulseMonitor()). Until one has, the reading is a placeholder, not a measurement
+// (readPulseSensor()).
+static bool gPulseCountEnded[MAX_MONITORS] = {false};
+// A reading of the monitor that is a measurement has been taken since boot, or since a config
+// started its count again (resetPulseMonitor()). Until one has, what telemetry sent of it, if
+// anything, was a placeholder that measured nothing, and the first measurement goes out whatever
+// its change (sampleMonitors()).
+static bool gPulseMeasured[MAX_MONITORS] = {false};
 
 // Atomic access helpers for volatile pulse counter (protects against future interrupt use)
 // On 32-bit ARM (Cortex-M7 in STM32H747XI), 32-bit aligned reads/writes are atomic,
@@ -1237,6 +1357,7 @@ static void enableDfuMode();
 static void pollForConfigUpdates();
 static void applyConfigUpdate(const JsonDocument &doc);
 static bool sendConfigAck(bool success, const char *message, const char *configVersion);
+static void answerRepeatedConfig(const char *cv);
 static bool sendOtaReportNote(const char *st, const char *targetV, const char *reason);
 static void reportOtaOutcome();
 static void persistConfigIfDirty();
@@ -1248,6 +1369,8 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx);
 static void assessLoopClipping(const MonitorConfig &cfg, uint8_t idx, float milliamps, bool pwmMode);
 static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx);
 static float readMonitorSensor(uint8_t idx);
+static void resetPulseMonitor(uint8_t idx);
+static bool pulseMonitorChanged(const MonitorConfig &was, const MonitorConfig &now);
 
 // ============================================================================
 // Non-blocking Pulse Sampler State Machine
@@ -1290,6 +1413,8 @@ struct PulseSamplerContext {
   // Result
   float resultRpm;
   bool resultReady;
+  bool resultStandsIn;  // the result is the last reading, and measures nothing: a run cut into the
+                        // count, or a count of the time between two pulses saw no second one
 };
 
 static PulseSamplerContext gPulseSampler[MAX_MONITORS];
@@ -1357,6 +1482,7 @@ static void startPulseSample(uint8_t idx, const MonitorConfig &cfg) {
   ctx.firstPulseDetected = false;
   ctx.secondPulseDetected = false;
   ctx.resultReady = false;
+  ctx.resultStandsIn = false;
 
   // For accumulated mode, use the global accumulated counter
   if (useAccumulatedMode && !gRpmAccumulatedInitialized[idx]) {
@@ -1364,6 +1490,7 @@ static void startPulseSample(uint8_t idx, const MonitorConfig &cfg) {
     gRpmAccumulatedStartMillis[idx] = millis();
     gRpmLastPinState[idx] = ctx.lastPinState;
     gRpmAccumulatedInitialized[idx] = true;
+    gRpmAccumulatedCutByRun[idx] = false;  // a count that starts now has no run's time in it
   }
 }
 
@@ -1403,7 +1530,13 @@ static bool pollPulseSampler(uint8_t idx) {
     unsigned long accumElapsed = now - gRpmAccumulatedStartMillis[idx];
     if (accumElapsed >= ctx.sampleDurationMs || (accumElapsed > 1000 && elapsed >= ctx.sampleDurationMs)) {
       uint32_t pulseCount = atomicReadAndResetPulses(idx);
-      if (accumElapsed > 1000 && pulseCount > 0) {
+      if (gRpmAccumulatedCutByRun[idx]) {
+        // A charger programming run held up a sample of this count: the last reading stands, and
+        // the next count starts now, as after any result.
+        ctx.resultRpm = gRpmLastReading[idx];
+        ctx.resultStandsIn = true;
+        gRpmAccumulatedCutByRun[idx] = false;
+      } else if (accumElapsed > 1000 && pulseCount > 0) {
         ctx.resultRpm = ((float)pulseCount * MS_PER_MINUTE) /
                         ((float)accumElapsed * (float)ctx.pulsesPerRev);
       } else {
@@ -1446,7 +1579,9 @@ static bool pollPulseSampler(uint8_t idx) {
       ctx.lastPinState = lastState;
     }
 
-    // Early exit if we got both pulses, or time is up
+    // Early exit if we got both pulses, or time is up. Without a period the last reading stands
+    // in for a result: it measures nothing (resultStandsIn), which readPulseSensor() heeds after a
+    // charger programming run.
     if (ctx.secondPulseDetected || timeUp) {
       if (ctx.secondPulseDetected) {
         unsigned long period = ctx.secondPulseTime - ctx.firstPulseTime;
@@ -1454,9 +1589,11 @@ static bool pollPulseSampler(uint8_t idx) {
           ctx.resultRpm = MS_PER_MINUTE / ((float)period * (float)ctx.pulsesPerRev);
         } else {
           ctx.resultRpm = gRpmLastReading[idx];
+          ctx.resultStandsIn = true;
         }
       } else {
         ctx.resultRpm = gRpmLastReading[idx]; // Keep last reading
+        ctx.resultStandsIn = true;
       }
       ctx.resultReady = true;
       ctx.state = PULSE_STATE_COMPLETE;
@@ -1508,6 +1645,47 @@ static float readPulseSensorResult(uint8_t idx) {
   }
   return gRpmLastReading[idx];
 }
+
+// A monitor's pulse count as at boot: no count under way, no last reading, no accumulated pulses,
+// no mark of a charger programming run, and no count ended, so that its readings are
+// placeholders until one has (readPulseSensor()), and none measured, so that the first
+// measurement goes out (sampleMonitors()). The slot's value and its time go too, as at boot: a
+// placeholder is sent with them (sampleMonitors() keeps the value of a reading that stands in),
+// and the new monitor has measured neither. For a slot that a config empties, fills, or gives
+// another sensor or other pulse settings (applyConfigUpdate(), pulseMonitorChanged()): what the
+// slot keeps is the old monitor's. A count under way would go on with the old pin and settings,
+// a count of the time between two pulses that sees no second one gives the last reading again,
+// the mark of a run that cut into the old monitor's count would keep every reading of the new
+// one marked reused until a count of it measures something, and the placeholders would send the
+// old monitor's value and time under the new one's number. A sensor that gives no pulses would
+// never get there: with stuck detection off, its alarms would never be judged.
+static void resetPulseMonitor(uint8_t idx) {
+  if (idx >= MAX_MONITORS) {
+    return;
+  }
+  memset(&gPulseSampler[idx], 0, sizeof(gPulseSampler[idx]));  // PULSE_STATE_IDLE: the next sample starts a count
+  gRpmLastReading[idx] = 0.0f;
+  atomicResetPulses(idx);
+  gRpmAccumulatedStartMillis[idx] = millis();
+  gRpmAccumulatedInitialized[idx] = false;
+  gRpmAccumulatedCutByRun[idx] = false;
+  gRpmReadingBeforeRun[idx] = false;
+  gRpmTimedOutAfterRun[idx] = false;
+  gPulseCountEnded[idx] = false;
+  gPulseMeasured[idx] = false;
+  gMonitorState[idx].currentValue = 0.0f;
+  gMonitorState[idx].lastReadingEpoch = 0.0;
+}
+
+// Whether the monitor a config puts in a slot is another sensor than the one it held (another
+// interface or number), or one counted another way (startPulseSample() takes all of these).
+static bool pulseMonitorChanged(const MonitorConfig &was, const MonitorConfig &now) {
+  return was.sensorInterface != now.sensorInterface || was.sensorIndex != now.sensorIndex ||
+         was.pulsePin != now.pulsePin || was.primaryPin != now.primaryPin || was.pulsesPerUnit != now.pulsesPerUnit ||
+         was.hallEffectType != now.hallEffectType || was.hallEffectDetection != now.hallEffectDetection ||
+         was.pulseSampleDurationMs != now.pulseSampleDurationMs || was.pulseAccumulatedMode != now.pulseAccumulatedMode ||
+         was.expectedPulseRate != now.expectedPulseRate;
+}
 static void evaluateAlarms(uint8_t idx);
 static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow);
 static float getEffectiveBatteryVoltage();
@@ -1519,6 +1697,8 @@ static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry, bool highInAl
 static uint8_t alarmPendingCodeFor(const char *alarmType);
 static const char *alarmPendingName(uint8_t code);
 static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated);
+static bool alarmTriggersRelay(const MonitorConfig &cfg, const char *alarmType);
+static void queueLatchedAlarmReassertion(uint8_t idx, float reading);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
 static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
@@ -1540,6 +1720,9 @@ static void triggerRemoteRelays(const char *targetClient, uint8_t relayMask, boo
 static int getRelayPin(uint8_t relayIndex);
 static float readVinDividerVoltage();
 static void checkRelayMomentaryTimeout(unsigned long now);
+static const char *relayTimeUp(uint8_t r, unsigned long now);
+static void switchOffRelaysTimeUp();
+static bool relayTimeRunsOutDuringChargerRun();
 static bool fetchNotecardLocation(float &latitude, float &longitude);
 static void resetRelayForMonitor(uint8_t idx);
 static void initializeClearButton();
@@ -1575,6 +1758,28 @@ static uint8_t chargerCheckChemistry();
 static void sendDueChargerReport(unsigned long now);
 static void loadChargerReportTime();
 static void keepChargerReportTime(uint32_t epoch);
+static sunsaver::Journal loadChargerJournal();
+static bool saveChargerJournal(const sunsaver::Journal &journal);
+#if defined(POSIX_FILE_IO_AVAILABLE)
+static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size);
+static bool keepUnreadChargerJournal(const char *path);
+static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent);
+static uint32_t keptChargerJournalCheck(const char *text);
+static void removeKeptChargerJournal();
+static void takeKeptChargerDuty();
+#endif
+static void keepChargerLookAfterLostFiles();
+static void handleChargerProgramRequest(JsonObjectConst program);
+static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId);
+static void withdrawUnsuitedChargerProgram();
+static void withdrawChargerProgramForOtherCharger(uint8_t before);
+static void bindChargerDutyBeforeOtherCharger(uint8_t before, bool wasOn);
+static unsigned long sampleIntervalMs();
+static bool chargerRunWouldHoldSample();
+static void restartPulseCountsAfterChargerRun();
+static void takeSampleDueAfterChargerRun();
+static bool serviceChargerProgramming(unsigned long now, bool allowed);
+static void sendDueChargerProgramReport(unsigned long now);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
 // Battery voltage monitoring (sourced from SunSaver MPPT or Vin divider via
@@ -1851,6 +2056,8 @@ void setup() {
     gMonitorState[i].currentSensorVoltage = 0.0f;
     gMonitorState[i].lastReadingEpoch = 0.0;
     gMonitorState[i].sampleReused = false;
+    gMonitorState[i].sampleBeforeRun = false;
+    gMonitorState[i].sampleStandsIn = false;
     gMonitorState[i].lastReportedValue = -9999.0f;
     gMonitorState[i].lastDailySentValue = -9999.0f;
     gMonitorState[i].highAlarmLatched = false;
@@ -1912,7 +2119,30 @@ void setup() {
       Serial.println(F("Warning: Solar charger initialization failed"));
       addSerialLog("Solar charger init failed");
     }
+  } else {
+    // No poll runs. The link's settings are kept all the same: a look at the charger that a run
+    // cut short left owed is made on them (see SolarManager::serviceChargerProgramming()).
+    gSolarManager.setConfig(gConfig.solarCharger);
   }
+
+  // Charger programming: whether a run that a restart of this client cut short left the charger
+  // owed a look. A request is run only once a poll in loop() has worked. The look goes to the
+  // charger that run talked to, and needs no poll when none speaks for that charger.
+  // A journal that lacks requests the config file says were answered (gChargerAnsweredKept) is
+  // older than the last config this client saved: flash did not take the journal after them.
+  // They count as answered, whether or not their results reached the server.
+  sunsaver::Journal chargerJournal = loadChargerJournal();
+  if (chargerJournal.answeredId < gChargerAnsweredKept) {
+    char line[128];
+    snprintf(line, sizeof(line), "Charger programming: the journal lacks the requests answered up to %lu, which count as answered",
+             (unsigned long)gChargerAnsweredKept);
+    Serial.println(line);
+    addSerialLog(line);
+    chargerJournal.answeredId = gChargerAnsweredKept;
+  }
+  gSolarManager.beginChargerProgramming(chargerJournal, saveChargerJournal);
+  // A run holds loop() for up to a minute, and a relay's time does not wait for it.
+  gSolarManager.setChargerRunHook(switchOffRelaysTimeUp);
 
   // Initialize battery voltage monitoring
   // Fix 11: source is auto-picked by getEffectiveBatteryVoltage() (SunSaver MPPT preferred,
@@ -2298,12 +2528,7 @@ void loop() {
 
   // ---- Power-state-aware sample interval ----
   // In ECO/LOW_POWER states, sample less frequently to conserve energy
-  unsigned long sampleInterval = (unsigned long)gConfig.sampleSeconds * 1000UL;
-  if (gPowerState == POWER_STATE_ECO) {
-    sampleInterval *= POWER_ECO_SAMPLE_MULTIPLIER;
-  } else if (gPowerState == POWER_STATE_LOW_POWER) {
-    sampleInterval *= POWER_LOW_SAMPLE_MULTIPLIER;
-  }
+  const unsigned long sampleInterval = sampleIntervalMs();
   // In CRITICAL_HIBERNATE, skip sampling entirely
   if (gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
     if (now - gLastTelemetryMillis >= sampleInterval) {
@@ -2400,16 +2625,25 @@ void loop() {
   // Poll solar charger for battery health data (SunSaver MPPT via RS-485)
   // In CRITICAL_HIBERNATE we still poll the solar charger (if enabled) to detect
   // battery recovery, but at reduced frequency (controlled by sleep duration).
+  //
+  // The poll, the charger check and charger programming all talk to the charger, so a pass of
+  // loop() reads for one of them only, and the poll comes first. A short poll interval with the
+  // long sleep of ECO or LOW_POWER makes every pass due to poll: then, after a poll, the next pass
+  // in which the line is free goes to a check that is under way, or to programming that has
+  // something due, and the poll waits for the pass after (see sunsaver::LineTurns).
+  bool solarPolled = false;
   if (gSolarManager.isEnabled()) {
-    // The poll and the charger check both talk to the charger, so a pass of loop() reads for one
-    // of them only. A short poll interval with the long sleep of ECO or LOW_POWER makes every
-    // pass due to poll: then a check that is under way takes the pass after one that polled, and
-    // the poll waits for the next pass. Not a check that is held back, which serviceChargerCheck()
-    // drops without reading: in hibernation the poll is what tells that the battery recovered.
-    const bool checkTurn = gSolarPolledLastPass && !chargerCheckHeldBack() && gSolarManager.chargerCheckActive();
-    const bool polled = !checkTurn && gSolarManager.poll(now);
-    gSolarPolledLastPass = polled;
-    if (polled) {
+    // Only for those that will talk to the charger in the next pass: not a check that is held
+    // back, which serviceChargerCheck() drops without reading (in hibernation the poll is what
+    // tells that the battery recovered), and not programming while a firmware update is being
+    // staged.
+    const bool othersWant =
+        (!chargerCheckHeldBack() && gSolarManager.chargerCheckActive()) ||
+        (!gDfuInProgress && !chargerRunWouldHoldSample() && !relayTimeRunsOutDuringChargerRun() &&
+         gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
+    solarPolled = !gSolarTurns.pollWaits(othersWant) && gSolarManager.poll(now);
+    gSolarTurns.afterPoll(solarPolled, gSolarManager.lineResting());
+    if (solarPolled) {
       // A poll was attempted - check alerts using the refreshed communication state
       // (suppress alarm sending in CRITICAL to save power).
       SolarAlertType alert = gSolarManager.checkAlerts();
@@ -2429,10 +2663,19 @@ void loop() {
       // Optional serial output for hardware bring-up.
       logSolarPollSnapshot(now, alert);
     }
+  }
+
+  // Charger programming: a request from a config, or a look that a run cut short by a restart
+  // of this client left owed. It comes before the check, and runs in every pass whether the
+  // charger is enabled or not, so that a request that waits runs out of time and a look that is
+  // owed is made all the same.
+  const bool programmed = serviceChargerProgramming(now, !solarPolled);
+
+  if (gSolarManager.isEnabled()) {
     // In every pass: a check that is due is set up and a report that waits is sent, which talk
-    // to nobody. A few registers of a check that is under way are read only in a pass without a
-    // poll.
-    serviceChargerCheck(now, !polled);
+    // to nobody. A few registers of a check that is under way are read only in a pass in which
+    // nothing else talked to the charger.
+    serviceChargerCheck(now, !solarPolled && !programmed);
   }
   
   // Poll battery voltage (sourced from MPPT/Vin divider — never the Notecard)
@@ -2641,8 +2884,13 @@ void loop() {
   // Higher states = longer sleep = lower power draw.
   // For sleep durations longer than the watchdog timeout, we sleep in chunks
   // and kick the watchdog between each chunk to prevent a hardware reset.
-  unsigned long sleepMs = getPowerStateSleepMs(gPowerState);
-  safeSleep(sleepMs);
+  // Not after a pass in which charger programming talked to the charger: that held the pass for
+  // up to a minute, and the next one sends the run's result. A sample that came due meanwhile was
+  // taken as the run returned (serviceChargerProgramming()).
+  if (!programmed) {
+    unsigned long sleepMs = getPowerStateSleepMs(gPowerState);
+    safeSleep(sleepMs);
+  }
 }
 
 // Helper: Get recommended pulse sampling parameters based on expected rate
@@ -2739,6 +2987,11 @@ static float getEffectiveSpecificGravity(const MonitorConfig &cfg) {
  * If a .tmp file exists but the target does NOT, the rename failed
  * after a write completed — complete the rename now.
  * If BOTH exist, the original is still valid — delete stale .tmp.
+ * The charger journal is not done here: a journal that is there and
+ * fails to open would pass for one that is not, and a .tmp that a lost
+ * save left half written would take its place. loadChargerJournal() reads
+ * its .tmp only when the journal itself is not there (ENOENT), and
+ * saveChargerJournal() puts that .tmp in place before it writes another.
  */
 #ifdef POSIX_FILE_IO_AVAILABLE
 static void recoverOrphanedTmpFiles() {
@@ -2775,6 +3028,65 @@ static void recoverOrphanedTmpFiles() {
 }
 #endif // POSIX_FILE_IO_AVAILABLE
 
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+// Whether partition 4 holds nothing yet: the first two blocks of LittleFileSystem, where it keeps
+// its superblocks, are erased. They never are once the partition was formatted, and they are on
+// a partition that never held a file system (KeyProvisioning makes the partition table and
+// formats only partition 2). False when it cannot tell.
+static bool appPartitionBlank(mbed::BlockDevice *part) {
+  const int erased = part->get_erase_value();
+  const mbed::bd_size_t readSize = part->get_read_size();
+  uint8_t chunk[256];
+  // LittleFileSystem's block is the larger of the erase size and 512 bytes, so two blocks of at
+  // least 4096 bytes hold both superblocks.
+  mbed::bd_size_t block = part->get_erase_size();
+  if (block < 4096) {
+    block = 4096;
+  }
+  const mbed::bd_size_t span = 2 * block;
+  if (erased < 0 || readSize == 0 || sizeof(chunk) % readSize != 0 || span > part->size()) {
+    return false;
+  }
+  for (mbed::bd_addr_t addr = 0; addr < span; addr += sizeof(chunk)) {
+    if (part->read(chunk, addr, sizeof(chunk)) != 0) {
+      return false;
+    }
+    for (size_t i = 0; i < sizeof(chunk); ++i) {
+      if (chunk[i] != (uint8_t)erased) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Whether the mounted file system on partition 4 holds no file at all. Every start writes the
+// config when it finds none (ensureConfigLoaded()), so such a file system was formatted at a start
+// that stopped before it wrote one. False when it cannot tell, which includes a listing that does
+// not show ".", as LittleFileSystem's always does: this is asked at every start, and a listing
+// that fails must not have every client look at its charger.
+static bool appFileSystemEmpty() {
+  DIR *dir = opendir(POSIX_FS_PREFIX "/");
+  if (dir == nullptr) {
+    return false;
+  }
+  bool self = false;
+  bool other = false;
+  errno = 0;
+  for (struct dirent *entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+    if (strcmp(entry->d_name, ".") == 0) {
+      self = true;
+    } else if (strcmp(entry->d_name, "..") != 0) {
+      other = true;
+      break;
+    }
+  }
+  const bool listed = errno == 0;  // readdir() sets it only for an error, not at the end
+  closedir(dir);
+  return listed && self && !other;
+}
+#endif
+
 static void initializeStorage() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -2808,9 +3120,12 @@ static void initializeStorage() {
 
     mbedFS = new LittleFileSystem("cfg");
     int err = mbedFS->mount(mbedAppPart);
+    bool formatted = false;
     if (err) {
       // Format ONLY partition 4 (never the whole device).
       Serial.println(F("Filesystem mount failed, formatting app partition (p4)..."));
+      // At a board's first start the partition holds nothing yet. Otherwise its files are lost.
+      const bool blank = appPartitionBlank(mbedAppPart);
       err = mbedFS->reformat(mbedAppPart);
       if (err) {
         Serial.println(F("LittleFS format failed; running without persistence"));
@@ -2818,11 +3133,24 @@ static void initializeStorage() {
         mbedFS = nullptr;
         return;
       }
+      formatted = true;
+      gStorageLostFiles = !blank;
+      if (gStorageLostFiles) {
+        Serial.println(F("The app partition held files that could not be read: they are lost"));
+      }
     }
     gStorageAvailable = true;
     Serial.println(F("Mbed OS LittleFileSystem initialized (QSPI partition 4)"));
     // Recover from any interrupted atomic writes (power loss during rename)
     recoverOrphanedTmpFiles();
+    if (!formatted && appFileSystemEmpty()) {
+      // A start formatted it and stopped before it wrote a file: maybe over files, before the
+      // journal could go in. A new board stopped in that moment of its first start reads the same.
+      gStorageLostFiles = true;
+      Serial.println(F("The app partition holds no file: a start that formatted it stopped at once, so its files may be lost"));
+    }
+    // Before anything else writes to it.
+    keepChargerLookAfterLostFiles();
   #else
     // STM32duino LittleFS
     if (!LittleFS.begin()) {
@@ -3473,7 +3801,7 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
     long fileSize = ftell(file);
     fseek(file, 0, SEEK_SET);
     
-    if (fileSize <= 0 || fileSize > 8192) {
+    if (fileSize <= 0 || fileSize > (long)CLIENT_CONFIG_MAX_BYTES) {
       fclose(file);
       return false;
     }
@@ -3677,6 +4005,8 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
 
   // Load config epoch timestamp
   cfg.configEpoch = doc["configEpoch"].is<int>() ? (uint32_t)doc["configEpoch"].as<int>() : 0;
+  // The requests answered as this config's save knew them (see gChargerAnsweredKept)
+  gChargerAnsweredKept = doc["chargerAnswered"].is<uint32_t>() ? doc["chargerAnswered"].as<uint32_t>() : 0;
 
   // Support both "sensors" (from server) and "monitors" (local config) array names
   JsonArray monitorsArray = doc["sensors"].as<JsonArray>();
@@ -3944,37 +4274,62 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
 
   // Save config epoch
   doc["configEpoch"] = cfg.configEpoch;
+  // And the newest request answered (gChargerAnsweredKept), which never goes down: a save before
+  // the journal is read at a start keeps the one the file had.
+  uint32_t answered = gSolarManager.chargerProgramming().journal().answeredId;
+  if (answered < gChargerAnsweredKept) {
+    answered = gChargerAnsweredKept;
+  }
+  doc["chargerAnswered"] = answered;
 
+  // Nothing is written from a document that ran out of memory: it lacks what did not fit, and
+  // the next start would take that for the config. Nor a text longer than a start loads
+  // (CLIENT_CONFIG_MAX_BYTES): a start that cannot load the file writes the defaults over it.
+  // The text goes into a buffer of its own size. The 4 KB buffer this had cut off a config of
+  // three monitors or more, which the next start then replaced with the defaults. A save that
+  // fails leaves the file as it was, and persistConfigIfDirty() tries again.
+  if (doc.overflowed()) {
+    Serial.println(F("Failed to serialize config: out of memory"));
+    return false;
+  }
+  const size_t need = measureJson(doc);
+  if (need == 0 || need > CLIENT_CONFIG_MAX_BYTES) {
+    static size_t reported = 0;  // once for each size: the save is tried in every pass of loop()
+    if (need != reported) {
+      Serial.print(F("Failed to serialize config: "));
+      Serial.print((unsigned long)need);
+      Serial.print(F(" bytes, more than the "));
+      Serial.print((unsigned long)CLIENT_CONFIG_MAX_BYTES);
+      Serial.println(F(" a start loads"));
+      reported = need;
+    }
+    return false;
+  }
+  char *jsonBuf = (char *)malloc(need + 1);
+  if (jsonBuf == nullptr) {
+    Serial.println(F("Failed to serialize config: out of memory"));
+    return false;
+  }
+  const size_t len = serializeJson(doc, jsonBuf, need + 1);
+  bool written = false;
+  if (len != need) {
+    Serial.println(F("Failed to serialize config"));
+  } else {
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     // Mbed OS — atomic write-to-temp-then-rename
-    // Use fixed buffer instead of Arduino String to avoid heap fragmentation
-    char jsonBuf[4096];
-    size_t len = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (len == 0) {
-      Serial.println(F("Failed to serialize config"));
-      return false;
-    }
-    if (!tankalarm_posix_write_file_atomic("/cfg/client_config.json",
-                                            jsonBuf, len)) {
-      Serial.println(F("Failed to write config"));
-      return false;
-    }
-    return true;
+    written = tankalarm_posix_write_file_atomic("/cfg/client_config.json", jsonBuf, len);
   #else
-    // Use fixed buffer instead of Arduino String to avoid heap fragmentation
-    char jsonBuf[4096];
-    size_t len = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (len == 0) {
-      Serial.println(F("Failed to serialize config"));
-      return false;
-    }
-    if (!tankalarm_littlefs_write_file_atomic(CLIENT_CONFIG_PATH,
-            (const uint8_t *)jsonBuf, len)) {
-      Serial.println(F("Failed to write config"));
-      return false;
-    }
-    return true;
+    written = tankalarm_littlefs_write_file_atomic(CLIENT_CONFIG_PATH, (const uint8_t *)jsonBuf, len);
   #endif
+    if (!written) {
+      Serial.println(F("Failed to write config"));
+    }
+  }
+  free(jsonBuf);
+  if (written) {
+    gChargerAnsweredKept = answered;
+  }
+  return written;
 #else
   return false; // Filesystem not available
 #endif
@@ -4891,8 +5246,8 @@ static void pollForConfigUpdates() {
             Serial.print(inboundTs);
             Serial.print(F(" Active TS: "));
             Serial.println(gConfig.configEpoch);
-            // Send config ACK indicating that we took it but bypassed it to prevent overwriting
-            sendConfigAck(true, "Config bypassed: newer version already exists", cv);
+            // Acknowledged as taken but bypassed, to prevent overwriting (answerRepeatedConfig()).
+            answerRepeatedConfig(cv);
             ackSent = true;
           } else {
             if (inboundTs > 0) {
@@ -4904,6 +5259,7 @@ static void pollForConfigUpdates() {
             // will send the ACK after saveConfigToFlash() completes.
             strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
             gPendingConfigAck = true;
+            gPendingConfigAckRepeated = false;
             gPendingConfigAckSuccess = true;
             strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
             gPendingConfigAckRetryAt = 0;
@@ -4939,6 +5295,60 @@ static void pollForConfigUpdates() {
   }
 
   notecard.deleteResponse(rsp);
+}
+
+// A pulse monitor that reads as before a charger programming run (gRpmReadingBeforeRun, see
+// readPulseSensor()): a config keeps its latches, which there is no reading to judge by
+// (reinitializeHardware()), and moves the relays of its alarm with it (moveHeldAlarmRelays()).
+static bool alarmsHeldAcrossConfig(uint8_t idx) {
+  return idx < gConfig.monitorCount && gConfig.monitors[idx].sensorInterface == SENSOR_PULSE &&
+         gRpmReadingBeforeRun[idx];
+}
+
+// Whether an alarm of `alarmType` ("high", "low", ...) switches the monitor's relays on, by its
+// relay trigger (sendAlarm()).
+static bool alarmTriggersRelay(const MonitorConfig &cfg, const char *alarmType) {
+  return cfg.relayTrigger == RELAY_TRIGGER_ANY ||
+         (cfg.relayTrigger == RELAY_TRIGGER_HIGH && strcmp(alarmType, "high") == 0) ||
+         (cfg.relayTrigger == RELAY_TRIGGER_LOW && strcmp(alarmType, "low") == 0);
+}
+
+// Whether an alarm of the monitor has relays on (gRelayRuntime, RELAY_SRC_ALARM), and since when
+// (`onAt`): an alarm switches its relays on together.
+static bool alarmRelaysOnSince(uint8_t idx, unsigned long &onAt) {
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    if (gRelayRuntime[r].active && gRelayRuntime[r].ownerMonitor == idx && gRelayRuntime[r].source == RELAY_SRC_ALARM) {
+      onAt = gRelayRuntime[r].activatedAt;
+      return true;
+    }
+  }
+  return false;
+}
+
+// A config gave the monitor another relay target or mask while an alarm of it had relays on
+// (since `onAt`), and has switched those off (applyConfigUpdate()). A monitor whose latches the
+// config keeps (alarmsHeldAcrossConfig()) makes no new edge for its alarm, which would switch on
+// the relays the config names now, and waits for a measurement that may not come for as long as
+// its sensor gives no pulses: its alarm switches them on here, as its edge would have (its relay
+// trigger), from the time it switched the old ones on, so that a momentary relay's time and the
+// safety limit of one that stays on until it is reset run on from then. Any other monitor's
+// latches go with the config (reinitializeHardware()), and its next edge switches its relays.
+static void moveHeldAlarmRelays(uint8_t idx, unsigned long onAt) {
+  if (!alarmsHeldAcrossConfig(idx)) {
+    return;
+  }
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  const MonitorRuntime &state = gMonitorState[idx];
+  const char *latched = state.highAlarmLatched ? "high" : (state.lowAlarmLatched ? "low" : nullptr);
+  if (latched == nullptr || cfg.relayTargetClient[0] == '\0' || cfg.relayMask == 0 || !alarmTriggersRelay(cfg, latched)) {
+    return;
+  }
+  triggerRemoteRelays(cfg.relayTargetClient, cfg.relayMask, true);
+  activateRelayForMonitor(idx, cfg.relayMask, RELAY_SRC_ALARM, onAt);
+  Serial.print(F("Relay moved with the config for the held "));
+  Serial.print(latched);
+  Serial.print(F(" alarm of monitor "));
+  Serial.println(idx);
 }
 
 static void reinitializeHardware() {
@@ -4978,8 +5388,27 @@ static void reinitializeHardware() {
       }
     }
 
+    // A pulse monitor that reads as before a charger programming run (gRpmReadingBeforeRun, see
+    // readPulseSensor()) has no measurement to judge its alarms by, and evaluateAlarms() holds
+    // them until a count that started after the run measures something: one whose sensor gives
+    // no pulses may never get there. Cleared here, an alarm would be reported cleared and not
+    // raised again, so its latches and the edge that waits to go out are held too, also when the
+    // config changed its thresholds: there is no reading to judge them by. Its evidence goes, as
+    // every monitor's. The config started the count again of a monitor it changed
+    // (resetPulseMonitor(), which takes the mark away), so such a monitor is cleared and judged
+    // anew, and the alarms of a monitor whose alarms it switched off are cleared already
+    // (applyConfigUpdate(), which also moves the relays of a held alarm to those it names).
+    const bool alarmsHeld = alarmsHeldAcrossConfig(i);
+    // The sensor-recovered note above, of a monitor that had failed, is a clear to the server: a
+    // monitor whose latches are held re-asserts its latched edge (NEW-B, see
+    // validateSensorReading()), which goes out with the first measurement in alarm. Any other
+    // monitor's latches go below, and a clear goes out for them.
+    if (alarmsHeld && gMonitorState[i].sensorFailed) {
+      queueLatchedAlarmReassertion(i, gMonitorState[i].currentValue);
+    }
+
     // If alarm was latched, send clear to server before resetting
-    if (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched) {
+    if (!alarmsHeld && (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched)) {
       Serial.print(F("Clearing latched alarm for sensor "));
       Serial.println(cfg.name);
       JsonDocument clearDoc;
@@ -4997,9 +5426,11 @@ static void reinitializeHardware() {
     gMonitorState[i].lowAlarmDebounceCount = 0;
     gMonitorState[i].highClearDebounceCount = 0;
     gMonitorState[i].lowClearDebounceCount = 0;
-    gMonitorState[i].highAlarmLatched = false;
-    gMonitorState[i].lowAlarmLatched = false;
-    gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;  // C-T01: latches reset; drop any unsent edge
+    if (!alarmsHeld) {
+      gMonitorState[i].highAlarmLatched = false;
+      gMonitorState[i].lowAlarmLatched = false;
+      gMonitorState[i].pendingAlarm = ALARM_PENDING_NONE;  // C-T01: latches reset; drop any unsent edge
+    }
     gMonitorState[i].consecutiveFailures = 0;
     gMonitorState[i].stuckReadingCount = 0;
     gMonitorState[i].sensorFailed = false;
@@ -5025,6 +5456,7 @@ static void resetTelemetryBaselines() {
 
 static void clearPendingConfigAckState() {
   gPendingConfigAck = false;
+  gPendingConfigAckRepeated = false;
   gPendingConfigAckVersion[0] = '\0';
   gPendingConfigAckSuccess = true;
   strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
@@ -5057,11 +5489,58 @@ static void attemptPendingConfigAckSend() {
   if (!gPendingConfigAck || !isPendingConfigAckRetryDue()) {
     return;
   }
+  // Not while a result of charger programming is in RAM alone, such as the answer to a request
+  // the config carried: flash did not take the journal, and the Notecard does not have the result
+  // yet. Until the config is acknowledged the server sends it again, a minute apart and up to five
+  // times (its MAX_CONFIG_DISPATCH_RETRIES), and with it the request: a client that restarted in
+  // that time, before flash took the config, takes the request on again. Once flash has the
+  // config, it has the request's answer too (gChargerAnsweredKept), and a restart does not take
+  // it on again. The next pass looks again (retryPendingConfigAckIfDue()).
+  // A config that arrives again and is set aside is acknowledged here too (answerRepeatedConfig()).
+  static bool heldForResult = false;
+  if (gSolarManager.chargerProgramming().resultOnlyInRam()) {
+    if (!heldForResult) {
+      Serial.println(F("Config ACK waits: a charger programming result is neither in flash nor with the Notecard yet"));
+      heldForResult = true;
+    }
+    return;
+  }
+  heldForResult = false;
   if (sendConfigAck(gPendingConfigAckSuccess, gPendingConfigAckMessage, gPendingConfigAckVersion)) {
     clearPendingConfigAckState();
   } else {
     schedulePendingConfigAckRetry();
   }
+}
+
+// A config whose time ("_ts") is not later than that of the config this client holds, which is
+// not applied again, and with it the charger request it carries. One with that very time is the
+// config held, delivered once more (the server gives each config it sends a later time than the
+// one before, so its own retries are applied): its request was answered when that config was
+// applied, and the config file says so (gChargerAnsweredKept), also to a start whose journal
+// lost the answer, which may have reached the server. It is acknowledged as an applied config
+// is, when no result of charger programming is in RAM alone (attemptPendingConfigAckSend()):
+// that acknowledgement stops the server from sending the config again, and with it the request.
+// An acknowledgement that waits already answers for this client. While the config this client
+// holds is not in flash (gConfigDirty), the acknowledgement waits for a save that succeeds
+// (persistConfigIfDirty()), as for a config just applied: a restart would bring the config
+// before it back, and the server would not send this one again. It never goes out as a failed
+// one: that would end the server's sending all the same, and says nothing of this config.
+static void answerRepeatedConfig(const char *cv) {
+  if (gPendingConfigAck) {
+    return;
+  }
+  strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
+  gPendingConfigAck = true;
+  gPendingConfigAckRepeated = true;
+  gPendingConfigAckSuccess = true;
+  strlcpy(gPendingConfigAckMessage, "Config bypassed: newer version already exists", sizeof(gPendingConfigAckMessage));
+  gPendingConfigAckRetryAt = 0;
+  gPendingConfigAckRetryDelayMs = 5000UL;
+  if (gConfigDirty) {
+    return;  // persistConfigIfDirty() sends it once flash has the config
+  }
+  attemptPendingConfigAckSend();
 }
 
 static void applyConfigUpdate(const JsonDocument &doc) {
@@ -5166,6 +5645,8 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   // runtime instead of being silently dropped and overwritten on next save.
   // If the enabled flag or transport parameters change, restart the
   // SolarManager so the RS-485 transport picks up the new settings.
+  const uint8_t chargerBefore = gConfig.solarCharger.modbusSlaveId;  // see withdrawChargerProgramForOtherCharger()
+  const bool chargerWasOn = gConfig.solarCharger.enabled;            // and bindChargerDutyBeforeOtherCharger()
   if (!doc["solarCharger"].isNull()) {
     JsonObjectConst solarCfg = doc["solarCharger"].as<JsonObjectConst>();
     bool prevEnabled  = gConfig.solarCharger.enabled;
@@ -5209,8 +5690,11 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       }
     } else if (!gConfig.solarCharger.enabled && prevEnabled) {
       gSolarManager.end();
+      gSolarManager.setConfig(gConfig.solarCharger);  // for a look at the charger that is owed: see setup()
       Serial.println(F("Solar charger disabled via config update"));
       addSerialLog("Solar charger disabled via config update");
+    } else if (!gConfig.solarCharger.enabled) {
+      gSolarManager.setConfig(gConfig.solarCharger);  // as above: the link's settings may have changed
     } else if (gConfig.solarCharger.enabled && prevEnabled && !transportChanged) {
       // Non-transport change: refresh thresholds/flags directly (Task 1.1)
       uint16_t prevPoll = gSolarManager.getConfig().pollIntervalSec;
@@ -5221,6 +5705,18 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       Serial.println(F("Solar: runtime config refreshed (no transport restart)"));
     }
   }
+  // Charger programming, for every config this client applies: one without "program", and so
+  // one without a "solarCharger" block, withdraws a request that waits. The battery block and
+  // the charger block above have been applied, and the link restarted if the transport changed,
+  // so the client's own refusals go by the new config. A config that names another charger
+  // withdraws it first, also when it carries the request again, and a look owed to no charger
+  // the journal names stays with the one the config named before, also when it turns the
+  // charger off.
+  bindChargerDutyBeforeOtherCharger(chargerBefore, chargerWasOn);
+  withdrawChargerProgramForOtherCharger(chargerBefore);
+  handleChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
+  // A request that waits goes on only while the client could still take it on.
+  withdrawUnsuitedChargerProgram();
 
   // Handle Vin voltage divider configuration
   if (!doc["vinMonitor"].isNull()) {
@@ -5344,11 +5840,14 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       }
       // Zero out stale runtime state so it's clean if monitor is re-added later
       memset(&gMonitorState[i], 0, sizeof(MonitorRuntime));
+      resetPulseMonitor(i);  // and its pulse count
     }
 
+    const uint8_t oldCount = gConfig.monitorCount;
     gConfig.monitorCount = newCount;
     for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
       // Capture previous state before config update
+      const MonitorConfig was = gConfig.monitors[i];
       bool wasAlarmsEnabled = gConfig.monitors[i].alarmsEnabled;
       bool wasStuckEnabled = gConfig.monitors[i].stuckDetectionEnabled;
       char wasRelayTarget[48];
@@ -5357,6 +5856,15 @@ static void applyConfigUpdate(const JsonDocument &doc) {
 
       JsonObjectConst t = sensors[i];
       parseMonitorFromJson(gConfig.monitors[i], t, i);
+      // A monitor in a slot that held none, or another sensor than before, or one counted another
+      // way: its pulse count starts as at boot (resetPulseMonitor()). One the config leaves as it
+      // was keeps its count, also when the config gives its accumulated mode again, unchanged:
+      // started again there, an accumulated count would end with the sample under way, whose
+      // time ran from before the config (pollPulseSampler()), and a count of a few seconds would
+      // be taken as a measurement, one that may read 0.
+      if (i >= oldCount || pulseMonitorChanged(was, gConfig.monitors[i])) {
+        resetPulseMonitor(i);
+      }
 
       // BugFix 04022026: When alarmsEnabled transitions from true to false,
       // clear any latched alarm state and send a "clear" note to the server.
@@ -5392,8 +5900,12 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           recovDoc["rd"] = 0;
           recovDoc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, recovDoc, true);
-          // C-T01: no NEW-B re-assertion here; reinitializeHardware() below clears the latch
-          // and sends a clear (see validateSensorReading())
+          // C-T01 (NEW-B): the server takes it as a clear, so the latched edge is re-asserted
+          // (see validateSensorReading()). reinitializeHardware() below drops it with the latch
+          // of a monitor whose alarms it clears, and sends a clear; a monitor whose alarms it
+          // holds (a pulse monitor that reads as before a charger programming run) keeps both,
+          // and the edge goes out with the first measurement in alarm.
+          queueLatchedAlarmReassertion(i, gMonitorState[i].currentValue);
         }
         gMonitorState[i].sensorFailed = false;
         gMonitorState[i].stuckReadingCount = 0;
@@ -5413,6 +5925,8 @@ static void applyConfigUpdate(const JsonDocument &doc) {
                                   (strcmp(wasRelayTarget, gConfig.monitors[i].relayTargetClient) != 0);
         bool relayMaskChanged = (wasRelayMask != 0) && (wasRelayMask != gConfig.monitors[i].relayMask);
         if (relayRemoved || relayTargetChanged || relayMaskChanged) {
+          unsigned long alarmRelaysOnAt = 0;  // see moveHeldAlarmRelays()
+          const bool alarmRelaysOn = alarmRelaysOnSince(i, alarmRelaysOnAt);
           // Deactivate relays using the OLD config (where the target/mask was)
           if (wasRelayTarget[0] != '\0' && wasRelayMask != 0) {
             triggerRemoteRelays(wasRelayTarget, wasRelayMask, false);
@@ -5421,15 +5935,12 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           deactivateRelayForMonitor(i, activeMask);
           Serial.print(F("Relay deactivated: config removed/changed for monitor "));
           Serial.println(i);
+          if (alarmRelaysOn && !relayRemoved) {
+            moveHeldAlarmRelays(i, alarmRelaysOnAt);
+          }
         }
       }
 
-      // Side effect: reset accumulated state when pulse mode config changes
-      if (!t["pulseAccumulatedMode"].isNull() || !t["rpmAccumulatedMode"].isNull()) {
-        atomicResetPulses(i);
-        gRpmAccumulatedStartMillis[i] = millis();
-        gRpmAccumulatedInitialized[i] = false;
-      }
       // BugFix 04022026: Reset unload tracking unconditionally when the field
       // is present, not only when enabled. Previously, disabling trackUnloads
       // left stale peak/epoch state that could cause false unload events if
@@ -5464,6 +5975,16 @@ static void persistConfigIfDirty() {
   if (!gConfigDirty) {
     return;
   }
+  // A look owed to no charger the journal named was bound to the one the config named before it
+  // named another, or turned the charger off (bindChargerDutyBeforeOtherCharger()): the config
+  // waits until flash has the journal that says so, which Supervisor::maintain() writes again
+  // until it does.
+  if (gChargerDutyBindingUnsaved) {
+    if (gSolarManager.chargerProgramming().journalUnsaved()) {
+      return;
+    }
+    gChargerDutyBindingUnsaved = false;
+  }
 
 #ifdef FILESYSTEM_AVAILABLE
   static bool warned = false;
@@ -5481,12 +6002,15 @@ static void persistConfigIfDirty() {
     // BugFix v1.6.2 (I-11): Now that config is safely on flash, send the deferred ACK.
     if (gPendingConfigAck) {
       gPendingConfigAckSuccess = true;
-      strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
+      if (!gPendingConfigAckRepeated) {  // one for a config set aside says so (answerRepeatedConfig())
+        strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
+      }
       attemptPendingConfigAckSend();
     }
   } else {
-    // Persistence failed — notify server so it can flag the issue.
-    if (gPendingConfigAck) {
+    // Persistence failed — notify server so it can flag the issue. Not for a config set aside:
+    // its acknowledgement waits for a save that succeeds (answerRepeatedConfig()).
+    if (gPendingConfigAck && !gPendingConfigAckRepeated) {
       gPendingConfigAckSuccess = false;
       strlcpy(gPendingConfigAckMessage, "Flash persistence failed", sizeof(gPendingConfigAckMessage));
       attemptPendingConfigAckSend();
@@ -5688,7 +6212,12 @@ static bool validateSensorReading(uint8_t idx, float reading) {
   // BugFix v1.6.2 (M-12): Exempt monitors actively tracking an unload — a slowly
   // emptying tank legitimately produces near-identical readings that would
   // otherwise trip the stuck detector.
-  bool exemptFromStuck = cfg.trackUnloads && state.unloadTracking;
+  // Not a pulse monitor's reading from before a charger programming run once it no longer stands
+  // in (sampleBeforeRun, see readPulseSensor()): a count after the run timed out, and the reading
+  // is the old one again, not a level that changes slowly. Such a reading is not taken for an
+  // unload either, so an unload tracked from before the run would never end, and a sensor that
+  // gives no pulses any more would never be found stuck.
+  bool exemptFromStuck = cfg.trackUnloads && state.unloadTracking && !state.sampleBeforeRun;
   if (cfg.stuckDetectionEnabled && !exemptFromStuck && state.hasLastValidReading && fabs(reading - state.lastValidReading) < 0.05f) {
     state.stuckReadingCount++;
     if (state.stuckReadingCount >= SENSOR_STUCK_THRESHOLD) {
@@ -5743,35 +6272,52 @@ static bool validateSensorReading(uint8_t idx, float reading) {
       // only while the sample is in alarm: a reading in the latch's release zone (level moved
       // during the outage, or a stuck float recovered by changing state) holds it, so no
       // false alarm, and the normal debounce's clear then supersedes it; if the level returns
-      // to alarm before the latch clears, it is sent then. Two other recoveries are not
-      // hooked. A config update that turns stuck detection off publishes sensor-recovered,
-      // but reinitializeHardware() then clears every latch, this pending edge with it, and
-      // sends a clear (NEW-A), so client and server agree and the level re-latches from fresh
-      // samples; C-A02 must re-assert there if it keeps latches across a config save. The I2C
-      // sensor-only recovery in loop() clears sensorFailed silently; the server's
-      // fresh-telemetry sensor-fault self-clear still drops the level alarm on that path (C-A04).
-      if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
-        if (cfg.sensorInterface == SENSOR_DIGITAL) {
-          if (state.highAlarmLatched) {
-            bool triggerOnActivated = true;
-            (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);  // resolves the type only
-            state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
-          }
-        } else if (state.highAlarmLatched) {
-          state.pendingAlarm = ALARM_PENDING_HIGH;
-        } else if (state.lowAlarmLatched) {
-          state.pendingAlarm = ALARM_PENDING_LOW;
-        }
-        if (state.pendingAlarm != ALARM_PENDING_NONE) {
-          Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
-          Serial.println(cfg.name);
-        }
-      }
+      // to alarm before the latch clears, it is sent then. A config publishes sensor-recovered
+      // too: one that turns stuck detection off (applyConfigUpdate()), and reinitializeHardware()
+      // for a monitor that had failed. reinitializeHardware() then clears the latches of most
+      // monitors, a pending edge with them, and sends a clear (NEW-A), so client and server
+      // agree and the level re-latches from fresh samples. A pulse monitor that reads as before
+      // a charger programming run keeps its latches (C-A02: there is no reading to judge them
+      // by), and there the edge is re-asserted as here. The I2C sensor-only recovery in loop()
+      // clears sensorFailed silently; the server's fresh-telemetry sensor-fault self-clear still
+      // drops the level alarm on that path (C-A04).
+      queueLatchedAlarmReassertion(idx, reading);
     }
   }
   state.lastValidReading = reading;
   state.hasLastValidReading = true;
   return true;
+}
+
+// C-T01 (NEW-B): a sensor-recovered note went out, which the server takes as a clear, while the
+// monitor keeps its latch: the latched edge is queued as the pending one, a publish-only
+// re-assertion that evaluateAlarms() sends from a later sample in alarm (retryPendingAlarm()).
+// Nothing when the monitor's alarms are off, an edge is pending already, or no latch is set.
+// `reading` resolves the alarm type of a digital monitor, and only that.
+static void queueLatchedAlarmReassertion(uint8_t idx, float reading) {
+  if (idx >= gConfig.monitorCount) {
+    return;
+  }
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  MonitorRuntime &state = gMonitorState[idx];
+  if (!cfg.alarmsEnabled || state.pendingAlarm != ALARM_PENDING_NONE) {
+    return;
+  }
+  if (cfg.sensorInterface == SENSOR_DIGITAL) {
+    if (state.highAlarmLatched) {
+      bool triggerOnActivated = true;
+      (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);  // resolves the type only
+      state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
+    }
+  } else if (state.highAlarmLatched) {
+    state.pendingAlarm = ALARM_PENDING_HIGH;
+  } else if (state.lowAlarmLatched) {
+    state.pendingAlarm = ALARM_PENDING_LOW;
+  }
+  if (state.pendingAlarm != ALARM_PENDING_NONE) {
+    Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
+    Serial.println(cfg.name);
+  }
 }
 
 // ============================================================================
@@ -6279,6 +6825,52 @@ static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx) {
   // Poll the sampler (non-blocking burst)
   pollPulseSampler(idx);
 
+  // A charger programming run cut into this monitor's count: until a count that started after the
+  // run measures something, the reading is the one from before the run, and is not a new
+  // measurement (restartPulseCountsAfterChargerRun()). Nor is a result that only stands in for one
+  // (resultStandsIn): that of the count the run cut into, and that of a count of the time between
+  // two pulses that saw no second one, which is the reading from before the run again.
+  // sampleMonitors() does not take such a reading for an unload (sampleBeforeRun), nor validate it
+  // (sampleStandsIn) until a count that started after the run has ended. Every count of the time
+  // between two pulses that ends while the mark holds started after the run (the run's count was
+  // started again), and from the first that saw no second pulse on, the reading is validated, as a
+  // time-out's reading is without a run: a sensor that gives no pulses any more is found stuck as
+  // it would be without the run, also while an unload is tracked (validateSensorReading()), and
+  // does not hide behind the mark for good.
+  if (gRpmReadingBeforeRun[idx]) {
+    if (pctx.resultReady && !pctx.resultStandsIn) {
+      gRpmReadingBeforeRun[idx] = false;
+      gRpmTimedOutAfterRun[idx] = false;
+    } else {
+      if (pctx.resultReady && pctx.useTimeBased) {
+        gRpmTimedOutAfterRun[idx] = true;
+      }
+      gMonitorState[idx].sampleReused = true;
+      gMonitorState[idx].sampleBeforeRun = true;
+      gMonitorState[idx].sampleStandsIn = !gRpmTimedOutAfterRun[idx];
+    }
+  }
+
+  // Until a count of this monitor has ended, since boot or since a config started its count again
+  // (resetPulseMonitor()), the reading is the placeholder that the sampler gives meanwhile (0), not
+  // a measurement: with samples a few seconds apart and a count of a minute, a dozen of them would
+  // raise a low alarm or switch its relay before anything was measured. It is taken as a reading
+  // from before a run is: marked reused, so evaluateAlarms() neither latches nor clears an alarm
+  // with it, nor restores a relay after boot on it; not taken for an unload (sampleBeforeRun); and
+  // standing in, so sampleMonitors() does not validate it: it counts towards no stuck sensor, the
+  // last valid value stands (0 as at boot, also after a config: resetPulseMonitor()), and it gets
+  // no time. A count ends with its result, a measurement or that of a count of the time between
+  // two pulses that saw no second one in its time (the last reading, the placeholder at first),
+  // which is a reading from then on, as before. The first reading that is a measurement goes out
+  // whatever its change (gPulseMeasured, sampleMonitors()).
+  if (pctx.resultReady) {
+    gPulseCountEnded[idx] = true;
+  } else if (!gPulseCountEnded[idx]) {
+    gMonitorState[idx].sampleReused = true;
+    gMonitorState[idx].sampleBeforeRun = true;
+    gMonitorState[idx].sampleStandsIn = true;
+  }
+
   // Return the best available reading
   return readPulseSensorResult(idx);
 }
@@ -6294,6 +6886,8 @@ static float readMonitorSensor(uint8_t idx) {
 
   // Default to fresh each cycle; specific sensor paths mark reuse when needed.
   gMonitorState[idx].sampleReused = false;
+  gMonitorState[idx].sampleBeforeRun = false;
+  gMonitorState[idx].sampleStandsIn = false;
 
   const MonitorConfig &cfg = gConfig.monitors[idx];
 
@@ -6347,7 +6941,17 @@ static void sampleMonitors() {
     float inches = readMonitorSensor(i);
 
     // Validate sensor reading
-    if (!validateSensorReading(i, inches)) {
+    if (gMonitorState[i].sampleStandsIn) {
+      // A pulse monitor's reading from before a charger programming run, or its placeholder before
+      // a count of it has ended (readPulseSensor()): no new measurement, and no failed read
+      // either. It is not validated, so it counts towards no stuck sensor, no failure and no
+      // recovery, and the last valid value stands. Marked reused, it keeps its time and
+      // evaluateAlarms() holds its counters; the unload is not evaluated (sampleBeforeRun). Once a
+      // count that started after the run has timed out, such a reading is validated below as any
+      // other, still marked reused and not taken for an unload, and with no exemption from the
+      // stuck check for an unload that is tracked.
+      inches = gMonitorState[i].currentValue;
+    } else if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
       inches = gMonitorState[i].currentValue;
       gMonitorState[i].sampleReused = true;
@@ -6355,13 +6959,23 @@ static void sampleMonitors() {
       gMonitorState[i].currentValue = inches;
       if (!gMonitorState[i].sampleReused) {
         gMonitorState[i].lastReadingEpoch = sampleEpoch;
+        // A pulse monitor's first measurement since boot, or since a config started its count
+        // again (resetPulseMonitor()). What telemetry sent of it until now, if anything, was a
+        // placeholder (readPulseSensor()), marked reused and with no time, which the server keeps
+        // out of its history. That placeholder may be the value a change is measured from (a
+        // sample's baseline, or an on-demand request's), and a first measurement at 0 like it, or
+        // within the threshold of it, would not go out: so it goes out whatever its change.
+        if (gConfig.monitors[i].sensorInterface == SENSOR_PULSE && !gPulseMeasured[i]) {
+          gPulseMeasured[i] = true;
+          gMonitorState[i].lastReportedValue = -9999.0f;
+        }
       }
     }
 
     if (!deferPublishes) {
       // No current-loop monitor present: keep the original interleaved evaluate + publish.
       evaluateAlarms(i);
-      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed) {
+      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleBeforeRun) {
         evaluateUnload(i);
       }
       if (gConfig.monitors[i].enableServerUpload && !gMonitorState[i].sensorFailed) {
@@ -6390,8 +7004,9 @@ static void sampleMonitors() {
     const float inches = gMonitorState[i].currentValue;
     evaluateAlarms(i);
 
-    // Evaluate tank unload if tracking is enabled for this tank
-    if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed) {
+    // Evaluate tank unload if tracking is enabled for this tank (not for a pulse monitor's reading
+    // from before a charger programming run, see Phase A)
+    if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleBeforeRun) {
       evaluateUnload(i);
     }
 
@@ -6957,13 +7572,7 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
     // Check if this alarm type matches the relay trigger condition
     // relay_timeout is excluded — it is a notification, not an alarm trigger
     if (isAlarm) {
-      if (cfg.relayTrigger == RELAY_TRIGGER_ANY) {
-        shouldActivateRelay = true;
-      } else if (cfg.relayTrigger == RELAY_TRIGGER_HIGH && strcmp(alarmType, "high") == 0) {
-        shouldActivateRelay = true;
-      } else if (cfg.relayTrigger == RELAY_TRIGGER_LOW && strcmp(alarmType, "low") == 0) {
-        shouldActivateRelay = true;
-      }
+      shouldActivateRelay = alarmTriggersRelay(cfg, alarmType);
     } else if (!isRelayTimeout) {
       // BugFix 04022026 (CRITICAL-3): UNTIL_CLEAR relay clearing was broken.
       // When alarmType is "clear", comparing it against "high"/"low" always fails.
@@ -7881,6 +8490,833 @@ static void keepChargerReportTime(uint32_t epoch) {
 #else
   (void)epoch;
 #endif
+}
+
+// ============================================================================
+// Charger programming (SunSaver MPPT)
+// ============================================================================
+// A config asks for a LiFePO4 charging profile, the LVD and the LVR to be written into the
+// controller. What may be asked for, the order of the writes, the restarts and the journal are
+// in TankAlarm_SunSaverProgram.h (Common library), which tests/host/sunsaver_program runs on a
+// PC against a simulated SunSaver; SolarManager talks to the controller. This sketch reads the
+// request, keeps the journal in flash and sends the results to the server.
+
+// A start whose flash lost its files (initializeStorage(), before anything else writes to it):
+// the journal went with them, and may have said that a run was cut short. The format leaves
+// nothing that says so, and Supervisor::begin() keeps the cautious journal only in memory while
+// the look waits for the charger, so it goes into the new file system now: a restart before the
+// look still owes it. Flash that cannot take it is not used at this start, so that it stays empty
+// and the next start reads it the same way. It is unmounted too: some writers check only mbedFS
+// (the firmware marker, the solar state, the note buffer), and any file they left would make the
+// next start read a file system with files and no journal as one that was never asked anything.
+static void keepChargerLookAfterLostFiles() {
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  if (!gStorageLostFiles || !isStorageAvailable()) {
+    return;
+  }
+  if (saveChargerJournal(sunsaver::cautiousJournal())) {
+    return;
+  }
+  gStorageAvailable = false;
+  mbedFS->unmount();
+  delete mbedFS;  // takes "/cfg" away, so that no fopen() reaches the partition either
+  mbedFS = nullptr;
+  Serial.println(F("The charger journal could not be written to the flash that lost its files: running without persistence"));
+#endif
+}
+
+// The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
+// the last run came that reached the charger, and the results that have yet to go out. No file,
+// and no .tmp of one: nothing was ever asked. Only its .tmp: a save whose rename failed, which is
+// read as the journal that rename would have made it (saveChargerJournal() puts it in place
+// before it writes another). A journal, or such a .tmp, that is there and does not open or does
+// not read (readChargerJournalFile() tries three times), or runs out of memory as it is read, is
+// kept aside (keepUnreadChargerJournal()), and the charger gets a look. So it does for a file that
+// holds no journal (which is not kept: it never reads as more than that; the look goes to the
+// controller the config names, also when a journal kept aside owes another one), when there is no flash
+// to read it from, and when the flash lost its files at this start (keepChargerLookAfterLostFiles()
+// writes the cautious journal for it). The cautious journal also says that the record of the
+// requests answered was lost at this start, so that a request asked for before it is refused,
+// now and at later starts (sunsaver::cautiousJournal()). A journal kept aside at an earlier start
+// gives what it says is owed once it reads (takeKeptChargerJournal()), also at a start whose own
+// journal does not read. Firmware without
+// programming keeps what is owed for firmware that has it (see beginChargerProgramming()), and
+// says nothing of a look.
+static sunsaver::Journal loadChargerJournal() {
+  const sunsaver::Journal none = sunsaver::emptyJournal();
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  gChargerJournalInTmp = false;
+  gChargerJournalHeld = false;
+  gChargerKeptToRemove = false;
+  gChargerKeptDutyWaits = false;
+  if (!isStorageAvailable()) {
+    // The journal may say that a run was cut short, and nothing can show otherwise. Without flash
+    // nothing can be kept either, so saveChargerJournal() fails and no request is taken on: the
+    // look writes nothing, and only sends the restart a pending edit waits for.
+#if TANKALARM_SUNSAVER_PROGRAMMING
+    Serial.println(F("Charger programming: no flash to read its journal from, so the charger gets a look"));
+    addSerialLog("Charger programming: no flash at start, so the charger gets a look");
+#endif
+    return sunsaver::cautiousJournal();
+  }
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
+  const char *path = CHARGER_JOURNAL_FILE;
+  uint8_t read = readChargerJournalFile(path, buf, sizeof(buf));
+  if (read == CHARGER_JOURNAL_ABSENT) {
+    // Its .tmp alone is the journal, not a sign that none was ever written: reading none would
+    // drop what it says, such as the look owed after a run cut short or a flash that lost its
+    // files. A .tmp beside the journal is a save that never took its place, and is not read.
+    path = CHARGER_JOURNAL_TMP_FILE;
+    read = readChargerJournalFile(path, buf, sizeof(buf));
+    if (read == CHARGER_JOURNAL_READ) {
+      gChargerJournalInTmp = true;
+      Serial.println(F("Charger programming: the journal is only in its .tmp, which could not be renamed, and is read from there"));
+    }
+  }
+  if (read == CHARGER_JOURNAL_ABSENT) {
+    if (!gStorageLostFiles) {
+      return takeKeptChargerJournal(none, true);
+    }
+    // None on a flash that lost its files at this start: keepChargerLookAfterLostFiles() wrote
+    // one there, so that is not to be expected.
+#if TANKALARM_SUNSAVER_PROGRAMMING
+    Serial.println(F("Charger programming: the journal could not be opened, so the charger gets a look"));
+#endif
+    return sunsaver::cautiousJournal();
+  }
+  JsonDocument doc;
+  DeserializationError parsed = DeserializationError::Ok;
+  if (read == CHARGER_JOURNAL_READ) {
+    parsed = deserializeJson(doc, buf);
+    if (parsed == DeserializationError::NoMemory) {
+      read = CHARGER_JOURNAL_UNREAD;  // it may read at the next start: no file that holds no journal
+    }
+  }
+  if (read == CHARGER_JOURNAL_UNREAD) {
+#if TANKALARM_SUNSAVER_PROGRAMMING
+    Serial.println(F("Charger programming: the journal could not be read, so the charger gets a look"));
+    addSerialLog("Charger programming: the journal could not be read, so the charger gets a look");
+#endif
+    doc.clear();  // the memory it took goes to the save of the cautious journal
+    if (!keepUnreadChargerJournal(path)) {
+      return sunsaver::cautiousJournal();
+    }
+    // A journal kept aside at an earlier start holds the place, and may read now: it may say
+    // that a controller other than the one the config names waits for its restart. It is taken
+    // in as at a start whose journal reads. The cautious look stands for the journal that did not
+    // read now, so it is owed to the controller the config names: a duty the kept journal owes
+    // another controller follows it (sunsaver::keptDutyLeftOut(), takeKeptChargerDuty()). Nothing
+    // is written at this start, so the kept file stays, and the next start takes it in again.
+    sunsaver::Journal cautious = sunsaver::cautiousJournal();
+    cautious.controller = gConfig.solarCharger.modbusSlaveId;
+    return takeKeptChargerJournal(cautious, false);
+  }
+  sunsaver::Journal journal = sunsaver::cautiousJournal();
+  const bool readable = parsed == DeserializationError::Ok && sunsaver::holdsJournal(doc.as<JsonObjectConst>());
+  if (readable) {
+    journal = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
+  } else {
+    // A file that holds no journal (text that does not parse, or one that is not a journal) is
+    // not kept aside: it never reads as more than that. The cautious look stands for it, and so is
+    // owed to the controller the config names, as for a journal that does not read beside one kept
+    // aside (above). A look that a journal kept aside at an earlier start owes another controller
+    // then follows this one (sunsaver::keptDutyLeftOut(), takeKeptChargerDuty()), and does not take
+    // its place, which would leave the controller the config names waiting for its restart. The
+    // cautious journal that keepUnreadChargerJournal() writes names no controller, and reads as
+    // such: it stands for the journal it kept aside, whose look takes its place once that one reads.
+    journal.controller = gConfig.solarCharger.modbusSlaveId;
+  }
+#if TANKALARM_SUNSAVER_PROGRAMMING
+  if (journal.phase != sunsaver::JOURNAL_IDLE) {
+    if (gStorageLostFiles) {
+      Serial.println(F("Charger programming: the flash lost its files at this start, so the charger gets a look"));
+      addSerialLog("Charger programming: the flash lost its files at start, so the charger gets a look");
+    } else if (!readable) {
+      Serial.println(F("Charger programming: the journal could not be read, so the charger gets a look"));
+      addSerialLog("Charger programming: the journal could not be read, so the charger gets a look");
+    } else {
+      // A run that a restart cut short, or a start before this one whose flash lost its files.
+      Serial.println(F("Charger programming: the journal says a run may have been cut short, so the charger gets a look"));
+      addSerialLog("Charger programming: the journal says a run may have been cut short");
+    }
+  }
+#endif
+  if (journal.waitingId != 0) {
+    Serial.println(F("Charger programming: a request waited at this restart, and is answered as interrupted"));
+  }
+  if (journal.reportDue || journal.lookDue) {
+    Serial.println(F("Charger programming: a result had yet to go out at this restart, and is due again"));
+  }
+  return takeKeptChargerJournal(journal, false);
+#else
+  return none;
+#endif
+}
+
+#if defined(POSIX_FILE_IO_AVAILABLE)
+// Reads a journal file into `buf` (`size` bytes: its text and the zero that ends it). Returns
+// CHARGER_JOURNAL_READ, CHARGER_JOURNAL_ABSENT when there is no such file, or
+// CHARGER_JOURNAL_UNREAD when it did not open for another reason or did not read. That is tried
+// CHARGER_JOURNAL_READ_TRIES times in all, CHARGER_JOURNAL_RETRY_PAUSE_MS apart: it can pass.
+static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size) {
+  for (uint8_t attempt = 1;; ++attempt) {
+    errno = 0;
+    FILE *file = fopen(path, "r");
+    if (file == nullptr && errno == ENOENT) {
+      return CHARGER_JOURNAL_ABSENT;
+    }
+    if (file != nullptr) {
+      const size_t len = fread(buf, 1, size - 1, file);
+      const bool failed = ferror(file) != 0;
+      fclose(file);
+      if (!failed) {
+        buf[len] = '\0';
+        return CHARGER_JOURNAL_READ;
+      }
+    }
+    if (attempt >= CHARGER_JOURNAL_READ_TRIES) {
+      return CHARGER_JOURNAL_UNREAD;
+    }
+    delay(CHARGER_JOURNAL_RETRY_PAUSE_MS);
+  }
+}
+
+// A journal, or the .tmp that is its only copy, that is there and does not read at this start, or
+// runs out of memory as it is read. It is kept aside, so that the journal this start writes does
+// not take its place: it may say that a controller other than the one the config names now waits
+// for its restart, which the cautious look does not reach, and a later start takes that up once
+// it reads (takeKeptChargerJournal()). The cautious journal goes to flash at once, so that a
+// restart before the look still owes it. A file that cannot be moved, or a journal kept aside
+// before that is still there, is not written over at this start: no journal is
+// (saveChargerJournal()). Returns true when a journal kept aside at an earlier start holds the
+// place (or a file there that does not open): the caller takes it in (takeKeptChargerJournal()).
+static bool keepUnreadChargerJournal(const char *path) {
+  errno = 0;
+  FILE *kept = fopen(CHARGER_JOURNAL_KEPT_FILE, "r");
+  const bool keptFree = kept == nullptr && errno == ENOENT;
+  if (kept != nullptr) {
+    fclose(kept);
+  }
+  // One kept aside at an earlier start and not taken up since is not put out of the way for it.
+  errno = 0;
+  if (keptFree && rename(path, CHARGER_JOURNAL_KEPT_FILE) == 0) {
+    gChargerJournalInTmp = false;  // a .tmp that was read is the kept file now
+    Serial.print(F("Charger programming: the journal that could not be read is kept as "));
+    Serial.println(CHARGER_JOURNAL_KEPT_FILE);
+    saveChargerJournal(sunsaver::cautiousJournal());
+    return false;
+  }
+  if (keptFree && errno == ENOENT) {
+    return false;  // nothing is there after all, to be kept or written over
+  }
+  gChargerJournalHeld = true;
+  Serial.println(F("Charger programming: the journal could not be read or kept aside, so no journal is written at this start"));
+  addSerialLog("Charger programming: the journal could not be read or kept aside");
+  return !keptFree;
+}
+
+// A journal kept aside at an earlier start because it could not be read then
+// (keepUnreadChargerJournal()). Once it reads, what it holds that `journal`, the journal read now,
+// does not comes into it (sunsaver::mergeKeptJournal()): above all the look owed to the controller
+// its run talked to, which the cautious look of that start did not reach when the config names
+// another one now, and the requests it answered. Where no journal was found (`absent`) it is the
+// journal. The journal says that it took this one in, by the check value of its text
+// (sunsaver::Journal::keptTaken), and goes to flash; the kept file is removed once a journal that
+// says so is there (saveChargerJournal()). A start whose journal says so already, because that
+// removal did not go through, removes the file and takes nothing in again: it may have settled
+// the look since. One that still does not read, or runs out of memory as it is read, stays, and
+// owes a look while no journal speaks for this client.
+static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent) {
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
+  const uint8_t read = readChargerJournalFile(CHARGER_JOURNAL_KEPT_FILE, buf, sizeof(buf));
+  if (read == CHARGER_JOURNAL_ABSENT) {
+    return journal;
+  }
+  const uint32_t check = read == CHARGER_JOURNAL_READ ? keptChargerJournalCheck(buf) : 0;
+  if (!absent && check != 0 && journal.keptTaken == check) {
+    Serial.println(F("Charger programming: a journal kept aside was taken in at an earlier start, and is removed now"));
+    removeKeptChargerJournal();
+    return journal;
+  }
+  JsonDocument doc;
+  DeserializationError parsed = DeserializationError::Ok;
+  if (read == CHARGER_JOURNAL_READ) {
+    parsed = deserializeJson(doc, buf);
+  }
+  if (read == CHARGER_JOURNAL_UNREAD || parsed == DeserializationError::NoMemory) {
+    Serial.println(F("Charger programming: a journal kept aside at an earlier start still cannot be read"));
+    // The journal says from when its record of the requests answered is whole: from the start that
+    // kept this one aside (sunsaver::cautiousJournal()).
+    return absent ? sunsaver::cautiousJournal() : journal;
+  }
+  // One that holds no journal says no more than the cautious journal.
+  const sunsaver::Journal kept =
+      parsed == DeserializationError::Ok ? sunsaver::decodeJournal(doc.as<JsonObjectConst>()) : sunsaver::cautiousJournal();
+  // A duty it owes a controller that the journal does not owe one to, while the journal owes one
+  // to another controller, does not fit in: the file stays until that one is settled, and
+  // everything else comes in now.
+  const bool dutyLeftOut = !absent && sunsaver::keptDutyLeftOut(journal, kept);
+  journal = absent ? kept : sunsaver::mergeKeptJournal(journal, kept);
+  if (dutyLeftOut) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "Charger programming: a journal kept aside owes charger %u a look, which follows the one owed to charger %u",
+             (unsigned)kept.controller, (unsigned)journal.controller);
+    Serial.println(line);
+    addSerialLog(line);
+    gChargerKeptDutyWaits = true;
+    gChargerKeptJournal = kept;
+    gChargerKeptCheck = check;
+    saveChargerJournal(journal);  // the kept file stays
+    return journal;
+  }
+  journal.keptTaken = check;
+  Serial.println(F("Charger programming: a journal kept aside at an earlier start reads now, and what it says is owed is taken up"));
+  addSerialLog("Charger programming: a journal kept aside at an earlier start reads now");
+  gChargerKeptToRemove = true;
+  saveChargerJournal(journal);  // which removes the kept file once flash has the journal
+  return journal;
+}
+
+// The duty of the journal kept aside that this start left out, because the journal owed a duty
+// to another controller (gChargerKeptDutyWaits): taken up in the first pass in which none is owed
+// any more, before serviceChargerProgramming() lets a request run, from the journal this start
+// read from the kept file (gChargerKeptJournal), and the file removed once flash holds a journal
+// that says so. Nothing is read again: the handing over cannot fail.
+static void takeKeptChargerDuty() {
+  if (!gChargerKeptDutyWaits || gSolarManager.chargerProgramming().dutyOwed()) {
+    return;
+  }
+  gChargerKeptDutyWaits = false;
+  if (!gSolarManager.takeKeptChargerDuty(gChargerKeptJournal, gChargerKeptCheck)) {
+    return;  // cannot happen: no duty is owed, and the kept journal owes one (keptDutyLeftOut())
+  }
+  char line[96];
+  snprintf(line, sizeof(line), "Charger programming: the look a journal kept aside owes charger %u is taken up now",
+           (unsigned)gChargerKeptJournal.controller);
+  Serial.println(line);
+  addSerialLog(line);
+  gChargerKeptToRemove = true;
+  if (!gSolarManager.chargerProgramming().journalUnsaved()) {
+    removeKeptChargerJournal();
+  }
+}
+
+// The check value of a kept journal's text (32-bit FNV-1a), never 0: 0 stands for none.
+static uint32_t keptChargerJournalCheck(const char *text) {
+  uint32_t hash = 2166136261u;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; ++p) {
+    hash = (hash ^ *p) * 16777619u;
+  }
+  return hash != 0 ? hash : 1u;
+}
+
+// Removes the kept journal that was taken in. Tried again after each journal that flash takes
+// while it stays (gChargerKeptToRemove).
+static void removeKeptChargerJournal() {
+  errno = 0;
+  if (remove(CHARGER_JOURNAL_KEPT_FILE) == 0 || errno == ENOENT) {
+    gChargerKeptToRemove = false;
+    return;
+  }
+  gChargerKeptToRemove = true;
+}
+#endif
+
+// The journal's writer (SolarManager::ChargerJournalWriter): true only once the file holds it.
+// A journal that was read from its .tmp is renamed into place first, or nothing is written: the
+// write goes to that .tmp, and would take its only copy away before it took the journal's place.
+// Nothing is written over a journal that could not be read or kept aside at this start
+// (keepUnreadChargerJournal()).
+static bool saveChargerJournal(const sunsaver::Journal &journal) {
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  if (!isStorageAvailable() || gChargerJournalHeld) {
+    return false;
+  }
+  JsonDocument doc;
+  sunsaver::encodeJournal(journal, doc.to<JsonObject>());
+  if (doc.overflowed()) {
+    return false;  // out of memory: it would still serialize, without what did not fit
+  }
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 2];
+  const size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len == 0 || len > sunsaver::JOURNAL_JSON_MAX) {
+    return false;
+  }
+  if (gChargerJournalInTmp) {
+    errno = 0;
+    if (rename(CHARGER_JOURNAL_TMP_FILE, CHARGER_JOURNAL_FILE) != 0 && errno != ENOENT) {
+      return false;  // the .tmp stays as it is, and the next start reads it again
+    }
+    gChargerJournalInTmp = false;
+  }
+  if (!tankalarm_posix_write_file_atomic(CHARGER_JOURNAL_FILE, buf, len)) {
+    return false;
+  }
+  if (gChargerKeptToRemove && journal.keptTaken != 0) {
+    removeKeptChargerJournal();  // flash holds a journal that took it in
+  }
+  return true;
+#else
+  (void)journal;
+  return false;
+#endif
+}
+
+// What keeps this client from taking a request on, as far as it can tell without the
+// controller: Refusal bits, 0 when nothing does. The battery counts as the server's
+// configSuitsChargerProgram() counts it: on, LiFePO4, 12 V. A config may switch the battery off
+// and leave its type as it was.
+static uint32_t chargerProgramClientRefusals() {
+  uint32_t refusals = 0;
+  if (!gConfig.batteryMonitor.enabled || chargerCheckChemistry() != sunsaver::CHEMISTRY_LIFEPO4 ||
+      gConfig.batteryMonitor.nominalVoltage != 12) {
+    refusals |= sunsaver::REFUSE_NOT_LIFEPO4;
+  }
+  if (!gConfig.solarCharger.enabled || !gSolarManager.isInitialized()) {
+    refusals |= sunsaver::REFUSE_NO_CHARGER;
+  }
+  return refusals;
+}
+
+static void logChargerProgramWithdrawn(uint32_t requestId) {
+  char line[96];
+  snprintf(line, sizeof(line), "Charger programming: request %lu withdrawn after a config change",
+           (unsigned long)requestId);
+  Serial.println(line);
+  addSerialLog(line);
+}
+
+// A config's "solarCharger.program", or a null object for a config without one (with or without
+// a "solarCharger" block): applyConfigUpdate() calls this for every config. Only a request with
+// an id is acted on: the server adds one when a person asks
+// for the values to be written, and the client answers each id once. The server also puts the
+// id of a request that has no result yet into each later config that asks for the same values,
+// so a config without that id (the values changed, or none are asked for) withdraws a request
+// that waits. The client refuses by itself what it can tell without the controller.
+static void handleChargerProgramRequest(JsonObjectConst program) {
+  const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
+  const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
+  if (waitingId != 0 && requestId < waitingId) {
+    if (gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_WITHDRAWN | chargerProgramClientRefusals(),
+                                             currentEpoch())) {
+      logChargerProgramWithdrawn(waitingId);
+    }
+    return;
+  }
+  if (requestId == 0) {
+    return;  // the values only travel with the config: nothing is to be written
+  }
+  takeChargerProgramRequest(program, requestId);
+}
+
+// The request of a config, with its id: taken on, or refused by the client itself.
+static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId) {
+  sunsaver::Profile profile;
+  const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
+  const uint32_t refusals = chargerProgramClientRefusals();
+  if (!gSolarManager.requestChargerProgram(requestId, profile, profileErrors, refusals,
+                                           sunsaver::readLoadAllowed(program), currentEpoch(),
+                                           sunsaver::readRequestAt(program))) {
+    return;  // the config again: this request has had its answer, or waits already
+  }
+  Serial.print(F("Charger programming: request "));
+  Serial.print(requestId);
+  Serial.println(gSolarManager.chargerProgramming().requestWaiting()
+                     ? F(" waits for the clock and the charger")
+                     : F(" refused"));
+}
+
+// After each config: a request that waits is withdrawn once the client could no longer take it
+// on (the battery is off, or no longer 12 V LiFePO4, or the charger is off). A config that
+// carries the request again does not change that.
+static void withdrawUnsuitedChargerProgram() {
+  const uint32_t refusals = chargerProgramClientRefusals();
+  const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
+  if (refusals != 0 && gSolarManager.withdrawChargerProgram(refusals, currentEpoch())) {
+    logChargerProgramWithdrawn(waitingId);
+  }
+}
+
+// Before a config's request is looked at: a request that waits was asked for the charger the
+// config named then (`before`, its Modbus id), and its run would talk to the one the config names
+// now (SolarManager::serviceChargerProgramming()). A config that names another charger withdraws
+// it, also when it carries the request again: the server carries a request on with each config
+// that asks for the same values, whatever charger it names (the config page sends no Modbus id,
+// so such a config was made another way). The request is then answered, so the same id does not
+// wait again, and a new request, asked for with the new charger in the config, can write to that
+// one. A duty that is owed stays with the charger its run talked to.
+static void withdrawChargerProgramForOtherCharger(uint8_t before) {
+  if (gConfig.solarCharger.modbusSlaveId == before) {
+    return;
+  }
+  const uint32_t waitingId = gSolarManager.chargerProgramming().waitingRequestId();
+  if (gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_WITHDRAWN | chargerProgramClientRefusals(),
+                                           currentEpoch())) {
+    char line[128];
+    snprintf(line, sizeof(line), "Charger programming: request %lu withdrawn, the config names charger %u in place of %u",
+             (unsigned long)waitingId, (unsigned)gConfig.solarCharger.modbusSlaveId, (unsigned)before);
+    Serial.println(line);
+    addSerialLog(line);
+  }
+}
+
+// A config that names another charger (another Modbus id) than `before`, the one the config named
+// until now with the charger on (`wasOn`), or that turns the charger off. A look that the journal
+// owes to no charger it names (sunsaver::cautiousJournal(): a start could not tell what its
+// journal held) goes to the one the config names at each try, and stands for a run that talked to
+// the one the config named then: a look at another one would settle it without asking the
+// charger that may wait for its restart. So it stays with `before` (sunsaver::Supervisor::
+// bindDuty()). With the charger off, the config may be the default one (a start without flash,
+// or with flash that lost its files), whose Modbus id names no charger in particular: the look
+// then goes to the one the config names, as before. That is why the look is bound as the charger
+// goes off, too, whatever Modbus id the config gives: a later config would name the next charger
+// with the charger off, and the look would go to that one. The new config waits for the journal
+// that binds the look: persistConfigIfDirty() saves no config until flash has taken it, so that a
+// restart never finds the new config beside a journal that names no charger, which would send the
+// look to the one the new config names.
+static void bindChargerDutyBeforeOtherCharger(uint8_t before, bool wasOn) {
+  const bool sameCharger = gConfig.solarCharger.enabled && gConfig.solarCharger.modbusSlaveId == before;
+  if (!wasOn || sameCharger || !gSolarManager.bindChargerDuty(before)) {
+    return;
+  }
+  gChargerDutyBindingUnsaved = gSolarManager.chargerProgramming().journalUnsaved();
+  char line[128];
+  if (gConfig.solarCharger.enabled) {
+    snprintf(line, sizeof(line), "Charger programming: the look owed stays with charger %u, which the config named before charger %u",
+             (unsigned)before, (unsigned)gConfig.solarCharger.modbusSlaveId);
+  } else {
+    snprintf(line, sizeof(line), "Charger programming: the look owed stays with charger %u, which the config named before it turned the charger off",
+             (unsigned)before);
+  }
+  Serial.println(line);
+  addSerialLog(line);
+}
+
+// The time between two samples of the monitors, in the power state the client is in.
+static unsigned long sampleIntervalMs() {
+  unsigned long interval = (unsigned long)gConfig.sampleSeconds * 1000UL;
+  if (gPowerState == POWER_STATE_ECO) {
+    interval *= POWER_ECO_SAMPLE_MULTIPLIER;
+  } else if (gPowerState == POWER_STATE_LOW_POWER) {
+    interval *= POWER_LOW_SAMPLE_MULTIPLIER;
+  }
+  return interval;
+}
+
+// A run holds loop() for up to a minute (sunsaver::RUN_LIMIT_MS; about 10 seconds on a line that
+// answers), and with it the sampling of the monitors, which also decides their alarms. So the
+// run of a request does not start while the next sample is due within that minute: it starts
+// once that sample has been taken. Samples two minutes apart or less leave no such time, and
+// then a run may hold one up, by a minute at most: it is taken as the run returns
+// (takeSampleDueAfterChargerRun()). A look that a run left owed is not held (the
+// charger may wait for its restart), and nothing is held where no sample is due: in hibernation,
+// or without monitors.
+static bool chargerRunWouldHoldSample() {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  if (!programming.requestWaiting() || programming.dutyOwed() || gConfig.monitorCount == 0 ||
+      gPowerState == POWER_STATE_CRITICAL_HIBERNATE) {
+    return false;
+  }
+  const unsigned long interval = sampleIntervalMs();
+  if (interval <= 2UL * sunsaver::RUN_LIMIT_MS) {
+    return false;
+  }
+  const unsigned long since = millis() - gLastTelemetryMillis;
+  return since >= interval || interval - since <= sunsaver::RUN_LIMIT_MS;
+}
+
+// A pulse monitor counts pulses only while a sample is taken: each sample polls its count for a
+// moment (pollPulseSampler()). A charger programming run that held up a sample took such moments
+// from a count under way. A count of pulses then has fewer of them than its time asks for, a
+// count of the time between two pulses can measure it across the run, and an accumulated count,
+// whose time runs from one result to the next, has the run's time without its pulses. Each would
+// read low, which could raise a low alarm. So a count of pulses or of the time between them that
+// is under way is started again by the sample that follows, and an accumulated count gives no
+// result this once: the last reading stands, and the next count starts as after any result.
+// Until a count that started after the run measures something (a count of the time between two
+// pulses that sees no second one gives the last reading again), the monitor reads as before the
+// run, and that reading is marked reused, as one that is not a new measurement: it neither latches
+// nor clears an alarm, counts towards no unload, and does not count as a reading taken now. Until
+// a count that started after the run has ended, it counts towards no stuck sensor, failure or
+// recovery either; from a count of the time between two pulses that saw no second one on, it does,
+// as without the run (readPulseSensor(), sampleMonitors()).
+// takeSampleDueAfterChargerRun() calls this only after a run that held up a sample: one that held
+// up none took no such moment.
+static void restartPulseCountsAfterChargerRun() {
+  for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    if (gConfig.monitors[i].sensorInterface != SENSOR_PULSE) {
+      continue;
+    }
+    PulseSamplerContext &ctx = gPulseSampler[i];
+    if (ctx.useAccumulatedMode) {
+      gRpmAccumulatedCutByRun[i] = true;
+    } else if (ctx.state == PULSE_STATE_SAMPLING) {
+      ctx.state = PULSE_STATE_IDLE;  // readPulseSensor() starts it again
+    } else {
+      continue;  // the run cut into no count
+    }
+    gRpmReadingBeforeRun[i] = true;
+    gRpmTimedOutAfterRun[i] = false;  // it stands in again until a count after this run has ended
+  }
+}
+
+// A sample of the monitors that came due while a charger programming run held loop(), taken as
+// soon as the run returns, with the time it returned: so a run holds a sample up by its own time
+// alone (a minute at most), and not by what the rest of that pass does as well. Not in
+// hibernation, and not without monitors, as at the top of loop(). The pulse counts that the run
+// cut into start again first (restartPulseCountsAfterChargerRun()).
+static void takeSampleDueAfterChargerRun() {
+  if (gPowerState == POWER_STATE_CRITICAL_HIBERNATE || gConfig.monitorCount == 0) {
+    return;
+  }
+  const unsigned long at = millis();
+  if (at - gLastTelemetryMillis >= sampleIntervalMs()) {
+    restartPulseCountsAfterChargerRun();
+    gLastTelemetryMillis = at;
+    sampleMonitors();
+  }
+}
+
+// Call from every pass of loop(). `allowed` is false in a pass in which a poll talked to the
+// charger, and while the run of a request would hold up a sample (chargerRunWouldHoldSample()).
+// A firmware update that is being staged holds programming back too, hibernation does
+// not: a run reads the battery first and refuses one below the new LVR, and a charger that
+// waits for its restart after a run that was cut short should not wait any longer. Returns true
+// when it talked to the charger.
+//
+// A request runs only once the config is in flash: the config that carried it may have come in
+// this pass, and is saved at its end (persistConfigIfDirty()). A restart during the run, or a
+// config that flash does not take, would leave the charger on values that the config this client
+// starts with next does not ask for. So the config is saved first, and a request whose config
+// flash does not take is refused (REFUSE_CONFIG_UNSAVED). A look that a run cut short left owed
+// does not wait for the config: it writes nothing, and goes first anyway.
+//
+// The config is saved first too while a result is in RAM alone (Supervisor::resultOnlyInRam()),
+// before that result goes out below (sendDueChargerProgramReport()). A request refused at once
+// because flash did not take the journal (REFUSE_JOURNAL) is answered in RAM alone, and the
+// config file is then where its answer is kept (gChargerAnsweredKept). Sent first, the answer
+// could reach the server while flash had it in neither file, and a restart before the save at
+// the end of this pass would take the request on again from the config the server sends again.
+// When flash does not take the config either, the result still goes out: nothing can keep it.
+static bool serviceChargerProgramming(unsigned long now, bool allowed) {
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  takeKeptChargerDuty();
+#endif
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  if (gConfigDirty && (programming.requestWaiting() || programming.resultOnlyInRam())) {
+    persistConfigIfDirty();
+    const uint32_t waitingId = programming.waitingRequestId();
+    if (gConfigDirty &&
+        gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_CONFIG_UNSAVED | chargerProgramClientRefusals(),
+                                             currentEpoch())) {
+      char line[112];
+      snprintf(line, sizeof(line), "Charger programming: request %lu refused: flash did not take the config that carried it",
+               (unsigned long)waitingId);
+      Serial.println(line);
+      addSerialLog(line);
+    }
+  }
+  const bool talked = gSolarManager.serviceChargerProgramming(
+      currentEpoch(),
+      allowed && !gDfuInProgress && !chargerRunWouldHoldSample() && !relayTimeRunsOutDuringChargerRun());
+  if (talked) {
+    // The run held loop() for up to a minute, and its hook (switchOffRelaysTimeUp()) does not run
+    // after its last request. Before anything is reported, a relay whose time ran out goes off,
+    // and what waits for checkRelayMomentaryTimeout() goes out too: the command that switches a
+    // remote relay off and the alarm of a safety timeout. Not in hibernation, where loop() does
+    // not call it either. A run does not start while a relay's time would run out before it ends
+    // (relayTimeRunsOutDuringChargerRun()): this is for a run that took longer than its limit, as
+    // a request can take longer than the bus says one may (sunsaver::modbusRequestLimitMs()).
+    switchOffRelaysTimeUp();
+    if (gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
+      checkRelayMomentaryTimeout(millis());
+    }
+    // A sample of the monitors that came due during the run is taken now, before what is left of
+    // this pass: a firmware check, the daily report and the rest of the Notecard's work could
+    // hold it up for some seconds more.
+    takeSampleDueAfterChargerRun();
+    // The charger may hold other settings now: check them again, and send that report at once.
+    requestChargerCheck();
+    // Its result goes out in the next pass, which loop() begins without a sleep.
+    return true;
+  }
+  sendDueChargerProgramReport(now);
+  return talked;
+}
+
+// A result on the serial console, once, as it comes about: what describeProgramResult() gives
+// the server's charger page.
+static void printChargerProgramResult(uint32_t requestId, const sunsaver::ProgramResult &result) {
+  JsonDocument doc;
+  JsonObject out = doc.to<JsonObject>();
+  sunsaver::describeProgramResult(result, out);
+  if (doc.overflowed()) {
+    Serial.print(F("Charger programming, request "));
+    Serial.print((unsigned long)requestId);
+    Serial.println(F(": not enough memory to print the result"));
+    return;
+  }
+  char line[128];
+  snprintf(line, sizeof(line), "Charger programming, request %lu: %s", (unsigned long)requestId,
+           out["summary"].as<const char *>());
+  Serial.println(line);
+  addSerialLog(line);
+  Serial.print(F("  "));
+  Serial.println(out["text"].as<const char *>());
+  if (out["restart"].is<const char *>()) {
+    Serial.print(F("  Restart: "));
+    Serial.println(out["restart"].as<const char *>());
+  }
+  if (out["battery"].is<const char *>()) {
+    Serial.print(F("  Battery when it began: "));
+    Serial.println(out["battery"].as<const char *>());
+  }
+  if (out["load"].is<const char *>()) {
+    Serial.print(F("  "));
+    Serial.println(out["load"].as<const char *>());
+  }
+  for (JsonVariantConst reason : out["reasons"].as<JsonArrayConst>()) {
+    Serial.print(F("  - "));
+    Serial.println(reason.as<const char *>());
+  }
+  for (JsonVariantConst note : out["notes"].as<JsonArrayConst>()) {
+    Serial.print(F("  Note: "));
+    Serial.println(note.as<const char *>());
+  }
+  for (JsonArrayConst row : out["registers"].as<JsonArrayConst>()) {
+    // [name, label, before, wanted, how it went]
+    Serial.print(F("    "));
+    Serial.print(row[0].as<const char *>());
+    Serial.print(F(": "));
+    Serial.print(row[2].as<const char *>());
+    Serial.print(F(" -> "));
+    Serial.print(row[3].as<const char *>());
+    Serial.print(F(", "));
+    Serial.println(row[4].as<const char *>());
+  }
+  if (result.followUp) {
+    Serial.println(F("  The charger gets another look once it answers, and the server another result."));
+  }
+}
+
+// Counts the age of one result that waits without a time of its own (ChargerResultAge), from the
+// supervisor's millis() of it: a new one starts at 0.
+static void ageChargerProgramResult(ChargerResultAge &age, bool waits, uint32_t requestId, uint32_t at) {
+  if (!waits) {
+    age.counted = false;
+    return;
+  }
+  if (!age.counted || age.requestId != requestId || age.at != at) {
+    age.counted = true;
+    age.requestId = requestId;
+    age.at = at;
+    age.seconds = 0;
+    age.agedMillis = at;
+  }
+  const uint32_t seconds = ((uint32_t)millis() - age.agedMillis) / 1000u;
+  age.seconds += seconds;
+  age.agedMillis += seconds * 1000u;
+}
+
+// The age of both results that may wait, in every pass, before anything that makes one wait, so
+// that no millis() difference comes near a turn of millis() (49.7 days). Taken once, after the
+// device UID or the clock took that long, or after the other result went out first, it would date
+// a result as hours old, and the server could keep an older result of the same request over it.
+// A result with a time of its own needs none (sunsaver::Journal::reportEpoch).
+static void ageChargerProgramResults() {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  const sunsaver::Journal &journal = programming.journal();
+  ageChargerProgramResult(gChargerResultAges[0], journal.reportDue && journal.reportEpoch == 0, journal.reportId,
+                          programming.resultMillis());
+  ageChargerProgramResult(gChargerResultAges[1], journal.lookDue && journal.lookEpoch == 0, 0,
+                          programming.lookMillis());
+}
+
+// Hands the result that is due to the Notecard, and keeps it due until the Notecard has it:
+// until then it is in the journal in flash too. A newer result takes the place of one that has
+// not gone out yet, unless it answers an older request; a look for no request has a place of its
+// own, and when both wait the one that came about first goes first (sunsaver::Supervisor).
+static void sendDueChargerProgramReport(unsigned long now) {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  ageChargerProgramResults();
+  if (!programming.reportDue()) {
+    return;
+  }
+  const uint32_t requestId = programming.reportRequestId();
+  const uint32_t resultAt = programming.reportMillis();
+  if (!gChargerProgramReportSeen || requestId != gChargerProgramReportId || resultAt != gChargerProgramReportAt) {
+    gChargerProgramReportSeen = true;
+    gChargerProgramReportId = requestId;
+    gChargerProgramReportAt = resultAt;
+    gChargerProgramReportEpoch = 0;
+    gChargerProgramReportTried = false;
+    printChargerProgramResult(requestId, programming.report());
+    if (!deviceUidKnown()) {
+      Serial.println(F("Charger programming: the result goes out once the Notecard has given this client its device UID"));
+    }
+  }
+  // Under the device label the server takes no note, and under a kept UID that may be another
+  // Notecard's it keeps the result for another client. Either way the result would count as taken
+  // (see sendDueChargerReport()): it waits in the journal for the client's id.
+  if (!deviceUidKnown()) {
+    return;
+  }
+  // The server keeps the newest result of a request by its time, as it keeps charger reports
+  // (see sendDueChargerReport()). The supervisor knows the time when the clock was set as the
+  // result came about. Otherwise it is worked out once, when the clock has one: from the millis()
+  // of the result, which for a result kept across a restart is the moment of that restart. It
+  // goes out later than the last result of the same request did, whatever the clock did since,
+  // and from then on it is the result's own (Supervisor::reportSending()): a restart that brings
+  // the result back sends it with that time again, not with the time of the restart.
+  if (gChargerProgramReportEpoch == 0) {
+    uint32_t epoch = programming.reportEpoch();
+    if (epoch == 0) {
+      const double nowEpoch = currentEpoch();
+      if (nowEpoch <= 0.0) {
+        return;
+      }
+      const ChargerResultAge &age = gChargerResultAges[requestId == 0 ? 1 : 0];
+      const double at =
+          nowEpoch - (double)age.seconds - (double)(uint32_t)((uint32_t)millis() - age.agedMillis) / 1000.0;
+      epoch = at >= 1.0 ? (uint32_t)at : 1u;
+    }
+    gChargerProgramReportEpoch = programming.sendEpoch(epoch);
+  }
+  if (gChargerProgramReportTried && (now - gChargerProgramReportTryMillis) < CHARGER_PROGRAM_REPORT_RETRY_MS) {
+    return;
+  }
+  // The time goes into the journal before the result goes out: the Notecard may take it, and this
+  // client restart before the journal says so, and a later result of the same request (a later
+  // look) must go out later still. When flash does not take it, the result goes out all the
+  // same, as it would without flash: it is all a person learns of the run, and may be the
+  // refusal that says flash failed. A restart would lose that result anyway.
+  if (!gSolarManager.chargerProgramReportSending(gChargerProgramReportEpoch) && !gChargerProgramReportTried) {
+    Serial.println(F("Charger programming: flash did not take the time the result goes out with"));
+  }
+
+  // On the config-ack notefile, as the charger report: the server tells it by the "chg-" status.
+  JsonDocument doc;
+  JsonObject body = doc.to<JsonObject>();
+  body["c"] = gDeviceUID;
+  body["st"] = "chg-prog";
+  body["req"] = requestId;
+  body["epoch"] = gChargerProgramReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
+  sunsaver::encodeProgramResult(programming.report(), body);
+  // To the Notecard, and not into the note buffer: the journal keeps the result until the
+  // Notecard has it, and the buffer drops its oldest records when it grows too large.
+  if (!publishNoteToNotecard(CONFIG_ACK_OUTBOX_FILE, doc, true)) {  // a person waits for it at the charger page
+    if (!gChargerProgramReportTried) {
+      Serial.println(F("Charger programming: the Notecard did not take the result, which waits in the journal: trying again every 10 minutes"));
+    }
+    gChargerProgramReportTried = true;
+    gChargerProgramReportTryMillis = now;
+    return;
+  }
+  if (gChargerProgramReportTried) {
+    Serial.println(F("Charger programming: the result that waited has gone out"));
+  }
+  gSolarManager.chargerProgramReportTaken(gChargerProgramReportEpoch);
 }
 
 // Append solar charger data to daily report (called from sendDailyReport)
@@ -9283,7 +10719,8 @@ static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow) {
 }
 
 // Returns true only when the Notecard has the note, for a caller that keeps the note itself
-// until then: the note buffer drops its oldest records once it outgrows NOTE_BUFFER_MAX_BYTES
+// until then (a programming result in its journal in flash, a charger report in RAM): the note
+// buffer drops its oldest records once it outgrows NOTE_BUFFER_MAX_BYTES
 // (pruneNoteBufferIfNeeded()), and a note it dropped would count as sent.
 static bool publishNoteToNotecard(const char *fileName, JsonDocument &doc, bool syncNow) {
   return sendNote(fileName, doc, syncNow, false);
@@ -9306,10 +10743,11 @@ static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool
 
   // A document that ran out of memory while it was filled in still serializes, without the members
   // that did not fit. A caller that keeps its note and tries again (publishNoteToNotecard(): the
-  // charger report) gets false: as sent, the report would say less than it seems to and would not
-  // go again. Every other note goes out with what fit, as it did before: its caller keeps no copy
-  // to try again with, and ignores the result (publishAlarmNote() among them, which has already
-  // cleared the alarm's pending edge), so an alarm that is not sent here is lost.
+  // charger report and the programming result) gets false: as sent, such a note would say less
+  // than it seems to and would not go again. Every other note goes out with what fit, as it did
+  // before: its caller keeps no copy to try again with, and ignores the result (publishAlarmNote()
+  // among them, which has already cleared the alarm's pending edge), so an alarm that is not sent
+  // here is lost.
   if (doc.overflowed()) {
     if (!mayBuffer) {
       Serial.println(F("publishNote: out of memory while the note was filled in, kept for a new try"));
@@ -10264,77 +11702,127 @@ static void triggerRemoteRelays(const char *targetClient, uint8_t relayMask, boo
 // Check and deactivate relays that have exceeded their individual momentary timeout
 // or the safety max-on timeout for MANUAL_RESET mode.
 // Each relay is tracked independently via gRelayRuntime[].
-static void checkRelayMomentaryTimeout(unsigned long now) {
-  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
-    if (!gRelayRuntime[r].active) continue;
-    
-    uint8_t monIdx = gRelayRuntime[r].ownerMonitor;
-    uint32_t elapsedMs = now - gRelayRuntime[r].activatedAt;
-    
-    bool expired = false;
-    const char *reason = nullptr;
-    bool hasOwner = (monIdx < gConfig.monitorCount);
-    
-    if (hasOwner) {
-      const MonitorConfig &cfg = gConfig.monitors[monIdx];
-      
-      // Check momentary mode timeout
-      if (cfg.relayMode == RELAY_MODE_MOMENTARY) {
-        uint16_t seconds = cfg.relayMomentarySeconds[r];
-        if (seconds == 0) {
-          seconds = DEFAULT_RELAY_MOMENTARY_SECONDS;
-        }
-        uint32_t durationMs = (uint32_t)seconds * 1000UL;
-        if (elapsedMs >= durationMs) {
-          expired = true;
-          reason = "momentary timeout";
-        }
+// Why relay `r` is to go off now, or nullptr while it stays on: the time of a momentary relay
+// is up, or the safety limit of one that stays on until it is reset, or the duration a manual
+// command gave a relay that no monitor owns.
+static const char *relayTimeUp(uint8_t r, unsigned long now) {
+  if (!gRelayRuntime[r].active) {
+    return nullptr;
+  }
+  const uint8_t monIdx = gRelayRuntime[r].ownerMonitor;
+  const uint32_t elapsedMs = now - gRelayRuntime[r].activatedAt;
+  if (monIdx < gConfig.monitorCount) {
+    const MonitorConfig &cfg = gConfig.monitors[monIdx];
+
+    // Check momentary mode timeout
+    if (cfg.relayMode == RELAY_MODE_MOMENTARY) {
+      uint16_t seconds = cfg.relayMomentarySeconds[r];
+      if (seconds == 0) {
+        seconds = DEFAULT_RELAY_MOMENTARY_SECONDS;
       }
-      
-      // Check manual-reset safety timeout (relayMaxOnSeconds or custom duration)
-      if (!expired && (cfg.relayMode == RELAY_MODE_MANUAL_RESET || gRelayRuntime[r].source == RELAY_SRC_MANUAL)) {
-        uint32_t limit = gRelayRuntime[r].customDurationSec;
-        if (limit == 0) limit = cfg.relayMaxOnSeconds;
-        if (limit > 0) {
-          uint32_t elapsedSec = elapsedMs / 1000UL;
-          if (elapsedSec >= limit) {
-            expired = true;
-            reason = "safety max-on timeout";
-          }
-        }
-      }
-    } else if (gRelayRuntime[r].source == RELAY_SRC_MANUAL && gRelayRuntime[r].customDurationSec > 0) {
-      // Ownerless manual relay with explicit duration — still honor the timeout
-      uint32_t elapsedSec = elapsedMs / 1000UL;
-      if (elapsedSec >= gRelayRuntime[r].customDurationSec) {
-        expired = true;
-        reason = "manual duration timeout";
+      uint32_t durationMs = (uint32_t)seconds * 1000UL;
+      if (elapsedMs >= durationMs) {
+        return "momentary timeout";
       }
     }
-    
-    if (expired) {
-      Serial.print(F("Relay "));
-      Serial.print(r + 1);
-      Serial.print(F(": "));
-      Serial.print(reason);
-      Serial.print(F(" after "));
-      Serial.print(elapsedMs / 1000UL);
-      Serial.print(F("s for monitor "));
-      Serial.println(monIdx);
-      
-      // Deactivate the single relay
-      if (hasOwner && gConfig.monitors[monIdx].relayTargetClient[0] != '\0') {
-        triggerRemoteRelays(gConfig.monitors[monIdx].relayTargetClient, 1 << r, false);
+
+    // Check manual-reset safety timeout (relayMaxOnSeconds or custom duration)
+    if (cfg.relayMode == RELAY_MODE_MANUAL_RESET || gRelayRuntime[r].source == RELAY_SRC_MANUAL) {
+      uint32_t limit = gRelayRuntime[r].customDurationSec;
+      if (limit == 0) limit = cfg.relayMaxOnSeconds;
+      if (limit > 0) {
+        uint32_t elapsedSec = elapsedMs / 1000UL;
+        if (elapsedSec >= limit) {
+          return "safety max-on timeout";
+        }
       }
-      deactivateRelayForMonitor(monIdx, 1 << r);
-      
-      // Send timeout notification through alarm pipeline for safety timeouts
-      // (only when we have an owning monitor to route the alarm through)
-      if (hasOwner && strcmp(reason, "safety max-on timeout") == 0) {
-        sendAlarm(monIdx, "relay_timeout", gMonitorState[monIdx].currentValue);
-      }
+    }
+  } else if (gRelayRuntime[r].source == RELAY_SRC_MANUAL && gRelayRuntime[r].customDurationSec > 0) {
+    // Ownerless manual relay with explicit duration — still honor the timeout
+    uint32_t elapsedSec = elapsedMs / 1000UL;
+    if (elapsedSec >= gRelayRuntime[r].customDurationSec) {
+      return "manual duration timeout";
     }
   }
+  return nullptr;
+}
+
+static void checkRelayMomentaryTimeout(unsigned long now) {
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    const char *reason = relayTimeUp(r, now);
+    if (reason == nullptr) continue;
+
+    uint8_t monIdx = gRelayRuntime[r].ownerMonitor;
+    uint32_t elapsedMs = now - gRelayRuntime[r].activatedAt;
+    bool hasOwner = (monIdx < gConfig.monitorCount);
+
+    Serial.print(F("Relay "));
+    Serial.print(r + 1);
+    Serial.print(F(": "));
+    Serial.print(reason);
+    Serial.print(F(" after "));
+    Serial.print(elapsedMs / 1000UL);
+    Serial.print(F("s for monitor "));
+    Serial.println(monIdx);
+
+    // Deactivate the single relay
+    if (hasOwner && gConfig.monitors[monIdx].relayTargetClient[0] != '\0') {
+      triggerRemoteRelays(gConfig.monitors[monIdx].relayTargetClient, 1 << r, false);
+    }
+    deactivateRelayForMonitor(monIdx, 1 << r);
+
+    // Send timeout notification through alarm pipeline for safety timeouts
+    // (only when we have an owning monitor to route the alarm through)
+    if (hasOwner && strcmp(reason, "safety max-on timeout") == 0) {
+      sendAlarm(monIdx, "relay_timeout", gMonitorState[monIdx].currentValue);
+    }
+  }
+}
+
+// While a charger programming run holds loop() (up to a minute: sunsaver::RUN_LIMIT_MS),
+// checkRelayMomentaryTimeout() does not run. The run calls this before each of its requests and
+// while it rests (SolarManager::setChargerRunHook()): the output of a relay whose time is up goes
+// off at once. The rest waits for checkRelayMomentaryTimeout(), which finds the relay still due
+// and which serviceChargerProgramming() calls as soon as the run returns, with this once more for
+// a relay whose time ran out during the last request: the command that switches a remote relay
+// off and the alarm of a safety timeout, which go through the Notecard, and the relay's
+// bookkeeping.
+static void switchOffRelaysTimeUp() {
+  const unsigned long now = millis();
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    if (gRelayState[r] && relayTimeUp(r, now) != nullptr) {
+      setRelayState(r, false);
+    }
+  }
+}
+
+// The longest a charger programming run holds loop(): its own limit, and room for the journal it
+// writes as it ends.
+#define CHARGER_RUN_HOLD_MS (sunsaver::RUN_LIMIT_MS + 5000UL)
+
+// Whether the time of a relay runs out before a charger programming run that starts now would
+// end (relayTimeUp()). The run then waits until checkRelayMomentaryTimeout() has switched that
+// relay off, a minute or so at most: within a run, the hook (switchOffRelaysTimeUp()) runs
+// between requests only, and one request can hold loop() for twice the Modbus timeout and more
+// (sunsaver::modbusRequestLimitMs()), about 9 seconds at the longest timeout. Relays go on in
+// loop() alone, never while a run holds it, so no other time runs out during the run.
+//
+// That counts a relay whose output is off while its time still runs, too: hibernation switches
+// the outputs off and leaves the rest to checkRelayMomentaryTimeout(), which sends the command
+// that switches a remote relay off when the time is up. After hibernation, that command would
+// otherwise wait for the run. In hibernation itself, where loop() does not call
+// checkRelayMomentaryTimeout() and the outputs are off, only an output that is on holds the run,
+// as a charger that waits for its restart should not wait any longer
+// (serviceChargerProgramming()).
+static bool relayTimeRunsOutDuringChargerRun() {
+  const unsigned long now = millis();
+  const bool hibernating = gPowerState == POWER_STATE_CRITICAL_HIBERNATE;
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    if ((gRelayState[r] || !hibernating) && relayTimeUp(r, now + CHARGER_RUN_HOLD_MS) != nullptr) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Reset relay for a specific monitor (called from server manual reset command)

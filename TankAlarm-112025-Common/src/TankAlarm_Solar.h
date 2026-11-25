@@ -86,6 +86,17 @@
 // its counters were last reset (vb_min; the highest, vb_max, is 0x0034), and the
 // register table of the SunSaver MPPT MODBUS Specification v11 has nothing at
 // 0x0035 or 0x0036.
+//
+// Charger programming writes a LiFePO4 charging profile and the LVD and LVR into
+// that block when the client's config asks for it (TankAlarm_SunSaverProgram.h
+// has the limits and the procedure, SolarManager::serviceChargerProgramming()
+// below runs it). It is compiled in only with TANKALARM_SUNSAVER_PROGRAMMING set
+// to 1, which stays 0 until a bench run has shown how a real SunSaver takes the
+// writes and the restart. A client built with 0 never writes to the controller:
+// it answers each request with "not built" and does nothing else.
+#ifndef TANKALARM_SUNSAVER_PROGRAMMING
+#define TANKALARM_SUNSAVER_PROGRAMMING 0
+#endif
 
 // ============================================================================
 // Scaling Factors for 12V System
@@ -231,11 +242,11 @@ enum SolarAlertType : uint8_t {
 // voltage readings already attached to telemetry (`v`) and the daily report
 // (`v`/`vs`, plus the solar block's `bv`), all emitted only when a voltage
 // source has data. No alert/SMS fires on this today (user decision
-// 2026-07-02), and firmware does not write charger setpoints over Modbus
-// (the EEPROM custom block is unverified on our bench, wears, needs a
-// controller reset, and temp compensation would defeat a cap anyway). The
-// charger check only reads that block. The constants below are retained for
-// future logic.
+// 2026-07-02), and firmware does not write a charge voltage cap over Modbus
+// (temperature compensation would defeat a cap anyway). The only writes are
+// those of charger programming (see "Stored charge settings" above), which a
+// config has to ask for and which refuses anything but a 12 V system. The
+// constants below are retained for future logic.
 #ifndef OPTA_SUPPLY_ABS_MAX_V
 #define OPTA_SUPPLY_ABS_MAX_V  28.8f  // Opta datasheet: 12-24 VDC +/-20%
 #endif
@@ -315,10 +326,16 @@ struct SolarConfig {
 // ============================================================================
 #ifdef __cplusplus
 
-#include "TankAlarm_SunSaverSettings.h"
+#include "TankAlarm_SunSaverProgram.h"
 
 class SolarManager {
 public:
+  // Writes the journal of charger programming to the client's flash. True only once the file
+  // holds it whole. See beginChargerProgramming().
+  typedef bool (*ChargerJournalWriter)(const sunsaver::Journal &journal);
+  // What the client does while a programming run holds its loop. See setChargerRunHook().
+  typedef void (*ChargerRunHook)();
+
   SolarManager();
   
   // Initialization
@@ -385,8 +402,10 @@ public:
   // Reset daily statistics (call at midnight or report time)
   void resetDailyStats();
 
-  // Force a poll execution on the next opportunity
-  void forcePollSoon() { _lastPollMillis = 0; }
+  // Force a poll execution on the next opportunity: the last poll is put one interval back, so
+  // that poll() finds the next one due however long the client has been running (0 would only
+  // be an interval back once millis() has passed one).
+  void forcePollSoon();
 
   // ---------------------------------------------------------------------------------------
   // Charger check: what the controller has stored (charging profile, LVD and LVR, DIP
@@ -458,6 +477,83 @@ public:
   void setPackChemistry(uint8_t chemistry) { _packChemistry = chemistry; }
   uint8_t getPackChemistry() const { return _packChemistry; }
 
+  // ---------------------------------------------------------------------------------------
+  // Charger programming: writes a LiFePO4 charging profile and the LVD and LVR into the
+  // controller when the client's config asks for it (sunsaver::Supervisor in
+  // TankAlarm_SunSaverProgram.h decides what is done and when). The client keeps the journal in
+  // its flash and sends the results to the server. None of it is touched by begin() and end(),
+  // which a config change calls to restart the link.
+  //
+  // With TANKALARM_SUNSAVER_PROGRAMMING 0 nothing here sends to the controller: every request
+  // is refused with REFUSE_NOT_BUILT, the journal keeps only the requests answered and the
+  // result that has yet to go out, and serviceChargerProgramming() only writes again a journal
+  // that flash did not take (sunsaver::Supervisor::maintain()).
+  // ---------------------------------------------------------------------------------------
+
+  // Once at start, with the journal from flash (sunsaver::cautiousJournal() when the file is
+  // there and cannot be read, sunsaver::emptyJournal() when there is none) and the function that
+  // writes it.
+  void beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer);
+
+  // The duty of a journal kept aside that the start did not take in, because the journal owed a
+  // duty to another controller then (sunsaver::keptDutyLeftOut()): taken once none is owed. See
+  // sunsaver::Supervisor::takeKeptDuty(). False while a duty is owed.
+  bool takeKeptChargerDuty(const sunsaver::Journal &kept, uint32_t check);
+
+  // A run holds loop() for as long as it takes (see serviceChargerProgramming()), and calls
+  // `hook` wherever it feeds the watchdog: before every request and while it rests between them,
+  // at least every 100 ms of a rest. The client does there what cannot wait for the run's end. A
+  // hook must not talk to the charger, and is quick. nullptr for none.
+  void setChargerRunHook(ChargerRunHook hook) { _runHook = hook; }
+
+  // A config carried a request. See sunsaver::Supervisor::request(): false for a request that
+  // this client has dealt with already. `askedAt` is when it was asked for (sunsaver::readRequestAt(),
+  // 0 when its id is that time). The request is in flash, or answered, on return.
+  bool requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
+                             uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow, uint32_t askedAt = 0);
+
+  // A request that waits is given up (see sunsaver::Supervisor::withdraw()). False when none
+  // waits.
+  bool withdrawChargerProgram(uint32_t refusals, double epochNow);
+
+  // The config is about to name another charger than `controller`: a duty owed to no controller
+  // that the journal names is bound to that one (see sunsaver::Supervisor::bindDuty()). Returns
+  // whether it was. Whether flash took the journal: chargerProgramming().journalUnsaved().
+  bool bindChargerDuty(uint8_t controller);
+
+  // Call from every pass of loop(), whether the charger is enabled or not: a request that waits
+  // runs out of time here too. `allowed` is false while the client must not talk to the
+  // controller (a firmware update is being staged, or a poll has just talked to it). Nothing is
+  // sent while the line rests. A request runs only once a poll has succeeded. A duty left by a
+  // run that was cut short goes to the controller that run talked to, whatever the config names
+  // now, and is made on its own timetable when no poll speaks for that controller: with the
+  // charger off in the config, the link is started for it and stopped after it (see
+  // sunsaver::Supervisor::mayTalk()). A link that does not start costs the duty a try, as a
+  // controller that does not answer would, and its result says so (sunsaver::NoLinkPort): the
+  // next try comes on the timetable. Returns true when a run talked to it: that held loop() for
+  // the whole run (about 10 seconds, never more than a minute: see sunsaver::RUN_LIMIT_MS; with
+  // the watchdog fed), and the controller may hold other settings now. A charger check under way
+  // is dropped then, and the next poll is due at once.
+  bool serviceChargerProgramming(double epochNow, bool allowed);
+
+  // Whether programming would talk to the controller now if the line were free: a run or a look
+  // at the controller is due (see sunsaver::Supervisor::wantsLine()), and a poll that answered
+  // lets it talk, where it needs one (sunsaver::Supervisor::wantsPass()). The client's loop then
+  // lets it have the pass after a poll, when every pass is due to poll. False without
+  // programming.
+  bool chargerProgrammingWantsLine(double epochNow) const;
+
+  // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis(),
+  // reportEpoch(), sendEpoch(), resultOnlyInRam()), the journal, and whether a request or a duty
+  // is open.
+  const sunsaver::Supervisor& chargerProgramming() const { return _programming; }
+  // The result that is due is about to go out with the time `sentEpoch`: the time goes into the
+  // journal first (sunsaver::Supervisor::reportSending()). False when flash did not take it.
+  bool chargerProgramReportSending(uint32_t sentEpoch);
+  // The Notecard has the result, sent with the time `sentEpoch` (not the note buffer, which may
+  // drop it: see sunsaver::Supervisor::reportTaken()).
+  void chargerProgramReportTaken(uint32_t sentEpoch);
+
 private:
   SolarConfig _config;
   SolarData _data;
@@ -476,8 +572,23 @@ private:
   unsigned long _chargerCheckGapMs;       // the pause before the next one (0 before the first)
   bool _chargerCheckCompleted;
   bool _chargerSettingsRead;
+
+  // Charger programming
+  class JournalFile : public sunsaver::JournalStore {
+   public:
+    JournalFile() : writer(nullptr) {}
+    bool saveJournal(const sunsaver::Journal &journal) override { return writer != nullptr && writer(journal); }
+    ChargerJournalWriter writer;
+  };
+  sunsaver::Supervisor _programming;
+  JournalFile _journalFile;
+  ChargerRunHook _runHook;
+  // The line as programming finds it in a pass (sunsaver::Line), `allowed` as for
+  // serviceChargerProgramming().
+  sunsaver::Line chargerProgramLine(bool allowed) const;
   
   // Modbus communication
+  bool startModbusLink();  // ModbusRTUClient on the RS-485 port, as _config says: false when it does not start
   bool readRegisters();
   float scaleVoltage(uint16_t raw) const;
   float scaleCurrent(uint16_t raw) const;

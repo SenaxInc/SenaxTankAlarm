@@ -137,6 +137,40 @@ static void drainRS485Rx() {
   }
 }
 
+// The silence Modbus RTU wants on the line before a frame (Modbus over Serial Line V1.02,
+// 2.5.1.1): 3.5 characters of 11 bits, as the client sends them (8N2), and at least 1750 us,
+// the figure the standard sets above 19200 baud. In microseconds, rounded up: 4011 at 9600 baud.
+static uint32_t modbusFrameGapUs(uint32_t baud) {
+  if (baud == 0) {
+    baud = SOLAR_DEFAULT_BAUD_RATE;
+  }
+  const uint32_t gapUs = (38500000UL + baud - 1UL) / baud;
+  return gapUs < 1750UL ? 1750UL : gapUs;
+}
+
+// When the last request on the line ended: its reply was in, or the master gave up on it. Every
+// request notes it. ArduinoModbus keeps no silence between two frames, and the RS-485 pre-delay
+// is 0 (startModbusLink()), so a request sent at once after the one before could start inside
+// the silence that ends the reply. A request of charger programming waits for the gap first
+// (keepFrameGap()); the poll and the charger check send as they did.
+static uint32_t sSolarRequestEndMicros = 0;
+static bool     sSolarRequestEnded = false;
+
+static void noteRequestEnd() {
+  sSolarRequestEndMicros = (uint32_t)micros();
+  sSolarRequestEnded = true;
+}
+
+static void keepFrameGap(uint32_t gapUs) {
+  if (!sSolarRequestEnded) {
+    return;
+  }
+  const uint32_t quietUs = (uint32_t)micros() - sSolarRequestEndMicros;
+  if (quietUs < gapUs) {
+    delayMicroseconds((unsigned int)(gapUs - quietUs));
+  }
+}
+
 // True while the line rests after a request that got no usable reply (see above).
 static bool solarLineResting() {
   if (!sSolarMissSeen) {
@@ -155,8 +189,10 @@ static bool solarLineResting() {
 // replies look alike for every register: after a miss on the array voltage and a refusal of the
 // other function code, the retry 100 ms later could take the array voltage for the battery's.
 // The charger check waits outside, without holding loop() (SolarManager::lineResting()), and ends
-// its step at a miss, so it never waits here. A poll waits here at most SOLAR_POLL_MAX_MISSES - 1
-// times: pollMayGoOn().
+// its step at a miss, so it never waits here. A programming run starts only on a line that does
+// not rest, rests at least one Modbus timeout after a miss before its next request
+// (ChargerProgramPort::rest()) and asks with its other function only after a refusal, so it does
+// not wait here either. A poll waits here at most SOLAR_POLL_MAX_MISSES - 1 times: pollMayGoOn().
 static void waitForLineRest() {
   while (solarLineResting()) {
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -206,7 +242,9 @@ static void captureSolarModbusError(uint16_t address, uint16_t elapsedMs) {
 static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
   waitForLineRest();
   unsigned long _t0 = millis();
-  if (!ModbusRTUClient.requestFrom(slaveId, HOLDING_REGISTERS, startAddress, count)) {
+  const int got = ModbusRTUClient.requestFrom(slaveId, HOLDING_REGISTERS, startAddress, count);
+  noteRequestEnd();
+  if (!got) {
     captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
@@ -232,7 +270,9 @@ static bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t
 static bool readInputRegisters(uint8_t slaveId, uint16_t startAddress, uint8_t count, uint16_t *buffer) {
   waitForLineRest();
   unsigned long _t0 = millis();
-  if (!ModbusRTUClient.requestFrom(slaveId, INPUT_REGISTERS, startAddress, count)) {
+  const int got = ModbusRTUClient.requestFrom(slaveId, INPUT_REGISTERS, startAddress, count);
+  noteRequestEnd();
+  if (!got) {
     captureSolarModbusError(startAddress, (uint16_t)(millis() - _t0));
     return false;
   }
@@ -337,7 +377,7 @@ SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
     _floatReferenceV(0.0f), _readingFactor((float)sunsaver::readingFactor(sunsaver::SCALE_UNKNOWN, SS_VOLTAGE_SCALE_ID)),
     _packVolts(0), _packChemistry(sunsaver::CHEMISTRY_NOT_JUDGED), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
-    _chargerCheckCompleted(false), _chargerSettingsRead(false) {
+    _chargerCheckCompleted(false), _chargerSettingsRead(false), _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -360,6 +400,53 @@ SolarManager::SolarManager()
   _config.includeInDailyReport = true;
 }
 
+// RS-485 timing fix per Arduino forum thread #1421875 post #18:
+// The Opta needs a post-TX delay of one full character time before DE drops,
+// otherwise the last byte of the Modbus query is corrupted on the wire and
+// the slave silently rejects it. setDelays(pre, post) is in microseconds.
+//
+// Fix S1 (v2.0.49): the post-delay must SCALE WITH BAUD RATE. The previous
+// hardcoded 1200 us was safe at 9600 baud (1 char time = 1146 us) but at the higher
+// baud rates the sanitizer also permits (19200..115200) it held DE active past the
+// Modbus 3.5-char inter-frame gap and caused bus contention with a fast slave's
+// response. One 11-bit character time (8N2) = 11,000,000 / baud microseconds, clamped
+// to a safe floor (150 us protects 115200 from underrunning the DE FET) and ceiling
+// (1500 us is more than enough for the slowest supported baud).
+//
+// Note on truncation margin: we add 50 microseconds of safety margin to the raw quotient
+// (11,000,000 / 9600 = 1145 us) to ensure integer truncation doesn't drop the DE pin
+// 0.83 microseconds BEFORE the stop bits have fully completed transmitting. This scales
+// 9600 to 1195 us (matching the stable 1200 us baseline).
+static uint32_t modbusPostDelayUs(uint16_t baud) {
+  uint32_t postDelayUs = (11000000UL / baud) + 50UL;
+  if (postDelayUs < 150)  postDelayUs = 150;
+  if (postDelayUs > 1500) postDelayUs = 1500;
+  return postDelayUs;
+}
+
+bool SolarManager::startModbusLink() {
+  // Arduino Opta RS485 uses the built-in RS485 interface.
+  // Modbus RTU spec requires 8N2 when no parity is used; SunSaver MPPT
+  // (and Morningstar MRC-1 adapter) expect 8N2. ArduinoModbus default is
+  // 8N1, which often appears to work but produces intermittent CRC errors.
+  if (!ModbusRTUClient.begin(TANKALARM_SOLAR_RS485, _config.modbusBaudRate, SERIAL_8N2)) {
+    return false;
+  }
+
+  // Set read timeout. Clamp to >=500 ms because SunSaver MPPT can take several
+  // hundred ms to assemble a reply over the MRC-1 MeterBus->RS-485 bridge,
+  // and the default 200 ms in older saved configs causes the client to
+  // give up before the reply arrives.
+  if (_config.modbusTimeoutMs < 500) {
+    _config.modbusTimeoutMs = 500;
+  }
+  ModbusRTUClient.setTimeout(_config.modbusTimeoutMs);
+  sSolarTimeoutMs = _config.modbusTimeoutMs;
+
+  TANKALARM_SOLAR_RS485.setDelays(0, modbusPostDelayUs(_config.modbusBaudRate));
+  return true;
+}
+
 bool SolarManager::begin(const SolarConfig& config) {
   // A charger check that was under way belongs to the link as it was, and so does what the
   // last one found: another charger may be on the line now, or none.
@@ -375,48 +462,11 @@ bool SolarManager::begin(const SolarConfig& config) {
   
   setConfig(config);
   
-  // Initialize Modbus RTU Client
-  // Arduino Opta RS485 uses the built-in RS485 interface.
-  // Modbus RTU spec requires 8N2 when no parity is used; SunSaver MPPT
-  // (and Morningstar MRC-1 adapter) expect 8N2. ArduinoModbus default is
-  // 8N1, which often appears to work but produces intermittent CRC errors.
-  if (!ModbusRTUClient.begin(TANKALARM_SOLAR_RS485, _config.modbusBaudRate, SERIAL_8N2)) {
+  if (!startModbusLink()) {
     Serial.println(F("Solar: Failed to initialize Modbus RTU Client"));
     _initialized = false;
     return false;
   }
-  
-  // Set read timeout. Clamp to >=500 ms because SunSaver MPPT can take several
-  // hundred ms to assemble a reply over the MRC-1 MeterBus->RS-485 bridge,
-  // and the default 200 ms in older saved configs causes the client to
-  // give up before the reply arrives.
-  if (_config.modbusTimeoutMs < 500) {
-    _config.modbusTimeoutMs = 500;
-  }
-  ModbusRTUClient.setTimeout(_config.modbusTimeoutMs);
-  sSolarTimeoutMs = _config.modbusTimeoutMs;
-
-  // RS-485 timing fix per Arduino forum thread #1421875 post #18:
-  // The Opta needs a post-TX delay of one full character time before DE drops,
-  // otherwise the last byte of the Modbus query is corrupted on the wire and
-  // the slave silently rejects it. setDelays(pre, post) is in microseconds.
-  //
-  // Fix S1 (v2.0.49): the post-delay must SCALE WITH BAUD RATE. The previous
-  // hardcoded 1200 us was safe at 9600 baud (1 char time = 1146 us) but at the higher
-  // baud rates the sanitizer also permits (19200..115200) it held DE active past the
-  // Modbus 3.5-char inter-frame gap and caused bus contention with a fast slave's
-  // response. One 11-bit character time (8N2) = 11,000,000 / baud microseconds, clamped
-  // to a safe floor (150 us protects 115200 from underrunning the DE FET) and ceiling
-  // (1500 us is more than enough for the slowest supported baud).
-  //
-  // Note on truncation margin: we add 50 microseconds of safety margin to the raw quotient
-  // (11,000,000 / 9600 = 1145 us) to ensure integer truncation doesn't drop the DE pin
-  // 0.83 microseconds BEFORE the stop bits have fully completed transmitting. This scales
-  // 9600 to 1195 us (matching the stable 1200 us baseline).
-  uint32_t postDelayUs = (11000000UL / _config.modbusBaudRate) + 50UL;
-  if (postDelayUs < 150)  postDelayUs = 150;
-  if (postDelayUs > 1500) postDelayUs = 1500;
-  TANKALARM_SOLAR_RS485.setDelays(0, postDelayUs);
   
   Serial.print(F("Solar: Modbus RTU initialized at "));
   Serial.print(_config.modbusBaudRate);
@@ -425,7 +475,7 @@ bool SolarManager::begin(const SolarConfig& config) {
   Serial.print(F(", timeout "));
   Serial.print(_config.modbusTimeoutMs);
   Serial.print(F(" ms, postDelay "));
-  Serial.print(postDelayUs);
+  Serial.print(modbusPostDelayUs(_config.modbusBaudRate));
   Serial.println(F(" us"));
   
   _initialized = true;
@@ -475,6 +525,10 @@ void SolarManager::end() {
 
 void SolarManager::setConfig(const SolarConfig& config) {
   _config = config;
+}
+
+void SolarManager::forcePollSoon() {
+  _lastPollMillis = millis() - (unsigned long)_config.pollIntervalSec * 1000UL;
 }
 
 bool SolarManager::poll(unsigned long nowMillis) {
@@ -1085,6 +1139,38 @@ void SolarManager::resetDailyStats() {
 
 namespace {
 
+// The poll's diagnostics (scErr, scMaddr, scResMs in the telemetry) describe the polls. A request
+// of the charger check or of charger programming puts them back as it found them: a register
+// that an older controller refuses there is no failing link. The line rest that a request
+// without a usable reply starts (captureSolarModbusError()) is not put back: it holds for
+// everything that sends on the link.
+class KeptPollDiagnostics {
+ public:
+  KeptPollDiagnostics() : _address(sSolarLastFailAddress), _responseMs(sSolarLastResponseMs) {
+    memcpy(_error, sSolarLastModbusError, sizeof(_error));
+    memcpy(_tag, sSolarLastErrorTag, sizeof(_tag));
+    sSolarLastModbusError[0] = '\0';
+  }
+  ~KeptPollDiagnostics() {
+    memcpy(sSolarLastModbusError, _error, sizeof(_error));
+    memcpy(sSolarLastErrorTag, _tag, sizeof(_tag));
+    sSolarLastFailAddress = _address;
+    sSolarLastResponseMs = _responseMs;
+  }
+
+ private:
+  char _error[sizeof(sSolarLastModbusError)];
+  char _tag[sizeof(sSolarLastErrorTag)];
+  uint16_t _address;
+  uint16_t _responseMs;
+};
+
+// The status of a request that failed: the controller answered with a Modbus exception, or
+// nothing usable came back. Read while the request's own error text is in place.
+sunsaver::IoStatus failedRequestStatus() {
+  return solarErrorIsRefusal(sSolarLastModbusError) ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
+}
+
 // How the charger check reads: one register per request, with the function code the poll found
 // to work. The other function code is not tried, so a register this controller does not have
 // costs one request and no more.
@@ -1094,39 +1180,127 @@ class ChargerCheckBus : public sunsaver::Reader {
 
   sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override {
     TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
-
-    // The poll's diagnostics (scErr, scMaddr, scResMs in the telemetry) describe the polls. A
-    // register that an older controller refuses here is no failing link, so they are put back.
-    char keptError[sizeof(sSolarLastModbusError)];
-    char keptTag[sizeof(sSolarLastErrorTag)];
-    memcpy(keptError, sSolarLastModbusError, sizeof(keptError));
-    memcpy(keptTag, sSolarLastErrorTag, sizeof(keptTag));
-    const uint16_t keptAddress = sSolarLastFailAddress;
-    const uint16_t keptResponseMs = sSolarLastResponseMs;
-
-    sSolarLastModbusError[0] = '\0';
+    KeptPollDiagnostics kept;
     uint16_t word = 0;
     const bool ok = (_functionCode == 4) ? readInputRegisters(_slaveId, addr, 1, &word)
                                          : readHoldingRegisters(_slaveId, addr, 1, &word);
-    sunsaver::IoStatus status = sunsaver::SSIO_OK;
-    if (ok) {
-      *raw = word;
-    } else {
-      // The controller answered with a Modbus exception, or nothing usable came back.
-      status = solarErrorIsRefusal(sSolarLastModbusError) ? sunsaver::SSIO_REFUSED : sunsaver::SSIO_NO_REPLY;
+    if (!ok) {
+      return failedRequestStatus();
     }
-
-    memcpy(sSolarLastModbusError, keptError, sizeof(keptError));
-    memcpy(sSolarLastErrorTag, keptTag, sizeof(keptTag));
-    sSolarLastFailAddress = keptAddress;
-    sSolarLastResponseMs = keptResponseMs;
-    return status;
+    *raw = word;
+    return sunsaver::SSIO_OK;
   }
 
  private:
   uint8_t _slaveId;
   uint8_t _functionCode;
 };
+
+#if TANKALARM_SUNSAVER_PROGRAMMING
+// What a programming run talks through: the reads of the charger check, writes with function 6,
+// the restart coil with function 5, the rest between requests and the clock. A request without a
+// usable reply starts the line rest like any other, so the poll and the charger check leave the
+// line alone after the run as well. `functionCode` is the read function the controller answers,
+// or 0 when it is not known: the port finds it out then (sunsaver::FunctionChoice). Before every
+// request it sends, the second request of a read that looks for its function too, it leaves the
+// line silent for the frame gap at `baud` (keepFrameGap()), since a run that goes well sends its
+// requests with no rest between them. Wherever it feeds the watchdog, before every request and
+// while it rests, it calls `hook` too (SolarManager::setChargerRunHook()).
+class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionReader {
+ public:
+  ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs, uint32_t baud,
+                     SolarManager::ChargerRunHook hook)
+      : _function(functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs), _gapUs(modbusFrameGapUs(baud)),
+        _hook(hook) {}
+
+  uint16_t timeoutMs() const override { return _timeoutMs; }
+
+  // ArduinoModbus may hold a request a timeout longer than _timeoutMs, and more for a reply that
+  // stops part way (sunsaver::modbusRequestLimitMs()); a read that looks for the function may ask
+  // twice (sunsaver::FunctionChoice). A run keeps to its time limit by this.
+  uint32_t requestLimitMs() const override {
+    return _function.readLimitMs(sunsaver::modbusRequestLimitMs(_timeoutMs), _timeoutMs);
+  }
+
+  sunsaver::IoStatus readRegister(uint16_t addr, uint16_t *raw) override { return _function.read(*this, addr, raw); }
+
+  uint8_t readFunction() const override { return _function.function(); }
+
+  // ArduinoModbus checks that the acknowledgement comes from this slave with this function and a
+  // good CRC, not which address and value it names. The run goes by what the register reads
+  // back, not by the acknowledgement (see sunsaver::Bus).
+  sunsaver::IoStatus writeRegister(uint16_t addr, uint16_t raw) override {
+    tick();
+    KeptPollDiagnostics kept;
+    keepFrameGap(_gapUs);
+    drainRS485Rx();
+    const unsigned long t0 = millis();
+    const int done = ModbusRTUClient.holdingRegisterWrite(_slaveId, addr, raw);
+    noteRequestEnd();
+    if (done == 1) {
+      return sunsaver::SSIO_OK;
+    }
+    captureSolarModbusError(addr, (uint16_t)(millis() - t0));
+    return failedRequestStatus();
+  }
+
+  sunsaver::IoStatus writeCoil(uint16_t addr) override {
+    tick();
+    KeptPollDiagnostics kept;
+    keepFrameGap(_gapUs);
+    drainRS485Rx();
+    const unsigned long t0 = millis();
+    const int done = ModbusRTUClient.coilWrite(_slaveId, addr, 1);
+    noteRequestEnd();
+    if (done == 1) {
+      return sunsaver::SSIO_OK;
+    }
+    captureSolarModbusError(addr, (uint16_t)(millis() - t0));
+    return failedRequestStatus();
+  }
+
+  void rest(uint16_t ms, bool afterMiss) override {
+    unsigned long wait = ms;
+    if (afterMiss && wait < _timeoutMs) {
+      wait = _timeoutMs;
+    }
+    const unsigned long start = millis();
+    for (;;) {
+      tick();
+      const unsigned long waited = (unsigned long)(millis() - start);
+      if (waited >= wait) {
+        break;
+      }
+      const unsigned long left = wait - waited;
+      delay(left > 100UL ? 100UL : left);
+    }
+  }
+
+  uint32_t millisNow() override { return (uint32_t)millis(); }
+
+  uint8_t controller() const override { return _slaveId; }
+
+ private:
+  sunsaver::IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) override {
+    tick();  // ChargerCheckBus feeds the watchdog as well
+    keepFrameGap(_gapUs);
+    return ChargerCheckBus(_slaveId, function).readRegister(addr, raw);
+  }
+
+  void tick() {
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    if (_hook != nullptr) {
+      _hook();
+    }
+  }
+
+  sunsaver::FunctionChoice _function;
+  uint8_t _slaveId;
+  uint16_t _timeoutMs;
+  uint32_t _gapUs;
+  SolarManager::ChargerRunHook _hook;
+};
+#endif  // TANKALARM_SUNSAVER_PROGRAMMING
 
 }  // namespace
 
@@ -1172,6 +1346,117 @@ bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
   return ended;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Charger programming
+// ---------------------------------------------------------------------------------------------
+
+void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer) {
+  _journalFile.writer = writer;
+  // A build without programming never talks to the controller for it (serviceChargerProgramming()
+  // only writes a journal that flash did not take), but keeps what an earlier build left owed, and
+  // to which controller: a build with programming that comes after it still settles that.
+  _programming.begin(journal, &_journalFile, (uint32_t)millis());
+}
+
+bool SolarManager::takeKeptChargerDuty(const sunsaver::Journal &kept, uint32_t check) {
+  return _programming.takeKeptDuty(kept, check, (uint32_t)millis());
+}
+
+sunsaver::Line SolarManager::chargerProgramLine(bool allowed) const {
+  // The poll comes first here too: it finds the function code and shows that the link works, for
+  // the controller the config names.
+  const bool linkKnown = _cachedHoldingFC == 3 || _cachedHoldingFC == 4;
+  sunsaver::Line line;
+  line.free = allowed && !lineResting();
+  line.polling = _config.enabled && _initialized;
+  line.pollAnswered = line.polling && _data.lastPollOk && linkKnown;
+  line.configured = _config.modbusSlaveId;
+  return line;
+}
+
+bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
+                                         uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow,
+                                         uint32_t askedAt) {
+#if !TANKALARM_SUNSAVER_PROGRAMMING
+  clientRefusals |= sunsaver::REFUSE_NOT_BUILT;  // whatever the caller says: such a request never waits
+#endif
+  return _programming.request(requestId, profile, profileErrors, clientRefusals, loadCurrentAllowed, epochNow,
+                              (uint32_t)millis(), askedAt);
+}
+
+bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
+  // Without programming no request ever waits, and this does nothing.
+  return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
+}
+
+bool SolarManager::bindChargerDuty(uint8_t controller) {
+  // In every build: what the journal says is owed stays in it, for a build that can settle it.
+  return _programming.bindDuty(controller, (uint32_t)millis());
+}
+
+void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
+  _programming.reportTaken(sentEpoch, (uint32_t)millis());
+}
+
+bool SolarManager::chargerProgramReportSending(uint32_t sentEpoch) {
+  return _programming.reportSending(sentEpoch, (uint32_t)millis());
+}
+
+bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
+#if TANKALARM_SUNSAVER_PROGRAMMING
+  sunsaver::Line line = chargerProgramLine(allowed);
+  // A duty goes to the controller its run talked to, should the config name another one now, and
+  // reads it with the function that run read it with. A port that is told no function finds one.
+  ChargerProgramPort port(_programming.controllerToUse(_config.modbusSlaveId),
+                          _programming.readFunctionToUse(_config.modbusSlaveId,
+                                                         line.pollAnswered ? _cachedHoldingFC : (uint8_t)0),
+                          _config.modbusTimeoutMs, _config.modbusBaudRate, _runHook);
+  // No poll runs, so the link is down (the charger is off in the config, or the link did not
+  // start). It is started for a duty whose turn has come, on the settings the config holds, and
+  // stopped again after it. Then service() talks only on a link started for it: a turn that comes
+  // after wantsLine() said no, in this same pass, waits for the next pass, and costs no try.
+  const bool linkForDuty = !line.polling && _programming.mayTalk(port, line) &&
+                           _programming.wantsLine(epochNow, (uint32_t)millis());
+  if (linkForDuty && !startModbusLink()) {
+    // The link does not start. The duty's turn is taken all the same, on a port that reaches no
+    // controller: the try counts, its result goes out (the client could not ask the controller),
+    // and the next try comes on the duty's timetable, not in the next pass.
+    sunsaver::NoLinkPort none(port.controller(), port.readFunction(), (uint32_t)millis());
+    _programming.service(none, epochNow, true);
+    return false;  // nothing talked to the controller
+  }
+  const bool talked = line.polling ? _programming.service(port, epochNow, line)
+                                   : _programming.service(port, epochNow, linkForDuty);
+  if (linkForDuty) {
+    ModbusRTUClient.end();
+  }
+  if (talked) {
+    _chargerCheck.cancel();  // it read the controller as it was before
+    forcePollSoon();         // and the poll reads it as it is now
+  }
+  return talked;
+#else
+  // Nothing to talk about with the controller, but a journal that flash did not take is written
+  // again: it holds the refusals and results that have yet to go out.
+  (void)epochNow;
+  (void)allowed;
+  _programming.maintain((uint32_t)millis());
+  return false;
+#endif
+}
+
+bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
+#if TANKALARM_SUNSAVER_PROGRAMMING
+  // Only while a poll runs: without one there is no pass to give up. And only for a pass in which
+  // programming may talk: after a poll that got no answer, a request waits for one that does.
+  return _config.enabled && _initialized &&
+         _programming.wantsPass(epochNow, (uint32_t)millis(), chargerProgramLine(true));
+#else
+  (void)epochNow;
+  return false;
+#endif
+}
+
 #else // Platform not supported
 
 // Stub implementation for non-RS485 platforms
@@ -1179,7 +1464,7 @@ SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
     _floatReferenceV(0.0f), _readingFactor(1.0f), _packVolts(0), _packChemistry(sunsaver::CHEMISTRY_NOT_JUDGED),
     _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
-    _chargerCheckCompleted(false), _chargerSettingsRead(false) {
+    _chargerCheckCompleted(false), _chargerSettingsRead(false), _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }
@@ -1192,6 +1477,7 @@ bool SolarManager::begin(const SolarConfig& config) {
 
 void SolarManager::end() {}
 void SolarManager::setConfig(const SolarConfig& config) { _config = config; }
+void SolarManager::forcePollSoon() { _lastPollMillis = 0; }
 bool SolarManager::poll(unsigned long nowMillis) { (void)nowMillis; return false; }
 bool SolarManager::lineResting() const { return false; }
 SolarAlertType SolarManager::checkAlerts() const { return SOLAR_ALERT_NONE; }
@@ -1220,5 +1506,43 @@ uint32_t SolarManager::getModbusErrOther()        const { return 0; }
 bool SolarManager::startChargerCheck() { return false; }
 void SolarManager::cancelChargerCheck() {}
 bool SolarManager::serviceChargerCheck(unsigned long nowMillis) { (void)nowMillis; return false; }
+void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer) {
+  _journalFile.writer = writer;
+  // Nothing here talks to a controller, but what the journal says is owed stays in it, for a
+  // build that can settle it.
+  _programming.begin(journal, &_journalFile, (uint32_t)millis());
+}
+bool SolarManager::takeKeptChargerDuty(const sunsaver::Journal &kept, uint32_t check) {
+  return _programming.takeKeptDuty(kept, check, (uint32_t)millis());
+}
+bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
+                                         uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow,
+                                         uint32_t askedAt) {
+  // No RS-485 here: refused as a charger that is not there.
+  return _programming.request(requestId, profile, profileErrors, clientRefusals | sunsaver::REFUSE_NO_CHARGER,
+                              loadCurrentAllowed, epochNow, (uint32_t)millis(), askedAt);
+}
+bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
+  return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
+}
+bool SolarManager::bindChargerDuty(uint8_t controller) {
+  return _programming.bindDuty(controller, (uint32_t)millis());
+}
+void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
+  _programming.reportTaken(sentEpoch, (uint32_t)millis());
+}
+bool SolarManager::chargerProgramReportSending(uint32_t sentEpoch) {
+  return _programming.reportSending(sentEpoch, (uint32_t)millis());
+}
+bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
+  (void)epochNow;
+  (void)allowed;
+  _programming.maintain((uint32_t)millis());  // as in firmware without programming
+  return false;
+}
+bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
+  (void)epochNow;
+  return false;
+}
 
 #endif // Platform check

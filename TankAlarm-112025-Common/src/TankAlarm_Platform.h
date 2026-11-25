@@ -191,26 +191,18 @@ static inline bool tankalarm_posix_write_file_atomic(const char *path,
     int writeErr = ferror(fp);
 
     // fclose() on Mbed OS flushes all buffers and syncs to storage.
-    // No separate fsync() needed on this platform. A small write sits in
-    // stdio's buffer until then, so a flash that does not take it (full, or
-    // a bad block) shows only in what fclose() returns.
-    int closeErr = fclose(fp);
+    // No separate fsync() needed on this platform. A flush that fails shows
+    // only here: the temp file may then hold less than was written, and must
+    // not take the place of the original.
+    const bool closed = fclose(fp) == 0;
 
-    if (writeErr || written != len) {
-        tankalarm_posix_log_error("atomic:fwrite", tmpPath);
-        Serial.print(F("atomic write failed (fwrite): "));
+    if (writeErr || written != len || !closed) {
+        tankalarm_posix_log_error(closed ? "atomic:fwrite" : "atomic:fclose", tmpPath);
+        Serial.print(F("atomic write failed ("));
+        Serial.print(closed ? "fwrite" : "fclose");
+        Serial.print(F("): "));
         Serial.println(path);
         remove(tmpPath);  // Clean up partial temp file to free flash space
-        return false;
-    }
-
-    // A temp file whose close failed may be short or empty: it must not take
-    // the target's place, nor be left for the boot-time cleanup to rename.
-    if (closeErr != 0) {
-        tankalarm_posix_log_error("atomic:fclose", tmpPath);
-        Serial.print(F("atomic write failed (fclose): "));
-        Serial.println(path);
-        remove(tmpPath);
         return false;
     }
 
