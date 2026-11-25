@@ -903,8 +903,9 @@ static bool gChargerReportDue = false;
 static sunsaver::Snapshot gChargerReportSnapshot;      // what it holds
 static sunsaver::Evaluation gChargerReportEvaluation;  // and how that was judged
 static uint32_t gChargerReportDueFingerprint = 0;
-static unsigned long gChargerReportDueMillis = 0;      // when its pass ended
-static uint32_t gChargerReportEpoch = 0;               // that moment as a time, once the clock has one; 0 until then
+static uint32_t gChargerReportEpoch = 0;               // when its pass ended, once the clock has a time; 0 until then
+static uint32_t gChargerReportAgeSeconds = 0;          // until then how long ago that was, in whole seconds,
+static unsigned long gChargerReportAgedMillis = 0;     // as of this millis(): see ageChargerReport()
 static bool gChargerReportWaited = false;              // it could not go out when its pass ended
 static bool gChargerReportTried = false;               // nothing would take it at the last try
 static unsigned long gChargerReportTryMillis = 0;      // which was then
@@ -1543,7 +1544,9 @@ static void requestChargerCheck();
 static bool chargerCheckHeldBack();
 static void serviceChargerCheck(unsigned long now, bool lineFree);
 static void finishChargerCheck(unsigned long now);
+static void ageChargerReport();
 static bool deviceUidKnown();
+static uint8_t configuredPackVolts();
 static void sendDueChargerReport(unsigned long now);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
@@ -1866,6 +1869,7 @@ void setup() {
   initializeUserButton();
   
   // Initialize solar/battery charger monitoring (SunSaver MPPT via RS-485)
+  gSolarManager.setPackVolts(configuredPackVolts());  // kept across begin() and end()
   if (gConfig.solarCharger.enabled) {
     if (gSolarManager.begin(gConfig.solarCharger)) {
       if (gSolarManager.isCommunicationOk()) {
@@ -5051,6 +5055,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
     bool prevEnabled     = gConfig.batteryMonitor.enabled;
     initBatteryConfig(&gConfig.batteryMonitor, bt, nominalV);
     gConfig.batteryMonitor.enabled = batEnabled && (bt != BATTERY_TYPE_NONE);
+    gSolarManager.setPackVolts(configuredPackVolts());
     if (prevType != bt || prevNominal != nominalV || prevEnabled != gConfig.batteryMonitor.enabled) {
       Serial.print(F("Battery config updated: type="));
       Serial.print(batteryTypeLabel(bt));
@@ -7431,6 +7436,7 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
   if (gChargerReportSent && (now - gChargerReportMillis) >= CHARGER_REPORT_REFRESH_MS) {
     gChargerReportStale = true;
   }
+  ageChargerReport();  // the same for the age of a report that waits for a time
   if (chargerCheckHeldBack()) {
     gSolarManager.cancelChargerCheck();
     return;
@@ -7520,26 +7526,33 @@ static void finishChargerCheck(unsigned long endedAt) {
   }
   Serial.println(line);
   if (changed) {
+    // The findings and the two scale lines say why the verdict is what it is. They go to the log
+    // the server can ask for too, each an entry of its own: the longest is 141 characters, within
+    // the 160 bytes of one (the settings suite checks that).
     addSerialLog(line);
     for (uint8_t bit = 0; bit < sunsaver::FINDING_BITS; ++bit) {
       const uint32_t finding = (uint32_t)1 << bit;
       if ((evaluation.findings & finding) != 0) {
-        Serial.print(F("  - "));
-        Serial.println(sunsaver::findingText(finding));
+        sunsaver::Text text(line, sizeof(line));
+        text.add("  - ").add(sunsaver::findingText(finding));
+        Serial.println(line);
+        addSerialLog(line);
       }
     }
     {
       sunsaver::Text text(line, sizeof(line));
+      text.add("  Stored voltages: ");
       sunsaver::describeSettingsScale(evaluation.settingsScale, &text);
     }
-    Serial.print(F("  Stored voltages: "));
     Serial.println(line);
+    addSerialLog(line);
     {
       sunsaver::Text text(line, sizeof(line));
+      text.add("  Live readings: ");
       sunsaver::describeLiveScale(evaluation.liveScale, evaluation.liveSource, evaluation.systemVolts, &text);
     }
-    Serial.print(F("  Live readings: "));
     Serial.println(line);
+    addSerialLog(line);
   }
 
   const bool stale = gChargerReportStale || (endedAt - gChargerReportMillis) >= CHARGER_REPORT_REFRESH_MS;
@@ -7550,8 +7563,9 @@ static void finishChargerCheck(unsigned long endedAt) {
   gChargerReportSnapshot = snapshot;
   gChargerReportEvaluation = evaluation;
   gChargerReportDueFingerprint = fingerprint;
-  gChargerReportDueMillis = endedAt;
   gChargerReportEpoch = 0;
+  gChargerReportAgeSeconds = 0;
+  gChargerReportAgedMillis = endedAt;
   gChargerReportWaited = false;
   gChargerReportTried = false;
   gChargerReportDue = true;
@@ -7564,11 +7578,35 @@ static void finishChargerCheck(unsigned long endedAt) {
 }
 
 // The client's id is the Notecard's device UID ("dev:..."), once the Notecard has given it at this
-// start or the config kept it from an earlier one. Until then gDeviceUID holds the device label,
-// and the server takes no note under that (its isValidClientUid()). checkNotecardHealth() asks
-// the Notecard again.
+// start or the config kept it from an earlier one: the config then holds the same. Until then
+// gDeviceUID holds the device label, which the server takes no note under (its
+// isValidClientUid()), or keeps a report under when the label starts with "dev:" too: the client
+// would then count the report as sent, and the server would not see it under the client's id
+// for a week. checkNotecardHealth() asks the Notecard again.
 static bool deviceUidKnown() {
-  return strncmp(gDeviceUID, "dev:", 4) == 0;
+  return strncmp(gDeviceUID, "dev:", 4) == 0 && strcmp(gDeviceUID, gConfig.deviceUid) == 0;
+}
+
+// The age of a report that is due and has no time yet, brought up to date: the whole seconds of
+// the millis() difference go into gChargerReportAgeSeconds. Called in every pass of
+// serviceChargerCheck(), held back or not, so that the difference never comes near a turn of
+// millis() (49.7 days): taken once, it would date a report that waited longer, in hibernation
+// for one, as hours old.
+static void ageChargerReport() {
+  if (!gChargerReportDue || gChargerReportEpoch != 0) {
+    return;
+  }
+  const unsigned long seconds = (millis() - gChargerReportAgedMillis) / 1000UL;
+  gChargerReportAgeSeconds += (uint32_t)seconds;
+  gChargerReportAgedMillis += seconds * 1000UL;
+}
+
+// The battery's nominal voltage as the config names it, for the solar manager's no-charge alert
+// (SolarManager::setPackVolts()): 0 while battery monitoring is off, as it is in a config without
+// a batteryConfig block, whose 12 V default could be wrong for the pack. The alert then goes by
+// the voltage it reads.
+static uint8_t configuredPackVolts() {
+  return gConfig.batteryMonitor.enabled ? gConfig.batteryMonitor.nominalVoltage : 0;
 }
 
 // Hands the report that is due to the Notecard, and keeps it due until that has worked. Not to
@@ -7595,7 +7633,9 @@ static void sendDueChargerReport(unsigned long now) {
       gChargerReportWaited = true;
       return;
     }
-    const double checkedAt = nowEpoch - (double)(millis() - gChargerReportDueMillis) / 1000.0;
+    ageChargerReport();
+    const double checkedAt =
+        nowEpoch - (double)gChargerReportAgeSeconds - (double)(millis() - gChargerReportAgedMillis) / 1000.0;
     gChargerReportEpoch = checkedAt >= 1.0 ? (uint32_t)checkedAt : 1u;  // whole seconds: see below
   }
   if (gChargerReportTried && (now - gChargerReportTryMillis) < CHARGER_REPORT_RETRY_MS) {

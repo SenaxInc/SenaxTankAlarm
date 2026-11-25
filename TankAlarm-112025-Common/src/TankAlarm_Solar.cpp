@@ -266,7 +266,8 @@ static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, ui
 
 SolarManager::SolarManager() 
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
+    _floatReferenceV(0.0f), _packVolts(0), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
+    _chargerSettingsRead(false) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -631,7 +632,12 @@ bool SolarManager::readRegisters() {
     // The low threshold can be a figure per 12 V whatever the pack (the default, 11.8 V, is
     // one, and a config without batteryLowV keeps it on a 24 V pack too) or one for a 24 V
     // pack: a threshold above SOLAR_24V_SYSTEM_MIN_V is taken as the latter.
-    const float packs = (nextData.systemNominalV == 24) ? 2.0f : 1.0f;
+    // The size of the pack is the config's when it names one (setPackVolts()). The voltage read
+    // decides only when it does not: a 12 V battery that a fault has taken above
+    // SOLAR_24V_SYSTEM_MIN_V would pass for a 24 V one, and with the float target of a 24 V pack
+    // it would look like one that was not being charged, hiding its BATTERY_HIGH.
+    const uint8_t packVolts = (_packVolts != 0) ? _packVolts : nextData.systemNominalV;
+    const float packs = (packVolts == 24) ? 2.0f : 1.0f;
     float lowPer12V = _config.batteryLowVoltage;
     if (lowPer12V > SOLAR_24V_SYSTEM_MIN_V) {
       lowPer12V /= 2.0f;
@@ -1066,7 +1072,8 @@ bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
 // Stub implementation for non-RS485 platforms
 SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
+    _floatReferenceV(0.0f), _packVolts(0), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
+    _chargerSettingsRead(false) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }
