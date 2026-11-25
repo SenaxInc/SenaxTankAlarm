@@ -269,6 +269,10 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 Long commands stop when you press a key. The console of the web page takes the same commands,
 except `watch`, `net` and `web`.
 
+A command runs with all its words or not at all. A word that it does not take, or a line longer
+than 159 characters, is refused and nothing is done: `timeout 1000 0` does not set 1000 ms, and
+`set EV_lvd 13 .10` writes nothing.
+
 ## What keeps a session safe
 
 The June demo treated any reply with a valid CRC as success (review finding F-26). Since
@@ -341,20 +345,21 @@ voltage scales, and each can be corrected on its own:
 | Scale | Used for | Starts as |
 |---|---|---|
 | `vlive` | Live readings: battery, array and load voltage, the LVD in effect, minimums and maximums | x100 |
-| `vset` | Stored settings: every voltage that `set` can write | x100 |
+| `vset` | Stored settings: every voltage that `set` can write, and `va_ref_fixed`, which the controller copies from `EVa_ref_fixed_init` at start-up | x100 |
 | `vref` | The regulation target `Vb_ref` | x96.667 |
 
 OptaView starts with the specification's figures and says so until `scalecheck` has settled
 them. It tests the first two separately, each on its own evidence:
 
-- **Stored settings.** A setting whose value you know, given as `scalecheck EV_float 13.70`,
-  decides. Read it in MSView, which does not depend on OptaView's figures. It has to match
-  within 0.5 %, and the two candidates are 3.3 % apart. A setting that OptaView has written
-  since it started is refused: it went in at the scale under test, so it would read back as
-  right at that scale. The check also counts the setpoints that are round numbers (14.40 V,
-  11.50 V) at each scale, but that only points, because a setting looks round at whatever
-  scale wrote it, a wrong one included. When the two disagree, `scalecheck` goes by the
-  setting you gave and says that some setpoints were written with a wrong scale.
+- **Stored settings.** A setting that `set` can change and whose value you know, given as
+  `scalecheck EV_float 13.70`, decides. Read it in MSView, which does not depend on OptaView's
+  figures. It has to match within 0.5 %, and the two candidates are 3.3 % apart. A setting
+  that OptaView has written since it started is refused: it went in at the scale under test,
+  so it would read back as right at that scale. The check also counts the setpoints that are
+  round numbers (14.40 V, 11.50 V) at each scale, but that only points, because a setting
+  looks round at whatever scale wrote it, a wrong one included. When the two disagree,
+  `scalecheck` goes by the setting you gave and says that some setpoints were written with a
+  wrong scale.
 - **Live readings.** A multimeter reading at the controller's battery terminals, given as
   `scalecheck 13.42`, decides, and nothing else does. In absorption and float the check also
   compares the battery with `Vb_ref`, the target the controller works towards, but that only
@@ -507,7 +512,8 @@ console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
 `sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
 next three replies are lost on the way), `sim random off` (the Opta's random number generator
 fails and the clock stands in for it). Add
-`PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
+`PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. A port
+or a `sim` line that is not written whole (`--port 80x`, `sim drop 2.5`) is refused. The
 simulated controller answers as the specification says, so the preview shows the page and not
 how a real SunSaver behaves.
 

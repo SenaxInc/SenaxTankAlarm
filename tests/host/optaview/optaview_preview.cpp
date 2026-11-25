@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include <string>
+#include <vector>
 
 #include "OptaViewBuiltinProfile.h"
 #include "OptaViewConsole.h"
@@ -332,41 +333,73 @@ static bool isOnOff(const std::string &word, bool *on) {
   return false;
 }
 
-// A "sim ..." line. Every change is confirmed with one line that starts with "sim:", which the
-// browser test waits for.
+// A whole number in decimal digits and nothing else, at most `most`. strtol would take "8080typo"
+// as 8080, and "nope" or "" as 0, which for --port means any free port.
+static bool parseWhole(const char *text, unsigned long most, unsigned long *out) {
+  if (text == nullptr || *text == '\0') {
+    return false;
+  }
+  unsigned long value = 0;
+  for (const char *p = text; *p != '\0'; ++p) {
+    if (*p < '0' || *p > '9') {
+      return false;
+    }
+    value = value * 10UL + (unsigned long)(*p - '0');
+    if (value > most) {
+      return false;
+    }
+  }
+  *out = value;
+  return true;
+}
+
+// A "sim ..." line: the word after "sim" and at most one value, each read whole. A word too many,
+// a value cut short or one that is only partly a number changes nothing and gets the list of
+// commands, so "sim battery 12 .4" cannot leave the battery at 12 V. Every change is confirmed
+// with one line that starts with "sim:", which the browser test waits for.
 static void simCommand(LiveSunSaver &sim, const std::string &line) {
-  char verb[16] = "";
-  char value[32] = "";
-  sscanf(line.c_str(), "sim %15s %31s", verb, value);
-  const std::string what(verb);
+  std::vector<std::string> words;
+  size_t at = 0;
+  while (at < line.size()) {
+    const size_t begin = line.find_first_not_of(" \t", at);
+    if (begin == std::string::npos) {
+      break;
+    }
+    const size_t end = line.find_first_of(" \t", begin);
+    words.push_back(line.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+    at = end == std::string::npos ? line.size() : end;
+  }
+  const std::string what = words.size() > 1 ? words[1] : std::string();
+  const bool bare = words.size() == 2;                           // "sim writes"
+  const char *value = words.size() == 3 ? words[2].c_str() : "";  // "sim battery 12.4", or none
   bool on = false;
-  char *end = nullptr;
-  const double number = strtod(value, &end);
-  const bool numeric = value[0] != '\0' && *end == '\0';
+  double number = 0.0;
+  unsigned long whole = 0;
+  const bool decimal = ovParseDecimal(value, &number);
   if (what == "power" && isOnOff(value, &on)) {
     sim.powered = on;
     printf("sim: the controller has %s\n", on ? "power" : "no power");
-  } else if (what == "battery" && numeric && number >= 0.0 && number <= 40.0) {
+  } else if (what == "battery" && decimal && number >= 0.0 && number <= 40.0) {
     sim.setBattery(number);
     printf("sim: the battery is at %.2f V\n", number);
   } else if (what == "refuse" && isOnOff(value, &on)) {
     sim.refuseWrites = on;
     printf("sim: writes are %s\n", on ? "refused" : "accepted");
-  } else if (what == "delay" && numeric && number >= 0.0 && number <= 10000.0) {
-    sim.responseDelayMs = (uint32_t)number;
+  } else if (what == "delay" && parseWhole(value, 10000UL, &whole)) {
+    sim.responseDelayMs = (uint32_t)whole;
     printf("sim: replies take %u ms\n", (unsigned)sim.responseDelayMs);
-  } else if (what == "drop" && numeric && number >= 1.0 && number <= 20.0) {
-    sim.failNext(SimSunSaver::FAULT_LOST_REPLY, (unsigned)number);
-    printf("sim: the next %u replies are lost\n", (unsigned)number);
-  } else if (what == "skip" && numeric && number >= 0.0 && number <= 86400.0) {
+  } else if (what == "drop" && parseWhole(value, 20UL, &whole) && whole >= 1UL) {
+    sim.failNext(SimSunSaver::FAULT_LOST_REPLY, (unsigned)whole);
+    printf("sim: the next %u replies are lost\n", (unsigned)whole);
+  } else if (what == "skip" && decimal && number >= 0.0 && number <= 86400.0) {
     sim.skip((uint32_t)(number * 1000.0));
-    printf("sim: %u s have passed\n", (unsigned)number);
-  } else if (what == "writes") {
+    printf("sim: %s s have passed\n", value);
+  } else if (what == "writes" && bare) {
     printf("sim: %u writes so far\n", sim.writes);
   } else if (what == "random" && isOnOff(value, &on)) {
     gRandomWorks = on;
     printf("sim: the random number generator %s\n", on ? "works" : "fails");
-  } else if (what == "quit") {
+  } else if (what == "quit" && bare) {
     printf("sim: bye\n");
     fflush(stdout);
     exit(0);
@@ -377,21 +410,20 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
 }
 
 int main(int argc, char **argv) {
-  long port = 8080;
+  unsigned long port = 8080;
   const char *pin = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-      port = strtol(argv[++i], nullptr, 10);
+      if (!parseWhole(argv[++i], 65535UL, &port)) {
+        fprintf(stderr, "optaview_preview: a port is a whole number from 0 to 65535, not '%s'\n", argv[i]);
+        return 2;
+      }
     } else if (strcmp(argv[i], "--pin") == 0 && i + 1 < argc) {
       pin = argv[++i];
     } else {
       fprintf(stderr, "usage: optaview_preview [--port <n>] [--pin <4 to 8 digits>]\n");
       return 2;
     }
-  }
-  if (port < 0 || port > 65535) {
-    fprintf(stderr, "optaview_preview: a port is 0 to 65535\n");
-    return 2;
   }
   signal(SIGPIPE, SIG_IGN);
 
@@ -419,7 +451,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   if (!host.listen((uint16_t)port)) {
-    fprintf(stderr, "optaview_preview: cannot listen on 127.0.0.1:%ld (%s)\n", port, strerror(errno));
+    fprintf(stderr, "optaview_preview: cannot listen on 127.0.0.1:%lu (%s)\n", port, strerror(errno));
     return 1;
   }
   console.addExtra(&web);
@@ -433,7 +465,7 @@ int main(int argc, char **argv) {
   for (;;) {
     std::string line;
     while (terminal.takeLine(&line)) {
-      if (line.compare(0, 3, "sim") == 0 && (line.size() == 3 || line[3] == ' ')) {
+      if (line.compare(0, 3, "sim") == 0 && (line.size() == 3 || line[3] == ' ' || line[3] == '\t')) {
         simCommand(sim, line);
       } else {
         console.handleLine(line.c_str());

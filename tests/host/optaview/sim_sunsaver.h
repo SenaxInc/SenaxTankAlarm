@@ -481,12 +481,23 @@ class SimSunSaver : public optaview::MbTransport {
     }
   }
 
+  // Firmware v08 and later copies a setting to its RAM twin at start-up; older firmware has neither.
+  void copyAtStartUp(uint16_t from, uint16_t to) {
+    if (regs.find(from) != regs.end() && regs.find(to) != regs.end()) {
+      regs[to] = regs[from];
+    }
+  }
+
   void restart() {
     ++resets;
     regs[0x0012] = (uint16_t)(regs[0x0012] & ~(1u << 5));  // array_fault: EEPROM setting edit
     regs[0x001B] = (uint16_t)(regs[0x001B] & ~(1u << 6));  // load_fault: EEPROM setting edit
     // The LVD in effect is taken from the EEPROM setting at start-up, in measurement units.
     regs[0x001C] = volts((double)regs[0xE022] * settingsNumerator / 32768.0);
+    // The fixed array targets are copied as they are, in the units of the settings: "On start-up,
+    // the value in this register is copied to the volatile RAM register 0x0039" (and 0x003A).
+    copyAtStartUp(0xE036, 0x0039);
+    copyAtStartUp(0xE037, 0x003A);
     downUntil_ = now_ + resetDownMs;
   }
 

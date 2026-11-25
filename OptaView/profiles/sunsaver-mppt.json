@@ -8,7 +8,7 @@
   "notes": [
     "Registers marked ~ come from the Morningstar specification and have not been confirmed on our bench.",
     "The voltage scales are unsettled: the specification gives n*100/32768 for every voltage except Vb_ref (n*96.667/32768), while the TankAlarm client scales 0x0008-0x000A by 96.667. Run 'scalecheck' before trusting or writing a voltage.",
-    "Voltages have three scales here so that each can be corrected alone: vlive for what the controller measures, vset for the settings it stores, vref for Vb_ref. A controller could use one figure for measurements and another for settings.",
+    "Voltages have three scales here so that each can be corrected alone: vlive for what the controller measures, vset for the settings it stores and for va_ref_fixed, its start-up copy of one, vref for Vb_ref. A controller could use one figure for measurements and another for settings.",
     "The limits on writable settings are OptaView sanity limits for 12 V setpoints, not Morningstar's own limits.",
     "Left out on purpose: the lighting coil (the specification prints address 0x0020 with logical number 27, which disagree) and the logged data block at 0x8000 (the specification's record layout overlaps itself)."
   ],
@@ -121,8 +121,8 @@
     { "addr": "0x0033", "name": "vb_min", "label": "Battery voltage minimum since reset", "scale": "vlive", "group": "daily" },
     { "addr": "0x0034", "name": "vb_max", "label": "Battery voltage maximum since reset", "scale": "vlive", "group": "daily" },
     { "addr": "0x0038", "name": "lighting_should_be_on", "label": "Lighting output wanted", "group": "mppt", "note": "Controller firmware v08 and later." },
-    { "addr": "0x0039", "name": "va_ref_fixed", "label": "Fixed array voltage target (0 = none)", "scale": "vlive", "group": "mppt", "note": "Controller firmware v08 and later. Not 0: MPPT sweeping and tracking stop, and the array is held at this voltage." },
-    { "addr": "0x003A", "name": "va_ref_fixed_pct", "label": "Fixed array target, percent of Voc", "scale": "pct256", "group": "mppt", "note": "Controller firmware v08 and later." },
+    { "addr": "0x0039", "name": "va_ref_fixed", "label": "Fixed array voltage target (0 = none)", "scale": "vset", "group": "mppt", "note": "Controller firmware v08 and later. The controller copies EVa_ref_fixed_init here at start-up, as it is, so this is on the scale of the stored settings. Not 0: MPPT sweeping and tracking stop, and the array is held at this voltage." },
+    { "addr": "0x003A", "name": "va_ref_fixed_pct", "label": "Fixed array target, percent of Voc", "scale": "pct256", "group": "mppt", "note": "Controller firmware v08 and later. The controller copies EVa_ref_fixed_pct_init here at start-up." },
 
     { "addr": "0xE000", "name": "EV_reg", "label": "Absorption voltage at 25 C", "scale": "vset", "group": "charge1", "writable": true, "min": 10.0, "max": 17.0 },
     { "addr": "0xE001", "name": "EV_float", "label": "Float voltage at 25 C (0 = no float)", "scale": "vset", "group": "charge1", "writable": true, "min": 10.0, "max": 17.0, "zeroOk": true },

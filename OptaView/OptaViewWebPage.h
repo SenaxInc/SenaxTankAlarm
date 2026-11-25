@@ -12,7 +12,7 @@
 
 namespace optaview {
 
-// The page: 54617 bytes, its lines ending in LF.
+// The page: 54685 bytes, its lines ending in LF.
 static const char OV_WEB_PAGE[] =
     R"OVWEB(<!DOCTYPE html>)OVWEB" "\n"
     R"OVWEB(<html lang="en">)OVWEB" "\n"
@@ -1005,8 +1005,9 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(  $('scaleText').textContent = lines.join(' ');)OVWEB" "\n"
     R"OVWEB(})OVWEB" "\n"
     "\n"
-    R"OVWEB(// The stored settings that can be checked against a value the user knows: one-word registers)OVWEB" "\n"
-    R"OVWEB(// on the scale of stored settings. Built once the register map and that scale's name are known.)OVWEB" "\n"
+    R"OVWEB(// The stored settings that can be checked against a value the user knows: one-word settings on)OVWEB" "\n"
+    R"OVWEB(// the scale of stored settings that 'set' can change, as the console takes them. Built once the)OVWEB" "\n"
+    R"OVWEB(// register map and that scale's name are known.)OVWEB" "\n"
     R"OVWEB(function buildKnownPick() {)OVWEB" "\n"
     R"OVWEB(  var pick = $('knownName');)OVWEB" "\n"
     R"OVWEB(  var scale = state && state.scales && state.scales.settings;)OVWEB" "\n"
@@ -1017,7 +1018,7 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(  none.value = '';)OVWEB" "\n"
     R"OVWEB(  add(pick, none);)OVWEB" "\n"
     R"OVWEB(  profile.registers.forEach(function (reg) {)OVWEB" "\n"
-    R"OVWEB(    if (reg.scale !== scale.name || reg.type === 'u32') { return; })OVWEB" "\n"
+    R"OVWEB(    if (reg.scale !== scale.name || reg.type === 'u32' || !reg.writable) { return; })OVWEB" "\n"
     R"OVWEB(    var option = el('option', '', reg.name + ': ' + reg.label);)OVWEB" "\n"
     R"OVWEB(    option.value = reg.name;)OVWEB" "\n"
     R"OVWEB(    add(pick, option);)OVWEB" "\n"
@@ -1394,7 +1395,7 @@ static const size_t OV_WEB_PAGE_LENGTH = sizeof(OV_WEB_PAGE) - 1;
 static const char OV_WEB_PAGE_HEADERS[] =
     "Content-Security-Policy: "
     "default-src 'none'; "
-    "script-src 'sha256-rtEQuki3yDwzb0ksU8ystN9pAT+b72Qzv1U0Lk0Y8Y0='; "
+    "script-src 'sha256-Sf3jzRGJ4yFFBQ+3bV2m4ccxT949TWUxgIga18/Mzcw='; "
     "style-src 'sha256-Ww9KXXDgOmF/WhmUHbakfApV1Aazm40Ei8oarUHhAcw='; "
     "connect-src 'self'; "
     "img-src data:; "

@@ -67,8 +67,32 @@ static std::string gTranscript;  // everything the console printed, checked for 
 // limit, which is hours. A wait inside the code under test ends on the simulated clock (see
 // SimSunSaver::idle). This is for everything else: after ten minutes of real time the program
 // says so and fails. OPTAVIEW_TEST_SECONDS sets another limit, and 0 switches it off, as for a
-// debugger or for a tool that runs the tests many times slower. A value that is not a number of
-// seconds, a day at most, changes nothing.
+// debugger or for a tool that runs the tests many times slower. A value that is not a whole number
+// of seconds, a day at most, stops the tests at once with a message: taken as 600, an "O" typed
+// for 0 would end a session in the debugger after ten minutes.
+//
+// The limit that OPTAVIEW_TEST_SECONDS asks for: 600 when it is not set or empty, and false when
+// it is anything but digits that make 0 to 86400. strtoul would also take " 5" and "+5", and
+// "-1" as a huge number.
+inline bool ovTestSecondsFrom(const char *text, unsigned long *out) {
+  if (text == nullptr || *text == '\0') {
+    *out = 600;
+    return true;
+  }
+  unsigned long value = 0;
+  for (const char *p = text; *p != '\0'; ++p) {
+    if (*p < '0' || *p > '9') {
+      return false;
+    }
+    value = value * 10UL + (unsigned long)(*p - '0');
+    if (value > 86400UL) {
+      return false;
+    }
+  }
+  *out = value;
+  return true;
+}
+
 #if defined(__unix__) || defined(__APPLE__)
 static void testTimeIsUp(int) {
   static const char text[] =
@@ -81,14 +105,14 @@ static void testTimeIsUp(int) {
 }
 
 inline void startTestTimeLimit() {
-  unsigned long seconds = 600;
+  unsigned long seconds = 0;
   const char *text = getenv("OPTAVIEW_TEST_SECONDS");
-  if (text != nullptr && text[0] != '\0') {
-    char *end = nullptr;
-    const unsigned long asked = strtoul(text, &end, 10);
-    if (end != text && *end == '\0' && asked <= 86400UL) {
-      seconds = asked;
-    }
+  if (!ovTestSecondsFrom(text, &seconds)) {
+    fprintf(stderr,
+            "optaview: OPTAVIEW_TEST_SECONDS is a whole number of seconds from 0 (no limit) to 86400, "
+            "not '%s'\n",
+            text);
+    exit(2);
   }
   if (seconds > 0) {
     signal(SIGALRM, testTimeIsUp);
