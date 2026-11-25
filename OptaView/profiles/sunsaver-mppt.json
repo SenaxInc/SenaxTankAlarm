@@ -204,7 +204,11 @@
     { "below": "EV_eq", "above": "EV_hvd", "message": "Equalize voltage (EV_eq) must be below battery high voltage disconnect (EV_hvd)." },
     { "below": "EV_reg2", "above": "EV_hvd", "message": "Bank 2 absorption voltage (EV_reg2) must be below battery high voltage disconnect (EV_hvd)." },
     { "below": "EV_float2", "above": "EV_hvd", "message": "Bank 2 float voltage (EV_float2) must be below battery high voltage disconnect (EV_hvd)." },
-    { "below": "EV_eq2", "above": "EV_hvd", "message": "Bank 2 equalize voltage (EV_eq2) must be below battery high voltage disconnect (EV_hvd)." }
+    { "below": "EV_eq2", "above": "EV_hvd", "message": "Bank 2 equalize voltage (EV_eq2) must be below battery high voltage disconnect (EV_hvd)." },
+    { "below": "EV_soc_g2y", "above": "EV_soc_y2g", "message": "LED yellow to green (EV_soc_y2g) must be above LED green to yellow (EV_soc_g2y), or the battery LED can flicker between the two." },
+    { "below": "EV_soc_y2r0", "above": "EV_soc_r2y", "message": "LED red to yellow (EV_soc_r2y) must be above LED yellow to blinking red (EV_soc_y2r0), or the battery LED can flicker between the two." },
+    { "below": "EV_soc_y2r0", "above": "EV_soc_g2y", "message": "LED yellow to blinking red (EV_soc_y2r0) must be below LED green to yellow (EV_soc_g2y), or a falling battery skips yellow." },
+    { "below": "EV_soc_r2y", "above": "EV_soc_y2g", "message": "LED red to yellow (EV_soc_r2y) must be below LED yellow to green (EV_soc_y2g), or a rising battery skips yellow." }
   ],
   "scaleCheck": {
     "alternates": [96.667],

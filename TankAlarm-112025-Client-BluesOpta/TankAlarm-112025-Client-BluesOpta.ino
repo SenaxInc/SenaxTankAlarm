@@ -1074,9 +1074,6 @@ static bool gTimeSyncDue = false;  // the clock was set 6 hours ago or more: see
 #define DEVICE_UID_RETRY_MS (10UL * 60UL * 1000UL)
 static unsigned long gDeviceUidAskedMillis = 0;
 static bool gDeviceUidFromNotecard = false;  // the Notecard gave gDeviceUID at this start
-// Firmware before this one kept the UID in the config in 32 bytes, and strlcpy() cut a longer UID
-// to 31 characters there. A kept UID of that length may be the start of another: see deviceUidKnown().
-#define LEGACY_DEVICE_UID_MAX_CHARS 31
 static double gNextDailyReportEpoch = 0.0;
 
 // DFU (Device Firmware Update) state tracking
@@ -2263,10 +2260,12 @@ void loop() {
     }
   }
 
-  // The client's id, when the Notecard did not give it at the start and no earlier start kept
-  // it. The health check above asks again only while the Notecard is unavailable, and a working
-  // Notecard would leave the charger report waiting for the id (deviceUidKnown()) for good. Not
-  // while a firmware update is staged, and not in hibernation, which sends no report either.
+  // The client's id, when the Notecard did not give it at this start. The UID an earlier start
+  // kept stands in for it in the notes until then (initializeNotecard()), but it may be the UID of
+  // a Notecard this one replaced. The health check above asks again only while the Notecard is
+  // unavailable, and a working Notecard would leave the charger report waiting for the id
+  // (deviceUidKnown()) for good, and the notes under the old UID. Not while a firmware update is
+  // staged, and not in hibernation, which sends no report either.
   if (gNotecardAvailable && !deviceUidKnown() && !gDfuInProgress && gPowerState != POWER_STATE_CRITICAL_HIBERNATE &&
       now - gDeviceUidAskedMillis >= DEVICE_UID_RETRY_MS) {
     gDeviceUidAskedMillis = now;
@@ -4546,9 +4545,11 @@ static void initializeNotecard() {
 }
 
 // Asks the Notecard for its device UID ("dev:..."), the client's id, and keeps it in gDeviceUID
-// and in the config, so that it holds across a start that finds the Notecard not ready (and the
-// client is not taken for another one). Only a UID that fits whole: one cut short could be
-// another client's id. True when the Notecard gave one that fits.
+// and in the config, so that the notes of a start that finds the Notecard not ready still go out
+// under it (and the client is not taken for another one). What must not go to another client
+// waits until the Notecard has given it at this start (deviceUidKnown()): the UID kept is the old
+// one after a Notecard is swapped. Only a UID that fits whole: one cut short could be another
+// client's id. True when the Notecard gave one that fits.
 // A UID too long to keep is still an answer: the UID the config kept from an earlier start is not
 // this Notecard's (it may be the one this Notecard replaced), so it is forgotten, and the client
 // goes by its device label, as when no UID is known (initializeNotecard()). What waits for the id
@@ -4709,8 +4710,9 @@ static bool checkNotecardHealth() {
   }
 
   // Deferred UID resolution: if the Notecard wasn't ready at boot, the device
-  // UID may still be a fallback (deviceLabel).  Now that the Notecard is
-  // healthy, retry hub.get to obtain the real UID and persist it.
+  // UID may still be a fallback (the UID an earlier start kept, or the
+  // deviceLabel).  Now that the Notecard is healthy, retry hub.get to obtain
+  // the real UID and persist it.
   if (!deviceUidKnown() && lookUpDeviceUid()) {
     Serial.print(F("Device UID resolved: "));
     Serial.println(gDeviceUID);
@@ -8079,20 +8081,18 @@ static void finishChargerCheck(unsigned long endedAt) {
 }
 
 // The client's id is the Notecard's device UID ("dev:..."), once the Notecard has given it at this
-// start or the config kept it from an earlier one: the config then holds the same. Until then
-// gDeviceUID holds the device label, which the server takes no note under (its
-// isValidClientUid()), or keeps a report under when the label starts with "dev:" too: the client
-// would then count the report as sent, and the server would not see it under the client's id
-// for a week. loop() asks the Notecard again every 10 minutes (lookUpDeviceUid()), and so does
-// checkNotecardHealth() once the Notecard is back. A UID the config kept with exactly
-// LEGACY_DEVICE_UID_MAX_CHARS characters counts only once the Notecard has given it at this start:
-// an earlier firmware may have cut a longer one to that length, and a report sent under it would
-// go to another client. A shorter one was kept whole, and so was a longer one, by this firmware.
+// start: the config then holds the same. Until then gDeviceUID holds the UID an earlier start kept
+// in the config, or the device label. The kept UID may not be this Notecard's: after a Notecard is
+// swapped it is the old one's, and a report sent under it goes to the client that Notecard was
+// (an earlier firmware may also have cut a longer UID to 31 characters, the start of another).
+// The server takes no note under the label (its isValidClientUid()), or keeps a report under it
+// when the label starts with "dev:" too. Either way the client would count the report as sent,
+// and the server would not see it under the client's id for a week. loop() asks the Notecard
+// again every 10 minutes until it answers (lookUpDeviceUid()), and so does checkNotecardHealth()
+// once the Notecard is back.
 static bool deviceUidKnown() {
-  if (strncmp(gDeviceUID, "dev:", 4) != 0 || strcmp(gDeviceUID, gConfig.deviceUid) != 0) {
-    return false;
-  }
-  return gDeviceUidFromNotecard || strlen(gDeviceUID) != LEGACY_DEVICE_UID_MAX_CHARS;
+  return gDeviceUidFromNotecard && strncmp(gDeviceUID, "dev:", 4) == 0 &&
+         strcmp(gDeviceUID, gConfig.deviceUid) == 0;
 }
 
 // The age of a report that is due and has no time yet, brought up to date: the whole seconds of
@@ -8125,8 +8125,9 @@ static void sendDueChargerReport(unsigned long now) {
   if (!gChargerReportDue) {
     return;
   }
-  // Sent under the device label, the report would count as sent while the server drops it, and
-  // an unchanged one would not go again for a week: it waits for the client's id.
+  // Sent under the device label, or under a kept UID that may be another Notecard's, the report
+  // would count as sent while the server drops it or keeps it for another client, and an
+  // unchanged one would not go again for a week: it waits for the client's id.
   if (!deviceUidKnown()) {
     gChargerReportWaited = true;
     return;
@@ -8911,8 +8912,9 @@ static void sendDueChargerProgramReport(unsigned long now) {
       Serial.println(F("Charger programming: the result goes out once the Notecard has given this client its device UID"));
     }
   }
-  // Under the device label the server takes no note, and the result would count as taken (see
-  // sendDueChargerReport()): it waits in the journal for the client's id.
+  // Under the device label the server takes no note, and under a kept UID that may be another
+  // Notecard's it keeps the result for another client. Either way the result would count as taken
+  // (see sendDueChargerReport()): it waits in the journal for the client's id.
   if (!deviceUidKnown()) {
     return;
   }

@@ -63,6 +63,17 @@ class OvConsoleExtra {
 
 static const uint8_t OV_MAX_EXTRAS = 4;
 
+// The characters that wait at a terminal's port, one at a time.
+class OvKeys {
+ public:
+  virtual ~OvKeys() {}
+  // The next character, or -1 when none is waiting.
+  virtual int read() = 0;
+};
+
+// How many characters OvLineEditor::take() takes in one go, at most.
+static const size_t OV_KEYS_PER_TAKE = 64;
+
 // Collects typed characters into a line, with echo and backspace, for a terminal that sends
 // each key as it is pressed. Lines may end with CR, LF or CR LF.
 class OvLineEditor {
@@ -95,9 +106,27 @@ class OvLineEditor {
     }
     // One character more than a console line can have is kept, and then the echo stops: a line
     // that was too long stays too long, so the console refuses it instead of running its start.
+    // A backspace takes back the last character shown, so what runs is what the terminal shows.
     if (length_ + 1 < sizeof(line_)) {
       line_[length_++] = (char)key;
       echo.printChar((char)key);
+    }
+    return false;
+  }
+
+  // Feeds what waits at `keys`, up to the end of a line and OV_KEYS_PER_TAKE characters at
+  // most. Returns true when a line ended, as feed() does; the rest waits at the port. The sketch
+  // runs that line and then gives the network and the web page their turn, so lines that wait
+  // (a paste) or a program that never stops sending cannot keep the page waiting.
+  bool take(OvKeys &keys, OvOut &echo) {
+    for (size_t taken = 0; taken < OV_KEYS_PER_TAKE; ++taken) {
+      const int key = keys.read();
+      if (key < 0) {
+        return false;
+      }
+      if (feed(key, echo)) {
+        return true;
+      }
     }
     return false;
   }
@@ -237,7 +266,6 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         trace_(false),
         stopped_(false),
         blocksNoticeShown_(false),
-        writeNotesShown_(false),
         extraCount_(0) {
     memset(&pending_, 0, sizeof(pending_));
     memset(&settingsScale_, 0, sizeof(settingsScale_));
@@ -292,7 +320,6 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         device_.master().trace = nullptr;
       }
     }
-    writeNotesShown_ = false;
     blocksNoticeShown_ = false;
     settingsScale_.noticed = false;
     liveScale_.noticed = false;
@@ -509,7 +536,6 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   ScaleState settingsScale_;
   ScaleState liveScale_;
   bool blocksNoticeShown_;
-  bool writeNotesShown_;
   OvConsoleExtra *extras_[OV_MAX_EXTRAS];
   uint8_t extraCount_;
 
@@ -1995,16 +2021,14 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.println(".");
   }
 
+  // The profile's notes on writing, before every question that may write a setting: what they
+  // warn of (here the controller's EEPROM fault, and how the Opta must be powered meanwhile)
+  // holds for each write, and the last question may have been somebody else's, hours ago.
   void printWriteNotes() {
     OvProfile &profile = device_.profile();
     if (profile.writeNoteCount() == 0) {
       return;
     }
-    if (writeNotesShown_) {
-      out_.println("  ('profile' repeats the notes on writing.)");
-      return;
-    }
-    writeNotesShown_ = true;
     out_.println("  Before you write:");
     for (size_t i = 0; i < profile.writeNoteCount(); ++i) {
       printWrapped("  - ", "    ", profile.writeNote(i));
@@ -2729,6 +2753,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.println("?");
       out_.println(
           "OptaView cannot tell what this request does: it may change the controller, and nothing is checked.");
+      printWriteNotes();  // it may write a setting
       out_.println("Type yes to send it. Anything else cancels.");
       ask(PENDING_RAW_FRAME);
       pending_.bodyLength = (uint8_t)length;
@@ -2751,6 +2776,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(" with function ");
       out_.printU(function);
       out_.println("? No limits apply and nothing is checked first.");
+      if (function != MB_FC_WRITE_COIL) {
+        printWriteNotes();  // a register: a setting, as with 'set'
+      }
       out_.println("Type yes to send it. Anything else cancels.");
       ask(PENDING_RAW_WRITE);
       pending_.slave = (uint8_t)slave;

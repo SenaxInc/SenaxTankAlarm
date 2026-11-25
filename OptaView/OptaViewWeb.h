@@ -545,10 +545,16 @@ class OvWeb : public OvConsoleExtra {
     response_.println(text);
   }
 
+  // Every 401 is one of these. RFC 9110 (15.5.2) has it say how to log in; the scheme is
+  // OptaView's own, and a browser asks for a user name and password only for the schemes it
+  // knows, so the page goes on to show its own login.
   void beginJson(int status, const char *extra = nullptr) {
     char headers[260];
     OvText all(headers, sizeof(headers));
     all.add(apiHeaders());
+    if (status == 401) {
+      all.add("WWW-Authenticate: OptaView-PIN realm=\"OptaView\"\r\n");
+    }
     all.add(extra);
     response_.begin(status, "application/json", headers);
   }
@@ -584,7 +590,7 @@ class OvWeb : public OvConsoleExtra {
       return;
     }
     if (strcmp(r.path, "/favicon.ico") == 0) {
-      response_.begin(204, nullptr, apiHeaders(), 0);
+      response_.begin(204, nullptr, apiHeaders());
       return;
     }
     if (strncmp(r.path, "/api/", 5) != 0) {

@@ -7,6 +7,10 @@
 
 #include "test_support.h"
 
+#include <sys/ioctl.h>
+
+#include "preview_terminal.h"
+
 // ============================================================================
 // Modbus master
 // ============================================================================
@@ -1287,7 +1291,7 @@ static void testBuiltinProfile() {
     CHECK_EQ(profile.coilCount(), 8);
     CHECK_EQ(profile.groupCount(), 13);
     CHECK_EQ(profile.liveGroupCount(), 2);
-    CHECK_EQ(profile.checkCount(), 9);
+    CHECK_EQ(profile.checkCount(), 13);
     CHECK(profile.noteCount() >= 3);
     CHECK(profile.writeNoteCount() >= 2);
     CHECK(profile.wiringCount() >= 8);
@@ -2817,6 +2821,29 @@ static std::string typeInto(OvLineEditor &editor, StringOut &echo, const std::st
   return lines;
 }
 
+// Characters that wait at a port. Once they are used up, read() says that none is waiting; an
+// endless one starts over instead, as a program at the other end that never stops sending.
+struct StringKeys : OvKeys {
+  std::string keys;
+  size_t at;
+  bool endless;
+  size_t reads;  // calls of read(), the ones that found nothing included
+
+  explicit StringKeys(const std::string &text, bool forEver = false)
+      : keys(text), at(0), endless(forEver), reads(0) {}
+
+  int read() override {
+    ++reads;
+    if (at == keys.size()) {
+      if (!endless || keys.empty()) {
+        return -1;
+      }
+      at = 0;
+    }
+    return (unsigned char)keys[at++];
+  }
+};
+
 static void testLineEditor() {
   {  // Nothing is typed until a character that counts arrives, and again after each Enter.
     OvLineEditor editor;
@@ -2910,6 +2937,68 @@ static void testLineEditor() {
     editor.lineFeedTaken();  // the sketch took the LF while a command ran
     CHECK(typeInto(editor, echo, "\n") == "|");
   }
+  {  // take(): what waits at the port, as far as the end of a line. The sketch runs that line and
+     // gives the web page its turn before it takes more.
+    OvLineEditor editor;
+    StringOut echo;
+    StringKeys keys("live\r\nprobe\n\nstatus");
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "live");
+    CHECK_EQ(keys.at, 5);  // up to the CR: the LF waits, as it did while a command ran
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "probe");  // the LF was the other half of that Enter
+    CHECK_EQ(keys.at, 12);
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "");
+    CHECK_EQ(keys.at, 13);
+    CHECK(!editor.take(keys, echo));  // "status" has no end yet
+    CHECK_EQ(keys.at, keys.keys.size());
+    CHECK(!editor.empty());
+    const size_t looks = keys.reads;
+    CHECK(!editor.take(keys, echo));  // nothing waits: one look, and back
+    CHECK_EQ(keys.reads, looks + 1);
+    keys.keys += "\n";
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "status");
+    CHECK(echo.text == "live\r\nprobe\r\n\r\nstatus\r\n");
+  }
+  {  // A port that never stops sending gives OV_KEYS_PER_TAKE characters to each take(), and one
+     // line at most, however short its lines are.
+    OvLineEditor editor;
+    StringOut echo;
+    StringKeys endless("x", true);
+    CHECK(!editor.take(endless, echo));
+    CHECK_EQ(endless.reads, OV_KEYS_PER_TAKE);
+    CHECK(!editor.take(endless, echo));
+    CHECK_EQ(endless.reads, 2 * OV_KEYS_PER_TAKE);
+    CHECK_EQ(echo.text.size(), 2 * OV_KEYS_PER_TAKE);
+    OvLineEditor other;
+    StringKeys lines("ab\n", true);
+    for (size_t i = 1; i <= 3; ++i) {
+      CHECK(other.take(lines, echo));
+      CHECK(std::string(other.line()) == "ab");
+      CHECK_EQ(lines.reads, 3 * i);
+    }
+    // A line longer than one take() ends in a later one.
+    OvLineEditor third;
+    StringKeys longer(std::string(OV_KEYS_PER_TAKE + 10, 'y') + "\n");
+    CHECK(!third.take(longer, echo));
+    CHECK_EQ(longer.at, OV_KEYS_PER_TAKE);
+    CHECK(third.take(longer, echo));
+    CHECK(std::string(third.line()) == std::string(OV_KEYS_PER_TAKE + 10, 'y'));
+  }
+  {  // Through the console: a paste of a question and its answer, a line per take().
+    Rig rig;
+    OvLineEditor editor;
+    StringKeys keys("set EV_lvd 13.10\r\nyes\r\n");
+    CHECK(editor.take(keys, rig.out));
+    CHECK_HAS(rig.run(editor.line()), "Type yes to write it.");
+    CHECK_EQ(rig.sent(0x06), 0);
+    CHECK(editor.take(keys, rig.out));
+    CHECK_HAS(rig.run(editor.line()), "Written and read back: EV_lvd = 13.10 V");
+    CHECK(!editor.take(keys, rig.out));
+    CHECK_EQ(keys.at, keys.keys.size());
+  }
   {  // Through the console: what a terminal session looks like, CR LF line ends included.
     Rig rig;
     OvLineEditor editor;
@@ -2926,6 +3015,171 @@ static void testLineEditor() {
     CHECK_HAS(rig.out.text, "Written and read back: EV_lvd = 13.10 V [0x10C5]");
     CHECK_EQ(rig.sim.regs[0xE022], 0x10C5);
   }
+}
+
+// The PC preview's terminal (preview_terminal.h), which stands for the USB port there, on a pipe.
+static void testPreviewTerminal() {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    CHECK_MSG(false, "no pipe: %s", strerror(errno));
+    return;
+  }
+  const auto put = [&](const std::string &text) {
+    CHECK_EQ(write(fds[1], text.data(), text.size()), text.size());
+  };
+  const auto unread = [&]() {
+    int count = -1;
+    CHECK_EQ(ioctl(fds[0], FIONREAD, &count), 0);
+    return count;
+  };
+  const size_t chunk = PreviewTerminal::CHUNK;
+  std::string line;
+  {  // Lines end with LF or CR LF; a line without its end counts as a key press, not as a line.
+    PreviewTerminal terminal(fds[0]);
+    CHECK(!terminal.takeLine(&line));
+    CHECK(!terminal.inputPending());
+    put("live\r\nprobe\n\nstatus");
+    CHECK(terminal.takeLine(&line) && line == "live");
+    CHECK_EQ(terminal.waiting(), 2);
+    CHECK(terminal.takeLine(&line) && line == "probe");
+    CHECK(terminal.takeLine(&line) && line.empty());
+    CHECK(!terminal.takeLine(&line));
+    CHECK(terminal.inputPending());
+    put("\n");
+    CHECK(terminal.takeLine(&line) && line == "status");
+    CHECK(!terminal.inputPending());
+    CHECK(terminal.open());
+  }
+  {  // It reads a chunk at a time, and only when no whole line waits: what a terminal sends
+     // without a pause stays in the pipe while the lines that came first are run.
+    PreviewTerminal terminal(fds[0]);
+    std::string text;
+    for (int i = 0; i < 300; ++i) {
+      text += "ab\n";
+    }
+    put(text);
+    CHECK(terminal.takeLine(&line) && line == "ab");
+    CHECK_EQ(unread(), text.size() - chunk);
+    CHECK_EQ(terminal.waiting(), chunk / 3 - 1);  // the whole lines of the chunk, but the one taken
+    for (size_t i = 0; i + 1 < chunk / 3; ++i) {
+      CHECK(terminal.takeLine(&line) && line == "ab");
+    }
+    CHECK_EQ(unread(), text.size() - chunk);  // none of those read more
+    CHECK(terminal.inputPending());           // a key press is there, and it took nothing
+    CHECK_EQ(unread(), text.size() - chunk);
+    size_t lines = chunk / 3;
+    while (terminal.takeLine(&line)) {
+      CHECK(line == "ab");
+      ++lines;
+    }
+    CHECK_EQ(lines, 300);
+    CHECK_EQ(unread(), 0);
+  }
+  {  // Of a line that does not end it keeps OV_LINE_MAX characters, one more than the console
+     // takes, so that the line is still too long when it ends.
+    PreviewTerminal terminal(fds[0]);
+    put(std::string(5000, 'x'));
+    for (int i = 0; i < 30; ++i) {
+      CHECK(!terminal.takeLine(&line));
+    }
+    CHECK_EQ(unread(), 0);
+    put("y\r\nok\r\n");
+    CHECK(terminal.takeLine(&line));
+    CHECK(line == std::string(OV_LINE_MAX, 'x'));
+    CHECK(terminal.takeLine(&line) && line == "ok");
+    put(std::string(OV_LINE_MAX - 1, 'z') + "\r\n");  // as long as a console line can be
+    CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX - 1, 'z'));
+    put(std::string(OV_LINE_MAX, 'z') + "\r\n");      // one more: its CR is not kept, and it is too long
+    CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX, 'z'));
+  }
+  {  // A CR that is the last character kept of a line too long is a part of that line, not its
+     // end, so the line stays too long. As the answer to a question it cancels it: taking off
+     // that CR left 159 characters, and "yes" and 156 spaces wrote the setting (review 20).
+    PreviewTerminal terminal(fds[0]);
+    const std::string yes = "yes" + std::string(OV_LINE_MAX - 4, ' ');  // as long as a line can be
+    put(yes + "\rno\n");
+    CHECK(terminal.takeLine(&line) && line == yes + "\r");
+    put(yes + "\r\r\n");  // the second CR is not kept, so the first one stays
+    CHECK(terminal.takeLine(&line) && line == yes + "\r");
+    put(yes + "\r\n");    // nothing was left out: this CR is the line's end
+    CHECK(terminal.takeLine(&line) && line == yes);
+    put(std::string(OV_LINE_MAX + 40, 'x') + "\nyes\r\n");  // the next line starts afresh
+    CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX, 'x'));
+    CHECK(terminal.takeLine(&line) && line == "yes");
+    put(yes + "\rno");    // a key press, which the command it stops takes along, to its end
+    CHECK(terminal.inputPending());
+    terminal.discardInput();
+    put("\nyes\r\n");
+    CHECK(terminal.takeLine(&line) && line == "yes");
+
+    Rig rig;
+    CHECK_HAS(rig.run("set EV_lvd 13.10"), "Type yes to write it.");
+    const uint16_t before = rig.sim.regs[0xE022];
+    put(yes + "\rno\n");
+    CHECK(terminal.takeLine(&line));
+    const std::string answered = rig.run(line);
+    CHECK_MSG(answered == "Cancelled. Nothing was sent.\r\n", "the answer was: %s", answered.c_str());
+    CHECK_EQ(rig.sent(0x06), 0);
+    CHECK_EQ(rig.sim.regs[0xE022], before);
+    CHECK(!rig.console.awaitingConfirmation());
+  }
+  {  // A NUL is kept: the preview gives that line to the console, which refuses it whole.
+    PreviewTerminal terminal(fds[0]);
+    put(std::string("sim\0delay 100\n", 14));
+    CHECK(terminal.takeLine(&line) && line == std::string("sim\0delay 100", 13));
+  }
+  {  // The key press that stops a command takes along what came with it, but not without end.
+    PreviewTerminal terminal(fds[0]);
+    put("stop\nlive\npart");
+    terminal.discardInput();
+    CHECK(!terminal.takeLine(&line));
+    CHECK(!terminal.inputPending());
+    put(std::string(chunk * (PreviewTerminal::DISCARD_CHUNKS + 2), '\n'));
+    terminal.discardInput();
+    CHECK_EQ(unread(), 2 * chunk);
+    size_t lines = 0;
+    while (terminal.takeLine(&line)) {
+      ++lines;
+    }
+    CHECK_EQ(lines, 2 * chunk);
+  }
+  {  // A line that was still arriving when the key press reached its limit goes with it: what is
+     // left of it is not run as a line of its own, however many reads it takes to arrive.
+    PreviewTerminal terminal(fds[0]);
+    const size_t limit = chunk * PreviewTerminal::DISCARD_CHUNKS;
+    put(std::string(limit + 10, 'x') + "\nlive\n");
+    terminal.discardInput();
+    CHECK_EQ(unread(), 16);
+    CHECK(terminal.takeLine(&line) && line == "live");
+    CHECK(!terminal.takeLine(&line));
+    put(std::string(limit + chunk + 50, 'y') + "\nprobe\n");
+    terminal.discardInput();
+    CHECK(!terminal.inputPending());  // what it read was the rest of that line
+    CHECK(terminal.takeLine(&line) && line == "probe");
+    put("part");
+    CHECK(terminal.inputPending());
+    terminal.discardInput();          // a key press whose line had not ended: its end is its own
+    put("\nstatus\n");
+    CHECK(terminal.takeLine(&line) && line == "status");
+    put(std::string(limit + 10, 'z'));
+    terminal.discardInput();
+    put(std::string(limit, 'z') + "\nlive\n");
+    terminal.discardInput();          // a second key press before the rest of that line was in:
+    CHECK_EQ(unread(), 16);           // all it read was more of that line, and so is what is left
+    CHECK(terminal.takeLine(&line) && line == "live");
+  }
+  {  // When the other end closes, the terminal is gone; the preview still serves the page.
+    PreviewTerminal terminal(fds[0]);
+    put("last\n");
+    close(fds[1]);
+    CHECK(terminal.takeLine(&line) && line == "last");
+    CHECK(terminal.open());
+    CHECK(!terminal.takeLine(&line));
+    CHECK(!terminal.open());
+    CHECK(!terminal.inputPending());
+    terminal.discardInput();
+  }
+  close(fds[0]);
 }
 
 static void testConsoleBasics() {
@@ -3223,8 +3477,13 @@ static void testConsoleSet() {
     CHECK_HAS(second, "\r\n  the LVD in effect.\r\n  now  ");
     CHECK_HAS(lineWith(second, "  new  "), "[0x10C5]");
     CHECK_HASNT(second, "Careful: Low voltage reconnect");  // 13.10 is below the new LVR
-    CHECK_HASNT(second, "Before you write:");               // the notes were shown once
-    CHECK_HAS(second, "'profile' repeats the notes on writing");
+    // The notes on writing come with every question: each write raises the EEPROM fault, and
+    // the Opta has to be powered from the battery for each one.
+    CHECK_HAS(second, "Before you write:");
+    CHECK_HAS(second, "'EEPROM setting edit' fault");
+    CHECK_HAS(second, "Power this Opta from the battery");
+    CHECK_HAS(second, "DIP switch 2 ON.\r\nType yes to write it.");
+    CHECK_HASNT(second, "repeats the notes");
     CHECK_HAS(rig.run("YES"), "Written and read back: EV_lvd = 13.10 V [0x10C5]");
     CHECK_EQ(rig.sim.regs[0xE022], 0x10C5);
     CHECK_HAS(rig.run("status"), "Settings were changed in this session");
@@ -3383,6 +3642,69 @@ static void testConsoleSet() {
     rig.run("no");
     rig.sim.regs[0xE022] = rig.sim.setVolts(11.50);
     rig.sim.regs[0xE024] = 0;
+
+    // The battery LED's four thresholds keep their order (review 21): each change of color has
+    // its way back above or below it, or the LED flickers between the two colors, and yellow
+    // lies between red and green, or the battery passes it by. As the simulated controller has
+    // them: red at 11.80 V, back to yellow at 12.40 V, yellow at 12.80 V, back to green at 13.10 V.
+    static const char kGreenBack[] =
+        "Careful: LED yellow to green (EV_soc_y2g) must be above LED green to yellow (EV_soc_g2y), or the battery LED can "
+        "flicker between the two.";
+    static const char kRedBack[] =
+        "Careful: LED red to yellow (EV_soc_r2y) must be above LED yellow to blinking red (EV_soc_y2r0), or the battery "
+        "LED can flicker between the two.";
+    static const char kRedBelow[] =
+        "Careful: LED yellow to blinking red (EV_soc_y2r0) must be below LED green to yellow (EV_soc_g2y), or a falling "
+        "battery skips yellow.";
+    static const char kYellowFirst[] =
+        "Careful: LED red to yellow (EV_soc_r2y) must be below LED yellow to green (EV_soc_y2g), or a rising battery skips "
+        "yellow.";
+    const auto unwrapped = [](std::string out) {
+      for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
+        out.replace(at, 6, " ");  // a long message is wrapped
+      }
+      return out;
+    };
+    const std::string green = unwrapped(rig.run("set EV_soc_g2y 13.10"));  // equal is not below
+    CHECK_MSG(has(green, kGreenBack), "%s", green.c_str());
+    CHECK_HAS(green, "After this write, EV_soc_g2y = 13.10 V and EV_soc_y2g = 13.10 V.");
+    CHECK_EQ(countOf(green, "Careful: LED"), 1);
+    rig.run("no");
+    const std::string back = unwrapped(rig.run("set EV_soc_y2g 12.70"));
+    CHECK_MSG(has(back, kGreenBack), "%s", back.c_str());
+    CHECK_HAS(back, "After this write, EV_soc_g2y = 12.80 V and EV_soc_y2g = 12.70 V.");
+    CHECK_EQ(countOf(back, "Careful: LED"), 1);
+    rig.run("no");
+    const std::string red = unwrapped(rig.run("set EV_soc_y2r0 12.50"));
+    CHECK_MSG(has(red, kRedBack), "%s", red.c_str());
+    CHECK_HAS(red, "After this write, EV_soc_y2r0 = 12.50 V and EV_soc_r2y = 12.40 V.");
+    CHECK_EQ(countOf(red, "Careful: LED"), 1);
+    rig.run("no");
+    // Above green to yellow as well: both of its pairs are named.
+    const std::string both = unwrapped(rig.run("set EV_soc_y2r0 12.80"));
+    CHECK_MSG(has(both, kRedBack) && has(both, kRedBelow), "%s", both.c_str());
+    CHECK_HAS(both, "After this write, EV_soc_y2r0 = 12.80 V and EV_soc_r2y = 12.40 V.");
+    CHECK_HAS(both, "After this write, EV_soc_y2r0 = 12.80 V and EV_soc_g2y = 12.80 V.");
+    CHECK_EQ(countOf(both, "Careful: LED"), 2);
+    rig.run("no");
+    const std::string rising = unwrapped(rig.run("set EV_soc_r2y 13.20"));
+    CHECK_MSG(has(rising, kYellowFirst), "%s", rising.c_str());
+    CHECK_HAS(rising, "After this write, EV_soc_r2y = 13.20 V and EV_soc_y2g = 13.10 V.");
+    CHECK_EQ(countOf(rising, "Careful: LED"), 1);  // still above yellow to blinking red
+    rig.run("no");
+    const std::string falling = unwrapped(rig.run("set EV_soc_g2y 11.80"));
+    CHECK_MSG(has(falling, kRedBelow), "%s", falling.c_str());
+    CHECK_HAS(falling, "After this write, EV_soc_y2r0 = 11.80 V and EV_soc_g2y = 11.80 V.");
+    CHECK_EQ(countOf(falling, "Careful: LED"), 1);
+    rig.run("no");
+    // In order, nothing is said, and the way back from red may lie above green to yellow.
+    CHECK_EQ(countOf(rig.run("set EV_soc_r2y 12.90"), "Careful: LED"), 0);
+    rig.run("no");
+    CHECK_EQ(countOf(rig.run("set EV_soc_g2y 11.90"), "Careful: LED"), 0);
+    rig.run("no");
+    CHECK_EQ(countOf(rig.run("set EV_soc_y2g 12.85"), "Careful: LED"), 0);
+    rig.run("no");
+    CHECK_EQ(rig.sent(0x06), 0);
 
     // Refusals. None of them reaches the bus as a write.
     CHECK_HAS(rig.run("set"), "Usage: set");
@@ -4163,25 +4485,44 @@ static void testConsoleCoilsAndReset() {
     CHECK_EQ(rig.sim.resets, 0);
   }
   {  // Each pair check of the built-in profile stops a restart with its own message and no other:
-     // the lower register of the pair above the upper one, everything else as the simulated
-     // controller has it.
+     // the lower register of the pair 0.50 V above the upper one, everything else as the
+     // simulated controller has it. The pairs share registers (the LED thresholds hang
+     // together), so the pair goes in at the highest height, in steps of 0.10 V down from
+     // 17.00 V, where it is the only one out of order; each pair has one.
     Rig first;
-    CHECK_EQ(first.profile.checkCount(), 9);
+    CHECK_EQ(first.profile.checkCount(), 13);
     for (size_t i = 0; i < first.profile.checkCount(); ++i) {
       Rig rig;
       const OvCheck &check = rig.profile.check(i);
-      rig.sim.regs[check.below->addr] = rig.sim.setVolts(15.50);
-      rig.sim.regs[check.above->addr] = rig.sim.setVolts(15.00);
-      std::string out = rig.run("reset");
-      for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
-        out.replace(at, 6, " ");  // a long message is wrapped
+      const uint16_t belowWas = rig.sim.regs[check.below->addr];
+      const uint16_t aboveWas = rig.sim.regs[check.above->addr];
+      bool alone = false;
+      for (int tenths = 170; tenths >= 90 && !alone; --tenths) {
+        const double upper = tenths / 10.0;
+        rig.sim.regs[check.below->addr] = rig.sim.setVolts(upper + 0.50);
+        rig.sim.regs[check.above->addr] = rig.sim.setVolts(upper);
+        std::string out = rig.run("reset");
+        CHECK(!rig.console.awaitingConfirmation());  // it is out of order: no question
+        for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
+          out.replace(at, 6, " ");  // a long message is wrapped
+        }
+        if (countOf(out, "Problem:") != 1) {
+          continue;  // another pair is out of order with it
+        }
+        alone = true;
+        CHECK_MSG(has(out, (std::string("Problem: ") + check.message + " Now " + check.below->name + " = " +
+                            fmtStr("%.2f", upper + 0.50) + " V and " + check.above->name + " = " +
+                            fmtStr("%.2f", upper) + " V.")
+                               .c_str()),
+                  "check %u: %s", (unsigned)i, out.c_str());
       }
-      CHECK_MSG(has(out, (std::string("Problem: ") + check.message + " Now " + check.below->name + " = 15.50 V and " +
-                          check.above->name + " = 15.00 V.")
-                             .c_str()),
-                "check %u: %s", (unsigned)i, out.c_str());
-      CHECK_MSG(countOf(out, "Problem:") == 1, "check %u: %s", (unsigned)i, out.c_str());
+      CHECK_MSG(alone, "check %u is never the only one out of order", (unsigned)i);
       CHECK_EQ(rig.sim.resets, 0);
+      // In order again, the restart is asked about.
+      rig.sim.regs[check.below->addr] = belowWas;
+      rig.sim.regs[check.above->addr] = aboveWas;
+      CHECK_HAS(rig.run("reset"), "Type yes to restart it.");
+      rig.run("no");
     }
   }
   {  // A pair that cannot be checked stands in the way like one that is out of order, whichever
@@ -4370,8 +4711,28 @@ static void testConsoleRawAndExpert() {
   CHECK_HAS(rig.run("status"), "expert on");
   const std::string ask = rig.run("raw 1 6 0xE022 0x10C5");
   CHECK_HAS(ask, "Write 0x10C5 to address 0xE022 on slave 1 with function 6?");
+  // A register is a setting: the notes on writing come before the question, as with 'set', and
+  // every time.
+  const std::string notes =
+      "  Before you write:\r\n"
+      "  - Every EEPROM write raises the controller's 'EEPROM setting edit' fault until the controller is\r\n";
+  const std::string unchecked = "No limits apply and nothing is checked first.\r\n" + notes;
+  CHECK_HAS(ask, unchecked.c_str());
+  CHECK_HAS(ask, "DIP switch 2 ON.\r\nType yes to send it.");
   CHECK_EQ(rig.sim.requests.size(), before);
   CHECK_HAS(rig.run("nope"), "Cancelled");
+  CHECK_HAS(rig.run("raw 1 16 0xE022 1"), unchecked.c_str());
+  rig.run("no");
+  CHECK_HAS(rig.run("raw 1 6 0xE022 0x10C5"), notes.c_str());
+  rig.run("no");
+  // A request OptaView cannot read may write one as well. A coil switches and stores nothing.
+  CHECK_HAS(rig.run("raw 1 0x2B 0E 01 00"), ("nothing is checked.\r\n" + notes).c_str());
+  rig.run("no");
+  const std::string coilAsk = rig.run("raw 1 5 1 0xFF00");
+  CHECK_HAS(coilAsk, "No limits apply and nothing is checked first.\r\nType yes to send it.");
+  CHECK_HASNT(coilAsk, "Before you write");
+  rig.run("no");
+  CHECK_EQ(rig.sim.requests.size(), before);
   CHECK_EQ(rig.sim.regs[0xE022], 0x0EB8);
   // In expert mode too, neither the address nor the value of a write wraps round into range.
   CHECK_HAS(rig.run("raw 1 6 0x1E022 0x10C5"), "Usage: raw");
@@ -6114,7 +6475,7 @@ static void testTwoConsoles() {
     CHECK(rig.master.trace == &web.console);
     CHECK(web.console.traceOn());
     CHECK_HAS(lineWith(web.run("status"), "Modes"), "expert on, trace on");
-    CHECK_HASNT(web.run("set EV_lvd 12.00"), "Before you write:");
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");  // the notes come every time
     CHECK(web.console.awaitingConfirmation());
     web.console.newVisitor();
     CHECK(!web.console.awaitingConfirmation());
@@ -6122,7 +6483,7 @@ static void testTwoConsoles() {
     CHECK(rig.master.trace == nullptr);
     CHECK_HAS(web.run("yes"), "Nothing is waiting for a yes or a no.");
     CHECK_HAS(web.run("raw 1 6 0xE022 0x1000"), "Only functions 1 to 4 are open here.");
-    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");  // the notes on writing, once more
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");
     web.run("no");
     CHECK_HAS(web.run("live"), "not confirmed on this controller");
     web.console.newVisitor();
@@ -6261,6 +6622,7 @@ int main() {
   testReadsAndFallback();
   testProbe();
   testLineEditor();
+  testPreviewTerminal();
   testConsoleBasics();
   testConsoleReads();
   testConsoleSet();

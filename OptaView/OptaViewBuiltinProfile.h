@@ -221,10 +221,17 @@ static const char OV_BUILTIN_PROFILE[] =
     R"OVPROFILE(_hvd","message":"Bank 2 absorption voltage (EV_reg2) must be below battery high voltage disconnect (EV_hvd)."})OVPROFILE"
     R"OVPROFILE(,{"below":"EV_float2","above":"EV_hvd","message":"Bank 2 float voltage (EV_float2) must be below battery high )OVPROFILE"
     R"OVPROFILE(voltage disconnect (EV_hvd)."},{"below":"EV_eq2","above":"EV_hvd","message":"Bank 2 equalize voltage (EV_eq2) )OVPROFILE"
-    R"OVPROFILE(must be below battery high voltage disconnect (EV_hvd)."}],"scaleCheck":{"alternates":[96.667],"grid":0.05,"se)OVPROFILE"
-    R"OVPROFILE(ttings":{"scale":"vset","setpoints":["EV_reg","EV_float","EV_eq","EV_reg2","EV_float2","EV_eq2","EV_hvd","EV_h)OVPROFILE"
-    R"OVPROFILE(vr","EV_lvd","EV_lvr","EV_soc_y2g","EV_soc_g2y","EV_soc_y2r0","EV_soc_r2y"]},"live":{"scale":"vlive","meter":")OVPROFILE"
-    R"OVPROFILE(adc_vb_f","battery":"Vb_f","reference":"Vb_ref","state":"charge_state","regulating":[6,7,8]}}})OVPROFILE";
+    R"OVPROFILE(must be below battery high voltage disconnect (EV_hvd)."},{"below":"EV_soc_g2y","above":"EV_soc_y2g","message")OVPROFILE"
+    R"OVPROFILE(:"LED yellow to green (EV_soc_y2g) must be above LED green to yellow (EV_soc_g2y), or the battery LED can flic)OVPROFILE"
+    R"OVPROFILE(ker between the two."},{"below":"EV_soc_y2r0","above":"EV_soc_r2y","message":"LED red to yellow (EV_soc_r2y) m)OVPROFILE"
+    R"OVPROFILE(ust be above LED yellow to blinking red (EV_soc_y2r0), or the battery LED can flicker between the two."},{"bel)OVPROFILE"
+    R"OVPROFILE(ow":"EV_soc_y2r0","above":"EV_soc_g2y","message":"LED yellow to blinking red (EV_soc_y2r0) must be below LED g)OVPROFILE"
+    R"OVPROFILE(reen to yellow (EV_soc_g2y), or a falling battery skips yellow."},{"below":"EV_soc_r2y","above":"EV_soc_y2g",")OVPROFILE"
+    R"OVPROFILE(message":"LED red to yellow (EV_soc_r2y) must be below LED yellow to green (EV_soc_y2g), or a rising battery s)OVPROFILE"
+    R"OVPROFILE(kips yellow."}],"scaleCheck":{"alternates":[96.667],"grid":0.05,"settings":{"scale":"vset","setpoints":["EV_re)OVPROFILE"
+    R"OVPROFILE(g","EV_float","EV_eq","EV_reg2","EV_float2","EV_eq2","EV_hvd","EV_hvr","EV_lvd","EV_lvr","EV_soc_y2g","EV_soc_)OVPROFILE"
+    R"OVPROFILE(g2y","EV_soc_y2r0","EV_soc_r2y"]},"live":{"scale":"vlive","meter":"adc_vb_f","battery":"Vb_f","reference":"Vb_)OVPROFILE"
+    R"OVPROFILE(ref","state":"charge_state","regulating":[6,7,8]}}})OVPROFILE";
 
 }  // namespace optaview
 

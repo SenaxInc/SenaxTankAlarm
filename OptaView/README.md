@@ -53,8 +53,9 @@ arduino-cli compile --upload -p COM4 --fqbn arduino:mbed_opta:opta:security=sien
 bootloader takes the plain `arduino:mbed_opta:opta`.
 
 Open the serial monitor at **115200 baud** and set the line ending to **New Line**. OptaView
-greets each time a terminal opens the port. It echoes what you type, so switch local echo off in
-terminal programs such as PuTTY.
+greets each time a terminal opens the port, and starts afresh for it, as the page does for each
+login: a question that was left open, expert mode and the trace end there. It echoes what you
+type, so switch local echo off in terminal programs such as PuTTY.
 
 A PIN for the web page and a fixed network address can be built in before you compile: see
 [Network and PIN](#network-and-pin).
@@ -109,8 +110,9 @@ What to know before you rely on it:
   4, 8 and 30 seconds, and up to 15 minutes. `web pin <digits>` on the USB console sets a new
   PIN and ends the wait.
 - **One thing at a time.** The Opta answers one request and then the next. While a command
-  runs on the USB console the page waits, and the other way round. A command from the page
-  that takes longer than a minute is stopped, and so is one whose browser has gone.
+  runs on the USB console the page waits, and the other way round. Lines that wait at the USB
+  port, as a paste does, run one at a time with the page's requests in between. A command from
+  the page that takes longer than a minute is stopped, and so is one whose browser has gone.
 - **No connection can hold the Opta up.** A request has 6 seconds to arrive. A browser that
   takes nothing of an answer for 5 seconds is taken to be gone, and an answer that is still
   not delivered after 30 seconds of sending is given up. The page is 55 KB and the Opta's
@@ -291,16 +293,20 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
 - `probe` reports a controller only after it has read a register. A controller that answers
   with an exception is reported as answering but refusing.
 - Settings are written by name, inside limits from the profile, after the old and the new value
-  were shown and `yes` was typed. Every write is read back.
+  were shown and `yes` was typed. Every write is read back. Every question before a write,
+  a `raw` one too, comes with the profile's notes on writing: the EEPROM fault, how to power the
+  Opta meanwhile, the DIP switches.
 - A write or a switch that gets no acknowledgement is never sent again by itself, and it is not
   called failed: the controller may have carried it out before its reply was lost. What the
   register or the coil reads afterwards decides. When that cannot be read either, OptaView says
   that it does not know, and it keeps saying that a restart may be due until the register has
   been read again.
 - Pairs that must stay in order are checked when you `set` one of them and again before
-  `reset`: each reconnect on its side of its disconnect, and every charge voltage of both banks
+  `reset`: each reconnect on its side of its disconnect, every charge voltage of both banks
   (absorption, float, equalize) below the battery's high voltage disconnect, which would stop
-  charging before the battery got there. A 0 switches a pair off only where it switches the
+  charging before the battery got there, and the battery LED's thresholds in order: green to
+  yellow below yellow to green and yellow to red below red to yellow, so that the LED does not
+  flicker, and yellow between red and green. A 0 switches a pair off only where it switches the
   setting off, as in the high voltage disconnects and a float or equalize stage at 0. A
   reconnect cannot be 0: the battery never falls to 0 V, so the output would not come back.
   `set` refuses that, and a 0 that the controller already holds there stands in the way of
@@ -514,14 +520,14 @@ make -C tests/host/optaview preview ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 
 This builds the firmware's web server and console as a program for your PC, with the simulated
 SunSaver behind them, and serves the page at <http://127.0.0.1:8080/>. Its terminal is the USB
-console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
-`sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
-next three replies are lost on the way), `sim random off` (the Opta's random number generator
-fails and the clock stands in for it). Add
-`PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. A port
-or a `sim` line that is not written whole (`--port 80x`, `sim drop 2.5`, a NUL in it) is
-refused. The simulated controller answers as the specification says, so the preview shows the
-page and not how a real SunSaver behaves.
+console, and like the Opta it takes a line at a time, with the page's requests in between. Lines
+that start with `sim` change the simulation: `sim battery 12.4`, `sim power off`, `sim refuse on`
+(every write is refused), `sim delay 300`, `sim drop 3` (the next three replies are lost on the
+way), `sim random off` (the Opta's random number generator fails and the clock stands in for it).
+Add `PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. A port
+or a `sim` line that is not written whole (`--port 80x`, `sim drop 2.5`, a NUL in it, more than 159
+characters) is refused. The simulated controller answers as the specification says, so the preview
+shows the page and not how a real SunSaver behaves.
 
 ```bash
 npm install playwright@1.63.0 && npx playwright install chromium    # once, in a folder of your choice

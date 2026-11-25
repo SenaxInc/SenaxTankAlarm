@@ -291,6 +291,20 @@ static void stir(uint32_t value) {
   gJitter ^= gJitter >> 29;
 }
 
+// The USB port's characters, for the line editor. Each one stirs the jitter.
+class SerialKeys : public optaview::OvKeys {
+ public:
+  int read() override {
+    if (Serial.available() <= 0) {
+      return -1;
+    }
+    stir(micros());
+    return Serial.read();
+  }
+};
+
+static SerialKeys gKeys;
+
 static MillisClock gClock;
 static EthernetDriver gEthernet;
 static optaview::OvNet gNet(gEthernet, gClock);
@@ -384,8 +398,10 @@ static void greet() {
     Serial.println(").");
     return;
   }
-  // A question the last visitor left open is not this visitor's to answer.
-  gConsole.cancelPending();
+  // Somebody else may be at the port now: a question the last visitor left open is not this
+  // visitor's to answer, and expert mode, the trace and what the console says only once (such
+  // as the reminder that a voltage scale is not confirmed) were the last visitor's as well.
+  gConsole.newVisitor();
   gConsole.begin();
   if (!gTransport.isOpen()) {
     Serial.println("The RS-485 port did not open with these link settings. 'link <baud> [format]' sets others.");
@@ -434,11 +450,10 @@ void loop() {
     greet();
   }
   gConnected = connected;
-  while (Serial.available() > 0) {
-    stir(micros());
-    if (gEditor.feed(Serial.read(), gOut)) {
-      runLine();
-    }
+  // One line at most, and then the network and the web page have their turn: lines that wait
+  // (a paste) or a program that never stops sending must not keep the page waiting.
+  if (gEditor.take(gKeys, gOut)) {
+    runLine();
   }
   if (!gReady) {
     return;

@@ -40,6 +40,7 @@ BROWSER_TEST_ARGS ?=
 SOURCES := optaview_test.cpp
 HEADERS := sim_sunsaver.h \
            test_support.h \
+           preview_terminal.h \
            $(OPTAVIEW_DIR)/OptaViewText.h \
            $(OPTAVIEW_DIR)/OptaViewModbus.h \
            $(OPTAVIEW_DIR)/OptaViewProfile.h \
