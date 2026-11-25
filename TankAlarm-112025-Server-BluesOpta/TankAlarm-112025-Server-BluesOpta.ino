@@ -1386,6 +1386,8 @@ static double gLastDailyEmailSentEpoch = 0.0;
 // Sensor registry & client metadata persistence state
 static bool gSensorRegistryDirty = false;         // True when sensor records need saving
 static bool gClientMetadataDirty = false;        // True when client metadata needs saving
+// The metadata cache was read whole at this start, or there was none (loadClientMetadataCache()).
+static bool gClientMetadataLoaded = false;
 static unsigned long gLastRegistrySaveMillis = 0;
 // The files of kept charger reports (CHARGER_REPORTS_PATH) and charger programming
 // (CHARGER_PROGRAMS_PATH) hold something that changed since their last write that worked. See
@@ -2287,7 +2289,7 @@ window.msgAssocChanged=function(id,cb){const cid=cb.dataset.cid;const aid=curren
 window.msgChannelChanged=function(chan,cb){const cid=cb.dataset.cid;const list=chan==='sms'?dirSms:dirEmail;const i=list.indexOf(cid);if(cb.checked&&i<0)list.push(cid);if(!cb.checked&&i>=0)list.splice(i,1);saveContactsDirectory();};
 window.saveContactsDirectory=async function(){try{const r=await fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:dirContacts,smsAlertRecipients:dirSms,emailAlertRecipients:dirEmail,dailyReportRecipients:dirDaily})});const d=await r.json();if(d&&d.success){showToast('Contact alert settings saved');}else{showToast('Failed to save contact settings',true);loadContactsDirectory();}}catch(e){showToast('Failed to save contact settings',true);loadContactsDirectory();}};
 window.autoOpenMsgSections=function(){if(!dirLoaded)return;document.querySelectorAll('.sensor-card').forEach(card=>{const id=parseInt(card.id.replace('sensor-',''));const aid=currentAlarmId(id);if(!aid)return;const msgSection=card.querySelector('.msg-section');if(!msgSection||msgSection.classList.contains('visible'))return;const alarmVisible=card.querySelector('.alarm-section').classList.contains('visible');if(!alarmVisible)return;const anyAssoc=dirContacts.some(c=>Array.isArray(c.alarmAssociations)&&c.alarmAssociations.includes(aid));if(anyAssoc)toggleMsgSection(id);});};
-document.getElementById('clientUid').addEventListener('input',()=>{document.querySelectorAll('.msg-section.visible').forEach(sec=>{const card=sec.closest('.sensor-card');if(card)renderMsgContacts(parseInt(card.id.replace('sensor-','')));});});
+document.getElementById('clientUid').addEventListener('input',()=>{document.querySelectorAll('.msg-section.visible').forEach(sec=>{const card=sec.closest('.sensor-card');if(card)renderMsgContacts(parseInt(card.id.replace('sensor-','')));});updatePowerConfigInfo();});
 loadContactsDirectory();
 window.toggleRelayDurations=function(id){const card=document.getElementById(`sensor-${id}`);const relayMode=card.querySelector('.relay-mode').value;const durationsSection=card.querySelector('.relay-durations-section');const maxOnSection=card.querySelector('.relay-max-on-section');if(relayMode==='momentary'){durationsSection.style.display='block';maxOnSection.style.display='none';}else if(relayMode==='manual_reset'){durationsSection.style.display='none';maxOnSection.style.display='flex';}else{durationsSection.style.display='none';maxOnSection.style.display='none';}};
 window.updateMonitorFields=function(id){const card=document.getElementById(`sensor-${id}`);const type=card.querySelector('.monitor-type').value;const numField=card.querySelector('.tank-num-field');const numFieldLabel=numField.querySelector('span');const nameLabel=card.querySelector('.name-label');const sensorTypeSelect=card.querySelector('.sensor-type');const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');const contentsField=card.querySelector('.contents-field');const calCheckbox=card.querySelector('.calibration-enabled');if(type==='gas'){numField.style.display='flex';numFieldLabel.textContent='Display Number (optional)';nameLabel.textContent='System Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';sensorTypeSelect.value='2';calCheckbox.checked=false;updatePinOptions(id);}else if(type==='rpm'){numField.style.display='flex';numFieldLabel.textContent='Engine Number (optional)';nameLabel.textContent='Engine Name';pulsesPerRevField.style.display='flex';contentsField.style.display='none';sensorTypeSelect.value='3';calCheckbox.checked=false;updatePinOptions(id);}else{numField.style.display='flex';numFieldLabel.textContent='Tank Number (optional)';nameLabel.textContent='Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';calCheckbox.checked=true;}updateSensorTypeFields(id);};
@@ -2338,7 +2340,7 @@ if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin
 function closeSelectClientModal(){els.selectClientModal.classList.add('hidden');}window.closeSelectClientModal=closeSelectClientModal;
 els.clientList.addEventListener('click',e=>{const it=e.target.closest('.client-item');if(it)window.fetchClientConfig(it.dataset.uid||'');});els.loadFromCloudBtn.addEventListener('click',async()=>{els.selectClientModal.classList.remove('hidden');els.clientList.innerHTML='Loading...';try{const r=await fetch('/api/clients?summary=1');const d=await r.json();const clients=d.cs||[];els.clientList.innerHTML=clients.map(c=>{const uid=c.c||'';const label=c.n||uid;const site=c.s||'';return `<div class="client-item" data-uid="${escapeHtml(uid)}"><strong>${escapeHtml(label)}</strong> (${escapeHtml(uid)})<br>${escapeHtml(site)}</div>`;}).join('');}catch(e){els.clientList.innerHTML='Error loading clients';}});
 window.fetchClientConfig=async(uid)=>{closeSelectClientModal();try{const r=await fetch('/api/client?uid='+encodeURIComponent(uid));if(r.status===404){startCommissioning(uid);return;}if(!r.ok)throw new Error('HTTP '+r.status);const c=await r.json();if(els.clientUid)els.clientUid.value=uid;if(c&&c.config)loadConfig(c.config);else startCommissioning(uid);}catch(e){showToast('Error loading config: '+(e.message||e),true);}};
-function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;if(!document.querySelector('#sensorsContainer .sensor-card'))addSensor();showToast('No stored configuration for '+uid+' yet. Fill in this new configuration and send it to commission the client.');}
+function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;updatePowerConfigInfo();if(!document.querySelector('#sensorsContainer .sensor-card'))addSensor();showToast('No stored configuration for '+uid+' yet. Fill in this new configuration and send it to commission the client.');}
 const importInput=document.getElementById('importFileInput');const importBtn=document.getElementById('importBtn');if(importBtn&&importInput){importBtn.addEventListener('click',()=>importInput.click());importInput.addEventListener('change',(e)=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=(evt)=>{try{loadConfig(JSON.parse(evt.target.result));}catch(err){showToast('Invalid JSON',true);}};r.readAsText(f);});}
 function getQueryParam(name){const params=new URLSearchParams(window.location.search);return params.get(name)||'';}
 async function basicInit(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv&&d.srv.pu)els.productUid.value=d.srv.pu;if(d&&d.srv&&d.srv.cf)els.clientFleet.value=d.srv.cf;window._siteClients=d;populateRelayTargets(d);}catch(e){}const urlUid=getQueryParam('uid');if(urlUid&&els.clientUid)els.clientUid.value=urlUid;const urlSite=getQueryParam('site');if(urlSite&&els.siteName)els.siteName.value=urlSite;if(urlUid){await fetchClientConfig(urlUid);}else{addSensor();}}function populateRelayTargets(d){const dl=document.getElementById('relayTargetSuggestions');if(!dl||!d||!d.cs)return;const seen=new Set();d.cs.forEach(c=>{const uid=c.c||'';if(uid&&!seen.has(uid)){seen.add(uid);const opt=document.createElement('option');const label=c.n||c.s||'';opt.value=uid;opt.label=label?label+' ('+uid+')':uid;dl.appendChild(opt);}});}basicInit();
@@ -13229,7 +13231,10 @@ static void saveChargerReportsIfDirty(bool force) {
 }
 
 // Call after loadClientMetadataCache(): a report is kept only for a client that has metadata, so
-// one that was removed does not come back.
+// one that was removed does not come back. Such a report is still in the file when it was not
+// written since the client went (a write that failed, and a restart): once the metadata cache
+// was read whole, the file is written again without it at the next save, so that it does not
+// come back with the client should that be added again.
 static void loadChargerReports() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -13270,9 +13275,15 @@ static void loadChargerReports() {
     uint8_t loaded = 0;
     for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
       ClientMetadata *meta = findClientMetadata(obj["c"] | "");
+      if (!meta) {
+        if (gClientMetadataLoaded) {
+          gChargerReportsDirty = true;  // saveChargerReportsIfDirty() leaves it out
+        }
+        continue;
+      }
       sunsaver::Snapshot snapshot;
       sunsaver::Evaluation evaluation;
-      if (!meta || !sunsaver::decodeReport(obj, &snapshot, &evaluation)) {
+      if (!sunsaver::decodeReport(obj, &snapshot, &evaluation)) {
         continue;
       }
       meta->chargerReportValid = true;
@@ -13582,7 +13593,8 @@ static bool saveChargerPrograms() {
   return true;  // no file system in this build: nothing to keep it in
 }
 
-// Call after loadClientMetadataCache(), as loadChargerReports().
+// Call after loadClientMetadataCache(), as loadChargerReports(), which says why an entry for a
+// client the cache does not hold is written out at the next save.
 static void loadChargerPrograms() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -13625,6 +13637,9 @@ static void loadChargerPrograms() {
     for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
       ClientMetadata *meta = findClientMetadata(obj["c"] | "");
       if (!meta) {
+        if (gClientMetadataLoaded) {
+          gChargerReportsDirty = true;  // saveChargerPrograms() leaves it out
+        }
         continue;
       }
       bool any = false;
@@ -14345,10 +14360,19 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
   
   // Reuse evicted slot
   ClientMetadata *meta = &gClientMetadata[evictIdx];
+  const bool hadChargerReport = meta->chargerReportValid || meta->chargerProgramValid || meta->chargerLookValid ||
+                                meta->chargerProgramAsked != 0;
   memset(meta, 0, sizeof(ClientMetadata));
   strlcpy(meta->clientUid, clientUid, sizeof(meta->clientUid));
   meta->cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
   gClientMetadataDirty = true;
+  if (hadChargerReport) {
+    // The evicted client's charger check and programming go from flash too: left in their
+    // files, they would come back with that client, should it be added again before a restart
+    // (loadChargerReports(), loadChargerPrograms()).
+    gChargerReportsDirty = true;
+    saveChargerReportsIfDirty(true);
+  }
   return meta;
 }
 
@@ -17217,7 +17241,14 @@ static bool saveClientMetadataCache() {
       }
       // Note: cachedTemperatureF and staleAlertSent are runtime-only, not persisted
     }
-    
+    if (doc.overflowed()) {
+      // What fitted would replace the whole file: the clients that did not fit would be gone at
+      // the next start, and their charger reports with them (loadChargerReports() keeps a report
+      // only for a client this file holds). The file stays as it is, and the save fails.
+      Serial.println(F("ERROR: Out of memory for the client metadata file"));
+      return false;
+    }
+
     size_t jsonLen = measureJson(doc);
     char *buf = (char *)malloc(jsonLen + 1);
     if (!buf) {
@@ -17246,6 +17277,7 @@ static void loadClientMetadataCache() {
     
     if (!posix_file_exists("/fs" CLIENT_METADATA_CACHE_PATH)) {
       Serial.println(F("No client metadata cache found - starting fresh"));
+      gClientMetadataLoaded = true;
       return;
     }
     
@@ -17317,6 +17349,7 @@ static void loadClientMetadataCache() {
       meta.staleAlertSent = false;
       meta.staleDeletionPending = obj["sdp"] | false;
     }
+    gClientMetadataLoaded = true;
     
     Serial.print(F("Client metadata loaded: "));
     Serial.print(gClientMetadataCount);

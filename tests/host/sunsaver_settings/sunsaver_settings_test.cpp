@@ -368,11 +368,14 @@ static void testValuesAgainstOptaView() {
       ss::Text text(mine, sizeof(mine));
       ss::describeValue(i, raw, ss::SCALE_100, ss::SCALE_100, &text);
       char theirs[400];
-      const uint16_t pair[2] = {raw, 0};
+      // The profile's note on EV_tempcomp says the controller uses only the low byte, and
+      // OptaView decodes the whole word; the text here is the value the controller uses.
+      const uint16_t shown = entry.kind == ss::KIND_TEMPCO ? (uint16_t)(raw & 0x00FFu) : raw;
+      const uint16_t pair[2] = {shown, 0};
       ovFormatValue(*reg, pair, theirs, sizeof(theirs));
 
       std::string expected = theirs;
-      if ((entry.flags & ss::ITEM_ZERO_IS_OFF) != 0 && raw == 0) {
+      if ((entry.flags & ss::ITEM_ZERO_IS_OFF) != 0 && shown == 0) {
         expected = "0 (off)";
       } else if (entry.kind == ss::KIND_SECONDS && raw >= 60) {
         expected = std::string(mine).substr(0, expected.size()) == expected ? std::string(mine) : expected;
@@ -428,6 +431,10 @@ static void testValuesAgainstOptaView() {
   CHECK(textOf(ss::I_ET_EQCALENDAR, 0) == "0 days");
   CHECK(textOf(ss::I_EV_TEMPCOMP, 20) == "0.0305 V/C");
   CHECK(textOf(ss::I_EV_TEMPCOMP, 0) == "0 (off)");
+  // Only the low byte is used.
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 0x0114) == "0.0305 V/C");
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 0x0100) == "0 (off)");
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 0xFF00) == "0 (off)");
   CHECK(textOf(ss::I_ER_ICOMP, 778) == "0.0150 ohm");
   CHECK(textOf(ss::I_ER_ICOMP, 0) == "0 (off)");
   CHECK(textOf(ss::I_ET_LVD_WARN, 600) == "60.0 s");
@@ -1299,6 +1306,55 @@ static void testLiveScale() {
     CHECK_EQ(source, ss::LIVE_SOURCE_PRESET_LVD);
   }
   {
+    // The controller works the LVD in effect out in whole words, so at the full compensation the
+    // word can read a little below the stored LVD less 0.30 V: EV_lvd 3051 (9.0006 V with
+    // x96.667) less 0.0200 ohm at 15 A comes back as V_lvd 2949, which reads 8.6997 V, below
+    // 8.7006 V. With x100 the same word reads 9.00 V, inside the room too: the reading decides
+    // nothing. Without room for the rounding, x100 alone would match and be taken for the scale.
+    SimSunSaver sim(96.667, 96.667);
+    makeLiFePO4(sim);
+    sim.regs[0xE022] = 3051;
+    sim.regs[0xE026] = 1037;
+    sim.regs[0x001C] = 2949;
+    CHECK(ss::storedCompensationFits(snapshotOf(sim)));
+    CHECK(ss::voltsFromRaw(2949, ss::SCALE_96667) < ss::voltsFromRaw(3051, ss::SCALE_96667) - ss::LVD_COMPENSATION_ROOM_VOLTS);
+    scale = source = 99;
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+    // At 13.10 V the two scales are further apart than the room, and the same compensation, worked
+    // out in whole words, decides for x96.667.
+    sim.regs[0xE022] = sim.setVolts(13.10);
+    const double stored = ss::voltsFromRaw(sim.regs[0xE022], ss::SCALE_96667);
+    sim.regs[0x001C] = (uint16_t)((stored - ss::ohmsFromRaw(1037) * ss::LOAD_RATED_AMPS) * 32768.0 / 96.667);
+    CHECK(ss::voltsFromRaw(sim.regs[0x001C], ss::SCALE_96667) < stored - ss::LVD_COMPENSATION_ROOM_VOLTS);
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_96667);
+    CHECK_EQ(source, ss::LIVE_SOURCE_STORED_LVD);
+    // The room is a few words, not more: 0.02 V further down is no LVD this compensation gives.
+    sim.regs[0x001C] = (uint16_t)((stored - ss::LVD_COMPENSATION_ROOM_VOLTS - 0.02) * 32768.0 / 96.667);
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+  }
+  {
+    // A 24 V system doubles the figures, and the rounding with them: EV_lvd 3051 with the same
+    // compensation can come back as V_lvd 5895 (twice 2947.5), 17.3906 V with x96.667, which is
+    // within twice the room below 18.0012 V. With x100 it reads 17.99 V, inside too.
+    SimSunSaver sim(96.667, 96.667);
+    makeLiFePO4(sim);
+    sim.regs[0xE022] = 3051;
+    sim.regs[0xE026] = 1037;
+    sim.regs[0x0008] = sim.volts(26.80);
+    sim.regs[0x001C] = 5895;
+    CHECK_EQ(ss::systemVolts(snapshotOf(sim)), 24);
+    CHECK(ss::voltsFromRaw(5895, ss::SCALE_96667) <
+          2.0 * ss::voltsFromRaw(3051, ss::SCALE_96667) - 2.0 * ss::LVD_COMPENSATION_ROOM_VOLTS - ss::LVD_ROUNDING_ROOM_VOLTS);
+    uint8_t scale = 99, source = 99;
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+  }
+  {
     // A write to the EEPROM, and no restart yet. The controller keeps the LVD it started with,
     // and both fault words report the edit until it restarts. An x100 controller that still uses
     // 11.50 V after its stored LVD went to 11.30 V reports a word that reads 11.12 V with x96.667,
@@ -1494,6 +1550,9 @@ static void testEvaluate() {
         {0xE014, 14.60, 0, ss::FINDING_EQUALIZE_STORED, ss::VERDICT_MISMATCH},
         {0xE007, -1, 1, ss::FINDING_EQUALIZE_STORED, ss::VERDICT_MISMATCH},
         {0xE01A, -1, 5, ss::FINDING_TEMPCOMP, ss::VERDICT_MISMATCH},
+        {0xE01A, -1, 0x0105, ss::FINDING_TEMPCOMP, ss::VERDICT_MISMATCH},
+        {0xE01A, -1, 0x0100, kNone, ss::VERDICT_OK},  // only the low byte is used
+        {0xE01A, -1, 0xFF00, kNone, ss::VERDICT_OK},
         {0xE000, 14.70, 0, ss::FINDING_ABSORB_RANGE, ss::VERDICT_MISMATCH},
         {0xE00D, 14.70, 0, ss::FINDING_ABSORB_RANGE, ss::VERDICT_MISMATCH},
         {0xE000, 13.70, 0, ss::FINDING_ABSORB_RANGE, ss::VERDICT_MISMATCH},
@@ -2099,7 +2158,7 @@ static void testFloatReference() {
     }
     sim.regs[0xE01A] = 20;
     CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
-    const uint16_t needed[] = {0x0025, 0xE01A, 0xE000, 0xE00D, 0xE001, 0xE00E, 0x0008};
+    const uint16_t needed[] = {0x0025, 0xE01A, 0xE000, 0xE00D, 0xE001, 0xE00E, 0x0008, 0xE01D};
     for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); ++i) {
       SimSunSaver other;
       makeLiFePO4(other);
@@ -2120,6 +2179,48 @@ static void testFloatReference() {
       }
     }
     CHECK(near(Rigged::reference(unproven), 0.0, 1e-12));
+  }
+  {
+    // The charger regulates to no more than its ceiling (Evb_ref_lim), so a float voltage above
+    // it holds the battery at the ceiling, as does an absorption voltage in a bank without float.
+    // 0 is no ceiling; one that was not read could be anywhere. With the float at 13.50 V and the
+    // ceiling at 13.00 V, a reference of 13.50 V would raise the no-charge alert for a battery
+    // that the charger holds at 13.00 V as it should.
+    SimSunSaver sim(96.667, 100.0);
+    makeLiFePO4(sim);
+    CHECK_EQ(sim.regs[0xE01D], sim.setVolts(15.00));
+    CHECK(near(Rigged::reference(sim), 13.50, 0.01));
+    sim.regs[0xE01D] = sim.setVolts(13.00);
+    CHECK(near(Rigged::reference(sim), 13.00, 0.01));
+    sim.regs[0xE01D] = sim.setVolts(13.50);
+    CHECK(near(Rigged::reference(sim), 13.50, 0.01));
+    // A bank under the ceiling keeps its own voltage, and the lower bank counts.
+    sim.regs[0xE00E] = sim.setVolts(13.30);
+    sim.regs[0xE01D] = sim.setVolts(13.40);
+    CHECK(near(Rigged::reference(sim), 13.30, 0.01));
+    sim.regs[0xE00E] = 0;
+    sim.regs[0xE001] = 0;
+    CHECK(near(Rigged::reference(sim), 13.40, 0.01));  // both banks held at 14.20 V, under 13.40 V
+    sim.regs[0xE01D] = 0;
+    CHECK(near(Rigged::reference(sim), 14.20, 0.01));
+    sim.regs[0xE01D] = sim.setVolts(9.50);  // below any voltage a battery is held at
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    sim.regs.erase(0xE01D);
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    // The ceiling is a stored figure: a 24 V system doubles it with the rest.
+    sim.regs[0xE01D] = sim.setVolts(13.40);
+    sim.regs[0x0008] = sim.volts(27.00);
+    sim.regs[0x001C] = sim.volts(26.20);
+    CHECK(near(Rigged::reference(sim), 26.80, 0.02));
+  }
+  {
+    // Only the low byte of EV_tempcomp is used: a word whose low byte is 0 is compensation off.
+    SimSunSaver sim(96.667, 100.0);
+    makeLiFePO4(sim);
+    sim.regs[0xE01A] = 0x0100;
+    CHECK(near(Rigged::reference(sim), 13.50, 0.01));
+    sim.regs[0xE01A] = 0x0114;
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
   }
   {
     // A write to the EEPROM, and no restart yet: the controller charges by the settings it
