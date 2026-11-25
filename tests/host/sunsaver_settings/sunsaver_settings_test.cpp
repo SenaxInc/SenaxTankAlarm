@@ -633,6 +633,38 @@ static void testText() {
   }
   // The finding names the built-in LVD of both systems: it has no system to go by.
   CHECK(strstr(ss::findingText(ss::FINDING_PRESET_LVD), "11.50 V (23.00 V on a 24 V system)") != nullptr);
+
+  // The client logs each finding and each scale line as an entry of its own, with the words it
+  // puts before it, and an entry of its log holds 160 bytes: none may be cut.
+  for (uint8_t bit = 0; bit < ss::FINDING_BITS; ++bit) {
+    ss::Text text(line, sizeof(line));
+    text.add("  - ").add(ss::findingText((uint32_t)1 << bit));
+    CHECK_MSG(!text.truncated(), "finding bit %d", (int)bit);
+  }
+  {
+    const ss::ScaleVerdict verdict = {255, {255, 255}, ss::SCALE_UNKNOWN};  // the longest
+    ss::Text text(line, sizeof(line));
+    text.add("  Stored voltages: ");
+    ss::describeSettingsScale(verdict, &text);
+    CHECK(!text.truncated());
+  }
+  for (uint8_t scale : {(uint8_t)ss::SCALE_100, (uint8_t)ss::SCALE_96667}) {
+    for (uint8_t source : {(uint8_t)ss::LIVE_SOURCE_PRESET_LVD, (uint8_t)ss::LIVE_SOURCE_STORED_LVD}) {
+      for (uint8_t system : {0, 12, 24}) {
+        ss::Text text(line, sizeof(line));
+        text.add("  Live readings: ");
+        ss::describeLiveScale(scale, source, system, &text);
+        CHECK(!text.truncated());
+      }
+    }
+  }
+  // And the test can tell: a sentence that does not fit is cut, and says so.
+  {
+    char small[8];
+    ss::Text text(small, sizeof(small));
+    text.add("  - ").add(ss::findingText(ss::FINDING_CHARGER_FAULT));
+    CHECK(text.truncated());
+  }
 }
 
 // ============================================================================
@@ -2705,6 +2737,38 @@ static void testReportOrder() {
   CHECK(ss::reportCheckTime(now + 10.0 * 86400.0, 0.0) == now + 10.0 * 86400.0);
   CHECK(ss::reportCheckTime(now, 1000.0) == now);
   CHECK(ss::reportCheckTime(0.0, 0.0) == 0.0);
+  // But one that the server could not keep is not known whether or not it knows the time: the
+  // server keeps and serves the time as a uint32_t, and an infinite or huge time would rank above
+  // every report after it.
+  CHECK(ss::REPORT_LATEST_EPOCH == 4294967295.0);  // 2106-02-07, the last second a uint32_t holds
+  for (double server : {0.0, 1000.0}) {
+    CHECK(ss::reportCheckTime(ss::REPORT_LATEST_EPOCH, server) == ss::REPORT_LATEST_EPOCH);
+    CHECK(ss::reportCheckTime(4294967295.0, server) == 4294967295.0);
+    CHECK(ss::reportCheckTime(4294967295.5, server) == 0.0);
+    CHECK(ss::reportCheckTime(4294967296.0, server) == 0.0);
+    CHECK(ss::reportCheckTime(1e10, server) == 0.0);
+    CHECK(ss::reportCheckTime(1e100, server) == 0.0);
+    CHECK(ss::reportCheckTime(HUGE_VAL, server) == 0.0);
+    CHECK(ss::reportCheckTime(-HUGE_VAL, server) == 0.0);
+    CHECK(ss::reportCheckTime(std::nan(""), server) == 0.0);
+  }
+  CHECK(ss::reportCheckTime(1e100, now) == 0.0);
+  CHECK(ss::reportCheckTime(HUGE_VAL, now) == 0.0);
+  // What fits is what the server can keep: the cast back gives the same time.
+  CHECK((double)(uint32_t)ss::reportCheckTime(ss::REPORT_LATEST_EPOCH, 0.0) == ss::REPORT_LATEST_EPOCH);
+  // The server judges the time of the report it holds again, by its clock now. One that came
+  // while it did not know the time, ten days ahead, is then not known, and the next report
+  // replaces it. Judged only as it was kept, it would rank above every report for ten days.
+  {
+    const double held = ss::reportCheckTime(now + 10.0 * 86400.0, 0.0);
+    CHECK(held == now + 10.0 * 86400.0);
+    CHECK(!ss::reportReplaces(true, held, now + 60.0));
+    CHECK(ss::reportCheckTime(held, now) == 0.0);
+    CHECK(ss::reportReplaces(true, ss::reportCheckTime(held, now), now + 60.0));
+    // A report held with a right time is judged the same again, and keeps its place.
+    CHECK(ss::reportCheckTime(now - 60.0, now + 3600.0) == now - 60.0);
+    CHECK(!ss::reportReplaces(true, ss::reportCheckTime(now - 60.0, now + 3600.0), now - 120.0));
+  }
 
   // The first report is kept whatever its time.
   CHECK(ss::reportReplaces(false, 0.0, 0.0));

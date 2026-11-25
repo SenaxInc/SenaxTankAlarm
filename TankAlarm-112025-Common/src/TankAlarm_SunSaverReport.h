@@ -204,6 +204,8 @@ inline bool decodeReport(JsonObjectConst in, Snapshot *snapshot, Evaluation *eva
 
 // 2020-09-13. A clock that reads less was never set.
 static const double REPORT_EARLIEST_EPOCH = 1600000000.0;
+// 2106-02-07, the last second a uint32_t holds: the server keeps and serves the time as one.
+static const double REPORT_LATEST_EPOCH = 4294967295.0;
 // A client's clock may run ahead of the server's by this much.
 static const double REPORT_CLOCK_AHEAD_SECONDS = 86400.0;
 
@@ -213,9 +215,15 @@ static const double REPORT_CLOCK_AHEAD_SECONDS = 86400.0;
 //
 // "Not known" is never replaced by the time of arrival: that would let an old report that was
 // held back pass for the newest one.
+//
+// The server also runs the time of the report it keeps through this, against its clock now:
+// one taken while its clock was not set, and more than a day ahead of it once it is, would
+// otherwise rank above every report that comes after it.
 inline double reportCheckTime(double clientEpoch, double serverNow) {
-  if (!(clientEpoch >= REPORT_EARLIEST_EPOCH)) {
-    return 0.0;  // also for a value that is not a number
+  // Also for a value that is not a number, or one past what the server keeps: an infinite or
+  // huge time is plainly wrong whether or not the server knows the time.
+  if (!(clientEpoch >= REPORT_EARLIEST_EPOCH && clientEpoch <= REPORT_LATEST_EPOCH)) {
+    return 0.0;
   }
   if (serverNow >= REPORT_EARLIEST_EPOCH && clientEpoch > serverNow + REPORT_CLOCK_AHEAD_SECONDS) {
     return 0.0;

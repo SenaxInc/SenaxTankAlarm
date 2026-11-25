@@ -3019,11 +3019,15 @@ static void testWebReading() {
       CHECK(str(json["coils"][i]["name"]) == profile.coil(i).name);
       CHECK_EQ(json["coils"][i]["addr"].as<long>(), profile.coil(i).addr);
       CHECK(str(json["coils"][i]["label"]) == profile.coil(i).label);
+      CHECK(str(json["coils"][i]["note"]) == profile.coil(i).note);
       CHECK_EQ(json["coils"][i]["trigger"] == true, profile.coil(i).trigger);
       resets += json["coils"][i]["reset"] == true ? 1 : 0;
     }
     CHECK_EQ(resets, 1);
     CHECK(findByName(json["coils"], "reset")["reset"] == true);
+    // A counter reset also restarts the battery's lowest and highest voltage (specification).
+    CHECK_HAS(str(findByName(json["coils"], "clear_kwh")["note"]), "It also sets vb_min and vb_max");
+    CHECK(str(findByName(json["coils"], "load_disconnect")["note"]).empty());
     CHECK_EQ(json["checks"].size(), profile.checkCount());
     for (size_t i = 0; i < profile.checkCount(); ++i) {
       CHECK(str(json["checks"][i]["below"]) == profile.check(i).below->name);

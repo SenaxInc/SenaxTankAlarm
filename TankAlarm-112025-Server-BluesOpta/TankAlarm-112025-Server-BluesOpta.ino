@@ -12999,7 +12999,11 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   // wrong, keeps 0 for "not known" and replaces only another such report (see reportCheckTime()).
   // A client of this firmware sends no report without a time: it waits for its clock.
   const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
-  if (!sunsaver::reportReplaces(meta->chargerReportValid, meta->chargerReportEpoch, checkedAt)) {
+  // The time of the report held is judged again, by this server's clock now: one that came while
+  // the clock was not set can be more than a day ahead of it, and would rank above every report
+  // after it.
+  const double heldAt = sunsaver::reportCheckTime(meta->chargerReportEpoch, currentEpoch());
+  if (!sunsaver::reportReplaces(meta->chargerReportValid, heldAt, checkedAt)) {
     Serial.print(F("Charger check from "));
     Serial.print(clientUid);
     Serial.println(checkedAt > 0.0 ? F(" is older than the one this server holds: not kept")
@@ -13373,6 +13377,7 @@ static void loadChargerReports() {
     return;
   }
   uint8_t loaded = 0;
+  const double now = currentEpoch();
   for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
     ClientMetadata *meta = findClientMetadata(obj["c"] | "");
     if (!meta || !meta->chargerReportUnread) {
@@ -13384,8 +13389,11 @@ static void loadChargerReports() {
     if (!sunsaver::decodeReport(obj, &snapshot, &evaluation)) {
       continue;
     }
-    const double checkedAt = obj["e"] | 0.0;
-    if (meta->chargerReportValid && sunsaver::reportReplaces(true, checkedAt, meta->chargerReportEpoch)) {
+    // Judged as at its arrival, and so is the one that came in since (see handleChargerReport()):
+    // the file can hold any time, written by an older firmware or by hand.
+    const double checkedAt = sunsaver::reportCheckTime(obj["e"] | 0.0, now);
+    if (meta->chargerReportValid &&
+        sunsaver::reportReplaces(true, checkedAt, sunsaver::reportCheckTime(meta->chargerReportEpoch, now))) {
       continue;  // the one that came in since would have replaced it, and is due to be written
     }
     meta->chargerReportValid = true;

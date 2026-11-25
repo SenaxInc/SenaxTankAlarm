@@ -886,8 +886,9 @@ function readCoils() {
         off.disabled = coil.on === false;
         add(actions, on, document.createTextNode(' '), off);
       }
-      add(row, add(el('td'), el('div', '', known.label), el('div', 'reg-name', known.name)),
-          el('td', coil.error ? 'bad' : 'num', shown), actions);
+      var what = add(el('td'), el('div', '', known.label), el('div', 'reg-name', known.name));
+      if (known.note) { add(what, el('div', 'reg-note', known.note)); }
+      add(row, what, el('td', coil.error ? 'bad' : 'num', shown), actions);
       add(body, row);
     });
     add(box, add(el('table'), add(el('thead'), add(el('tr'), el('th', '', 'Switch'), el('th', '', 'Now'),

@@ -92,6 +92,7 @@ struct OvCoil {
   bool trigger;  // write-only action; reads back 0
   const char *name;
   const char *label;
+  const char *note;  // what else it does, shown before it is sent; "" for none
 };
 
 struct OvGroup {
@@ -99,7 +100,8 @@ struct OvGroup {
   const char *title;
 };
 
-// "below" must be lower than "above". Skipped while either one is 0 (switched off).
+// "below" must be lower than "above". Skipped while one of them holds a 0 that switches its
+// setting off (zeroOk); any other 0 fails (OV_CHECK_ZERO).
 struct OvCheck {
   const OvRegister *below;
   const OvRegister *above;
@@ -532,6 +534,69 @@ class OvProfile {
     return false;
   }
 
+  // The JSON type a member must have when it is there. Most are read with a default, and a
+  // member of another type would fall back to that default without a word: "min": "0" would
+  // leave a setting without its lower limit, "scale": 1 without its scale, "slaveId": 2.0 would
+  // talk to slave 1, and "checks": {} would leave out every pair check.
+  enum MemberKind : uint8_t { MEMBER_TEXT, MEMBER_NUMBER, MEMBER_WHOLE, MEMBER_FLAG, MEMBER_LIST, MEMBER_OBJECT };
+  struct Member {
+    const char *key;
+    MemberKind kind;
+  };
+
+  static bool memberFits(JsonVariantConst value, MemberKind kind) {
+    if (value.isNull()) {
+      return true;  // not there: the default applies
+    }
+    if (kind == MEMBER_TEXT) {
+      return value.is<const char *>();
+    }
+    if (kind == MEMBER_FLAG) {
+      return value.is<bool>();
+    }
+    if (kind == MEMBER_WHOLE) {
+      return value.is<int>();  // 2.0 is not one: read as an int it would give the default
+    }
+    if (kind == MEMBER_LIST) {
+      return value.is<JsonArrayConst>();
+    }
+    if (kind == MEMBER_OBJECT) {
+      return value.is<JsonObjectConst>();
+    }
+    if (!value.is<double>()) {
+      return false;  // a string, true or false, a list or an object
+    }
+    const double x = value.as<double>();
+    return x >= -1e300 && x <= 1e300;  // neither NaN nor infinite
+  }
+
+  // Fails on the first of `members` that `object` holds with another type.
+  template <size_t N>
+  static bool membersFit(JsonVariantConst object, const Member (&members)[N], const char *where,
+                         const char *name, char *error, size_t cap) {
+    for (size_t i = 0; i < N; ++i) {
+      if (memberFits(object[members[i].key], members[i].kind)) {
+        continue;
+      }
+      OvText text(error, cap);
+      text.add("\"");
+      text.add(members[i].key);
+      text.add(members[i].kind == MEMBER_TEXT     ? "\" must be text on "
+               : members[i].kind == MEMBER_FLAG   ? "\" must be true or false on "
+               : members[i].kind == MEMBER_WHOLE  ? "\" must be a whole number on "
+               : members[i].kind == MEMBER_LIST   ? "\" must be a list on "
+               : members[i].kind == MEMBER_OBJECT ? "\" must be an object on "
+                                                  : "\" must be a number on ");
+      text.add(where);
+      if (name != nullptr && name[0] != '\0') {
+        text.add(": ");
+        text.add(name);
+      }
+      return false;
+    }
+    return true;
+  }
+
   static bool jsonU32(JsonVariantConst v, uint32_t *out) {
     if (v.is<const char *>()) {
       return ovParseU32(v.as<const char *>(), out);
@@ -614,21 +679,26 @@ class OvProfile {
     return groups_[groupCount_++].name;
   }
 
-  bool loadStringList(JsonArrayConst list, const char ***items, size_t *count) {
+  // A list of lines of text. A line of another type is refused: skipped, it would leave out a
+  // note, a warning before a write, or a step of the wiring without a word.
+  bool loadStringList(JsonArrayConst list, const char *what, const char ***items, size_t *count, char *error,
+                      size_t errorCap) {
     *count = 0;
     *items = nullptr;
     if (list.isNull() || list.size() == 0) {
       return true;
     }
+    for (JsonVariantConst item : list) {
+      if (!item.is<const char *>()) {
+        return fail(error, errorCap, "a list of lines must hold only text", what);
+      }
+    }
     *items = (const char **)OV_ALLOC(list.size(), sizeof(const char *));
     if (*items == nullptr) {
-      return false;
+      return fail(error, errorCap, "out of memory");
     }
     for (JsonVariantConst item : list) {
-      const char *text = item.as<const char *>();
-      if (text != nullptr) {
-        (*items)[(*count)++] = keep(text);
-      }
+      (*items)[(*count)++] = keep(item.as<const char *>());
     }
     return true;
   }
@@ -650,6 +720,17 @@ class OvProfile {
       return fail(error, errorCap, "unsupported profile schema (this firmware reads schema 1)");
     }
 
+    static const Member kRootMembers[] = {
+        {"profile", MEMBER_TEXT},     {"title", MEMBER_TEXT},     {"version", MEMBER_TEXT},
+        {"source", MEMBER_TEXT},      {"verifiedBy", MEMBER_TEXT}, {"notes", MEMBER_LIST},
+        {"writeNotes", MEMBER_LIST},  {"wiring", MEMBER_LIST},    {"scales", MEMBER_OBJECT},
+        {"labels", MEMBER_OBJECT},    {"groups", MEMBER_LIST},    {"registers", MEMBER_LIST},
+        {"coils", MEMBER_LIST},       {"modbus", MEMBER_OBJECT},  {"liveGroups", MEMBER_LIST},
+        {"checks", MEMBER_LIST},      {"scaleCheck", MEMBER_OBJECT}};
+    if (!membersFit(root, kRootMembers, "the profile", nullptr, error, errorCap)) {
+      return false;
+    }
+
     arenaCap_ = len + 16;
     arena_ = (char *)OV_ALLOC(arenaCap_, 1);
     if (arena_ == nullptr) {
@@ -665,10 +746,11 @@ class OvProfile {
     if (id_[0] == '\0') {
       return fail(error, errorCap, "the profile has no \"profile\" name");
     }
-    if (!loadStringList(root["notes"].as<JsonArrayConst>(), &notes_, &noteCount_) ||
-        !loadStringList(root["writeNotes"].as<JsonArrayConst>(), &writeNotes_, &writeNoteCount_) ||
-        !loadStringList(root["wiring"].as<JsonArrayConst>(), &wiring_, &wiringCount_)) {
-      return fail(error, errorCap, "out of memory");
+    if (!loadStringList(root["notes"].as<JsonArrayConst>(), "notes", &notes_, &noteCount_, error, errorCap) ||
+        !loadStringList(root["writeNotes"].as<JsonArrayConst>(), "writeNotes", &writeNotes_, &writeNoteCount_, error,
+                        errorCap) ||
+        !loadStringList(root["wiring"].as<JsonArrayConst>(), "wiring", &wiring_, &wiringCount_, error, errorCap)) {
+      return false;
     }
 
     // --- scales ---
@@ -682,6 +764,11 @@ class OvProfile {
         JsonVariantConst v = pair.value();
         OvScale &s = scales_[scaleCount_];
         s.name = keep(pair.key().c_str());
+        static const Member kScaleMembers[] = {{"num", MEMBER_NUMBER}, {"den", MEMBER_NUMBER},
+                                               {"units", MEMBER_TEXT}, {"decimals", MEMBER_WHOLE}};
+        if (!membersFit(v, kScaleMembers, "scale", s.name, error, errorCap)) {
+          return false;
+        }
         if (!v["num"].is<double>() || !v["den"].is<double>()) {
           return fail(error, errorCap, "a scale needs \"num\" and \"den\"", s.name);
         }
@@ -692,7 +779,11 @@ class OvProfile {
         }
         s.units = keep(v["units"] | "");
         const int decimals = v["decimals"] | 0;
-        s.decimals = (uint8_t)(decimals < 0 ? 0 : (decimals > 6 ? 6 : decimals));
+        if (decimals < 0 || decimals > 6) {
+          // The values are shown with at most 6 (ovFormatFixed): 9 would have shown 6 unseen.
+          return fail(error, errorCap, "\"decimals\" must be 0 to 6 on scale", s.name);
+        }
+        s.decimals = (uint8_t)decimals;
         ++scaleCount_;
       }
     }
@@ -717,6 +808,10 @@ class OvProfile {
           return fail(error, errorCap, "out of memory");
         }
         for (JsonVariantConst item : items) {
+          if (!item.isNull() && !item.is<const char *>()) {
+            // Read as a value without a name, a 5 would leave that value unnamed without a word.
+            return fail(error, errorCap, "a label set holds names, or null for a value without one", set.name);
+          }
           const char *text = item.as<const char *>();
           set.items[set.count++] = text != nullptr ? keep(text) : nullptr;
         }
@@ -737,6 +832,10 @@ class OvProfile {
     }
     if (!groups.isNull()) {
       for (JsonVariantConst g : groups) {
+        static const Member kGroupMembers[] = {{"name", MEMBER_TEXT}, {"title", MEMBER_TEXT}};
+        if (!membersFit(g, kGroupMembers, "a group", nullptr, error, errorCap)) {
+          return false;
+        }
         const char *name = g["name"].as<const char *>();
         if (name == nullptr || name[0] == '\0') {
           return fail(error, errorCap, "a group needs a \"name\"");
@@ -751,6 +850,16 @@ class OvProfile {
       if (!validName(name)) {
         return fail(error, errorCap, "a register needs a \"name\" made of letters, digits and _",
                     name != nullptr ? name : "");
+      }
+      static const Member kRegisterMembers[] = {
+          {"label", MEMBER_TEXT},   {"note", MEMBER_TEXT},       {"type", MEMBER_TEXT},
+          {"order", MEMBER_TEXT},   {"scale", MEMBER_TEXT},      {"labels", MEMBER_TEXT},
+          {"units", MEMBER_TEXT},   {"group", MEMBER_TEXT},      {"verified", MEMBER_TEXT},
+          {"words", MEMBER_WHOLE},  {"decimals", MEMBER_WHOLE},  {"min", MEMBER_NUMBER},
+          {"max", MEMBER_NUMBER},   {"writable", MEMBER_FLAG},   {"zeroOk", MEMBER_FLAG},
+          {"sentinel", MEMBER_OBJECT}};
+      if (!membersFit(v, kRegisterMembers, "register", name, error, errorCap)) {
+        return false;
       }
       uint32_t addr = 0;
       if (!jsonU32(v["addr"], &addr) || addr > 0xFFFF) {
@@ -804,7 +913,10 @@ class OvProfile {
                                               : (r.scale != nullptr ? r.scale->units : "");
       int decimals = r.scale != nullptr ? r.scale->decimals : 0;
       decimals = v["decimals"] | decimals;
-      r.decimals = (uint8_t)(decimals < 0 ? 0 : (decimals > 6 ? 6 : decimals));
+      if (decimals < 0 || decimals > 6) {
+        return fail(error, errorCap, "\"decimals\" must be 0 to 6 on register", name);
+      }
+      r.decimals = (uint8_t)decimals;
 
       const char *groupName = v["group"] | "other";
       r.group = internGroup(groupName, nullptr);
@@ -887,6 +999,11 @@ class OvProfile {
           return fail(error, errorCap, "a coil needs a \"name\" made of letters, digits and _",
                       name != nullptr ? name : "");
         }
+        static const Member kCoilMembers[] = {{"label", MEMBER_TEXT}, {"note", MEMBER_TEXT},
+                                              {"trigger", MEMBER_FLAG}};
+        if (!membersFit(v, kCoilMembers, "coil", name, error, errorCap)) {
+          return false;
+        }
         if (!jsonU32(v["addr"], &addr) || addr > 0xFFFF) {
           return fail(error, errorCap, "bad or missing \"addr\" on coil", name);
         }
@@ -896,6 +1013,7 @@ class OvProfile {
         c.addr = (uint16_t)addr;
         c.name = keep(name);
         c.label = v["label"].is<const char *>() ? keep(v["label"].as<const char *>()) : c.name;
+        c.note = keep(v["note"] | "");
         c.trigger = v["trigger"] | false;
         ++coilCount_;
       }
@@ -903,6 +1021,13 @@ class OvProfile {
 
     // --- link defaults ---
     JsonVariantConst modbus = root["modbus"];
+    static const Member kModbusMembers[] = {
+        {"slaveId", MEMBER_WHOLE},      {"readFunction", MEMBER_WHOLE},      {"maxBlock", MEMBER_WHOLE},
+        {"baud", MEMBER_WHOLE},         {"responseTimeoutMs", MEMBER_WHOLE}, {"resetWaitMs", MEMBER_WHOLE},
+        {"format", MEMBER_TEXT},        {"probeRegister", MEMBER_TEXT},       {"resetCoil", MEMBER_TEXT}};
+    if (!membersFit(modbus, kModbusMembers, "modbus", nullptr, error, errorCap)) {
+      return false;
+    }
     const int slaveId = modbus["slaveId"] | 1;
     const int readFunction = modbus["readFunction"] | 4;
     const int maxBlock = modbus["maxBlock"] | 16;
@@ -975,6 +1100,11 @@ class OvProfile {
       }
       for (JsonVariantConst v : checks) {
         OvCheck &c = checks_[checkCount_];
+        static const Member kCheckMembers[] = {{"below", MEMBER_TEXT}, {"above", MEMBER_TEXT},
+                                               {"message", MEMBER_TEXT}};
+        if (!membersFit(v, kCheckMembers, "a check", nullptr, error, errorCap)) {
+          return false;
+        }
         c.below = findRegister(v["below"].as<const char *>());
         c.above = findRegister(v["above"].as<const char *>());
         if (c.below == nullptr || c.above == nullptr || !ovIsNumeric(*c.below) || !ovIsNumeric(*c.above)) {
@@ -989,9 +1119,25 @@ class OvProfile {
     JsonVariantConst sc = root["scaleCheck"];
     if (!sc.isNull()) {
       OvScaleCheck &check = scaleCheck_;
-      for (JsonVariantConst alt : sc["alternates"].as<JsonArrayConst>()) {
-        if (check.alternateCount < sizeof(check.alternates) / sizeof(check.alternates[0]) &&
-            alt.is<double>() && alt.as<double>() > 0.0) {
+      static const Member kScaleCheckMembers[] = {{"grid", MEMBER_NUMBER}, {"alternates", MEMBER_LIST},
+                                                  {"settings", MEMBER_OBJECT}, {"live", MEMBER_OBJECT}};
+      if (!membersFit(sc, kScaleCheckMembers, "scaleCheck", nullptr, error, errorCap)) {
+        return false;
+      }
+      // A list longer than the room for it is refused: cut short, the numerators past the
+      // fourth would have dropped out of the comparison unseen. The same for the setpoints and
+      // the regulating states below.
+      JsonArrayConst alternates = sc["alternates"].as<JsonArrayConst>();
+      static_assert(sizeof(check.alternates) / sizeof(check.alternates[0]) == 4, "the message names 4");
+      if (alternates.size() > sizeof(check.alternates) / sizeof(check.alternates[0])) {
+        return fail(error, errorCap, "scaleCheck.alternates holds at most 4 numerators");
+      }
+      for (JsonVariantConst alt : alternates) {
+        // A numerator that is not a number above 0 would drop out of the comparison unseen.
+        if (!memberFits(alt, MEMBER_NUMBER) || !(alt.as<double>() > 0.0)) {
+          return fail(error, errorCap, "scaleCheck.alternates must be numbers above zero");
+        }
+        if (check.alternateCount < sizeof(check.alternates) / sizeof(check.alternates[0])) {
           check.alternates[check.alternateCount++] = ovJsonNumber(alt);
         }
       }
@@ -1003,12 +1149,21 @@ class OvProfile {
       // Stored settings: the setpoints whose roundness is judged.
       JsonVariantConst settings = sc["settings"];
       if (!settings.isNull()) {
+        static const Member kSettingsMembers[] = {{"scale", MEMBER_TEXT}, {"setpoints", MEMBER_LIST}};
+        if (!membersFit(settings, kSettingsMembers, "scaleCheck.settings", nullptr, error, errorCap)) {
+          return false;
+        }
         check.settingsScale = findScale(settings["scale"] | "");
         if (check.settingsScale == nullptr) {
           return fail(error, errorCap, "scaleCheck.settings.scale names no scale");
         }
         check.settingsFileNum = check.settingsScale->num;
-        for (JsonVariantConst item : settings["setpoints"].as<JsonArrayConst>()) {
+        JsonArrayConst setpoints = settings["setpoints"].as<JsonArrayConst>();
+        static_assert(sizeof(check.setpoints) / sizeof(check.setpoints[0]) == 24, "the message names 24");
+        if (setpoints.size() > sizeof(check.setpoints) / sizeof(check.setpoints[0])) {
+          return fail(error, errorCap, "scaleCheck.settings.setpoints names at most 24 registers");
+        }
+        for (JsonVariantConst item : setpoints) {
           const OvRegister *reg = findRegister(item.as<const char *>());
           if (reg == nullptr || reg->scale != check.settingsScale || reg->words != 1) {
             return fail(error, errorCap,
@@ -1024,6 +1179,12 @@ class OvProfile {
       // Live readings: the registers behind the regulation and multimeter tests.
       JsonVariantConst live = sc["live"];
       if (!live.isNull()) {
+        static const Member kLiveMembers[] = {{"scale", MEMBER_TEXT},     {"meter", MEMBER_TEXT},
+                                              {"battery", MEMBER_TEXT},   {"reference", MEMBER_TEXT},
+                                              {"state", MEMBER_TEXT},     {"regulating", MEMBER_LIST}};
+        if (!membersFit(live, kLiveMembers, "scaleCheck.live", nullptr, error, errorCap)) {
+          return false;
+        }
         check.liveScale = findScale(live["scale"] | "");
         if (check.liveScale == nullptr) {
           return fail(error, errorCap, "scaleCheck.live.scale names no scale");
@@ -1073,9 +1234,17 @@ class OvProfile {
         if (check.state != nullptr && check.state->words != 1) {
           return fail(error, errorCap, "scaleCheck.live.state must be a one-word register");
         }
-        for (JsonVariantConst value : live["regulating"].as<JsonArrayConst>()) {
-          if (check.regulatingCount < sizeof(check.regulating) / sizeof(check.regulating[0]) &&
-              value.is<uint16_t>()) {
+        JsonArrayConst regulating = live["regulating"].as<JsonArrayConst>();
+        static_assert(sizeof(check.regulating) / sizeof(check.regulating[0]) == 8, "the message names 8");
+        if (regulating.size() > sizeof(check.regulating) / sizeof(check.regulating[0])) {
+          return fail(error, errorCap, "scaleCheck.live.regulating lists at most 8 states");
+        }
+        for (JsonVariantConst value : regulating) {
+          if (!value.is<uint16_t>()) {
+            // Skipped, it would leave the regulation test blind to that state without a word.
+            return fail(error, errorCap, "scaleCheck.live.regulating must list state values from 0 to 65535");
+          }
+          if (check.regulatingCount < sizeof(check.regulating) / sizeof(check.regulating[0])) {
             check.regulating[check.regulatingCount++] = value.as<uint16_t>();
           }
         }

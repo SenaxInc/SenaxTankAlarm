@@ -248,7 +248,7 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 | `scalecheck [volts] [setting volts]` | Test the voltage scales. The live readings need a multimeter reading, the stored settings a setting whose value you know |
 | `set <name> <value>` | Write a setting, for example `set EV_lvd 13.10` |
 | `set <name> raw <n>` | The same with a raw register value |
-| `coil <name> on\|off` | Switch a coil |
+| `coil <name> on\|off` | Switch a coil, or carry out an action. Clearing the Ah or kWh counters also sets `vb_min` and `vb_max` to the battery voltage now, as the specification says |
 | `reset` | Restart the controller so that new settings apply |
 | `status` | Link settings and counters |
 | `link <baud> [format]`, `slave <n>`, `fc <3\|4>`, `timeout <ms>` | Change the link |
@@ -449,7 +449,24 @@ low byte of its word: the high byte is not part of the value and is not compared
 writes 0 there (a raw value for a `u8` is 0 to 255). `"verified": "bench"` marks a register that
 was seen on our hardware; the others show `~` in the lists. Only one-word `u16`, `i16` and `u8`
 registers can be writable. The limits are OptaView's own sanity limits for a 12 V system, not
-Morningstar's.
+Morningstar's. A coil's `note` says what else switching it does; `coils`, the question before a
+switch and the web page show it.
+
+Every member must have its JSON type. A limit written as `"0"`, a slave address as `2.0`, or a
+list or section of another kind (`"checks": {}`) is refused, by the sketch and by
+`check_profile.py`, where read with a default it would have fallen back to that default without
+a word: no lower limit, slave 1, no pair checks. Nor is anything cut short: `decimals` is 0 to 6,
+`scaleCheck.alternates` holds at most 4 numerators, `scaleCheck.settings.setpoints` at most 24
+registers and `scaleCheck.live.regulating` at most 8 states, and a longer list is refused. An
+address or raw value written as text is decimal digits, or `0x` and hex digits, and nothing else
+(no sign, space or `_`).
+
+`check_profile.py` reads the file as the sketch's JSON parser does (no `NaN` or `Infinity`, a
+number of at most 63 characters, lists and objects at most 10 deep) and adds house rules of its
+own: every text, member names included, is printable ASCII, and every member is one the sketch
+reads, since the sketch ignores the others and a misspelt `"mn"` would leave a setting without its
+lower limit. `check_profile.py --selftest` shows that it refuses each of those and passes their
+edges, and the host tests run it.
 
 ## Tests
 
@@ -511,7 +528,10 @@ python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
 The script also works out the hashes that the page's policy names for its style sheet and its
 script, and refuses a page that needs more than that policy allows (an inline event handler, a
 style sheet brought in with `@import` or a link, a font, a script file, any file but a `data:`
-image). It reads each tag the way a browser does, so a `>` inside a quoted value hides nothing.
+image). It reads the page the way a browser does where the two could differ: each tag attribute
+by attribute with its character references decoded, tag names in any case, a block that ends at
+the first `</script` or `</style`, and the escapes of the style sheet and of the script's names.
+So a `>` inside a quoted value, a `&#9;` in a `srcset` or `@\69mport` hides nothing.
 `embed_web.py --selftest` shows that each of those rules refuses what it should, and that a
 `data:` image passes wherever an image can go. The host tests run it, and fail when the header
 is out of date.

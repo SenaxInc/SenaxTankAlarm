@@ -423,6 +423,15 @@ public:
   void setFloatReference(float volts) { _floatReferenceV = volts; }
   float getFloatReference() const { return _floatReferenceV; }
 
+  // The battery's nominal voltage as the config names it: 12 or 24. The no-charge alert takes
+  // the size of the pack from it when the float voltage is not known. 0 (the default, and what
+  // any other value is taken as) means the config names none: the alert then goes by the
+  // voltage it reads, and a 12 V battery that a fault has taken above SOLAR_24V_SYSTEM_MIN_V
+  // passes for a 24 V one, which hides its BATTERY_HIGH behind NO_CHARGE in daylight. Kept
+  // across begin() and end(): it is the config's, not the link's.
+  void setPackVolts(uint8_t volts) { _packVolts = (volts == 12 || volts == 24) ? volts : 0; }
+  uint8_t getPackVolts() const { return _packVolts; }
+
   // ---------------------------------------------------------------------------------------
   // Charger programming: writes a LiFePO4 charging profile and the LVD and LVR into the
   // controller when the client's config asks for it (sunsaver::Supervisor in
@@ -494,6 +503,7 @@ private:
   uint8_t _noChargeConsecutivePolls;
   uint8_t _cachedHoldingFC; // Caches whether FC03 (holding) or FC04 (inputs) works: 3 = holding, 4 = inputs, 0 = unknown
   float _floatReferenceV;   // See setFloatReference(). 0 = not known.
+  uint8_t _packVolts;       // See setPackVolts(). 0 = the config names none.
 
   // Charger check
   sunsaver::SnapshotReader _chargerCheck;

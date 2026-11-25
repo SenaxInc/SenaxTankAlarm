@@ -1618,7 +1618,66 @@ static void testScaleCheckRejects() {
   }
   CHECK_EQ(gAllocLive, 0);
 
+  // Each list may fill the room the loader has for it. One more is refused: cut short, the
+  // numerators, setpoints or states past the room would have dropped out of the test unseen.
+  std::string setpoints24 = "[\"sp1\"";
+  for (int i = 1; i < 24; ++i) {
+    setpoints24 += i % 2 != 0 ? ",\"sp2\"" : ",\"sp1\"";
+  }
+  const std::string setpoints25 = setpoints24 + ",\"sp1\"]";
+  setpoints24 += "]";
+  {
+    OvProfile profile;
+    char error[200];
+    const std::string full = replaced(replaced(replaced(good, "[96.667]", "[90,95,96.667,100]"), "[\"sp1\",\"sp2\"]",
+                                               setpoints24.c_str()),
+                                      "\"regulating\":[1]", "\"regulating\":[0,1,2,3,4,5,6,7]");
+    CHECK_MSG(profile.load(full.c_str(), full.size(), error, sizeof(error)), "%s", error);
+    const OvScaleCheck &check = profile.scaleCheck();
+    CHECK_EQ(check.alternateCount, 4);
+    CHECK(check.alternates[3] == 100.0);
+    CHECK_EQ(check.setpointCount, 24);
+    CHECK(check.setpoints[23] == profile.findRegister("sp2"));
+    CHECK_EQ(check.regulatingCount, 8);
+    CHECK_EQ(check.regulating[7], 7);
+  }
+  CHECK_EQ(gAllocLive, 0);
+  expectRejected(replaced(good, "[96.667]", "[90,95,96.667,100,105]"), "scaleCheck.alternates holds at most 4 numerators");
+  expectRejected(replaced(good, "[\"sp1\",\"sp2\"]", setpoints25.c_str()),
+                 "scaleCheck.settings.setpoints names at most 24 registers");
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":[0,1,2,3,4,5,6,7,8]"),
+                 "scaleCheck.live.regulating lists at most 8 states");
+
   expectRejected(replaced(good, "\"grid\":0.05", "\"grid\":0"), "scaleCheck.grid");
+  expectRejected(replaced(good, "\"grid\":0.05", "\"grid\":\"0.05\""), "\"grid\" must be a number on scaleCheck");
+  // A numerator that is not a number above 0 is refused, where it used to drop out unseen.
+  expectRejected(replaced(good, "[96.667]", "[\"96.667\"]"), "scaleCheck.alternates must be numbers above zero");
+  expectRejected(replaced(good, "[96.667]", "[96.667,0]"), "scaleCheck.alternates must be numbers above zero");
+  expectRejected(replaced(good, "[96.667]", "[-96.667]"), "scaleCheck.alternates must be numbers above zero");
+  expectRejected(replaced(good, "[96.667]", "[null]"), "scaleCheck.alternates must be numbers above zero");
+  expectRejected(replaced(good, "[96.667]", "[true]"), "scaleCheck.alternates must be numbers above zero");
+  expectRejected(replaced(good, "[96.667]", "[1e999]"), "scaleCheck.alternates must be numbers above zero");
+  // A list or a section of another kind would have been read as empty.
+  expectRejected(replaced(good, "[96.667]", "96.667"), "\"alternates\" must be a list on scaleCheck");
+  expectRejected(replaced(good, "\"settings\":{\"scale\":\"vs\",\"setpoints\":[\"sp1\",\"sp2\"]}", "\"settings\":[\"vs\"]"),
+                 "\"settings\" must be an object on scaleCheck");
+  expectRejected(replaced(good, "\"setpoints\":[\"sp1\",\"sp2\"]", "\"setpoints\":\"sp1\""),
+                 "\"setpoints\" must be a list on scaleCheck.settings");
+  expectRejected(replaced(good, "\"settings\":{\"scale\":\"vs\"", "\"settings\":{\"scale\":1"),
+                 "\"scale\" must be text on scaleCheck.settings");
+  expectRejected(replaced(replaced(good, "\"live\":{", "\"live\":[{"), "\"regulating\":[1]}", "\"regulating\":[1]}]"),
+                 "\"live\" must be an object on scaleCheck");
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":1"), "\"regulating\" must be a list on scaleCheck.live");
+  expectRejected(replaced(good, "\"meter\":\"batt\"", "\"meter\":8"), "\"meter\" must be text on scaleCheck.live");
+  // A state value that is not one would have been skipped, and the regulation test blind to it.
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":[1,70000]"),
+                 "scaleCheck.live.regulating must list state values from 0 to 65535");
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":[\"1\"]"),
+                 "scaleCheck.live.regulating must list state values from 0 to 65535");
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":[1.5]"),
+                 "scaleCheck.live.regulating must list state values from 0 to 65535");
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":[-1]"),
+                 "scaleCheck.live.regulating must list state values from 0 to 65535");
   expectRejected(replaced(good, "\"settings\":{\"scale\":\"vs\"", "\"settings\":{\"scale\":\"zz\""),
                  "scaleCheck.settings.scale names no scale");
   expectRejected(replaced(good, "\"settings\":{\"scale\":\"vs\",", "\"settings\":{"),
@@ -1780,6 +1839,22 @@ static void testProfileRejects() {
   expectRejected("{\"schema\":1,\"profile\":\"x\",\"registers\":[]}", "no registers");
   expectRejected(replaced(mini, "\"name\":\"a\"", "\"name\":\"9a\""), "needs a \"name\"");
   expectRejected(replaced(mini, "\"name\":\"a\"", "\"name\":\"a b\""), "needs a \"name\"");
+  expectRejected(replaced(mini, "\"name\":\"a\"", "\"name\":\"a\\n\""), "needs a \"name\"");  // as check_profile.py
+  // An address written as text is decimal digits, or 0x and hex digits, and nothing else.
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"+57361\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\" 57361\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"57361 \""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"57_361\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"0xE0_11\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":57361.0"), "bad or missing \"addr\"");
+  for (const char *spelling : {"\"addr\":\"0XE011\"", "\"addr\":\"0xe011\"", "\"addr\":\"057361\""}) {
+    OvProfile profile;
+    char error[200];
+    const std::string text = replaced(mini, "\"addr\":57361", spelling);
+    CHECK_MSG(profile.load(text.c_str(), text.size(), error, sizeof(error)), "%s: %s", spelling, error);
+    CHECK_EQ(profile.findRegister("b")->addr, 0xE011);
+  }
+  CHECK_EQ(gAllocLive, 0);
   expectRejected(replaced(mini, "\"name\":\"b\"", "\"name\":\"A\""), "share a name");
   expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"0xE010\""), "share an address");
   expectRejected(replaced(mini, "\"addr\":\"0xE012\"", "\"addr\":\"0xE013\""), "share an address");  // the u32 runs into d
@@ -1797,6 +1872,114 @@ static void testProfileRejects() {
   expectRejected(replaced(mini, "\"type\":\"u32\",\"group\":\"g\"", "\"type\":\"u32\",\"group\":\"g\",\"writable\":true"),
                  "only one-word");
   expectRejected(replaced(mini, "\"min\":1,\"max\":20", "\"min\":21,\"max\":20"), "\"min\" is above \"max\"");
+  {  // A member of the wrong JSON type is refused, where read with a default it would have fallen
+     // back to that default without a word: "min": "0" would have left the setting without its
+     // lower limit, "scale": 1 without its scale, "slaveId": 2.0 would have talked to slave 1.
+    const struct {
+      const char *from;
+      const char *to;
+      const char *because;
+    } wrong[] = {
+        {"\"min\":1,\"max\":20", "\"min\":\"0\",\"max\":\"0.2\"", "\"min\" must be a number on register: a"},
+        {"\"min\":1,\"max\":20", "\"min\":1,\"max\":\"20\"", "\"max\" must be a number on register: a"},
+        {"\"min\":1,\"max\":20", "\"min\":true,\"max\":20", "\"min\" must be a number on register: a"},
+        {"\"min\":1,\"max\":20", "\"min\":1,\"max\":[20]", "\"max\" must be a number on register: a"},
+        {"\"writable\":true", "\"writable\":\"true\"", "\"writable\" must be true or false on register: a"},
+        {"\"writable\":true", "\"writable\":true,\"zeroOk\":1", "\"zeroOk\" must be true or false on register: a"},
+        {"\"scale\":\"v\"", "\"scale\":1", "\"scale\" must be text on register: a"},
+        {"\"type\":\"enum\"", "\"type\":5", "\"type\" must be text on register: b"},
+        {"\"labels\":\"st\"", "\"labels\":[\"A\"]", "\"labels\" must be text on register: b"},
+        {"\"order\":\"lo-hi\"", "\"order\":1", "\"order\" must be text on register: e"},
+        {"\"name\":\"d\",\"group\":\"h\"", "\"name\":\"d\",\"group\":7", "\"group\" must be text on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"words\":2.0", "\"words\" must be a whole number on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"decimals\":\"1\"", "\"decimals\" must be a whole number on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"label\":5", "\"label\" must be text on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"note\":[]", "\"note\" must be text on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"units\":false", "\"units\" must be text on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"verified\":1", "\"verified\" must be text on register: d"},
+        {"\"trigger\":true", "\"trigger\":\"yes\"", "\"trigger\" must be true or false on coil: reset"},
+        {"\"name\":\"reset\"", "\"name\":\"reset\",\"note\":1", "\"note\" must be text on coil: reset"},
+        {"\"name\":\"reset\"", "\"name\":\"reset\",\"label\":{}", "\"label\" must be text on coil: reset"},
+        {"\"num\":100", "\"num\":true", "\"num\" must be a number on scale: v"},
+        {"\"units\":\"V\"", "\"units\":1", "\"units\" must be text on scale: v"},
+        {"\"decimals\":2", "\"decimals\":2.5", "\"decimals\" must be a whole number on scale: v"},
+        {"\"slaveId\":1", "\"slaveId\":2.0", "\"slaveId\" must be a whole number on modbus"},
+        {"\"baud\":9600", "\"baud\":\"9600\"", "\"baud\" must be a whole number on modbus"},
+        {"\"maxBlock\":3", "\"maxBlock\":3.5", "\"maxBlock\" must be a whole number on modbus"},
+        {"\"readFunction\":4", "\"readFunction\":\"4\"", "\"readFunction\" must be a whole number on modbus"},
+        {"\"format\":\"8N2\"", "\"format\":82", "\"format\" must be text on modbus"},
+        {"\"probeRegister\":\"a\"", "\"probeRegister\":1", "\"probeRegister\" must be text on modbus"},
+        {"\"resetCoil\":\"reset\"", "\"resetCoil\":true", "\"resetCoil\" must be text on modbus"},
+        {"\"baud\":9600", "\"baud\":9600,\"responseTimeoutMs\":\"500\"", "\"responseTimeoutMs\" must be a whole number"},
+        {"\"baud\":9600", "\"baud\":9600,\"resetWaitMs\":1.5", "\"resetWaitMs\" must be a whole number on modbus"},
+        {"\"title\":\"Mini\"", "\"title\":1", "\"title\" must be text on the profile"},
+        {"\"version\":\"1\"", "\"version\":1", "\"version\" must be text on the profile"},
+        {"\"message\":\"m\"", "\"message\":1", "\"message\" must be text on a check"},
+        {"\"below\":\"a\"", "\"below\":1", "\"below\" must be text on a check"},
+        {"\"above\":\"d\"", "\"above\":[\"d\"]", "\"above\" must be text on a check"},
+        {"\"profile\":\"mini\"", "\"profile\":1", "\"profile\" must be text on the profile"},
+        {"\"title\":\"Mini\"", "\"title\":\"Mini\",\"source\":[]", "\"source\" must be text on the profile"},
+        {"\"title\":\"Mini\"", "\"title\":\"Mini\",\"verifiedBy\":true", "\"verifiedBy\" must be text on the profile"},
+        {"\"den\":32768", "\"den\":\"32768\"", "\"den\" must be a number on scale: v"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"decimals\":1.5", "\"decimals\" must be a whole number on register: d"},
+        {"\"name\":\"d\"", "\"name\":\"d\",\"sentinel\":0", "\"sentinel\" must be an object on register: d"},
+        {"\"baud\":9600", "\"baud\":9600.0", "\"baud\" must be a whole number on modbus"},
+        {"\"readFunction\":4", "\"readFunction\":3.0", "\"readFunction\" must be a whole number on modbus"},
+        {"\"baud\":9600", "\"baud\":9600,\"responseTimeoutMs\":500.5", "\"responseTimeoutMs\" must be a whole number"},
+        // A list or a section of another kind would have been read as empty: "checks": {} would
+        // have left out every pair check, "coils": {...} every coil.
+        {"\"checks\":[{\"below\":\"a\",\"above\":\"d\",\"message\":\"m\"}]",
+         "\"checks\":{\"below\":\"a\",\"above\":\"d\",\"message\":\"m\"}", "\"checks\" must be a list on the profile"},
+        {"\"coils\":[{\"addr\":\"0xFF\",\"name\":\"reset\",\"trigger\":true}]",
+         "\"coils\":{\"addr\":\"0xFF\",\"name\":\"reset\",\"trigger\":true}", "\"coils\" must be a list on the profile"},
+        {"\"liveGroups\":[\"g\"]", "\"liveGroups\":\"g\"", "\"liveGroups\" must be a list on the profile"},
+        {"\"groups\":[{\"name\":\"g\",\"title\":\"G\"}]", "\"groups\":{\"name\":\"g\",\"title\":\"G\"}",
+         "\"groups\" must be a list on the profile"},
+        {"\"scales\":{\"v\":{\"num\":100,\"den\":32768,\"units\":\"V\",\"decimals\":2}}",
+         "\"scales\":[{\"v\":{\"num\":100,\"den\":32768,\"units\":\"V\",\"decimals\":2}}]",
+         "\"scales\" must be an object on the profile"},
+        {"\"labels\":{\"st\":[\"A\",\"B\"]}", "\"labels\":[[\"A\",\"B\"]]", "\"labels\" must be an object on the profile"},
+        {"\"modbus\":{\"slaveId\":1,", "\"modbus\":\"slave 1\",\"x\":{\"slaveId\":1,",
+         "\"modbus\" must be an object on the profile"},
+        {"\"registers\":[", "\"registers\":{\"list\":[]},\"r\":[", "\"registers\" must be a list on the profile"},
+        {"\"version\":\"1\"", "\"version\":\"1\",\"notes\":\"one line\"", "\"notes\" must be a list on the profile"},
+        {"\"version\":\"1\"", "\"version\":\"1\",\"wiring\":{}", "\"wiring\" must be a list on the profile"},
+        {"\"version\":\"1\"", "\"version\":\"1\",\"writeNotes\":true", "\"writeNotes\" must be a list on the profile"},
+        {"\"version\":\"1\"", "\"version\":\"1\",\"scaleCheck\":[]", "\"scaleCheck\" must be an object on the profile"},
+        // So would a line of a list of notes that is not text, a name in a label set that is
+        // neither text nor null, and a group's title that is not text.
+        {"\"version\":\"1\"", "\"version\":\"1\",\"writeNotes\":[\"Read it first.\",5]",
+         "a list of lines must hold only text: writeNotes"},
+        {"\"version\":\"1\"", "\"version\":\"1\",\"notes\":[null]", "a list of lines must hold only text: notes"},
+        {"\"version\":\"1\"", "\"version\":\"1\",\"wiring\":[[\"A1\"]]", "a list of lines must hold only text: wiring"},
+        {"[\"A\",\"B\"]", "[\"A\",2]", "a label set holds names, or null for a value without one: st"},
+        {"\"title\":\"G\"", "\"title\":5", "\"title\" must be text on a group"},
+        {"{\"name\":\"g\",\"title\":\"G\"}", "{\"name\":7,\"title\":\"G\"}", "\"name\" must be text on a group"},
+    };
+    for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); ++i) {
+      expectRejected(replaced(mini, wrong[i].from, wrong[i].to), wrong[i].because);
+    }
+    // A number too large for a double is not a limit either, at either end.
+    expectRejected(replaced(mini, "\"min\":1,\"max\":20", "\"min\":1,\"max\":1e999"), "\"max\"");
+    expectRejected(replaced(mini, "\"min\":1,\"max\":20", "\"min\":-1e999,\"max\":20"), "\"min\" must be a number");
+    {  // The lists and lines that are fine: a gap in a label set, notes of text.
+      const std::string fine =
+          replaced(replaced(mini, "[\"A\",\"B\"]", "[\"A\",null,\"B\"]"), "\"version\":\"1\"",
+                   "\"version\":\"1\",\"notes\":[\"One.\",\"Two.\"],\"writeNotes\":[],\"notes2\":5");
+      OvProfile loaded;
+      char why[200];
+      CHECK_MSG(loaded.load(fine.c_str(), fine.size(), why, sizeof(why)), "%s", why);
+      CHECK_EQ(loaded.noteCount(), 2U);
+    }
+    // Left out, or null, a member keeps its default; of the right type it is taken as written.
+    const std::string open = replaced(mini, "\"min\":1,\"max\":20", "\"min\":null,\"max\":20.5");
+    OvProfile profile;
+    char error[200];
+    CHECK_MSG(profile.load(open.c_str(), open.size(), error, sizeof(error)), "%s", error);
+    CHECK(!profile.findRegister("a")->hasMin);
+    CHECK(profile.findRegister("a")->hasMax);
+    CHECK(profile.findRegister("a")->maxValue == 20.5);
+  }
   expectRejected(replaced(mini, "\"order\":\"lo-hi\"", "\"order\":\"mid\""), "\"order\"");
   expectRejected(replaced(mini, "\"name\":\"d\"", "\"name\":\"d\",\"verified\":\"maybe\""), "\"verified\"");
   expectRejected(replaced(mini, "\"name\":\"d\"", "\"name\":\"d\",\"sentinel\":{\"raw\":1}"), "sentinel");
@@ -1804,6 +1987,28 @@ static void testProfileRejects() {
                  "\"words\"");
   expectRejected(replaced(mini, "\"den\":32768", "\"den\":0"), "above zero");
   expectRejected(replaced(mini, "\"num\":100,", ""), "needs \"num\" and \"den\"");
+  // Values are shown with at most 6 decimals: 7 or -1 was cut to 6 or 0 without a word.
+  expectRejected(replaced(mini, "\"decimals\":2", "\"decimals\":7"), "\"decimals\" must be 0 to 6 on scale: v");
+  expectRejected(replaced(mini, "\"decimals\":2", "\"decimals\":-1"), "\"decimals\" must be 0 to 6 on scale: v");
+  expectRejected(replaced(mini, "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":7"),
+                 "\"decimals\" must be 0 to 6 on register: d");
+  expectRejected(replaced(mini, "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":-1"),
+                 "\"decimals\" must be 0 to 6 on register: d");
+  {  // 0 and 6 are fine, on a scale and on a register, which takes its scale's unless it says.
+    OvProfile profile;
+    char error[200];
+    const std::string six =
+        replaced(replaced(mini, "\"decimals\":2", "\"decimals\":6"), "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":0");
+    CHECK_MSG(profile.load(six.c_str(), six.size(), error, sizeof(error)), "%s", error);
+    CHECK_EQ(profile.findRegister("a")->decimals, 6);
+    CHECK_EQ(profile.findRegister("d")->decimals, 0);
+    const std::string zero =
+        replaced(replaced(mini, "\"decimals\":2", "\"decimals\":0"), "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":6");
+    CHECK_MSG(profile.load(zero.c_str(), zero.size(), error, sizeof(error)), "%s", error);
+    CHECK_EQ(profile.findRegister("a")->decimals, 0);
+    CHECK_EQ(profile.findRegister("d")->decimals, 6);
+  }
+  CHECK_EQ(gAllocLive, 0);
   expectRejected(replaced(mini, "[\"A\",\"B\"]", "[]"), "label set");
   expectRejected(replaced(mini, "{\"name\":\"g\",\"title\":\"G\"}", "{\"title\":\"G\"}"), "a group needs");
   expectRejected(replaced(mini, "\"slaveId\":1", "\"slaveId\":0"), "slaveId");
@@ -2829,6 +3034,11 @@ static void testConsoleReads() {
   CHECK_HAS(lineWith(coils, "load_disconnect"), "off");
   CHECK_HAS(lineWith(coils, "clear_kwh"), "(action)");
   CHECK_HAS(coils, "have not been tried on our bench");
+  // What the three counter actions do besides, under each of them and under nothing else.
+  CHECK_HAS(coils, "Clear the kWh counter\r\n        It also sets vb_min and vb_max,");
+  CHECK_HAS(coils, "Clear the total Ah counters\r\n        It also sets vb_min and vb_max,");
+  CHECK_HAS(coils, "Clear the resettable Ah counters\r\n        It also sets vb_min and vb_max,");
+  CHECK_EQ(countOf(coils, "It also sets vb_min"), 3U);
   rig.sim.coils[0x0001] = true;
   CHECK_HAS(lineWith(rig.run("coils"), "load_disconnect"), "on ");
   rig.sim.coils.erase(0x0002);
@@ -3553,9 +3763,25 @@ static void testConsoleCoilsAndReset() {
       CHECK_HAS(lineWith(counters, kCounters[i]), kBefore[i]);
       CHECK_HAS(lineWith(stored, kStored[i]), kBefore[i]);
     }
+    // Each of the three also sets the lowest and highest battery voltage since the last reset to
+    // the battery voltage now, as the specification says, and the question says so first.
+    const double kBattery[] = {12.60, 12.80, 13.20};
+    const char *const kBatteryText[] = {" 12.60 V", " 12.80 V", " 13.20 V"};
     for (size_t step = 0; step < 3; ++step) {
-      CHECK_HAS(rig.run(std::string("coil ") + kSteps[step] + " on"), "?");
+      rig.sim.regs[0x0033] = rig.sim.volts(11.90);  // vb_min
+      rig.sim.regs[0x0034] = rig.sim.volts(14.90);  // vb_max
+      rig.sim.setBattery(kBattery[step]);
+      CHECK_HAS(lineWith(rig.run("dump daily"), " vb_min "), " 11.90 V");
+      const std::string ask = rig.run(std::string("coil ") + kSteps[step] + " on");
+      CHECK_HAS(ask, "\r\n  It also sets vb_min and vb_max, the lowest and highest battery voltage since the last "
+                     "reset, to\r\n  the battery voltage now.\r\n  Switch it on (coil 0x00");
       CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
+      const std::string daily = rig.run("dump daily");
+      CHECK_MSG(lineWith(daily, " vb_min ").find(kBatteryText[step]) != std::string::npos, "after %s: %s",
+                kSteps[step], lineWith(daily, " vb_min ").c_str());
+      CHECK_MSG(lineWith(daily, " vb_max ").find(kBatteryText[step]) != std::string::npos, "after %s: %s",
+                kSteps[step], lineWith(daily, " vb_max ").c_str());
+      CHECK_HAS(lineWith(daily, " Vb_min_daily "), " 12.60 V");  // the day's own stay as they were
       counters = rig.run("dump counters");
       stored = rig.run("dump totals");
       for (size_t i = 0; i < 6; ++i) {
@@ -3574,8 +3800,10 @@ static void testConsoleCoilsAndReset() {
     rig.sim.setU32HiLo(0x0017, 222222);  // Ahc_t, both words
     rig.sim.regs[0x0019] = 333;          // kWhc
     rig.sim.setU32HiLo(0x0021, 66666);   // hourmeter
-    rig.run("coil force_eeprom_update on");
+    rig.sim.regs[0x0033] = rig.sim.volts(11.90);  // vb_min: storing the totals leaves it alone
+    CHECK_HASNT(rig.run("coil force_eeprom_update on"), "It also sets");
     CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
+    CHECK_HAS(lineWith(rig.run("dump daily"), " vb_min "), " 11.90 V");
     stored = rig.run("dump totals");
     const char *const kAfter[] = {"111.1 Ah", "22222.2 Ah", "33.3 kWh", "0.0 Ah", "0.0 Ah", "66666 h"};
     for (size_t i = 0; i < 6; ++i) {

@@ -68,6 +68,7 @@ check-arduinojson:
 	@[ -f "$(ARDUINOJSON_DIR)/ArduinoJson.h" ] || { echo "Set ARDUINOJSON_DIR to the src folder of ArduinoJson v7.4.3"; exit 1; }
 
 check-profile:
+	$(PYTHON) $(OPTAVIEW_DIR)/tools/check_profile.py --selftest
 	$(PYTHON) $(OPTAVIEW_DIR)/tools/check_profile.py
 	$(PYTHON) $(OPTAVIEW_DIR)/tools/embed_profile.py --check
 
