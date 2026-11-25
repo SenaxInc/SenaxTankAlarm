@@ -93,7 +93,9 @@ class OvLineEditor {
     if (key < 0x20 || key > 0x7E) {
       return false;
     }
-    if (length_ + 1 < sizeof(line_)) {  // a longer line loses its end and shows it: the echo stops
+    // One character more than a console line can have is kept, and then the echo stops: a line
+    // that was too long stays too long, so the console refuses it instead of running its start.
+    if (length_ + 1 < sizeof(line_)) {
       line_[length_++] = (char)key;
       echo.printChar((char)key);
     }
@@ -119,7 +121,7 @@ class OvLineEditor {
   void lineFeedTaken() { skipLineFeed_ = false; }
 
  private:
-  char line_[OV_LINE_MAX];
+  char line_[OV_LINE_MAX + 1];
   size_t length_;
   bool skipLineFeed_;
 };
@@ -315,29 +317,49 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
  private:
   void runLine(const char *line) {
     char buffer[OV_LINE_MAX];
+    // A line is run whole or not at all. One that does not fit here, or that has more words than
+    // any command takes, is refused rather than run without its end, which may have been half
+    // of a number.
+    const bool fits = strlen(line) < sizeof(buffer);
     ovCopy(buffer, sizeof(buffer), line);
     char *argv[OV_MAX_ARGS];
     const int argc = split(buffer, argv, OV_MAX_ARGS);
+    const bool whole = fits && argc <= OV_MAX_ARGS;
 
     device_.beginBatch();
     stopped_ = false;
     settingsScale_.shown = false;
     liveScale_.shown = false;
 
-    if (argc == 0) {
+    if (argc == 0 && whole) {
       return;  // an empty line is not an answer either: the question stays open
     }
     if (pending_.kind != PENDING_NONE) {
       const Pending action = pending_;
       pending_.kind = PENDING_NONE;
-      if (argc == 1 && is(argv[0], "yes")) {
+      if (whole && argc == 1 && is(argv[0], "yes")) {
         runPending(action);
       } else {
         out_.println("Cancelled. Nothing was sent.");
       }
       return;
     }
+    if (!whole) {
+      out_.print("That line is longer than the console takes (");
+      out_.printU(OV_LINE_MAX - 1);
+      out_.print(" characters and ");
+      out_.printU(OV_MAX_ARGS);
+      out_.println(" words). Nothing was done.");
+      return;
+    }
     const char *cmd = argv[0];
+    const char *form = nullptr;
+    if (argc > mostWords(cmd, &form)) {
+      out_.print("Too many words for '");
+      out_.print(form);
+      out_.println("'. Nothing was done.");
+      return;
+    }
     if (is(cmd, "help") || is(cmd, "?")) {
       cmdHelp();
     } else if (is(cmd, "status")) {
@@ -488,15 +510,20 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
 
   static bool is(const char *a, const char *b) { return ovEqualsIgnoreCase(a, b); }
 
+  // Splits a line into its words. maxArgs + 1 means that it has more words than that, and only
+  // the first maxArgs are in argv.
   static int split(char *line, char **argv, int maxArgs) {
     int argc = 0;
     char *p = line;
-    while (*p != '\0' && argc < maxArgs) {
+    while (*p != '\0') {
       while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
         ++p;
       }
       if (*p == '\0') {
         break;
+      }
+      if (argc == maxArgs) {
+        return maxArgs + 1;
       }
       argv[argc++] = p;
       while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
@@ -507,6 +534,52 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       }
     }
     return argc;
+  }
+
+  // The most words a command takes, its own name included, and the form it takes them in. A
+  // line with more is refused and nothing is done: "timeout 1000 0" is as likely a slip for
+  // 10000 as anything, and "timeout 1000" would be half of what was typed. 'help' shows the same
+  // whatever follows it; 'scalecheck', 'raw', 'yes', 'no' and the commands of the web page and
+  // the network count their own words.
+  static int mostWords(const char *cmd, const char **form) {
+    static const struct {
+      const char *name;
+      int most;
+      const char *form;
+    } kWords[] = {{"status", 1, "status"},
+                  {"probe", 1, "probe"},
+                  {"scan", 3, "scan [first] [last]"},
+                  {"id", 1, "id"},
+                  {"wires", 1, "wires"},
+                  {"live", 1, "live"},
+                  {"read", 1, "read"},
+                  {"watch", 2, "watch [seconds]"},
+                  {"dump", 2, "dump [group]"},
+                  {"groups", 1, "groups"},
+                  {"get", 3, "get <name>' or 'get <address> [count]"},
+                  {"coils", 1, "coils"},
+                  {"snapshot", 1, "snapshot"},
+                  {"scale", 3, "scale [name] [x]"},
+                  {"set", 4, "set <name> <value>' or 'set <name> raw <n>"},
+                  {"coil", 3, "coil <name> on|off"},
+                  {"reset", 2, "reset' or 'reset anyway"},
+                  {"link", 3, "link <baud> [format]"},
+                  {"slave", 2, "slave <n>"},
+                  {"fc", 2, "fc <3|4>"},
+                  {"timeout", 2, "timeout <ms>"},
+                  {"blocks", 2, "blocks <auto|on|off>"},
+                  {"profile", 1, "profile"},
+                  {"trace", 2, "trace on|off"},
+                  {"expert", 2, "expert on|off"},
+                  {"sniff", 2, "sniff [ms]"}};
+    for (size_t i = 0; i < sizeof(kWords) / sizeof(kWords[0]); ++i) {
+      if (is(cmd, kWords[i].name)) {
+        *form = kWords[i].form;
+        return kWords[i].most;
+      }
+    }
+    *form = cmd;
+    return OV_MAX_ARGS;
   }
 
   static bool parseOnOff(const char *text, bool *on) {
@@ -1308,6 +1381,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         out_.println(". 'dump' lists them all.");
         return;
       }
+      if (argc > 2) {
+        out_.println("A count goes with an address, not with a name: get <name>   or   get <address> [count]");
+        return;
+      }
       uint16_t words[2] = {0, 0};
       OvWordStatus status;
       device_.readRegister(*reg, words, &status);
@@ -1747,7 +1824,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     if (usage) {
       out_.println("Usage: scalecheck [volts] [setting volts], for example: scalecheck 13.42 EV_float 13.70");
       out_.println("  volts alone: a multimeter reading at the controller's battery terminals");
-      out_.println("  setting volts: a stored setting and the value you know it has (MSView shows it)");
+      out_.println("  setting volts: a setting that 'set' can change and the value you know it has (MSView shows it)");
       return;
     }
     if (knownName != nullptr) {
@@ -1762,11 +1839,14 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         out_.println("This profile has no test for stored settings, so the setting cannot be used.");
         return;
       }
-      if (known->scale != check.settingsScale || known->words != 1) {
+      // Only a setting that 'set' can change: one the user finds among MSView's settings, and
+      // never a register that the controller fills from one (va_ref_fixed holds a copy of
+      // EVa_ref_fixed_init), which OptaView cannot tell from the setting it stands for.
+      if (known->scale != check.settingsScale || known->words != 1 || !known->writable) {
         out_.print(known->name);
-        out_.print(" is not a stored voltage setting on the scale ");
+        out_.print(" cannot test the scale ");
         out_.print(check.settingsScale->name);
-        out_.println(", so it cannot test that scale.");
+        out_.println(": it is not a setting on it that 'set' can change.");
         return;
       }
       if (device_.wroteRegister(known->addr)) {
@@ -1966,7 +2046,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   }
 
   void cmdSet(int argc, char **argv) {
-    if (argc < 3) {
+    if (argc < 3 || (argc > 3 && !is(argv[2], "raw"))) {
       out_.println("Usage: set <name> <value>   or   set <name> raw <number>");
       return;
     }
@@ -2035,6 +2115,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(reg->name);
     out_.print(": ");
     out_.println(reg->label);
+    // What else the setting does, before the question: the note is where a profile says so.
+    if (reg->note[0] != '\0') {
+      printWrapped("  ", "  ", reg->note);
+    }
     ovFormatValue(*reg, now, text, sizeof(text));
     out_.print("  now  ");
     out_.printPadded(text, 14);
@@ -2223,7 +2307,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.println("This profile has no reset command. Power-cycle the controller instead.");
       return;
     }
-    const bool anyway = argc > 1 && is(argv[1], "anyway");
+    if (argc > 1 && !is(argv[1], "anyway")) {
+      out_.println("Usage: reset   or   reset anyway (which restarts although a pair check fails)");
+      return;
+    }
+    const bool anyway = argc > 1;
     bool problems = false;
     for (size_t i = 0; i < profile.checkCount() && !device_.linkDown(); ++i) {
       const OvCheck &check = profile.check(i);
@@ -2637,7 +2725,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     uint32_t addr = 0;
     uint32_t value = 0;
-    if (argc < 5 || !ovParseU32(argv[3], &addr) || addr > 0xFFFF || !ovParseU32(argv[4], &value) ||
+    if (argc != 5 || !ovParseU32(argv[3], &addr) || addr > 0xFFFF || !ovParseU32(argv[4], &value) ||
         value > 0xFFFF) {
       rawUsage();
       return;

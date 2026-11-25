@@ -2125,9 +2125,10 @@ static void testFingerprint() {
 // ============================================================================
 static void testFloatReference() {
   struct Rigged {
-    static double reference(const SimSunSaver &sim, uint8_t firmwareScale = ss::SCALE_96667) {
+    // packVolts is the pack that was configured: 12, 24, or 0 for none.
+    static double reference(const SimSunSaver &sim, uint8_t firmwareScale = ss::SCALE_96667, uint8_t packVolts = 12) {
       const ss::Snapshot snapshot = snapshotOf(sim);
-      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, 12, firmwareScale};
+      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, packVolts, firmwareScale};
       ss::Evaluation evaluation;
       ss::evaluate(snapshot, want, &evaluation);
       return ss::floatReferenceVolts(snapshot, evaluation, firmwareScale);
@@ -2175,12 +2176,17 @@ static void testFloatReference() {
     CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
   }
   {
-    // A 24 V system holds twice the stored 12 V figure.
+    // A 24 V system holds twice the stored 12 V figure, when a 24 V pack was configured or none
+    // was.
     SimSunSaver sim(96.667, 100.0);
     makeLiFePO4(sim);
     sim.regs[0x0008] = sim.volts(27.00);
     sim.regs[0x001C] = sim.volts(26.20);
-    CHECK(near(Rigged::reference(sim), 27.00, 0.02));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 24), 27.00, 0.02));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 0), 27.00, 0.02));
+    // Not for a pack configured as 12 V: the measured system is not the pack (a pack voltage
+    // finding), and the no-charge alert keeps the default of the configured pack.
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12), 0.0, 1e-12));
     // A 12 V battery at 16.60 V reads 17.17 V with x100. It is not taken for a 24 V system, which
     // would double the reference: no reference until the battery voltage tells.
     sim.regs[0x0008] = sim.volts(16.60);
@@ -2188,6 +2194,38 @@ static void testFloatReference() {
     CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
     sim.regs[0x0008] = sim.volts(13.30);
     CHECK(near(Rigged::reference(sim), 13.50, 0.01));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 0), 13.50, 0.01));
+    // A pack configured as 24 V that reads as a 12 V system has no reference either: twice its
+    // settings is not where it is held, and they alone are not where a 24 V pack is.
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 24), 0.0, 1e-12));
+  }
+  {
+    // A 12 V pack at 18 V (a charger out of regulation, or a charging source of its own) fits a
+    // 24 V system with either scale. Its 13.50 V float would make a reference near 26.10 V, and
+    // three daylight polls without charging current would then raise the no-charge alert, not
+    // the high battery one. The measured system is not the configured pack, so there is none.
+    SimSunSaver sim(100.0, 100.0);
+    makeLiFePO4(sim);
+    sim.regs[0x0008] = sim.volts(18.00);
+    {
+      const ss::Snapshot snapshot = snapshotOf(sim);
+      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, 12, ss::SCALE_96667};
+      ss::Evaluation evaluation;
+      ss::evaluate(snapshot, want, &evaluation);
+      CHECK_EQ(evaluation.systemVolts, 24);
+      CHECK((evaluation.findings & ss::FINDING_PACK_VOLTAGE) != 0);
+      CHECK(near(ss::floatReferenceVolts(snapshot, evaluation, ss::SCALE_96667), 0.0, 1e-12));
+      // The same snapshot judged with the finding taken away has the doubled reference: the
+      // finding alone is what keeps it out.
+      evaluation.findings &= ~(uint32_t)ss::FINDING_PACK_VOLTAGE;
+      CHECK(ss::floatReferenceVolts(snapshot, evaluation, ss::SCALE_96667) > 26.0);
+    }
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_100, 12), 0.0, 1e-12));
+    CHECK(Rigged::reference(sim, ss::SCALE_96667, 0) > 26.0);
+    // Back at 13.40 V it is the 12 V pack that was configured again.
+    sim.regs[0x0008] = sim.volts(13.40);
+    CHECK(near(Rigged::reference(sim, ss::SCALE_100, 12), 13.50, 0.01));
   }
   {
     // Not known: a built-in profile, temperature compensation, an unproven scale, a missing
@@ -2268,7 +2306,7 @@ static void testFloatReference() {
     sim.regs[0xE01D] = sim.setVolts(13.40);
     sim.regs[0x0008] = sim.volts(27.00);
     sim.regs[0x001C] = sim.volts(26.20);
-    CHECK(near(Rigged::reference(sim), 26.80, 0.02));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 24), 26.80, 0.02));
   }
   {
     // Only the low byte of EV_tempcomp is used: a word whose low byte is 0 is compensation off.

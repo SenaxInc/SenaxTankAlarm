@@ -2809,11 +2809,11 @@ static void reconcileClientOta(ClientMetadata *meta, double now);
 static void noteClientFirmwareAndReconcile(const char *clientUid, const char *fwVer, double epoch);
 static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, double now);
 static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now);
-static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc, double now);
+static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc);
 static void handleChargerGet(EthernetClient &client, const String &query);
 // What configuredChargerChemistry() could tell.
 enum ConfigChemistry : uint8_t {
-  CONFIG_CHEMISTRY_NONE = 0,  // no config, or one that names no battery type
+  CONFIG_CHEMISTRY_NONE = 0,  // no config, or one that names no battery type and leaves monitoring on
   CONFIG_CHEMISTRY_KNOWN,     // the chemistry is set
   CONFIG_CHEMISTRY_NO_MEMORY  // the config could not be read for lack of memory
 };
@@ -2824,7 +2824,7 @@ static void saveChargerReportsIfDirty(bool force);
 static void beginChargerReports();
 static void loadChargerReports();
 static void setChargerReportsAside(const char *why);
-static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc, double now);
+static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc);
 static bool chargerProgramAnswered(const ClientMetadata &meta);
 static int stampChargerProgramRequest(const char *clientUid, JsonVariant config, char *message, size_t messageSize);
 static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantConst config);
@@ -12973,9 +12973,9 @@ static void handleOtaResult(const char *clientUid, const char *status, JsonDocum
 // rules are in TankAlarm_SunSaverReport.h and TankAlarm_SunSaverSettings.h (Common library),
 // shared with the client and tested in tests/host/sunsaver_settings.
 
-static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc, double now) {
+static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc) {
   if (strcmp(status, "chg-prog") == 0) {
-    handleChargerProgramResult(clientUid, doc, now);
+    handleChargerProgramResult(clientUid, doc);
     return;
   }
   if (strcmp(status, "chg-check") != 0) {
@@ -12998,11 +12998,14 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   // older one must not replace a newer one. A report without a time, or with one that is plainly
   // wrong, keeps 0 for "not known" and replaces only another such report (see reportCheckTime()).
   // A client of this firmware sends no report without a time: it waits for its clock.
-  const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
-  // The time of the report held is judged again, by this server's clock now: one that came while
-  // the clock was not set can be more than a day ahead of it, and would rank above every report
-  // after it.
-  const double heldAt = sunsaver::reportCheckTime(meta->chargerReportEpoch, currentEpoch());
+  //
+  // Both are judged by this server's clock, not by the time the note carries: that is the
+  // clock of the Notecard that sent it, and a report whose time is days ahead with it would
+  // pass and rank above every report after it. The time of the report held is judged again:
+  // one that came while the clock was not set can be more than a day ahead of it.
+  const double serverNow = currentEpoch();
+  const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, serverNow);
+  const double heldAt = sunsaver::reportCheckTime(meta->chargerReportEpoch, serverNow);
   if (!sunsaver::reportReplaces(meta->chargerReportValid, heldAt, checkedAt)) {
     Serial.print(F("Charger check from "));
     Serial.print(clientUid);
@@ -13130,16 +13133,19 @@ static void handleChargerGet(EthernetClient &client, const String &query) {
 
 // The chemistry that the battery type in the config this server holds for a client is judged as,
 // as the client judges it (sunsaver::chemistryForBatteryType()). A config that waits to be sent,
-// or that the client turned down, counts as well: it is the one the config page shows. NONE when
-// there is no config, or it names no battery type: the client then keeps the battery it had,
-// which is not known here. NO_MEMORY when the config could not be read: a caller that shows a
-// verdict answers with an error then, as it does when its own document runs out.
+// or that the client turned down, counts as well: it is the one the config page shows. One that
+// switches battery monitoring off ("enabled": false) is judged as no battery, whatever its type
+// says, as the client judges it. NONE when there is no config, or it names no battery type and
+// does not switch the monitoring off: the client then keeps the battery it had, which is not
+// known here. NO_MEMORY when the config could not be read: a caller that shows a verdict answers
+// with an error then, as it does when its own document runs out.
 static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *config, uint8_t *chemistry) {
   if (!config || config->payload[0] == '\0') {
     return CONFIG_CHEMISTRY_NONE;
   }
   JsonDocument filter;
   filter["batteryConfig"]["batteryType"] = true;
+  filter["batteryConfig"]["enabled"] = true;
   if (filter.overflowed()) {
     return CONFIG_CHEMISTRY_NO_MEMORY;  // a filter cut short would keep nothing
   }
@@ -13150,6 +13156,12 @@ static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *co
   }
   if (error != DeserializationError::Ok) {
     return CONFIG_CHEMISTRY_NONE;
+  }
+  // The client reads the flag as true unless it is the boolean false.
+  JsonVariantConst enabled = cfg["batteryConfig"]["enabled"];
+  if (enabled.is<bool>() && !enabled.as<bool>()) {
+    *chemistry = sunsaver::CHEMISTRY_NOT_JUDGED;
+    return CONFIG_CHEMISTRY_KNOWN;
   }
   JsonVariantConst type = cfg["batteryConfig"]["batteryType"];
   if (!type.is<int>()) {
@@ -13619,7 +13631,7 @@ static void recoverChargerProgramRequests() {
 
 // A "chg-prog" report: the result of a request, or of the look at the controller that a client
 // owes it after a run that was cut short (request 0 when the client could not read its journal).
-static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc, double now) {
+static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc) {
   sunsaver::ProgramResult result;
   if (!sunsaver::decodeProgramResult(doc.as<JsonObjectConst>(), &result)) {
     Serial.print(F("Charger programming result from "));
@@ -13636,15 +13648,18 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
   // read as the time of a charger check is (see handleChargerReport()), and by that time as it
   // came while the one kept came with a time this server took (sunsaver::resultFollows()). A look
   // for request 0 is kept apart, by its time alone (ClientMetadata::chargerLook).
-  const double madeAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
+  //
+  // Both times are judged by this server's clock, as a charger report's are, not by the time the
+  // note carries (the sending Notecard's clock): a result days ahead with it would pass. The time
+  // of the one held is judged again: one that came while the clock was not set can be more than
+  // a day ahead of it, and would hold back every later result of its request, or every later
+  // look, that a client sends with a time it has to start again (a journal it could not read).
+  const double serverNow = currentEpoch();
+  const double madeAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, serverNow);
   const uint32_t sent = doc["epoch"].is<uint32_t>() ? doc["epoch"].as<uint32_t>() : 0;
   const bool look = requestId == 0;
-  // The time of the one held is judged again, by this server's clock now, as a charger report's
-  // is: one that came while the clock was not set can be more than a day ahead of it, and would
-  // hold back every later result of its request, or every later look, that a client sends with a
-  // time it has to start again (a journal it could not read).
   const double heldAt =
-      sunsaver::reportCheckTime(look ? meta->chargerLookEpoch : meta->chargerProgramEpoch, currentEpoch());
+      sunsaver::reportCheckTime(look ? meta->chargerLookEpoch : meta->chargerProgramEpoch, serverNow);
   if (look ? meta->chargerLookValid && !sunsaver::resultFollows(heldAt, meta->chargerLookSent, madeAt, sent)
            : !sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId, heldAt,
                                               meta->chargerProgramSent, requestId, madeAt, sent)) {
@@ -17906,7 +17921,7 @@ static void handleConfigAck(JsonDocument &doc, double epoch) {
   }
   // So do the reports about the client's SunSaver MPPT, under "chg-".
   if (strncmp(status, "chg-", 4) == 0) {
-    handleChargerReport(clientUid, status, doc, (epoch > 0.0) ? epoch : currentEpoch());
+    handleChargerReport(clientUid, status, doc);  // judged by this server's clock
     return;
   }
 

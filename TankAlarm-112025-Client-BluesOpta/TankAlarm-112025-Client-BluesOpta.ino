@@ -789,7 +789,7 @@ struct MonitorConfig {
 struct ClientConfig {
   uint8_t configSchemaVersion;  // Schema version for forward/backward compat detection
   char siteName[32];
-  char deviceUid[32];   // Device UID (e.g., dev:...)
+  char deviceUid[48];   // Device UID (e.g., dev:...), as long as gDeviceUID: see lookUpDeviceUid()
   char deviceLabel[24];
   char clientFleet[32]; // Fleet for this device context
   char serverFleet[32]; // Target fleet name for server (e.g., "tankalarm-server")
@@ -902,6 +902,7 @@ static bool gChargerCheckWanted = false;          // a config change asks for a 
 static bool gChargerReportSyncNow = false;        // and for its report to be sent at once
 static unsigned long gChargerCheckEndMillis = 0;  // when the last pass ended, done or failed
 static uint8_t gChargerCheckFailures = 0;         // passes in a row that the link did not carry
+static bool gChargerCheckOverdue = false;         // the wait after it is over: see serviceChargerCheck()
 static sunsaver::LineTurns gSolarTurns;           // who of the poll, the check and programming has a pass
 static bool gChargerReportSent = false;           // a report has gone out since boot
 static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
@@ -1028,8 +1029,18 @@ static char gDeviceUID[48] = {0};
 static unsigned long gLastTelemetryMillis = 0;
 static unsigned long gLastHeartbeatMillis = 0;
 static unsigned long gLastConfigCheckMillis = 0;
-static unsigned long gLastTimeSyncMillis = 0;
-static double gLastSyncedEpoch = 0.0;
+static unsigned long gLastTimeSyncMillis = 0;  // when the clock was last set from the Notecard
+static double gLastSyncedEpoch = 0.0;          // what it was set to, 0 while it never was
+// The clock: the time at gClockMillis, moved on in whole seconds in every pass of loop()
+// (keepClock()). Taken as one millis() difference from the last sync, it would lose 49.7 days
+// once millis() came round with no sync in between: in 50 days of hibernation, which syncs
+// nothing, or of a Notecard that has no time.
+static double gClockEpoch = 0.0;
+static unsigned long gClockMillis = 0;
+static bool gTimeSyncDue = false;  // the clock was set 6 hours ago or more: see keepClock()
+// Asking the Notecard again for its device UID: see loop() and lookUpDeviceUid().
+#define DEVICE_UID_RETRY_MS (10UL * 60UL * 1000UL)
+static unsigned long gDeviceUidAskedMillis = 0;
 static double gNextDailyReportEpoch = 0.0;
 
 // DFU (Device Firmware Update) state tracking
@@ -1606,6 +1617,8 @@ static void serviceChargerCheck(unsigned long now, bool lineFree);
 static void finishChargerCheck(unsigned long now);
 static void ageChargerReport();
 static bool deviceUidKnown();
+static bool lookUpDeviceUid();
+static void keepClock();
 static uint8_t configuredPackVolts();
 static void sendDueChargerReport(unsigned long now);
 static sunsaver::Journal loadChargerJournal();
@@ -2117,6 +2130,7 @@ void loop() {
 #endif
 
   unsigned long now = millis();
+  keepClock();  // in every pass, hibernating or not
 
   logSolarHardwareTestHeartbeat(now);
 
@@ -2162,6 +2176,19 @@ void loop() {
         Serial.print(healthCheckInterval / 60000UL);
         Serial.println(F(" min"));
       }
+    }
+  }
+
+  // The client's id, when the Notecard did not give it at the start and no earlier start kept
+  // it. The health check above asks again only while the Notecard is unavailable, and a working
+  // Notecard would leave the charger report waiting for the id (deviceUidKnown()) for good. Not
+  // while a firmware update is staged, and not in hibernation, which sends no report either.
+  if (gNotecardAvailable && !deviceUidKnown() && !gDfuInProgress && gPowerState != POWER_STATE_CRITICAL_HIBERNATE &&
+      now - gDeviceUidAskedMillis >= DEVICE_UID_RETRY_MS) {
+    gDeviceUidAskedMillis = now;
+    if (lookUpDeviceUid()) {
+      Serial.print(F("Device UID resolved: "));
+      Serial.println(gDeviceUID);
     }
   }
 
@@ -3682,7 +3709,11 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
   }
 
   strlcpy(cfg.siteName, doc["site"].as<const char *>() ? doc["site"].as<const char *>() : "", sizeof(cfg.siteName));
-  strlcpy(cfg.deviceUid, doc["deviceUid"].as<const char *>() ? doc["deviceUid"].as<const char *>() : "", sizeof(cfg.deviceUid));
+  {
+    // Kept whole or not at all: a UID cut short could be another client's id.
+    const char *storedUid = doc["deviceUid"].as<const char *>() ? doc["deviceUid"].as<const char *>() : "";
+    strlcpy(cfg.deviceUid, strlen(storedUid) < sizeof(cfg.deviceUid) ? storedUid : "", sizeof(cfg.deviceUid));
+  }
   strlcpy(cfg.deviceLabel, doc["deviceLabel"].as<const char *>() ? doc["deviceLabel"].as<const char *>() : "", sizeof(cfg.deviceLabel));
   strlcpy(cfg.serverFleet, doc["serverFleet"].as<const char *>() ? doc["serverFleet"].as<const char *>() : "", sizeof(cfg.serverFleet));
   strlcpy(cfg.clientFleet, doc["clientFleet"].as<const char *>() ? doc["clientFleet"].as<const char *>() : "", sizeof(cfg.clientFleet));
@@ -4402,23 +4433,7 @@ static void initializeNotecard() {
   }
 
   // Try to retrieve the Notecard's Device UID (e.g. "dev:860322068012345").
-  J *req = notecard.newRequest("hub.get");
-  if (req) {
-    J *rsp = notecard.requestAndResponse(req);
-    if (rsp) {
-      const char *uid = JGetString(rsp, "device");
-      if (uid && uid[0] != '\0') {
-        strlcpy(gDeviceUID, uid, sizeof(gDeviceUID));
-        // Persist UID in config so it survives reboot even if the Notecard
-        // hasn't synced yet on next startup (avoids phantom client IDs).
-        if (strcmp(gConfig.deviceUid, uid) != 0) {
-          strlcpy(gConfig.deviceUid, uid, sizeof(gConfig.deviceUid));
-          gConfigDirty = true;
-        }
-      }
-      notecard.deleteResponse(rsp);
-    }
-  }
+  lookUpDeviceUid();
 
   // Fallback chain: persisted UID from config → deviceLabel → hardcoded default
   if (gDeviceUID[0] == '\0' && gConfig.deviceUid[0] != '\0') {
@@ -4432,6 +4447,37 @@ static void initializeNotecard() {
 
   Serial.print(F("Device UID: "));
   Serial.println(gDeviceUID);
+}
+
+// Asks the Notecard for its device UID ("dev:..."), the client's id, and keeps it in gDeviceUID
+// and in the config, so that it holds across a start that finds the Notecard not ready (and the
+// client is not taken for another one). Only a UID that fits whole: one cut short could be
+// another client's id. True when the Notecard gave one that fits.
+static bool lookUpDeviceUid() {
+  J *req = notecard.newRequest("hub.get");
+  if (!req) {
+    return false;
+  }
+  J *rsp = notecard.requestAndResponse(req);
+  if (!rsp) {
+    return false;
+  }
+  bool kept = false;
+  const char *uid = JGetString(rsp, "device");
+  if (uid != nullptr && uid[0] != '\0') {
+    if (strlen(uid) >= sizeof(gDeviceUID) || strlen(uid) >= sizeof(gConfig.deviceUid)) {
+      Serial.println(F("Device UID too long to keep: not used"));
+    } else {
+      strlcpy(gDeviceUID, uid, sizeof(gDeviceUID));
+      if (strcmp(gConfig.deviceUid, uid) != 0) {
+        strlcpy(gConfig.deviceUid, uid, sizeof(gConfig.deviceUid));
+        gConfigDirty = true;
+      }
+      kept = true;
+    }
+  }
+  notecard.deleteResponse(rsp);
+  return kept;
 }
 
 static bool checkNotecardHealth() {
@@ -4555,22 +4601,9 @@ static bool checkNotecardHealth() {
   // Deferred UID resolution: if the Notecard wasn't ready at boot, the device
   // UID may still be a fallback (deviceLabel).  Now that the Notecard is
   // healthy, retry hub.get to obtain the real UID and persist it.
-  if (gConfig.deviceUid[0] == '\0') {
-    J *uidReq = notecard.newRequest("hub.get");
-    if (uidReq) {
-      J *uidRsp = notecard.requestAndResponse(uidReq);
-      if (uidRsp) {
-        const char *uid = JGetString(uidRsp, "device");
-        if (uid && uid[0] != '\0') {
-          strlcpy(gDeviceUID, uid, sizeof(gDeviceUID));
-          strlcpy(gConfig.deviceUid, uid, sizeof(gConfig.deviceUid));
-          gConfigDirty = true;
-          Serial.print(F("Device UID resolved: "));
-          Serial.println(uid);
-        }
-        notecard.deleteResponse(uidRsp);
-      }
-    }
+  if (!deviceUidKnown() && lookUpDeviceUid()) {
+    Serial.print(F("Device UID resolved: "));
+    Serial.println(gDeviceUID);
   }
 
   flushBufferedNotes();
@@ -4603,18 +4636,37 @@ static void syncTimeFromNotecard() {
   if (time > 0) {
     gLastSyncedEpoch = time;
     gLastTimeSyncMillis = millis();
+    gClockEpoch = time;
+    gClockMillis = gLastTimeSyncMillis;
+    gTimeSyncDue = false;
     gLastSuccessfulNotecardComm = millis();
     gNotecardFailureCount = 0;
   }
   notecard.deleteResponse(rsp);
 }
 
+// Called at the top of every pass of loop(), hibernating or not: moves the clock on by the whole
+// seconds since the last pass, so that the millis() difference that currentEpoch() adds never
+// comes near a turn of millis(). The same for the 6 hours after which the clock is set from the
+// Notecard again: latched here, it does not wait most of another 49.7 days once millis() has
+// come round.
+static void keepClock() {
+  const unsigned long nowMs = millis();
+  if (gClockEpoch > 0.0) {
+    const unsigned long seconds = (nowMs - gClockMillis) / 1000UL;
+    gClockEpoch += (double)seconds;
+    gClockMillis += seconds * 1000UL;
+  }
+  if (nowMs - gLastTimeSyncMillis > 6UL * 60UL * 60UL * 1000UL) {
+    gTimeSyncDue = true;
+  }
+}
+
 static double currentEpoch() {
-  if (gLastSyncedEpoch <= 0.0) {
+  if (gClockEpoch <= 0.0) {
     return 0.0;
   }
-  unsigned long deltaMs = millis() - gLastTimeSyncMillis;
-  return gLastSyncedEpoch + (double)deltaMs / 1000.0;
+  return gClockEpoch + (double)(millis() - gClockMillis) / 1000.0;
 }
 
 // Note times: whole minutes, truncated, so a reading never moves to another UTC day. Always
@@ -4630,7 +4682,7 @@ static uint32_t noteEpochMinute(double epoch) {
 }
 
 static void ensureTimeSync() {
-  if (millis() - gLastTimeSyncMillis > 6UL * 60UL * 60UL * 1000UL || gLastSyncedEpoch <= 0.0) {
+  if (gTimeSyncDue || gLastSyncedEpoch <= 0.0) {
     syncTimeFromNotecard();
   }
 }
@@ -7660,10 +7712,16 @@ static void sendSolarAlarm(SolarAlertType alertType) {
 // server. The registers and the rules are in TankAlarm_SunSaverSettings.h (Common library),
 // which tests/host/sunsaver_settings runs on a PC; SolarManager does the reading.
 
-// The battery the charger's settings are judged against.
+// The battery the charger's settings are judged against. None while battery monitoring is off:
+// the 12 V AGM that a config without a batteryConfig block starts with, or one that switches the
+// monitoring off, is a placeholder that nobody chose, and an OK or WRONG verdict on it would be
+// about a battery that may not be there.
 static uint8_t chargerCheckChemistry() {
-  // The server maps the battery type of the config it holds the same way, to tell whether the
-  // report it keeps is about the battery that config names.
+  // The server maps the battery of the config it holds the same way, to tell whether the report
+  // it keeps is about the battery that config names.
+  if (!gConfig.batteryMonitor.enabled) {
+    return sunsaver::CHEMISTRY_NOT_JUDGED;
+  }
   return sunsaver::chemistryForBatteryType(gConfig.batteryMonitor.batteryType);
 }
 
@@ -7686,6 +7744,16 @@ static bool chargerCheckHeldBack() {
   return gDfuInProgress || gPowerState == POWER_STATE_CRITICAL_HIBERNATE;
 }
 
+// How long after the end of the last pass the next one is due: a day after one that completed,
+// 10 minutes after one that the link did not carry, and a day again from the third of those in a
+// row.
+static unsigned long chargerCheckWaitMs() {
+  if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
+    return CHARGER_CHECK_INTERVAL_MS;
+  }
+  return gChargerCheckFailures > 0 ? CHARGER_CHECK_RETRY_MS : CHARGER_CHECK_INTERVAL_MS;
+}
+
 // Call from every pass of loop() while the charger is enabled. Starts a pass when one is due and
 // reads a few registers of it per call, so that loop() is never held for longer than a poll holds
 // it. `lineFree` is false in a pass in which a poll talked to the charger: then nothing is read,
@@ -7696,6 +7764,13 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
   if (gChargerReportSent && (now - gChargerReportMillis) >= CHARGER_REPORT_REFRESH_MS) {
     gChargerReportStale = true;
   }
+  // The same for the end of the wait for the next pass: after 50 days of hibernation, or of polls
+  // that fail so that a due pass cannot start, the last pass would look a few hours old, and the
+  // daily pass would wait most of another day. It stays due until a pass ends: one that is
+  // cancelled part way (held back, or by a config change) leaves it due.
+  if ((now - gChargerCheckEndMillis) >= chargerCheckWaitMs()) {
+    gChargerCheckOverdue = true;
+  }
   ageChargerReport();  // the same for the age of a report that waits for a time
   if (chargerCheckHeldBack()) {
     gSolarManager.cancelChargerCheck();
@@ -7705,17 +7780,10 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
   sendDueChargerReport(now);  // one that had to wait
 
   if (!gSolarManager.chargerCheckActive()) {
-    const unsigned long sinceLast = now - gChargerCheckEndMillis;
-    bool due;
-    if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
-      due = sinceLast >= CHARGER_CHECK_INTERVAL_MS;
-    } else if (gChargerCheckFailures > 0) {
-      due = sinceLast >= CHARGER_CHECK_RETRY_MS;
-    } else {
-      // No pass has completed since the link was set up, a config change asked for one, or the
-      // last one is a day old.
-      due = gChargerCheckWanted || !gSolarManager.chargerSettingsRead() || sinceLast >= CHARGER_CHECK_INTERVAL_MS;
-    }
+    // Due once the wait is over, and, while no pass in a row has failed, when none has completed
+    // since the link was set up or a config change asked for one.
+    const bool due = gChargerCheckOverdue ||
+                     (gChargerCheckFailures == 0 && (gChargerCheckWanted || !gSolarManager.chargerSettingsRead()));
     if (due) {
       // False until a poll has succeeded: the check waits for a working link.
       gSolarManager.startChargerCheck();
@@ -7729,6 +7797,7 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
 
   // The pass ended. `now` is when this loop() began, before the requests that ended it.
   gChargerCheckEndMillis = now;
+  gChargerCheckOverdue = false;
   if (gSolarManager.chargerCheckDone()) {
     gChargerCheckFailures = 0;
     gChargerCheckWanted = false;
@@ -7763,8 +7832,9 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
 // is the millis() of the moment the pass ended.
 static void finishChargerCheck(unsigned long endedAt) {
   const sunsaver::Snapshot &snapshot = gSolarManager.chargerSnapshot();
-  const sunsaver::Expectation want = {chargerCheckChemistry(), gConfig.batteryMonitor.nominalVoltage,
-                                      (uint8_t)SS_VOLTAGE_SCALE_ID};
+  // The pack as the no-charge alert takes it (configuredPackVolts()): none while battery
+  // monitoring is off, whose 12 V default is no pack that anyone chose.
+  const sunsaver::Expectation want = {chargerCheckChemistry(), configuredPackVolts(), (uint8_t)SS_VOLTAGE_SCALE_ID};
   sunsaver::Evaluation evaluation;
   sunsaver::evaluate(snapshot, want, &evaluation);
 
@@ -7842,7 +7912,8 @@ static void finishChargerCheck(unsigned long endedAt) {
 // gDeviceUID holds the device label, which the server takes no note under (its
 // isValidClientUid()), or keeps a report under when the label starts with "dev:" too: the client
 // would then count the report as sent, and the server would not see it under the client's id
-// for a week. checkNotecardHealth() asks the Notecard again.
+// for a week. loop() asks the Notecard again every 10 minutes (lookUpDeviceUid()), and so does
+// checkNotecardHealth() once the Notecard is back.
 static bool deviceUidKnown() {
   return strncmp(gDeviceUID, "dev:", 4) == 0 && strcmp(gDeviceUID, gConfig.deviceUid) == 0;
 }

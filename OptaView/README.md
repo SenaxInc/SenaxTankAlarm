@@ -134,7 +134,10 @@ What to know before you rely on it:
 While it waits for DHCP the Opta cannot tell a cable that is out from a network without DHCP.
 A cable that was out for more than 20 s therefore finds the fixed address in use when it goes
 back in, and DHCP gets its one more try then. (A cable that goes back in within 3 s of the
-change to the fixed address looks like one that was in all along, and keeps the fixed address.)
+change to the fixed address looks like one that was in all along, and keeps the fixed address.
+So does one that goes in while a long command on the USB console, a scan for one, holds the Opta
+from before those 3 s were up: the Opta takes a link for a cable that went in only when it has
+seen the link missing.)
 A router that needs longer than 20 s to hand out addresses again, as after a power cut, can
 leave the Opta on the fixed address, so on a network that always has DHCP use `dhcp`. Once the
 fixed address is in use and the extra try is spent, a cable moved from a laptop to a network
@@ -190,7 +193,9 @@ Controller view (7).
    [The voltage scales](#the-voltage-scales). Do this before writing any voltage.
 6. `set EV_lvr 13.25`, then `set EV_lvd 13.10`: each shows the old and the new value and waits
    for `yes`. Raising the reconnect voltage first keeps it above the disconnect voltage at
-   every step.
+   every step. Before the values, `set` shows what else a setting does where its note says so:
+   for the LVD, that a load current compensation (`ER_icomp`) other than 0 lowers it under
+   load, so `get ER_icomp` tells whether 13.10 V is where the load goes off.
 7. `reset` restarts the controller so that it uses the new settings, waits for it to come
    back and shows the status again. `dump load` then shows what is stored. If it says that the
    controller answered all the time and was not seen to restart, the restart is still due.
@@ -264,6 +269,10 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 Long commands stop when you press a key. The console of the web page takes the same commands,
 except `watch`, `net` and `web`.
 
+A command runs with all its words or not at all. A word that it does not take, or a line longer
+than 159 characters, is refused and nothing is done: `timeout 1000 0` does not set 1000 ms, and
+`set EV_lvd 13 .10` writes nothing.
+
 ## What keeps a session safe
 
 The June demo treated any reply with a valid CRC as success (review finding F-26). Since
@@ -336,20 +345,21 @@ voltage scales, and each can be corrected on its own:
 | Scale | Used for | Starts as |
 |---|---|---|
 | `vlive` | Live readings: battery, array and load voltage, the LVD in effect, minimums and maximums | x100 |
-| `vset` | Stored settings: every voltage that `set` can write | x100 |
+| `vset` | Stored settings: every voltage that `set` can write, and `va_ref_fixed`, which the controller copies from `EVa_ref_fixed_init` at start-up | x100 |
 | `vref` | The regulation target `Vb_ref` | x96.667 |
 
 OptaView starts with the specification's figures and says so until `scalecheck` has settled
 them. It tests the first two separately, each on its own evidence:
 
-- **Stored settings.** A setting whose value you know, given as `scalecheck EV_float 13.70`,
-  decides. Read it in MSView, which does not depend on OptaView's figures. It has to match
-  within 0.5 %, and the two candidates are 3.3 % apart. A setting that OptaView has written
-  since it started is refused: it went in at the scale under test, so it would read back as
-  right at that scale. The check also counts the setpoints that are round numbers (14.40 V,
-  11.50 V) at each scale, but that only points, because a setting looks round at whatever
-  scale wrote it, a wrong one included. When the two disagree, `scalecheck` goes by the
-  setting you gave and says that some setpoints were written with a wrong scale.
+- **Stored settings.** A setting that `set` can change and whose value you know, given as
+  `scalecheck EV_float 13.70`, decides. Read it in MSView, which does not depend on OptaView's
+  figures. It has to match within 0.5 %, and the two candidates are 3.3 % apart. A setting
+  that OptaView has written since it started is refused: it went in at the scale under test,
+  so it would read back as right at that scale. The check also counts the setpoints that are
+  round numbers (14.40 V, 11.50 V) at each scale, but that only points, because a setting
+  looks round at whatever scale wrote it, a wrong one included. When the two disagree,
+  `scalecheck` goes by the setting you gave and says that some setpoints were written with a
+  wrong scale.
 - **Live readings.** A multimeter reading at the controller's battery terminals, given as
   `scalecheck 13.42`, decides, and nothing else does. In absorption and float the check also
   compares the battery with `Vb_ref`, the target the controller works towards, but that only
@@ -502,7 +512,8 @@ console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
 `sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
 next three replies are lost on the way), `sim random off` (the Opta's random number generator
 fails and the clock stands in for it). Add
-`PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
+`PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. A port
+or a `sim` line that is not written whole (`--port 80x`, `sim drop 2.5`) is refused. The
 simulated controller answers as the specification says, so the preview shows the page and not
 how a real SunSaver behaves.
 
@@ -528,13 +539,16 @@ python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
 The script also works out the hashes that the page's policy names for its style sheet and its
 script, and refuses a page that needs more than that policy allows (an inline event handler, a
 style sheet brought in with `@import` or a link, a font, a script file, any file but a `data:`
-image). It reads the page the way a browser does where the two could differ: each tag attribute
-by attribute with its character references decoded, tag names in any case, a block that ends at
-the first `</script` or `</style`, and the escapes of the style sheet and of the script's names.
-So a `>` inside a quoted value, a `&#9;` in a `srcset` or `@\69mport` hides nothing.
-`embed_web.py --selftest` shows that each of those rules refuses what it should, and that a
-`data:` image passes wherever an image can go. The host tests run it, and fail when the header
-is out of date.
+image, a string run as code). It reads the page the way a browser does where the two could
+differ: each tag attribute by attribute with its character references decoded, tag names in any
+case, a `srcset` split where a browser splits it, a block that ends at the first `</script` or
+`</style`, the escapes of the style sheet and of the script, and HTML names and the schemes of
+addresses in any case. So a `>` inside a quoted value, a `&#9;` in a `srcset`, `@\69mport` or
+`setAttribute('STYLE', ...)` hides nothing. An SVG animation that changes an address is refused,
+since the check cannot see what it loads. What the script puts together while it runs is left to
+the browser test. `embed_web.py --selftest` shows that each of those rules refuses what it
+should, and that a `data:` image passes wherever an image can go. The host tests run it, and fail
+when the header is out of date.
 
 ## Files
 

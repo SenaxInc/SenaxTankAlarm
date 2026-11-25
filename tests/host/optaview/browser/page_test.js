@@ -19,7 +19,7 @@
 'use strict';
 
 const { chromium } = require('playwright');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
@@ -434,6 +434,12 @@ async function settingsView(win, profile) {
   checkEq(await win.text('#settingsGroups tr[data-register="EV_lvd"] td:nth-child(3)'), '9.00 to 15.00 V', 'what is allowed');
   checkEq(await win.text('#settingsGroups tr[data-register="EV_float"] td:nth-child(3)'), '10.00 to 17.00 V, or 0', 'a setting that 0 switches off');
   checkEq(await page.locator('#writeNotes li').count(), profile.writeNotes.length, 'the notes on writing');
+  // What else a setting does is under it: the load current compensation also moves the LEDs.
+  checkHas(await win.text('#settingsGroups tr[data-register="ER_icomp"] .reg-note'),
+           'the LED thresholds are compensated the same way', 'a setting\'s note is under it');
+  checkEq(await page.locator('#settingsGroups .reg-note').count(), writable.filter((reg) => reg.note).length,
+          'every note, and none where there is none');
+  checkEq(await page.locator('#settingsGroups tr[data-register="EV_lvr"] .reg-note').count(), 0, 'a setting without a note has none');
   checkHas(await win.text(notice('scale')), 'Run the scale check under Tools before you change a voltage', 'the warning on the voltage scale');
   check(await page.isHidden(notice('reset')), 'no restart is due yet');
   const before = await win.preview.writes();
@@ -456,6 +462,7 @@ async function settingsView(win, profile) {
   checkEq(await win.text('#dialogTitle'), 'Change Low voltage disconnect', 'the dialog\'s title');
   checkHas(asked, 'now  11.50 V', 'the value the controller holds');
   checkHas(asked, 'new  13.10 V', 'the value that would be written');
+  checkHas(asked, 'When ER_icomp is not 0, the controller lowers it', 'the setting\'s note, as the console asks it');
   checkHas(asked, 'the scale of stored settings (vset, x100/32768) is not confirmed', 'the console\'s warning');
   checkHas(asked, 'Low voltage reconnect (EV_lvr) must be above low voltage disconnect (EV_lvd)', 'the pair rule');
   checkHas(asked, 'Type yes to write it. Anything else cancels.', 'the console\'s question');
@@ -705,8 +712,11 @@ async function toolsView(win, profile) {
         'it lists the stored voltage settings');
   check(!names.includes('adc_vb_f') && !names.includes('Et_float') && !names.includes('EV_tempcomp'),
         'and nothing on another scale');
-  checkEq(names.length, 1 + profile.registers.filter((reg) => reg.scale === 'vset').length,
-          'every register on the scale of stored settings is offered');
+  // Nor what 'set' cannot change: va_ref_fixed is on that scale only as the copy of a setting.
+  check(!names.includes('va_ref_fixed') && !names.includes('EVa_ref_fixed_init'),
+        'nor a register on that scale that set cannot change');
+  checkEq(names.length, 1 + profile.registers.filter((reg) => reg.scale === 'vset' && reg.writable).length,
+          'every setting on the scale of stored settings that set can change is offered');
   await page.fill('#meterVolts', '13.68');
   await page.selectOption('#knownName', 'EV_float');
   await page.fill('#knownVolts', '13.7 V');
@@ -1168,6 +1178,42 @@ async function neverPauses(preview) {
   check(performance.now() - asked < 2000, 'and the console answers again at once');
 }
 
+// The preview reads its options and its "sim" lines whole. strtol took "--port 8080typo" as port
+// 8080 and "--port nope" as 0, any free port, so a mistyped option could start it on another port
+// than the one asked for; a "sim" line with a word too many or half a number changes nothing.
+async function previewInput(preview) {
+  for (const port of ['nope', '8080typo', '', ' 80', '80 ', '+80', '-1', '65536', '0x50', '1e3', '99999999999']) {
+    const run = spawnSync(binary, ['--port', port], { encoding: 'utf8', timeout: 10000 });
+    checkEq(run.status, 2, `--port '${port}' is refused`);
+    checkHas(run.stderr, `optaview_preview: a port is a whole number from 0 to 65535, not '${port}'`,
+             `and the preview says why ('${port}')`);
+    checkHasnt(run.stdout, 'http://', `and listens nowhere ('${port}')`);
+  }
+  const battery = /adc_vb_f +(\d+\.\d\d V)/;
+  const before = (await preview.line('get adc_vb_f', battery))[1];
+  const writes = await preview.writes();
+  const noReply = /Counters +sent \d+, ok \d+, no reply (\d+),/;
+  const lost = (await preview.line('status', noReply))[1];
+  const usage = /sim: power off\|on, battery <volts>, refuse on\|off, delay <ms>, drop <replies>, skip <seconds>, writes, random off\|on, quit\n/;
+  const wrong = ['sim battery 12 .4', 'sim battery 12.4 V', 'sim battery 12.4x', 'sim battery 1e1', 'sim battery 0x0C',
+                 'sim battery ' + '1'.repeat(40), 'sim drop 2.5', 'sim drop 3 4', 'sim delay 1.5', 'sim delay 100ms',
+                 'sim skip 10 s', 'sim power off now', 'sim refuse on x', 'sim random off x', 'sim writes 3', 'sim quit now',
+                 'sim power', 'sim', 'sim nothing', 'sim drop 0', 'sim drop 21', 'sim delay 10001', 'sim battery 40.01'];
+  for (const line of wrong) {
+    await preview.line(line, usage);
+  }
+  // Nothing changed: the battery reads as before, no reply was lost, and nothing was written.
+  checkEq((await preview.line('get adc_vb_f', battery))[1], before, 'the battery is as it was');
+  checkEq((await preview.line('status', noReply))[1], lost, 'every request got its reply');
+  checkEq(await preview.writes(), writes, 'and nothing was written');
+  // Whole values still work, with spaces or a tab around them, up to each one's limit.
+  await preview.line('sim delay\t20 ', /sim: replies take 20 ms\n/);
+  await preview.line('sim  skip 0.5', /sim: 0.5 s have passed\n/);
+  await preview.line('sim\tdelay 10000', /sim: replies take 10000 ms\n/);
+  await preview.line('sim drop 20', /sim: the next 20 replies are lost\n/);
+  await preview.line('sim battery 40', /sim: the battery is at 40.00 V\n/);
+}
+
 // ---------------------------------------------------------------------------------------------
 
 async function main() {
@@ -1194,6 +1240,8 @@ async function main() {
     await desktop.context.close();
     scenario = 'a sender that never pauses';
     await neverPauses(fresh);
+    scenario = 'the preview reads its input whole';
+    await previewInput(fresh);
 
     // An Opta that starts with a PIN, as OptaViewConfig.h gives it one.
     scenario = 'wrong PIN';

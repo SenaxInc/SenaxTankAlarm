@@ -939,9 +939,16 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
 // With the scale of the live readings proven the figure is exact. Without it the lower of the
 // two possible readings is returned, so that a battery at its float voltage never reads as
 // below it.
+//
+// Nor is it known while the measured system is not the pack that was configured
+// (FINDING_PACK_VOLTAGE): a 12 V pack read at 18 V fits a 24 V system, and its 13.50 V float
+// would become a 27 V reference. The caller then keeps the default of the configured pack.
 inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &evaluation, uint8_t firmwareScale) {
   const uint8_t scale = evaluation.settingsScale.scale;
   if (scale == SCALE_UNKNOWN || firmwareScale == SCALE_UNKNOWN || evaluation.systemVolts == 0) {
+    return 0.0;
+  }
+  if ((evaluation.findings & FINDING_PACK_VOLTAGE) != 0) {
     return 0.0;
   }
   if (!have(snapshot, I_DIP_SWITCH) || (snapshot.raw[I_DIP_SWITCH] & DIP_CUSTOM_CHARGE) == 0) {
