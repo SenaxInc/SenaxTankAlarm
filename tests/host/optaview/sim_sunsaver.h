@@ -53,6 +53,11 @@ class SimSunSaver : public optaview::MbTransport {
   bool resetAcknowledged = true;     // false: the controller restarts without answering
   bool resetWorks = true;            // false: the reset coil is acknowledged but nothing restarts
   uint32_t responseDelayMs = 20;
+  // The controller answers one request at a time, in the order they came, as a Modbus RTU slave
+  // does: a reply starts only once the one before it is out, however much quicker it is. False:
+  // each reply comes at its own time, so a quick one overtakes a slow one, as a reply from
+  // another device on the bus could.
+  bool answersInOrder = true;
   uint32_t resetDownMs = 1500;       // silent for this long after a reset
   uint8_t leadingNoiseBytes = 0;     // 0x00 bytes in front of every reply (the DE-flip artifact)
   bool powered = true;               // false: nothing answers
@@ -227,9 +232,24 @@ class SimSunSaver : public optaview::MbTransport {
     for (unsigned i = 0; i < times; ++i) faults_.push_back(fault);
   }
 
-  // Bytes that appear on the bus by themselves, `afterMs` from now.
+  // Bytes that appear on the bus by themselves, `afterMs` from now and one every millisecond.
+  // Where they overlap a reply, the two mix (see putOnBus).
   void inject(uint32_t afterMs, const std::vector<uint8_t> &bytes) {
-    for (size_t i = 0; i < bytes.size(); ++i) incoming_.push_back(std::make_pair(now_ + afterMs + i, bytes[i]));
+    for (size_t i = 0; i < bytes.size(); ++i) putOnBus(now_ + afterMs + i, bytes[i]);
+  }
+
+  // The battery is at `v` volts: both of its filtered readings say so, and the lowest and highest
+  // voltage of the day and since the last reset take it in.
+  void setBattery(double v) {
+    const uint16_t raw = volts(v);
+    regs[0x0008] = raw;  // adc_vb_f
+    regs[0x0013] = raw;  // Vb_f: the slow filter, settled
+    const uint16_t lows[] = {0x002B, 0x0033};   // Vb_min_daily, vb_min
+    const uint16_t highs[] = {0x002C, 0x0034};  // Vb_max_daily, vb_max
+    for (size_t i = 0; i < 2; ++i) {
+      if (raw < regs[lows[i]]) regs[lows[i]] = raw;
+      if (raw > regs[highs[i]]) regs[highs[i]] = raw;
+    }
   }
 
   uint64_t elapsedMs() const { return now_; }
@@ -324,14 +344,25 @@ class SimSunSaver : public optaview::MbTransport {
         break;
     }
 
-    // The reply starts responseDelayMs after the request, and each byte can be read once its
-    // last bit is in: one character time after the one before, at the baud rate and format of
-    // the link (1.15 ms at 9600 baud 8N2, 36.7 ms at 300).
+    // The reply starts responseDelayMs after the request, or once the reply before it is out
+    // (see answersInOrder), and each byte can be read once its last bit is in: one character
+    // time after the one before, at the baud rate and format of the link (1.15 ms at 9600 baud
+    // 8N2, 36.7 ms at 300).
     uint64_t at = now_ + responseDelayMs;
-    if (!incoming_.empty() && incoming_.back().first >= at) at = incoming_.back().first + 1;
+    if (answersInOrder && busyUntil_ > at) at = busyUntil_;
     std::vector<uint8_t> wire((size_t)leadingNoiseBytes, (uint8_t)0x00);
     wire.insert(wire.end(), reply.begin(), reply.end());
-    for (size_t i = 0; i < wire.size(); ++i) incoming_.push_back(std::make_pair(at + wireMs(i + 1), wire[i]));
+    for (size_t i = 0; i < wire.size(); ++i) putOnBus(at + wireMs(i + 1), wire[i]);
+    if (at + wireMs(wire.size()) > busyUntil_) busyUntil_ = at + wireMs(wire.size());
+  }
+
+  // Puts one byte on the bus, readable from `at`, behind the bytes that are due no later. Two
+  // senders on the bus at once mix their bytes in time order, so that neither frame survives,
+  // as two transmitters on one RS-485 pair garble each other.
+  void putOnBus(uint64_t at, uint8_t value) {
+    std::deque<std::pair<uint64_t, uint8_t> >::iterator it = incoming_.end();
+    while (it != incoming_.begin() && (it - 1)->first > at) --it;
+    incoming_.insert(it, std::make_pair(at, value));
   }
 
   // How long `bytes` characters take on the wire at the link's baud rate and format, rounded up
@@ -368,7 +399,8 @@ class SimSunSaver : public optaview::MbTransport {
   uint32_t linkBaud_ = 0;
   uint8_t linkFormat_ = 0;
   std::deque<Fault> faults_;
-  std::deque<std::pair<uint64_t, uint8_t> > incoming_;
+  std::deque<std::pair<uint64_t, uint8_t> > incoming_;  // in time order
+  uint64_t busyUntil_ = 0;  // when the last byte of the controller's last reply is in
 
   static std::vector<uint8_t> exception(const uint8_t *request, uint8_t code) {
     std::vector<uint8_t> body;
@@ -376,6 +408,30 @@ class SimSunSaver : public optaview::MbTransport {
     body.push_back((uint8_t)(request[1] | 0x80));
     body.push_back(code);
     return frame(body);
+  }
+
+  uint32_t u32HiLo(uint16_t addr) { return ((uint32_t)regs[addr] << 16) | regs[(uint16_t)(addr + 1)]; }
+
+  // What an action coil does, as the specification names it. The stored totals at 0xE040 on
+  // change only when the running totals are stored (force_eeprom_update): when a real
+  // controller stores them by itself is not known, and this one never does.
+  void act(uint16_t coil) {
+    if (coil == 0x0010) {         // clear_ah_resettable
+      setU32HiLo(0x0015, 0);      // Ahc_r
+      setU32HiLo(0x001D, 0);      // Ahl_r
+    } else if (coil == 0x0011) {  // clear_ah_total
+      setU32HiLo(0x0017, 0);      // Ahc_t
+      setU32HiLo(0x001F, 0);      // Ahl_t
+    } else if (coil == 0x0012) {  // clear_kwh
+      regs[0x0019] = 0;           // kWhc
+    } else if (coil == 0x0016) {  // force_eeprom_update: the running totals, low word first
+      setU32LoHi(0xE040, u32HiLo(0x0021));  // Ehourmeter
+      setU32LoHi(0xE042, u32HiLo(0x001D));  // EAhl_r
+      setU32LoHi(0xE044, u32HiLo(0x001F));  // EAhl_t
+      setU32LoHi(0xE046, u32HiLo(0x0015));  // EAhc_r
+      setU32LoHi(0xE048, u32HiLo(0x0017));  // EAhc_t
+      regs[0xE04A] = regs[0x0019];          // EkWhc
+    }
   }
 
   void restart() {
@@ -470,7 +526,10 @@ class SimSunSaver : public optaview::MbTransport {
         return true;
       }
       if (addr >= 0x0010) {  // action coils do their thing and read back off
-        if (value == 0xFF00) triggered.push_back(addr);
+        if (value == 0xFF00) {
+          triggered.push_back(addr);
+          act(addr);
+        }
         return true;
       }
       coils[addr] = value == 0xFF00;

@@ -339,7 +339,7 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
     sim.powered = on;
     printf("sim: the controller has %s\n", on ? "power" : "no power");
   } else if (what == "battery" && numeric && number >= 0.0 && number <= 40.0) {
-    sim.regs[0x0008] = sim.volts(number);
+    sim.setBattery(number);
     printf("sim: the battery is at %.2f V\n", number);
   } else if (what == "refuse" && isOnOff(value, &on)) {
     sim.refuseWrites = on;

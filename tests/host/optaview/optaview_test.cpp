@@ -627,6 +627,66 @@ static void testLateReplies() {
     CHECK_EQ(word, b.sim.regs[0xE022]);
     CHECK_EQ(r.noiseBytes, 7);  // the late reply to the function 4 read
   }
+  {  // The other order. One controller answers in turn, so above the late reply always comes in
+     // first. A reply from another device on the bus, or from a controller that does not keep to
+     // its turn, can come after the quick answer to the next request instead. That answer is
+     // taken as it is, and the late reply, which then arrives while nothing waits for it, is
+     // still kept from the next request of its own kind.
+    Bare b;
+    b.sim.answersInOrder = false;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    b.sim.responseDelayMs = 20;
+    MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
+    CHECK(b.sim.requestTimes[1] <= gaveUp + 10);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0xE022]);
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_EQ(b.sim.incomingCount(), 7U);  // the late reply is still on its way
+    r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x0009]);
+    CHECK(word != b.sim.regs[0x0008]);
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
+    CHECK_MSG(b.sim.requestTimes[2] >= gaveUp + 1000 && b.sim.requestTimes[2] <= gaveUp + 1010, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[2] - gaveUp));
+  }
+  {  // Two senders on the bus at once garble each other, and neither frame is taken: here the
+     // late reply and the answer to the next request, which begins at the same moment.
+    Bare b;
+    b.sim.answersInOrder = false;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0xAAAA;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    // Both requests are 8 bytes long, so the same delay after each puts their replies on top
+    // of each other.
+    b.sim.responseDelayMs = (uint32_t)(b.sim.requestTimes[0] + 1200 - b.sim.elapsedMs());
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
+    CHECK_MSG(r.status != MB_OK, "%s", mbStatusText(r.status));
+    CHECK_EQ(word, 0xAAAA);
+    // The same with bytes from elsewhere in the middle of a reply.
+    Bare c;
+    c.sim.inject(20, std::vector<uint8_t>(40, 0xFF));
+    CHECK(c.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status != MB_OK);
+    CHECK_EQ(word, 0xAAAA);
+  }
+  {  // The bus keeps every byte in time order, whenever it was put there: bytes from elsewhere
+     // that are due before a reply already on its way come in first.
+    Bare b;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    CHECK_EQ(b.sim.incomingCount(), 7U);  // the late reply, still on its way
+    b.sim.inject(50, bytes({0xAA, 0xBB}));
+    b.sim.advance(100);
+    CHECK_EQ(b.sim.read(), 0xAA);
+    CHECK_EQ(b.sim.read(), 0xBB);
+    CHECK_EQ(b.sim.read(), -1);  // the late reply is not due yet
+    CHECK_EQ(b.sim.incomingCount(), 7U);
+  }
   {  // Two unanswered requests of different kinds, the second given up while the reply to the
      // first could still arrive (the probe does this when it shortens the timeout). One record
      // cannot name both, so until both waits are over every request waits, whatever its kind.
@@ -3219,6 +3279,53 @@ static void testConsoleCoilsAndReset() {
     rig.run("coil charge_disconnect on");
     CHECK_HAS(rig.run("yes"), "The controller refused it: exception 2 (illegal data address).");
   }
+  {  // What each action does, as the console reads it back: each clears what it names and nothing
+     // else, and the stored totals change only when they are stored.
+    Rig rig;
+    const char *const kCounters[] = {" Ahc_r ", " Ahc_t ", " kWhc ", " Ahl_r ", " Ahl_t ", " hourmeter "};
+    const char *const kStored[] = {" EAhc_r ", " EAhc_t ", " EkWhc ", " EAhl_r ", " EAhl_t ", " Ehourmeter "};
+    const char *const kBefore[] = {"123.4 Ah", "7000.0 Ah", "8.5 kWh", "45.6 Ah", "6554.5 Ah", "4321 h"};
+    const char *const kSteps[] = {"clear_kwh", "clear_ah_total", "clear_ah_resettable"};
+    // After each step, the counters that are 0 by then.
+    const bool kCleared[][6] = {{false, false, true, false, false, false},
+                                {false, true, true, false, true, false},
+                                {true, true, true, true, true, false}};
+    std::string counters = rig.run("dump counters");
+    std::string stored = rig.run("dump totals");
+    for (size_t i = 0; i < 6; ++i) {
+      CHECK_HAS(lineWith(counters, kCounters[i]), kBefore[i]);
+      CHECK_HAS(lineWith(stored, kStored[i]), kBefore[i]);
+    }
+    for (size_t step = 0; step < 3; ++step) {
+      CHECK_HAS(rig.run(std::string("coil ") + kSteps[step] + " on"), "?");
+      CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
+      counters = rig.run("dump counters");
+      stored = rig.run("dump totals");
+      for (size_t i = 0; i < 6; ++i) {
+        const std::string now = lineWith(counters, kCounters[i]);
+        if (kCleared[step][i]) {
+          CHECK_MSG(now.find(" 0.0 ") != std::string::npos, "after %s: %s", kSteps[step], now.c_str());
+        } else {
+          CHECK_MSG(now.find(kBefore[i]) != std::string::npos, "after %s: %s", kSteps[step], now.c_str());
+        }
+        CHECK_HAS(lineWith(stored, kStored[i]), kBefore[i]);  // not stored yet
+      }
+    }
+    // Storing them copies the running totals into the EEPROM, each into its own place and low
+    // word first there: the cleared ones, and the others as they have grown.
+    rig.sim.setU32HiLo(0x0015, 1111);    // Ahc_r
+    rig.sim.setU32HiLo(0x0017, 222222);  // Ahc_t, both words
+    rig.sim.regs[0x0019] = 333;          // kWhc
+    rig.sim.setU32HiLo(0x0021, 66666);   // hourmeter
+    rig.run("coil force_eeprom_update on");
+    CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
+    stored = rig.run("dump totals");
+    const char *const kAfter[] = {"111.1 Ah", "22222.2 Ah", "33.3 kWh", "0.0 Ah", "0.0 Ah", "66666 h"};
+    for (size_t i = 0; i < 6; ++i) {
+      CHECK_HAS(lineWith(stored, kStored[i]), kAfter[i]);
+    }
+    CHECK_EQ(rig.sim.triggered.size(), 4U);
+  }
   {  // The acknowledgement is lost, but the controller has switched. That is not a refusal: the
      // coil is read back, and what it reads is what is said.
     Rig rig;
@@ -3696,6 +3803,32 @@ static void testScaleCheck() {
     const std::string turned = rig.run("scalecheck EV_float 13.70 13.68");
     CHECK_HAS(turned, "  Stored settings: x100, which is what OptaView uses now.\r\n"
                       "  Live readings:   x100, which is what OptaView uses now.");
+  }
+  {  // The battery voltage that the PC preview's 'sim battery' sets reaches every reading of it.
+     // The regulation test compares the slow-filtered one with the target, and a battery that
+     // has fallen well below its target matches no candidate there.
+    Rig rig(100.0);
+    rig.sim.setBattery(12.40);
+    const std::string out = rig.run("scalecheck 12.40");
+    CHECK_HAS(out, "Vb_f reads 12.40 V at x100, 11.99 V at x96.667\r\n     -> no candidate matches the target\r\n");
+    CHECK_HAS(out, "adc_vb_f reads 12.40 V at x100, 11.99 V at x96.667");
+    CHECK_HAS(out, "  Live readings:   x100, which is what OptaView uses now.");
+    CHECK_HASNT(out, "The regulation test disagrees");
+    // The lowest and highest voltage of the day and since the last reset take it in.
+    std::string daily = rig.run("dump daily");
+    CHECK_HAS(lineWith(daily, " Vb_min_daily "), "12.40 V");  // it was 12.60
+    CHECK_HAS(lineWith(daily, " Vb_max_daily "), "14.10 V");
+    CHECK_HAS(lineWith(daily, " vb_min "), "11.90 V");        // lower already
+    CHECK_HAS(lineWith(daily, " vb_max "), "14.90 V");
+    rig.sim.setBattery(15.10);
+    daily = rig.run("dump daily");
+    CHECK_HAS(lineWith(daily, " Vb_min_daily "), "12.40 V");
+    CHECK_HAS(lineWith(daily, " Vb_max_daily "), "15.10 V");
+    CHECK_HAS(lineWith(daily, " vb_min "), "11.90 V");
+    CHECK_HAS(lineWith(daily, " vb_max "), "15.10 V");
+    rig.sim.setBattery(11.50);
+    CHECK_HAS(lineWith(rig.run("dump daily"), " vb_min "), "11.50 V");
+    CHECK_HAS(rig.run("get Vb_f"), "11.50 V");
   }
   {  // B. Everything x96.667, as the TankAlarm client assumes.
     Rig rig(96.667);

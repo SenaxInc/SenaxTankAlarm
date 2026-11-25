@@ -651,6 +651,21 @@ async function controllerView(win, profile) {
   await dialogHidden(win);
   checkEq(await win.preview.writes(), before + 2, 'a cancelled action sent nothing');
 
+  // An action, carried out: the counter it clears reads 0 when it is read again.
+  const kwh = '#groupBox tr[data-register="kWhc"] td:nth-child(4)';
+  await page.selectOption('#groupPick', 'counters');
+  await page.click('#groupBtn');
+  await page.waitForSelector(kwh);
+  checkEq(await win.text(kwh), '8.5 kWh', 'the kWh counter before the action');
+  await page.click('#coilsBox tr[data-coil="clear_kwh"] button:has-text("Do it")');
+  await question(win);
+  await yes(win);
+  checkHas(await result(win), 'Sent and acknowledged.', 'the action was carried out');
+  await close(win);
+  checkEq(await win.preview.writes(), before + 3, 'and reached the controller');
+  await page.click('#groupBtn');
+  await page.waitForFunction((selector) => document.querySelector(selector).textContent === '0.0 kWh', kwh);
+
   // Any group, with addresses and raw values.
   await page.selectOption('#groupPick', 'load');
   await page.click('#groupBtn');
@@ -700,6 +715,7 @@ async function toolsView(win, profile) {
   checkHas(verdict, 'Multimeter: 13.68 V measured', 'the reading reached the console');
   checkHas(verdict, 'A setting you know: EV_float = 13.70 V', 'and so did the setting');
   checkHas(verdict, 'Stored settings: x100, which is what OptaView uses now.', 'the verdict');
+  checkHas(verdict, 'Vb_f reads 13.68 V at x100', 'the slow battery reading follows the battery');
   await close(win);
   await page.waitForFunction(() => !document.querySelector('#scaleText').textContent.includes('not confirmed'));
   checkEq((await win.text('#scaleText')).split('confirmed on this controller').length - 1, 2, 'both scales are confirmed now');
