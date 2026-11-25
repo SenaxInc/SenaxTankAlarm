@@ -121,7 +121,7 @@
     { "addr": "0x0033", "name": "vb_min", "label": "Battery voltage minimum since reset", "scale": "vlive", "group": "daily" },
     { "addr": "0x0034", "name": "vb_max", "label": "Battery voltage maximum since reset", "scale": "vlive", "group": "daily" },
     { "addr": "0x0038", "name": "lighting_should_be_on", "label": "Lighting output wanted", "group": "mppt", "note": "Controller firmware v08 and later." },
-    { "addr": "0x0039", "name": "va_ref_fixed", "label": "Fixed array voltage target", "scale": "vlive", "group": "mppt", "note": "Controller firmware v08 and later." },
+    { "addr": "0x0039", "name": "va_ref_fixed", "label": "Fixed array voltage target (0 = none)", "scale": "vlive", "group": "mppt", "note": "Controller firmware v08 and later. Not 0: MPPT sweeping and tracking stop, and the array is held at this voltage." },
     { "addr": "0x003A", "name": "va_ref_fixed_pct", "label": "Fixed array target, percent of Voc", "scale": "pct256", "group": "mppt", "note": "Controller firmware v08 and later." },
 
     { "addr": "0xE000", "name": "EV_reg", "label": "Absorption voltage at 25 C", "scale": "vset", "group": "charge1", "writable": true, "min": 10.0, "max": 17.0 },
@@ -155,23 +155,23 @@
     { "addr": "0xE01E", "name": "ETb_max", "label": "Highest temperature used for compensation", "type": "i8", "units": "C", "group": "charge", "note": "Read-only in this profile: how the controller stores a negative limit is not confirmed." },
     { "addr": "0xE01F", "name": "ETb_min", "label": "Lowest temperature used for compensation", "type": "i8", "units": "C", "group": "charge", "note": "The specification's description calls this a maximum too; taken as the minimum from its name. Read-only in this profile." },
 
-    { "addr": "0xE022", "name": "EV_lvd", "label": "Low voltage disconnect", "scale": "vset", "group": "load", "writable": true, "min": 9.0, "max": 15.0 },
+    { "addr": "0xE022", "name": "EV_lvd", "label": "Low voltage disconnect", "scale": "vset", "group": "load", "writable": true, "min": 9.0, "max": 15.0, "note": "When ER_icomp is not 0, the controller lowers it in proportion to the load current; V_lvd shows the LVD in effect." },
     { "addr": "0xE023", "name": "EV_lvr", "label": "Low voltage reconnect", "scale": "vset", "group": "load", "writable": true, "min": 9.0, "max": 15.0 },
     { "addr": "0xE024", "name": "EV_lhvd", "label": "Load high voltage disconnect (0 = off)", "scale": "vset", "group": "load", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
     { "addr": "0xE025", "name": "EV_lhvr", "label": "Load high voltage reconnect", "scale": "vset", "group": "load", "writable": true, "min": 10.0, "max": 18.0, "note": "0 does not switch it off: the battery never falls to 0 V, so after a load high voltage disconnect the load would not come back. 0 in EV_lhvd switches the disconnect off." },
-    { "addr": "0xE026", "name": "ER_icomp", "label": "LVD load current compensation (0 = off)", "scale": "icomp", "group": "load", "writable": true, "min": 0, "max": 0.2, "note": "The specification's table gives ohms; its description block says V/A (the same thing)." },
-    { "addr": "0xE027", "name": "Et_lvd_warn", "label": "LVD warning time", "scale": "tenths", "group": "load", "writable": true },
+    { "addr": "0xE026", "name": "ER_icomp", "label": "Load current compensation of the LVD and LED thresholds (0 = off)", "scale": "icomp", "group": "load", "writable": true, "min": 0, "max": 0.2, "note": "It lowers the LVD in proportion to the load current, so that a battery under load is not disconnected too early; V_lvd shows the LVD in effect. The specification says the LED thresholds are compensated the same way, without saying how. Its table gives ohms; its description block says V/A (the same thing)." },
+    { "addr": "0xE027", "name": "Et_lvd_warn", "label": "LVD warning time", "scale": "tenths", "group": "load", "writable": true, "note": "How long the load stays on after the battery has fallen to the LVD, before it is disconnected." },
 
-    { "addr": "0xE030", "name": "EV_soc_y2g", "label": "LED yellow to green (rising)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0 },
-    { "addr": "0xE031", "name": "EV_soc_g2y", "label": "LED green to yellow (falling)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0 },
-    { "addr": "0xE032", "name": "EV_soc_y2r0", "label": "LED yellow to blinking red (falling)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0 },
-    { "addr": "0xE033", "name": "EV_soc_r2y", "label": "LED red to yellow (rising)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0 },
+    { "addr": "0xE030", "name": "EV_soc_y2g", "label": "LED yellow to green (rising)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0, "note": "When ER_icomp is not 0, the controller also compensates the LED thresholds for load current, as it does the LVD (the specification does not say how)." },
+    { "addr": "0xE031", "name": "EV_soc_g2y", "label": "LED green to yellow (falling)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0, "note": "When ER_icomp is not 0, the controller also compensates the LED thresholds for load current, as it does the LVD (the specification does not say how)." },
+    { "addr": "0xE032", "name": "EV_soc_y2r0", "label": "LED yellow to blinking red (falling)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0, "note": "When ER_icomp is not 0, the controller also compensates the LED thresholds for load current, as it does the LVD (the specification does not say how)." },
+    { "addr": "0xE033", "name": "EV_soc_r2y", "label": "LED red to yellow (rising)", "scale": "vset", "group": "led", "writable": true, "min": 9.0, "max": 15.0, "note": "When ER_icomp is not 0, the controller also compensates the LED thresholds for load current, as it does the LVD (the specification does not say how)." },
 
     { "addr": "0xE034", "name": "Emodbus_id", "label": "MODBUS slave address", "group": "comm", "note": "Read-only in this profile: a wrong value makes the controller unreachable." },
     { "addr": "0xE035", "name": "Emeter_id", "label": "MeterBus address", "group": "comm", "note": "Read-only in this profile: Morningstar warns against changing it." },
 
-    { "addr": "0xE036", "name": "EVa_ref_fixed_init", "label": "Fixed array voltage target at start-up", "scale": "vset", "group": "mpptsetup", "note": "Controller firmware v08 and later. Read-only in this profile." },
-    { "addr": "0xE037", "name": "EVa_ref_fixed_pct_init", "label": "Fixed array target at start-up, percent of Voc", "scale": "pct256", "group": "mpptsetup", "note": "Controller firmware v08 and later. Read-only in this profile." },
+    { "addr": "0xE036", "name": "EVa_ref_fixed_init", "label": "Fixed array voltage target at start-up (0 = none)", "scale": "vset", "group": "mpptsetup", "note": "Controller firmware v08 and later. Copied to va_ref_fixed at start-up: not 0 stops MPPT sweeping and tracking, and the array is held at this voltage. Read-only in this profile." },
+    { "addr": "0xE037", "name": "EVa_ref_fixed_pct_init", "label": "Fixed array target at start-up, percent of Voc", "scale": "pct256", "group": "mpptsetup", "note": "Controller firmware v08 and later. Copied to va_ref_fixed_pct at start-up. EVa_ref_fixed_init overrides it when that is not 0. Read-only in this profile." },
     { "addr": "0xE038", "name": "Eic_lim", "label": "Charge current limit", "scale": "i79", "group": "mpptsetup", "note": "Read-only in this profile." },
 
     { "addr": "0xE040", "name": "Ehourmeter", "label": "Hourmeter", "type": "u32", "order": "lo-hi", "units": "h", "group": "totals" },
@@ -186,7 +186,7 @@
     { "addr": "0xE04F", "name": "Etmr_eqcalendar", "label": "Days since the last equalize", "units": "days", "group": "totals" }
   ],
   "coils": [
-    { "addr": "0x0000", "name": "equalize", "label": "Equalize triggered" },
+    { "addr": "0x0000", "name": "equalize", "label": "Equalize triggered", "note": "Once the equalize is done, the controller resets the equalize calendar: the days to the next one count from then." },
     { "addr": "0x0001", "name": "load_disconnect", "label": "Load disconnect (on = load forced off)" },
     { "addr": "0x0002", "name": "charge_disconnect", "label": "Charge disconnect (on = charging stopped)" },
     { "addr": "0x0010", "name": "clear_ah_resettable", "label": "Clear the resettable Ah counters", "trigger": true, "note": "It also sets vb_min and vb_max, the lowest and highest battery voltage since the last reset, to the battery voltage now." },

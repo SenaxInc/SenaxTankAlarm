@@ -2035,6 +2035,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(reg->name);
     out_.print(": ");
     out_.println(reg->label);
+    // What else the setting does, before the question: the note is where a profile says so.
+    if (reg->note[0] != '\0') {
+      printWrapped("  ", "  ", reg->note);
+    }
     ovFormatValue(*reg, now, text, sizeof(text));
     out_.print("  now  ");
     out_.printPadded(text, 14);

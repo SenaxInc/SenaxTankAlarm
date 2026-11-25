@@ -3074,6 +3074,8 @@ static void testWebReading() {
         CHECK(near(item["max"].as<double>(), reg.maxValue, 1e-6));
       }
       CHECK_EQ(item["zeroOk"] == true, reg.zeroOk);
+      // The Settings view shows a note under its setting; a register without one has no member.
+      CHECK_MSG(reg.note[0] == '\0' ? item["note"].isNull() : str(item["note"]) == reg.note, "%s", reg.name);
       writable += reg.writable ? 1 : 0;
     }
     CHECK_EQ(writable, 36);
@@ -3100,6 +3102,14 @@ static void testWebReading() {
     // A counter reset also restarts the battery's lowest and highest voltage (specification).
     CHECK_HAS(str(findByName(json["coils"], "clear_kwh")["note"]), "It also sets vb_min and vb_max");
     CHECK(str(findByName(json["coils"], "load_disconnect")["note"]).empty());
+    CHECK_HAS(str(findByName(json["coils"], "equalize")["note"]), "resets the equalize calendar");
+    // The load current compensation also moves the LED thresholds (specification), and the page
+    // says so where the setting is changed.
+    JsonVariantConst icomp = findByName(json["registers"], "ER_icomp");
+    CHECK(str(icomp["label"]) == "Load current compensation of the LVD and LED thresholds (0 = off)");
+    CHECK_HAS(str(icomp["note"]), "the LED thresholds are compensated the same way");
+    CHECK_HAS(str(findByName(json["registers"], "EV_soc_g2y")["note"]), "When ER_icomp is not 0");
+    CHECK(findByName(json["registers"], "EV_lvr")["note"].isNull());  // no note, no member
     CHECK_EQ(json["checks"].size(), profile.checkCount());
     for (size_t i = 0; i < profile.checkCount(); ++i) {
       CHECK(str(json["checks"][i]["below"]) == profile.check(i).below->name);

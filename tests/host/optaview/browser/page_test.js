@@ -434,6 +434,12 @@ async function settingsView(win, profile) {
   checkEq(await win.text('#settingsGroups tr[data-register="EV_lvd"] td:nth-child(3)'), '9.00 to 15.00 V', 'what is allowed');
   checkEq(await win.text('#settingsGroups tr[data-register="EV_float"] td:nth-child(3)'), '10.00 to 17.00 V, or 0', 'a setting that 0 switches off');
   checkEq(await page.locator('#writeNotes li').count(), profile.writeNotes.length, 'the notes on writing');
+  // What else a setting does is under it: the load current compensation also moves the LEDs.
+  checkHas(await win.text('#settingsGroups tr[data-register="ER_icomp"] .reg-note'),
+           'the LED thresholds are compensated the same way', 'a setting\'s note is under it');
+  checkEq(await page.locator('#settingsGroups .reg-note').count(), writable.filter((reg) => reg.note).length,
+          'every note, and none where there is none');
+  checkEq(await page.locator('#settingsGroups tr[data-register="EV_lvr"] .reg-note').count(), 0, 'a setting without a note has none');
   checkHas(await win.text(notice('scale')), 'Run the scale check under Tools before you change a voltage', 'the warning on the voltage scale');
   check(await page.isHidden(notice('reset')), 'no restart is due yet');
   const before = await win.preview.writes();
@@ -456,6 +462,7 @@ async function settingsView(win, profile) {
   checkEq(await win.text('#dialogTitle'), 'Change Low voltage disconnect', 'the dialog\'s title');
   checkHas(asked, 'now  11.50 V', 'the value the controller holds');
   checkHas(asked, 'new  13.10 V', 'the value that would be written');
+  checkHas(asked, 'When ER_icomp is not 0, the controller lowers it', 'the setting\'s note, as the console asks it');
   checkHas(asked, 'the scale of stored settings (vset, x100/32768) is not confirmed', 'the console\'s warning');
   checkHas(asked, 'Low voltage reconnect (EV_lvr) must be above low voltage disconnect (EV_lvd)', 'the pair rule');
   checkHas(asked, 'Type yes to write it. Anything else cancels.', 'the console\'s question');

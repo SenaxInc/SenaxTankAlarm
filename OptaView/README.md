@@ -193,7 +193,9 @@ Controller view (7).
    [The voltage scales](#the-voltage-scales). Do this before writing any voltage.
 6. `set EV_lvr 13.25`, then `set EV_lvd 13.10`: each shows the old and the new value and waits
    for `yes`. Raising the reconnect voltage first keeps it above the disconnect voltage at
-   every step.
+   every step. Before the values, `set` shows what else a setting does where its note says so:
+   for the LVD, that a load current compensation (`ER_icomp`) other than 0 lowers it under
+   load, so `get ER_icomp` tells whether 13.10 V is where the load goes off.
 7. `reset` restarts the controller so that it uses the new settings, waits for it to come
    back and shows the status again. `dump load` then shows what is stored. If it says that the
    controller answered all the time and was not seen to restart, the restart is still due.

@@ -1380,6 +1380,30 @@ static void testBuiltinProfile() {
       }
     }
 
+    // What a setting or a switch does besides, as the specification says it, is in its label or
+    // its note, where 'get', 'set', 'coils', 'coil' and the page show it. The load current
+    // compensation lowers the LVD and moves the LED thresholds too (specification, "Load Mode").
+    const OvRegister *icomp = profile.findRegister("ER_icomp");
+    CHECK(strstr(icomp->label, "LVD and LED thresholds") != nullptr);
+    CHECK_HAS(icomp->note, "It lowers the LVD in proportion to the load current");
+    CHECK_HAS(icomp->note, "the LED thresholds are compensated the same way");
+    CHECK_HAS(icomp->note, "V_lvd shows the LVD in effect.");
+    CHECK_HAS(profile.findRegister("EV_lvd")->note, "When ER_icomp is not 0, the controller lowers it in proportion");
+    const char *const kLeds[] = {"EV_soc_y2g", "EV_soc_g2y", "EV_soc_y2r0", "EV_soc_r2y"};
+    for (const char *name : kLeds) {
+      CHECK_HAS(profile.findRegister(name)->note, "When ER_icomp is not 0, the controller also compensates the LED");
+    }
+    CHECK(profile.findRegister("EV_lvr")->note[0] == '\0');  // the reconnect is not compensated
+    CHECK_HAS(profile.findRegister("Et_lvd_warn")->note, "How long the load stays on after the battery has fallen");
+    // A start-up target that is not 0 stops the MPPT, and the voltage overrides the percentage.
+    CHECK(strstr(profile.findRegister("va_ref_fixed")->label, "(0 = none)") != nullptr);
+    CHECK_HAS(profile.findRegister("va_ref_fixed")->note, "Not 0: MPPT sweeping and tracking stop");
+    CHECK(strstr(profile.findRegister("EVa_ref_fixed_init")->label, "(0 = none)") != nullptr);
+    CHECK_HAS(profile.findRegister("EVa_ref_fixed_init")->note, "not 0 stops MPPT sweeping and tracking");
+    CHECK_HAS(profile.findRegister("EVa_ref_fixed_pct_init")->note, "EVa_ref_fixed_init overrides it when that is not 0.");
+    // An equalize started by hand restarts the count of days to the next one.
+    CHECK_HAS(profile.findCoil("equalize")->note, "the controller resets the equalize calendar");
+
     // Loading again replaces the profile without leaking; clear() empties it.
     const long live = gAllocLive;
     CHECK(profile.load(OV_BUILTIN_PROFILE, strlen(OV_BUILTIN_PROFILE), error, sizeof(error)));
@@ -2955,7 +2979,8 @@ static void testConsoleReads() {
     CHECK_HASNT(other.run("get charge_state"), "Note: voltages are shown");
     CHECK_HASNT(other.run("get Vb_ref"), "Note: voltages are shown");  // the target's scale is not one of the two
     const std::string setting = other.run("get EV_lvd");
-    CHECK_HAS(setting, "'set' accepts from 9.00 V to 15.00 V.\r\n"
+    CHECK_HAS(setting, "'set' accepts from 9.00 V to 15.00 V.\r\n    When ER_icomp is not 0, the controller lowers it");
+    CHECK_HAS(setting, "\r\n    the LVD in effect.\r\n"
                        "Note: voltages are shown with a scale that is not confirmed on this controller\r\n"
                        "      (stored settings x100/32768). 'scalecheck' tests it.");
     CHECK_HASNT(other.run("get EV_lvr"), "Note: voltages are shown");
@@ -3039,6 +3064,8 @@ static void testConsoleReads() {
   CHECK_HAS(coils, "Clear the total Ah counters\r\n        It also sets vb_min and vb_max,");
   CHECK_HAS(coils, "Clear the resettable Ah counters\r\n        It also sets vb_min and vb_max,");
   CHECK_EQ(countOf(coils, "It also sets vb_min"), 3U);
+  // An equalize started by hand restarts the count of days to the next one (specification).
+  CHECK_HAS(coils, "Equalize triggered\r\n        Once the equalize is done, the controller resets the equalize calendar");
   rig.sim.coils[0x0001] = true;
   CHECK_HAS(lineWith(rig.run("coils"), "load_disconnect"), "on ");
   rig.sim.coils.erase(0x0002);
@@ -3056,7 +3083,7 @@ static void testConsoleSet() {
     Rig rig;
     // The whole flow for the setting this project is after: LVD 13.10 V, LVR 13.25 V.
     const std::string ask = rig.run("set EV_lvr 13.25");
-    CHECK_HAS(ask, "EV_lvr: Low voltage reconnect");
+    CHECK_HAS(ask, "EV_lvr: Low voltage reconnect\r\n  now  ");  // no note: the values come next
     CHECK_HAS(lineWith(ask, "  now  "), "12.60 V");
     CHECK_HAS(lineWith(ask, "  now  "), "[0x1021]");
     CHECK_HAS(lineWith(ask, "  new  "), "13.25 V");
@@ -3083,6 +3110,11 @@ static void testConsoleSet() {
           SimSunSaver::frame(bytes({0x01, 0x06, 0xE0, 0x23, 0x10, 0xF6})));
 
     const std::string second = rig.run("set ev_lvd 13.10");
+    // The setting's note comes with the question, before the values: the LVD in effect may be
+    // lower under load than the one written.
+    const size_t lvdNote = second.find("EV_lvd: Low voltage disconnect\r\n  When ER_icomp is not 0, the controller lowers it");
+    CHECK_MSG(lvdNote != std::string::npos && lvdNote < second.find("  now  "), "%s", second.c_str());
+    CHECK_HAS(second, "\r\n  the LVD in effect.\r\n  now  ");
     CHECK_HAS(lineWith(second, "  new  "), "[0x10C5]");
     CHECK_HASNT(second, "Careful: Low voltage reconnect");  // 13.10 is below the new LVR
     CHECK_HASNT(second, "Before you write:");               // the notes were shown once
@@ -3092,6 +3124,28 @@ static void testConsoleSet() {
     CHECK_HAS(rig.run("status"), "Settings were changed in this session");
     // The controller now shows its "EEPROM changed" fault.
     CHECK_HAS(lineWith(rig.run("live"), "array_fault"), "EEPROM setting edit (reset required)");
+  }
+  {  // What else a setting does is said before the question: the load current compensation
+     // moves the LVD and the LED thresholds, and a raw write is asked the same way.
+    Rig rig;
+    for (const char *command : {"set ER_icomp 0.01", "set ER_icomp raw 519"}) {
+      const std::string ask = rig.run(command);
+      const size_t note = ask.find("ER_icomp: Load current compensation of the LVD and LED thresholds (0 = off)\r\n"
+                                   "  It lowers the LVD in proportion to the load current, so that a battery under load");
+      CHECK_MSG(note != std::string::npos && note < ask.find("  now  "), "%s: %s", command, ask.c_str());
+      CHECK_HAS(ask, "The specification says the LED thresholds\r\n  are compensated the same way");
+      CHECK_HAS(lineWith(ask, "  new  "), "0.0100 ohm");
+      CHECK_HAS(ask, "Type yes to write it.");
+      CHECK_HAS(rig.run("no"), "Cancelled. Nothing was sent.");
+    }
+    // And a note that says something else as well: the one byte of the temperature compensation.
+    CHECK_HAS(rig.run("set EV_tempcomp 0.03"), "EV_tempcomp: Temperature compensation per C (0 = off)\r\n"
+                                               "  Only the low byte is used");
+    rig.run("no");
+    // A setting that cannot be written still says why, with its note, and asks nothing.
+    CHECK_HAS(rig.run("set EVa_ref_fixed_init 0"), "not 0 stops MPPT sweeping");
+    CHECK(!rig.console.awaitingConfirmation());
+    CHECK_EQ(rig.sent(0x06), 0);
   }
   {
     Rig rig;
@@ -3739,7 +3793,8 @@ static void testConsoleCoilsAndReset() {
     CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
     CHECK_EQ(rig.sim.triggered.size(), 1);
     CHECK_EQ(rig.sim.triggered[0], 0x0012);
-    rig.run("coil equalize on");
+    CHECK_HAS(rig.run("coil equalize on"), "equalize: Equalize triggered\r\n"
+                                           "  Once the equalize is done, the controller resets the equalize calendar");
     CHECK_HAS(rig.run("n"), "Cancelled");
     CHECK(!rig.sim.coils[0x0000]);
     rig.sim.coils.erase(0x0002);
