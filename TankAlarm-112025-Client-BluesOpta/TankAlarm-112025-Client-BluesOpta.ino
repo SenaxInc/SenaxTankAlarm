@@ -1219,6 +1219,10 @@ static bool gRpmAccumulatedInitialized[MAX_MONITORS] = {false};
 // samples: the time it divides by then takes in the run, and its pulses do not
 // (restartPulseCountsAfterChargerRun()).
 static bool gRpmAccumulatedCutByRun[MAX_MONITORS] = {false};
+// From a charger programming run that cut into a monitor's count until a count that started after
+// the run gives its result: the monitor reads as before the run, and that reading is not a new
+// measurement (readPulseSensor()).
+static bool gRpmReadingBeforeRun[MAX_MONITORS] = {false};
 
 // Atomic access helpers for volatile pulse counter (protects against future interrupt use)
 // On 32-bit ARM (Cortex-M7 in STM32H747XI), 32-bit aligned reads/writes are atomic,
@@ -1363,6 +1367,7 @@ struct PulseSamplerContext {
   // Result
   float resultRpm;
   bool resultReady;
+  bool resultStandsIn;  // the result is the last reading: a run cut into the count
 };
 
 static PulseSamplerContext gPulseSampler[MAX_MONITORS];
@@ -1430,6 +1435,7 @@ static void startPulseSample(uint8_t idx, const MonitorConfig &cfg) {
   ctx.firstPulseDetected = false;
   ctx.secondPulseDetected = false;
   ctx.resultReady = false;
+  ctx.resultStandsIn = false;
 
   // For accumulated mode, use the global accumulated counter
   if (useAccumulatedMode && !gRpmAccumulatedInitialized[idx]) {
@@ -1437,6 +1443,7 @@ static void startPulseSample(uint8_t idx, const MonitorConfig &cfg) {
     gRpmAccumulatedStartMillis[idx] = millis();
     gRpmLastPinState[idx] = ctx.lastPinState;
     gRpmAccumulatedInitialized[idx] = true;
+    gRpmAccumulatedCutByRun[idx] = false;  // a count that starts now has no run's time in it
   }
 }
 
@@ -1480,6 +1487,7 @@ static bool pollPulseSampler(uint8_t idx) {
         // A charger programming run held up a sample of this count: the last reading stands, and
         // the next count starts now, as after any result.
         ctx.resultRpm = gRpmLastReading[idx];
+        ctx.resultStandsIn = true;
         gRpmAccumulatedCutByRun[idx] = false;
       } else if (accumElapsed > 1000 && pulseCount > 0) {
         ctx.resultRpm = ((float)pulseCount * MS_PER_MINUTE) /
@@ -6556,6 +6564,17 @@ static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx) {
   // Poll the sampler (non-blocking burst)
   pollPulseSampler(idx);
 
+  // A charger programming run cut into this monitor's count: until a count that started after the
+  // run gives its result, the reading is the one from before the run, and is not a new measurement
+  // (restartPulseCountsAfterChargerRun()). Nor is the result of the count the run cut into.
+  if (gRpmReadingBeforeRun[idx]) {
+    if (pctx.resultReady && !pctx.resultStandsIn) {
+      gRpmReadingBeforeRun[idx] = false;
+    } else {
+      gMonitorState[idx].sampleReused = true;
+    }
+  }
+
   // Return the best available reading
   return readPulseSensorResult(idx);
 }
@@ -8578,6 +8597,9 @@ static bool chargerRunWouldHoldSample() {
 // read low, which could raise a low alarm. So a count of pulses or of the time between them that
 // is under way is started again by the sample that follows, and an accumulated count gives no
 // result this once: the last reading stands, and the next count starts as after any result.
+// Until a count that started after the run gives its result, the monitor reads as before the run,
+// and that reading is marked reused, as one that is not a new measurement: it neither latches nor
+// clears an alarm, and does not count as a reading taken now (readPulseSensor()).
 // takeSampleDueAfterChargerRun() calls this only after a run that held up a sample: one that held
 // up none took no such moment.
 static void restartPulseCountsAfterChargerRun() {
@@ -8588,8 +8610,10 @@ static void restartPulseCountsAfterChargerRun() {
     PulseSamplerContext &ctx = gPulseSampler[i];
     if (ctx.useAccumulatedMode) {
       gRpmAccumulatedCutByRun[i] = true;
+      gRpmReadingBeforeRun[i] = true;
     } else if (ctx.state == PULSE_STATE_SAMPLING) {
       ctx.state = PULSE_STATE_IDLE;  // readPulseSensor() starts it again
+      gRpmReadingBeforeRun[i] = true;
     }
   }
 }
