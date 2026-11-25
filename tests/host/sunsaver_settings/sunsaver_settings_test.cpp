@@ -422,6 +422,12 @@ static void testValuesAgainstOptaView() {
   CHECK(textOf(ss::I_EV_EQ, 0) == "0 (off)");
   CHECK(textOf(ss::I_EV_EQ, 0, ss::SCALE_UNKNOWN) == "0 (off)");
   CHECK(textOf(ss::I_EV_LVD, 0) == "0.00 V");  // the LVD has no "off"
+  // Nor have the high voltage reconnects: the battery never falls to 0 V, so 0 there would keep
+  // charging, or the load, off after a high voltage disconnect. 0 in the disconnect is "off".
+  CHECK(textOf(ss::I_EV_HVR, 0) == "0.00 V");
+  CHECK(textOf(ss::I_EV_LHVR, 0) == "0.00 V");
+  CHECK(textOf(ss::I_EV_HVD, 0) == "0 (off)");
+  CHECK(textOf(ss::I_EV_LHVD, 0) == "0 (off)");
   CHECK(textOf(ss::I_ET_FLOAT, 900) == "900 s (15 min)");
   CHECK(textOf(ss::I_ET_FLOAT, 90) == "90 s (1.5 min)");
   CHECK(textOf(ss::I_ET_FLOAT, 59) == "59 s");

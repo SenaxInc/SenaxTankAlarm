@@ -161,7 +161,7 @@ inline const char *groupTitle(uint8_t group) {
 }
 
 enum ItemFlag : uint8_t {
-  ITEM_ZERO_IS_OFF = 0x01,  // 0 switches the feature off
+  ITEM_ZERO_IS_OFF = 0x01,  // 0 switches the feature off (not a reconnect: the battery never falls to 0 V)
   ITEM_WITNESS = 0x02       // a setpoint the scale test looks at
 };
 
@@ -274,7 +274,7 @@ inline const Item &item(uint8_t index) {
        "Temperature compensation per C"},
       {0xE01B, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_WITNESS | ITEM_ZERO_IS_OFF, "EV_hvd",
        "Battery high voltage disconnect at 25 C"},
-      {0xE01C, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_WITNESS | ITEM_ZERO_IS_OFF, "EV_hvr",
+      {0xE01C, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_WITNESS, "EV_hvr",
        "Battery high voltage reconnect"},
       {0xE01D, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_ZERO_IS_OFF, "Evb_ref_lim",
        "Regulation ceiling, not compensated"},
@@ -284,7 +284,7 @@ inline const Item &item(uint8_t index) {
       {0xE022, KIND_VOLT_SETTING, GROUP_LOAD, 9, 15, ITEM_WITNESS, "EV_lvd", "Low voltage disconnect"},
       {0xE023, KIND_VOLT_SETTING, GROUP_LOAD, 9, 15, ITEM_WITNESS, "EV_lvr", "Low voltage reconnect"},
       {0xE024, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, ITEM_ZERO_IS_OFF, "EV_lhvd", "Load high voltage disconnect"},
-      {0xE025, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, ITEM_ZERO_IS_OFF, "EV_lhvr", "Load high voltage reconnect"},
+      {0xE025, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, 0, "EV_lhvr", "Load high voltage reconnect"},
       {0xE026, KIND_OHMS, GROUP_LOAD, 0, 0, ITEM_ZERO_IS_OFF, "ER_icomp", "LVD load current compensation"},
       {0xE027, KIND_TENTHS, GROUP_LOAD, 0, 0, 0, "Et_lvd_warn", "LVD warning time"},
 
