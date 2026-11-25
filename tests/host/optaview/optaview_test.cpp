@@ -1287,7 +1287,7 @@ static void testBuiltinProfile() {
     CHECK_EQ(profile.coilCount(), 8);
     CHECK_EQ(profile.groupCount(), 13);
     CHECK_EQ(profile.liveGroupCount(), 2);
-    CHECK_EQ(profile.checkCount(), 5);
+    CHECK_EQ(profile.checkCount(), 9);
     CHECK(profile.noteCount() >= 3);
     CHECK(profile.writeNoteCount() >= 2);
     CHECK(profile.wiringCount() >= 8);
@@ -2034,6 +2034,38 @@ static void testProfileRejects() {
       char why[200];
       CHECK_MSG(loaded.load(fine.c_str(), fine.size(), why, sizeof(why)), "%s", why);
       CHECK_EQ(loaded.noteCount(), 2U);
+    }
+    {  // JSON can carry a NUL in a text, as an escape. Read as C text, the text would end there: a
+       // check would name register "a" whatever followed, an address or a format would be taken
+       // from its start, and a label or a message would be cut. Any text that holds one fails the
+       // profile, member names included.
+      const std::string nul = std::string("\\") + "u0000";
+      const struct {
+        const char *from;
+        std::string to;
+      } places[] = {
+          {"\"below\":\"a\"", "\"below\":\"a" + nul + "d\""},
+          {"\"name\":\"d\"", "\"name\":\"d" + nul + "\""},
+          {"\"message\":\"m\"", "\"message\":\"m" + nul + "ore\""},
+          {"\"title\":\"Mini\"", "\"title\":\"Mi" + nul + "ni\""},
+          {"\"title\":\"G\"", "\"title\":\"G" + nul + "\""},
+          {"[\"A\",\"B\"]", "[\"A\",\"B" + nul + "\"]"},
+          {"\"format\":\"8N2\"", "\"format\":\"8N2" + nul + "\""},
+          {"\"addr\":\"0xE010\"", "\"addr\":\"0xE010" + nul + "1\""},
+          {"\"version\":\"1\"", "\"version\":\"1\",\"notes\":[\"One." + nul + "Two.\"]"},
+          {"\"version\":\"1\"", "\"version\":\"1\",\"x" + nul + "\":1"},
+          {"\"liveGroups\":[\"g\"]", "\"liveGroups\":[\"g" + nul + "\"]"},
+      };
+      for (size_t i = 0; i < sizeof(places) / sizeof(places[0]); ++i) {
+        expectRejected(replaced(mini, places[i].from, places[i].to.c_str()), "a text in the profile holds a NUL");
+      }
+      // The same escape of any other character is text like any other.
+      const std::string tab =
+          replaced(mini, "\"title\":\"Mini\"", ("\"title\":\"Mi" + std::string("\\") + "u0009ni\"").c_str());
+      OvProfile loaded;
+      char why[200];
+      CHECK_MSG(loaded.load(tab.c_str(), tab.size(), why, sizeof(why)), "%s", why);
+      CHECK(strcmp(loaded.title(), "Mi\tni") == 0);
     }
     // Left out, or null, a member keeps its default; of the right type it is taken as written.
     const std::string open = replaced(mini, "\"min\":1,\"max\":20", "\"min\":null,\"max\":20.5");
@@ -3267,14 +3299,41 @@ static void testConsoleSet() {
     rig.run("no");
     CHECK_HASNT(rig.run("set EV_lvr 11.55"), "Careful: Low voltage reconnect");
     rig.run("no");
-    // A register that stands in three pairs has all three looked at.
+    // A register that stands in seven pairs has all seven looked at. Four of them fail here: the
+    // reconnect, both absorption voltages and bank 2's equalize voltage are above 13.90 V. Both
+    // float voltages (13.70 V) are below it, and bank 1 does not equalize (0).
     const std::string hvd = rig.run("set EV_hvd 13.90");
     CHECK_HAS(hvd, "(EV_hvr) must be below high voltage disconnect (EV_hvd).");
     CHECK_HAS(hvd, "After this write, EV_hvr = 14.00 V and EV_hvd = 13.90 V.");
     CHECK_HAS(hvd, "After this write, EV_reg = 14.00 V and EV_hvd = 13.90 V.");
     CHECK_HAS(hvd, "After this write, EV_reg2 = 14.40 V and EV_hvd = 13.90 V.");
-    CHECK_EQ(countOf(hvd, "After this write, "), 3);
+    CHECK_HAS(hvd, "After this write, EV_eq2 = 14.90 V and EV_hvd = 13.90 V.");
+    CHECK_EQ(countOf(hvd, "After this write, "), 4);
     rig.run("no");
+    // Every charge voltage of both banks is compared with the disconnect, not only absorption:
+    // the disconnect stops charging before the battery reaches a target at it or above it.
+    const std::string under = rig.run("set EV_hvd 14.50");
+    CHECK_HAS(under, "Careful: Bank 2 equalize voltage (EV_eq2) must be below battery high voltage disconnect (EV_hvd).");
+    CHECK_HAS(under, "After this write, EV_eq2 = 14.90 V and EV_hvd = 14.50 V.");
+    CHECK_EQ(countOf(under, "After this write, "), 1);
+    rig.run("no");
+    CHECK_EQ(countOf(rig.run("set EV_hvd 14.95"), "After this write, "), 0);
+    rig.run("no");
+    // Raising a target to the disconnect (equal is not below) or above it, in either bank.
+    const char *const targets[] = {"EV_float", "EV_eq", "EV_float2", "EV_eq2"};
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+      const std::string name(targets[i]);
+      const std::string at = rig.run("set " + name + " 15.20");
+      CHECK_MSG(has(at, ("After this write, " + name + " = 15.20 V and EV_hvd = 15.20 V.").c_str()), "%s", at.c_str());
+      CHECK_EQ(countOf(at, "After this write, "), 1);
+      rig.run("no");
+      const std::string above = rig.run("set " + name + " 15.30");
+      CHECK_MSG(has(above, ("After this write, " + name + " = 15.30 V and EV_hvd = 15.20 V.").c_str()), "%s",
+                above.c_str());
+      rig.run("no");
+      CHECK_EQ(countOf(rig.run("set " + name + " 15.15"), "After this write, "), 0);
+      rig.run("no");
+    }
 
     // A 0 switches a disconnect off, but not a reconnect: the battery never falls to 0 V, so
     // after a high voltage disconnect charging, or the load, would not come back.
@@ -3293,7 +3352,8 @@ static void testConsoleSet() {
     // leave the load off after the first disconnect.
     const std::string lhvd = rig.run("set EV_lhvd 15.00");
     CHECK_HAS(lhvd, "Careful: Load high voltage reconnect (EV_lhvr) must be below load high voltage disconnect");
-    CHECK_HAS(lhvd, "After this write, EV_lhvr = 0.00 V and EV_lhvd = 15.00 V. Put the other one right before you 'reset'.\r\n"
+    CHECK_HAS(lhvd, "After this write, EV_lhvr = 0.00 V and EV_lhvd = 15.00 V.\r\n"
+                    "    Put the other one right before you 'reset'.\r\n"
                     "    EV_lhvr cannot be 0: 0 does not switch it off.\r\n");
     CHECK_EQ(countOf(lhvd, "cannot be 0"), 1);
     CHECK_EQ(countOf(lhvd, "After this write, "), 1);
@@ -4073,6 +4133,57 @@ static void testConsoleCoilsAndReset() {
     CHECK_HAS(hvr, "Put that right first, or use 'reset anyway'.");
     CHECK_EQ(rig.sim.resets, 0);
   }
+  {  // A charge voltage at the battery's high voltage disconnect or above it stands in the way of
+     // a restart, in either bank: the disconnect would stop charging before the battery got
+     // there. A stage that is switched off (0) is not compared, nor is anything while the
+     // disconnect is off.
+    Rig rig;
+    rig.sim.regs[0xE014] = rig.sim.setVolts(15.30);  // EV_eq2, above EV_hvd at 15.20 V
+    const std::string eq2 = rig.run("reset");
+    CHECK_HAS(eq2, "  Problem: Bank 2 equalize voltage (EV_eq2) must be below battery high voltage disconnect (EV_hvd).\r\n"
+                   "    Now EV_eq2 = 15.30 V and EV_hvd = 15.20 V.\r\n");
+    CHECK_EQ(countOf(eq2, "Problem:"), 1);
+    CHECK_HAS(eq2, "Put that right first, or use 'reset anyway'.");
+    CHECK(!rig.console.awaitingConfirmation());
+    rig.sim.regs[0xE014] = 0;  // no equalize in bank 2
+    CHECK_HASNT(rig.run("reset"), "Problem:");
+    rig.run("no");
+    rig.sim.regs[0xE001] = rig.sim.setVolts(15.20);  // EV_float at the disconnect
+    rig.sim.regs[0xE007] = rig.sim.setVolts(15.30);  // EV_eq: bank 1 equalizes above it
+    rig.sim.regs[0xE00E] = rig.sim.setVolts(15.25);  // EV_float2 above it
+    const std::string three = rig.run("reset");
+    CHECK_HAS(three, "    Now EV_float = 15.20 V and EV_hvd = 15.20 V.\r\n");
+    CHECK_HAS(three, "    Now EV_eq = 15.30 V and EV_hvd = 15.20 V.\r\n");
+    CHECK_HAS(three, "    Now EV_float2 = 15.25 V and EV_hvd = 15.20 V.\r\n");
+    CHECK_EQ(countOf(three, "Problem:"), 3);
+    CHECK(!rig.console.awaitingConfirmation());
+    rig.sim.regs[0xE01B] = 0;  // no high voltage disconnect: nothing to stay below
+    CHECK_HAS(rig.run("reset"), "Type yes to restart it.");
+    rig.run("no");
+    CHECK_EQ(rig.sim.resets, 0);
+  }
+  {  // Each pair check of the built-in profile stops a restart with its own message and no other:
+     // the lower register of the pair above the upper one, everything else as the simulated
+     // controller has it.
+    Rig first;
+    CHECK_EQ(first.profile.checkCount(), 9);
+    for (size_t i = 0; i < first.profile.checkCount(); ++i) {
+      Rig rig;
+      const OvCheck &check = rig.profile.check(i);
+      rig.sim.regs[check.below->addr] = rig.sim.setVolts(15.50);
+      rig.sim.regs[check.above->addr] = rig.sim.setVolts(15.00);
+      std::string out = rig.run("reset");
+      for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
+        out.replace(at, 6, " ");  // a long message is wrapped
+      }
+      CHECK_MSG(has(out, (std::string("Problem: ") + check.message + " Now " + check.below->name + " = 15.50 V and " +
+                          check.above->name + " = 15.00 V.")
+                             .c_str()),
+                "check %u: %s", (unsigned)i, out.c_str());
+      CHECK_MSG(countOf(out, "Problem:") == 1, "check %u: %s", (unsigned)i, out.c_str());
+      CHECK_EQ(rig.sim.resets, 0);
+    }
+  }
   {  // A pair that cannot be checked stands in the way like one that is out of order, whichever
      // of its two registers does not read.
     Rig rig;
@@ -4178,10 +4289,11 @@ static void testConsoleCoilsAndReset() {
       }
     }
     CHECK_MSG(polls >= 10 && polls <= 14, "%zu requests while the restart was awaited", polls);
-    // A write of unknown outcome stays an open question too.
+    // A write of unknown outcome stays an open question too, while nothing reads its register:
+    // no pair check reads EV_floatlb_trip before the restart.
     Rig unsure;
     unsure.sim.resetWorks = false;
-    unsure.run("set EV_float 13.60");
+    unsure.run("set EV_floatlb_trip 12.40");
     unsure.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
     unsure.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
     CHECK_HAS(unsure.run("yes"), "whether it was written is not known.");
@@ -4195,6 +4307,18 @@ static void testConsoleCoilsAndReset() {
     CHECK_HAS(unsure.run("yes"), "The controller answers again");
     CHECK(!unsure.device.resetMaybeNeeded());
     CHECK(!unsure.device.resetNeeded());
+    // One that a pair check reads before the restart is settled there. This write of EV_float
+    // was taken, only its reply was lost, and the check against EV_hvd reads the new value.
+    Rig settled;
+    settled.run("set EV_float 13.60");
+    settled.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    settled.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_HAS(settled.run("yes"), "whether it was written is not known.");
+    CHECK(settled.device.resetMaybeNeeded());
+    CHECK_HAS(settled.run("reset"), "Type yes to restart it.");
+    CHECK(!settled.device.resetMaybeNeeded());
+    CHECK(settled.device.resetNeeded());
+    settled.run("no");
   }
   {  // No link: say so instead of asking for a yes.
     Rig rig;
@@ -5135,11 +5259,14 @@ static void testScaleCheck() {
     CHECK(!report.live.meterGiven);
     // It was read from the controller, not taken from the round test's reads: one more request.
     CHECK_EQ(rig.sim.requests.size() - sent, (size_t)(14 + 3 + 1));
-    // A register on another scale is not used (the console refuses it before this), nor one on
-    // that scale that 'set' cannot change.
-    CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("adc_vb_f"), 13.68, &report));
-    CHECK(report.settings.known == nullptr);
-    CHECK_EQ(report.settings.verdict, -1);
+    // A register on another scale is not used, whether 'set' can change it or not (the console
+    // refuses it before this), nor one on that scale that 'set' cannot change.
+    const char *const others[] = {"adc_vb_f", "EV_tempcomp", "Et_float"};
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); ++i) {
+      CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister(others[i]), 13.68, &report));
+      CHECK_MSG(report.settings.known == nullptr, "%s was used", others[i]);
+      CHECK_EQ(report.settings.verdict, -1);
+    }
     rig.sim.regs[0x0039] = rig.sim.regs[0xE001];  // as if the float voltage were the fixed target
     CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("va_ref_fixed"), 13.70, &report));
     CHECK(report.settings.known == nullptr);
@@ -5387,6 +5514,16 @@ static void testSettingsCopies() {
     CHECK(rig.sim.regs.find(0x0039) == rig.sim.regs.end());
     CHECK(rig.sim.regs.find(0x003A) == rig.sim.regs.end());
   }
+  {  // Nor does a restart make a copy that a test has taken away, with its setting still there:
+     // the simulated controller answers for the registers it has, before a restart and after it.
+    Rig rig;
+    rig.sim.regs.erase(0x0039);
+    rig.sim.regs[0xE037] = 179;
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(rig.sim.regs.find(0x0039) == rig.sim.regs.end());
+    CHECK_EQ(rig.sim.regs[0x003A], 179);
+  }
 }
 
 // A command is run with all its words or not at all. A word it does not take is refused, and
@@ -5491,6 +5628,35 @@ static void testWholeLines() {
   CHECK_EQ(rig.sim.regs[0xE022], lvd);
   rig.run("set EV_lvd 13.10");
   CHECK_HAS(rig.run("yes" + std::string(OV_LINE_MAX - 4, ' ')), "Written and read back: EV_lvd = 13.10 V");
+
+  // A NUL would end a line early for everything that reads it as text. A line that holds one is
+  // refused whole, wherever the NUL is, and as the answer to a question it cancels it. The PC
+  // preview passes one on as it comes; the USB line editor drops it and the web page refuses it.
+  const std::string nul = "That line holds a NUL byte, which no command takes. Nothing was done.\r\n";
+  const std::string timeoutBefore = rig.run("timeout");
+  const size_t quietNul = rig.sim.requests.size();
+  const std::string withNul[] = {std::string("status") + '\0',
+                                 std::string("timeout 1000") + '\0' + "0",
+                                 std::string(1, '\0'),
+                                 std::string(1, '\0') + "live",
+                                 std::string("  ") + '\0' + "  ",
+                                 std::string("live") + '\0' + std::string(400, 'x')};
+  for (size_t i = 0; i < sizeof(withNul) / sizeof(withNul[0]); ++i) {
+    const std::string out = rig.run(withNul[i]);
+    CHECK_MSG(out == nul, "line %u gave %s", (unsigned)i, out.c_str());
+  }
+  CHECK_EQ(rig.sim.requests.size(), quietNul);
+  CHECK(rig.run("timeout") == timeoutBefore);
+  const uint16_t written = rig.sim.regs[0xE022];
+  const std::string answers[] = {std::string("yes") + '\0', std::string("yes") + '\0' + "no", std::string(1, '\0')};
+  for (size_t i = 0; i < sizeof(answers) / sizeof(answers[0]); ++i) {
+    rig.run("set EV_lvd 13.00");
+    CHECK(rig.console.awaitingConfirmation());
+    CHECK_MSG(rig.run(answers[i]) == "Cancelled. Nothing was sent.\r\n", "answer %u", (unsigned)i);
+    CHECK(!rig.console.awaitingConfirmation());
+  }
+  CHECK_EQ(rig.sim.regs[0xE022], written);
+  CHECK_HAS(rig.run("status"), "Link");  // the same line without its NUL runs
 }
 
 static void testSnapshot() {

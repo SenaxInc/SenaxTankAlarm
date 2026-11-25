@@ -1180,7 +1180,7 @@ async function neverPauses(preview) {
 
 // The preview reads its options and its "sim" lines whole. strtol took "--port 8080typo" as port
 // 8080 and "--port nope" as 0, any free port, so a mistyped option could start it on another port
-// than the one asked for; a "sim" line with a word too many or half a number changes nothing.
+// than the one asked for; a "sim" line with a word too many, half a number or a NUL changes nothing.
 async function previewInput(preview) {
   for (const port of ['nope', '8080typo', '', ' 80', '80 ', '+80', '-1', '65536', '0x50', '1e3', '99999999999']) {
     const run = spawnSync(binary, ['--port', port], { encoding: 'utf8', timeout: 10000 });
@@ -1202,6 +1202,20 @@ async function previewInput(preview) {
   for (const line of wrong) {
     await preview.line(line, usage);
   }
+  // A NUL would end a line early for everything that reads it as text: 'sim delay 100' would run
+  // without its 'ms'. A line that holds one is refused whole, whatever it starts with, and as the
+  // answer to a question it cancels it.
+  const timeout = /Reply timeout: (\d+) ms\r\n/;
+  const timeoutBefore = (await preview.line('timeout', timeout))[1];
+  const nul = /That line holds a NUL byte, which no command takes\. Nothing was done\.\r\n/;
+  for (const line of ['sim battery 12\0.4', 'sim drop 2\0 3', 'sim power off\0', 'sim\0power off', 'sim delay 100\0ms',
+                      'timeout 1000\0 0', '\0']) {
+    await preview.line(line, nul);
+  }
+  checkEq((await preview.line('timeout', timeout))[1], timeoutBefore, 'the timeout is as it was');
+  await preview.line('set EV_lvd 13.00', /Type yes to write it\./);
+  await preview.line('yes\0', /Cancelled\. Nothing was sent\.\r\n/);
+  await preview.line('yes', /Nothing is waiting for a yes or a no\./);
   // Nothing changed: the battery reads as before, no reply was lost, and nothing was written.
   checkEq((await preview.line('get adc_vb_f', battery))[1], before, 'the battery is as it was');
   checkEq((await preview.line('status', noReply))[1], lost, 'every request got its reply');
