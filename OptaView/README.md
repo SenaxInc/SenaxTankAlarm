@@ -455,8 +455,18 @@ switch and the web page show it.
 Every member must have its JSON type. A limit written as `"0"`, a slave address as `2.0`, or a
 list or section of another kind (`"checks": {}`) is refused, by the sketch and by
 `check_profile.py`, where read with a default it would have fallen back to that default without
-a word: no lower limit, slave 1, no pair checks. `check_profile.py --selftest` shows that it
-refuses each of those, and the host tests run it.
+a word: no lower limit, slave 1, no pair checks. Nor is anything cut short: `decimals` is 0 to 6,
+`scaleCheck.alternates` holds at most 4 numerators, `scaleCheck.settings.setpoints` at most 24
+registers and `scaleCheck.live.regulating` at most 8 states, and a longer list is refused. An
+address or raw value written as text is decimal digits, or `0x` and hex digits, and nothing else
+(no sign, space or `_`).
+
+`check_profile.py` reads the file as the sketch's JSON parser does (no `NaN` or `Infinity`, a
+number of at most 63 characters, lists and objects at most 10 deep) and adds house rules of its
+own: every text, member names included, is printable ASCII, and every member is one the sketch
+reads, since the sketch ignores the others and a misspelt `"mn"` would leave a setting without its
+lower limit. `check_profile.py --selftest` shows that it refuses each of those and passes their
+edges, and the host tests run it.
 
 ## Tests
 

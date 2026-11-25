@@ -779,7 +779,11 @@ class OvProfile {
         }
         s.units = keep(v["units"] | "");
         const int decimals = v["decimals"] | 0;
-        s.decimals = (uint8_t)(decimals < 0 ? 0 : (decimals > 6 ? 6 : decimals));
+        if (decimals < 0 || decimals > 6) {
+          // The values are shown with at most 6 (ovFormatFixed): 9 would have shown 6 unseen.
+          return fail(error, errorCap, "\"decimals\" must be 0 to 6 on scale", s.name);
+        }
+        s.decimals = (uint8_t)decimals;
         ++scaleCount_;
       }
     }
@@ -909,7 +913,10 @@ class OvProfile {
                                               : (r.scale != nullptr ? r.scale->units : "");
       int decimals = r.scale != nullptr ? r.scale->decimals : 0;
       decimals = v["decimals"] | decimals;
-      r.decimals = (uint8_t)(decimals < 0 ? 0 : (decimals > 6 ? 6 : decimals));
+      if (decimals < 0 || decimals > 6) {
+        return fail(error, errorCap, "\"decimals\" must be 0 to 6 on register", name);
+      }
+      r.decimals = (uint8_t)decimals;
 
       const char *groupName = v["group"] | "other";
       r.group = internGroup(groupName, nullptr);
@@ -1117,7 +1124,15 @@ class OvProfile {
       if (!membersFit(sc, kScaleCheckMembers, "scaleCheck", nullptr, error, errorCap)) {
         return false;
       }
-      for (JsonVariantConst alt : sc["alternates"].as<JsonArrayConst>()) {
+      // A list longer than the room for it is refused: cut short, the numerators past the
+      // fourth would have dropped out of the comparison unseen. The same for the setpoints and
+      // the regulating states below.
+      JsonArrayConst alternates = sc["alternates"].as<JsonArrayConst>();
+      static_assert(sizeof(check.alternates) / sizeof(check.alternates[0]) == 4, "the message names 4");
+      if (alternates.size() > sizeof(check.alternates) / sizeof(check.alternates[0])) {
+        return fail(error, errorCap, "scaleCheck.alternates holds at most 4 numerators");
+      }
+      for (JsonVariantConst alt : alternates) {
         // A numerator that is not a number above 0 would drop out of the comparison unseen.
         if (!memberFits(alt, MEMBER_NUMBER) || !(alt.as<double>() > 0.0)) {
           return fail(error, errorCap, "scaleCheck.alternates must be numbers above zero");
@@ -1143,7 +1158,12 @@ class OvProfile {
           return fail(error, errorCap, "scaleCheck.settings.scale names no scale");
         }
         check.settingsFileNum = check.settingsScale->num;
-        for (JsonVariantConst item : settings["setpoints"].as<JsonArrayConst>()) {
+        JsonArrayConst setpoints = settings["setpoints"].as<JsonArrayConst>();
+        static_assert(sizeof(check.setpoints) / sizeof(check.setpoints[0]) == 24, "the message names 24");
+        if (setpoints.size() > sizeof(check.setpoints) / sizeof(check.setpoints[0])) {
+          return fail(error, errorCap, "scaleCheck.settings.setpoints names at most 24 registers");
+        }
+        for (JsonVariantConst item : setpoints) {
           const OvRegister *reg = findRegister(item.as<const char *>());
           if (reg == nullptr || reg->scale != check.settingsScale || reg->words != 1) {
             return fail(error, errorCap,
@@ -1214,7 +1234,12 @@ class OvProfile {
         if (check.state != nullptr && check.state->words != 1) {
           return fail(error, errorCap, "scaleCheck.live.state must be a one-word register");
         }
-        for (JsonVariantConst value : live["regulating"].as<JsonArrayConst>()) {
+        JsonArrayConst regulating = live["regulating"].as<JsonArrayConst>();
+        static_assert(sizeof(check.regulating) / sizeof(check.regulating[0]) == 8, "the message names 8");
+        if (regulating.size() > sizeof(check.regulating) / sizeof(check.regulating[0])) {
+          return fail(error, errorCap, "scaleCheck.live.regulating lists at most 8 states");
+        }
+        for (JsonVariantConst value : regulating) {
           if (!value.is<uint16_t>()) {
             // Skipped, it would leave the regulation test blind to that state without a word.
             return fail(error, errorCap, "scaleCheck.live.regulating must list state values from 0 to 65535");
