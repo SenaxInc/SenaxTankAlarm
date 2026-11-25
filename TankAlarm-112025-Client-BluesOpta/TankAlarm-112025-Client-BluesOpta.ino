@@ -197,6 +197,12 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #ifndef CLIENT_CONFIG_PATH
 #define CLIENT_CONFIG_PATH "/client_config.json"
 #endif
+// The largest config file a start loads (loadConfigFromFlash()), and so the largest one
+// saveConfigToFlash() writes. Each monitor takes about 1 KB of it, with every text at its
+// longest about 1.2 KB: MAX_MONITORS of them and the rest take under 11 KB.
+#ifndef CLIENT_CONFIG_MAX_BYTES
+#define CLIENT_CONFIG_MAX_BYTES 16384
+#endif
 
 // Persisted record of the firmware build sequence that last booted on this device.
 // Compared on boot to FIRMWARE_BUILD_SEQ to detect a just-installed firmware (OTA or USB)
@@ -1605,6 +1611,8 @@ static void handleChargerProgramRequest(JsonObjectConst program);
 static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId);
 static void retakeChargerProgramRequest(JsonObjectConst program);
 static void withdrawUnsuitedChargerProgram();
+static unsigned long sampleIntervalMs();
+static bool chargerRunWouldHoldSample();
 static bool serviceChargerProgramming(unsigned long now, bool allowed);
 static void sendDueChargerProgramReport(unsigned long now);
 static void recoverI2CBus();
@@ -2322,12 +2330,7 @@ void loop() {
 
   // ---- Power-state-aware sample interval ----
   // In ECO/LOW_POWER states, sample less frequently to conserve energy
-  unsigned long sampleInterval = (unsigned long)gConfig.sampleSeconds * 1000UL;
-  if (gPowerState == POWER_STATE_ECO) {
-    sampleInterval *= POWER_ECO_SAMPLE_MULTIPLIER;
-  } else if (gPowerState == POWER_STATE_LOW_POWER) {
-    sampleInterval *= POWER_LOW_SAMPLE_MULTIPLIER;
-  }
+  const unsigned long sampleInterval = sampleIntervalMs();
   // In CRITICAL_HIBERNATE, skip sampling entirely
   if (gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
     if (now - gLastTelemetryMillis >= sampleInterval) {
@@ -2438,7 +2441,8 @@ void loop() {
     // staged.
     const bool othersWant =
         (!chargerCheckHeldBack() && gSolarManager.chargerCheckActive()) ||
-        (!gDfuInProgress && gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
+        (!gDfuInProgress && !chargerRunWouldHoldSample() &&
+         gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
     solarPolled = !gSolarTurns.pollWaits(othersWant) && gSolarManager.poll(now);
     gSolarTurns.afterPoll(solarPolled, gSolarManager.lineResting());
     if (solarPolled) {
@@ -3594,7 +3598,7 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
     long fileSize = ftell(file);
     fseek(file, 0, SEEK_SET);
     
-    if (fileSize <= 0 || fileSize > 8192) {
+    if (fileSize <= 0 || fileSize > (long)CLIENT_CONFIG_MAX_BYTES) {
       fclose(file);
       return false;
     }
@@ -4062,36 +4066,51 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
   // Save config epoch
   doc["configEpoch"] = cfg.configEpoch;
 
+  // Nothing is written from a document that ran out of memory: it lacks what did not fit, and
+  // the next start would take that for the config. Nor a text longer than a start loads
+  // (CLIENT_CONFIG_MAX_BYTES): a start that cannot load the file writes the defaults over it.
+  // The text goes into a buffer of its own size. The 4 KB buffer this had cut off a config of
+  // three monitors or more, which the next start then replaced with the defaults. A save that
+  // fails leaves the file as it was, and persistConfigIfDirty() tries again.
+  if (doc.overflowed()) {
+    Serial.println(F("Failed to serialize config: out of memory"));
+    return false;
+  }
+  const size_t need = measureJson(doc);
+  if (need == 0 || need > CLIENT_CONFIG_MAX_BYTES) {
+    static size_t reported = 0;  // once for each size: the save is tried in every pass of loop()
+    if (need != reported) {
+      Serial.print(F("Failed to serialize config: "));
+      Serial.print((unsigned long)need);
+      Serial.print(F(" bytes, more than the "));
+      Serial.print((unsigned long)CLIENT_CONFIG_MAX_BYTES);
+      Serial.println(F(" a start loads"));
+      reported = need;
+    }
+    return false;
+  }
+  char *jsonBuf = (char *)malloc(need + 1);
+  if (jsonBuf == nullptr) {
+    Serial.println(F("Failed to serialize config: out of memory"));
+    return false;
+  }
+  const size_t len = serializeJson(doc, jsonBuf, need + 1);
+  bool written = false;
+  if (len != need) {
+    Serial.println(F("Failed to serialize config"));
+  } else {
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     // Mbed OS — atomic write-to-temp-then-rename
-    // Use fixed buffer instead of Arduino String to avoid heap fragmentation
-    char jsonBuf[4096];
-    size_t len = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (len == 0) {
-      Serial.println(F("Failed to serialize config"));
-      return false;
-    }
-    if (!tankalarm_posix_write_file_atomic("/cfg/client_config.json",
-                                            jsonBuf, len)) {
-      Serial.println(F("Failed to write config"));
-      return false;
-    }
-    return true;
+    written = tankalarm_posix_write_file_atomic("/cfg/client_config.json", jsonBuf, len);
   #else
-    // Use fixed buffer instead of Arduino String to avoid heap fragmentation
-    char jsonBuf[4096];
-    size_t len = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (len == 0) {
-      Serial.println(F("Failed to serialize config"));
-      return false;
-    }
-    if (!tankalarm_littlefs_write_file_atomic(CLIENT_CONFIG_PATH,
-            (const uint8_t *)jsonBuf, len)) {
-      Serial.println(F("Failed to write config"));
-      return false;
-    }
-    return true;
+    written = tankalarm_littlefs_write_file_atomic(CLIENT_CONFIG_PATH, (const uint8_t *)jsonBuf, len);
   #endif
+    if (!written) {
+      Serial.println(F("Failed to write config"));
+    }
+  }
+  free(jsonBuf);
+  return written;
 #else
   return false; // Filesystem not available
 #endif
@@ -5166,7 +5185,11 @@ static void attemptPendingConfigAckSend() {
 // already (retakeChargerProgramRequest()). It is acknowledged as an applied config is, when no
 // result of charger programming is in RAM alone (attemptPendingConfigAckSend()): that
 // acknowledgement stops the server from sending the config again, and with it the request. An
-// acknowledgement that waits already answers for this client.
+// acknowledgement that waits already answers for this client. While the config this client holds
+// is not in flash (gConfigDirty: its save failed, and the note came again because deleting it
+// failed too), the acknowledgement waits for persistConfigIfDirty(), as for a config just
+// applied: a restart would bring the config before it back, and the server would not send this
+// one again.
 static void answerRepeatedConfig(const JsonDocument &doc, uint32_t inboundTs, const char *cv) {
   if (inboundTs == gConfig.configEpoch) {
     retakeChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
@@ -5180,6 +5203,9 @@ static void answerRepeatedConfig(const JsonDocument &doc, uint32_t inboundTs, co
   strlcpy(gPendingConfigAckMessage, "Config bypassed: newer version already exists", sizeof(gPendingConfigAckMessage));
   gPendingConfigAckRetryAt = 0;
   gPendingConfigAckRetryDelayMs = 5000UL;
+  if (gConfigDirty) {
+    return;  // persistConfigIfDirty() sends it once flash has the config, or says that it failed
+  }
   attemptPendingConfigAckSend();
 }
 
@@ -5334,12 +5360,12 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       }
       Serial.println(F("Solar: runtime config refreshed (no transport restart)"));
     }
-
-    // Charger programming. The battery block above has been applied, and the link restarted
-    // if the transport changed, so the client's own refusals go by the new config. A config
-    // without "program" withdraws a request that waits.
-    handleChargerProgramRequest(solarCfg["program"].as<JsonObjectConst>());
   }
+  // Charger programming, for every config this client applies: one without "program", and so
+  // one without a "solarCharger" block, withdraws a request that waits. The battery block and
+  // the charger block above have been applied, and the link restarted if the transport changed,
+  // so the client's own refusals go by the new config.
+  handleChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
   // A request that waits goes on only while the client could still take it on.
   withdrawUnsuitedChargerProgram();
 
@@ -8175,8 +8201,9 @@ static void logChargerProgramWithdrawn(uint32_t requestId) {
   addSerialLog(line);
 }
 
-// A config's "solarCharger.program", or a null object for a config with a "solarCharger" block
-// but no program. Only a request with an id is acted on: the server adds one when a person asks
+// A config's "solarCharger.program", or a null object for a config without one (with or without
+// a "solarCharger" block): applyConfigUpdate() calls this for every config. Only a request with
+// an id is acted on: the server adds one when a person asks
 // for the values to be written, and the client answers each id once. The server also puts the
 // id of a request that has no result yet into each later config that asks for the same values,
 // so a config without that id (the values changed, or none are asked for) withdraws a request
@@ -8235,8 +8262,41 @@ static void withdrawUnsuitedChargerProgram() {
   }
 }
 
+// The time between two samples of the monitors, in the power state the client is in.
+static unsigned long sampleIntervalMs() {
+  unsigned long interval = (unsigned long)gConfig.sampleSeconds * 1000UL;
+  if (gPowerState == POWER_STATE_ECO) {
+    interval *= POWER_ECO_SAMPLE_MULTIPLIER;
+  } else if (gPowerState == POWER_STATE_LOW_POWER) {
+    interval *= POWER_LOW_SAMPLE_MULTIPLIER;
+  }
+  return interval;
+}
+
+// A run holds loop() for up to a minute (sunsaver::RUN_LIMIT_MS; about 10 seconds on a line that
+// answers), and with it the sampling of the monitors, which also decides their alarms. So the
+// run of a request does not start while the next sample is due within that minute: it starts
+// once that sample has been taken. Samples two minutes apart or less leave no such time, and
+// then a run may hold one up, by a minute at most. A look that a run left owed is not held (the
+// charger may wait for its restart), and nothing is held where no sample is due: in hibernation,
+// or without monitors.
+static bool chargerRunWouldHoldSample() {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  if (!programming.requestWaiting() || programming.dutyOwed() || gConfig.monitorCount == 0 ||
+      gPowerState == POWER_STATE_CRITICAL_HIBERNATE) {
+    return false;
+  }
+  const unsigned long interval = sampleIntervalMs();
+  if (interval <= 2UL * sunsaver::RUN_LIMIT_MS) {
+    return false;
+  }
+  const unsigned long since = millis() - gLastTelemetryMillis;
+  return since >= interval || interval - since <= sunsaver::RUN_LIMIT_MS;
+}
+
 // Call from every pass of loop(). `allowed` is false in a pass in which a poll talked to the
-// charger. A firmware update that is being staged holds programming back too, hibernation does
+// charger, and while the run of a request would hold up a sample (chargerRunWouldHoldSample()).
+// A firmware update that is being staged holds programming back too, hibernation does
 // not: a run reads the battery first and refuses one below the new LVR, and a charger that
 // waits for its restart after a run that was cut short should not wait any longer. Returns true
 // when it talked to the charger.
@@ -8262,8 +8322,18 @@ static bool serviceChargerProgramming(unsigned long now, bool allowed) {
       addSerialLog(line);
     }
   }
-  const bool talked = gSolarManager.serviceChargerProgramming(currentEpoch(), allowed && !gDfuInProgress);
+  const bool talked = gSolarManager.serviceChargerProgramming(
+      currentEpoch(), allowed && !gDfuInProgress && !chargerRunWouldHoldSample());
   if (talked) {
+    // The run held loop() for up to a minute, and its hook (switchOffRelaysTimeUp()) does not run
+    // after its last request. Before anything is reported, a relay whose time ran out goes off,
+    // and what waits for checkRelayMomentaryTimeout() goes out too: the command that switches a
+    // remote relay off and the alarm of a safety timeout. Not in hibernation, where loop() does
+    // not call it either.
+    switchOffRelaysTimeUp();
+    if (gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
+      checkRelayMomentaryTimeout(millis());
+    }
     // The charger may hold other settings now: check them again, and send that report at once.
     requestChargerCheck();
   }
@@ -8357,7 +8427,10 @@ static void sendDueChargerProgramReport(unsigned long now) {
   // (see sendDueChargerReport()). The supervisor knows the time when the clock was set as the
   // result came about. Otherwise it is worked out once, when the clock has one: from the millis()
   // of the result, which for a result kept across a restart is the moment of that restart. It
-  // goes out later than the last result of the same request did, whatever the clock did since.
+  // goes out later than the last result of the same request did, whatever the clock did since,
+  // and from then on it is the result's own (Supervisor::reportSending()): a restart that brings
+  // the result back sends it with that time again (a second later), not with the time of the
+  // restart.
   if (gChargerProgramReportEpoch == 0) {
     uint32_t epoch = programming.reportEpoch();
     if (epoch == 0) {
@@ -10861,9 +10934,11 @@ static void checkRelayMomentaryTimeout(unsigned long now) {
 // While a charger programming run holds loop() (up to a minute: sunsaver::RUN_LIMIT_MS),
 // checkRelayMomentaryTimeout() does not run. The run calls this before each of its requests and
 // while it rests (SolarManager::setChargerRunHook()): the output of a relay whose time is up goes
-// off at once. The rest waits for checkRelayMomentaryTimeout() in the next pass of loop(), which
-// finds the relay still due: the command that switches a remote relay off and the alarm of a
-// safety timeout, which go through the Notecard, and the relay's bookkeeping.
+// off at once. The rest waits for checkRelayMomentaryTimeout(), which finds the relay still due
+// and which serviceChargerProgramming() calls as soon as the run returns, with this once more for
+// a relay whose time ran out during the last request: the command that switches a remote relay
+// off and the alarm of a safety timeout, which go through the Notecard, and the relay's
+// bookkeeping.
 static void switchOffRelaysTimeUp() {
   const unsigned long now = millis();
   for (uint8_t r = 0; r < MAX_RELAYS; r++) {

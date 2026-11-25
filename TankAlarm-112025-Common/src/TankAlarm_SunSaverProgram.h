@@ -698,7 +698,9 @@ inline const char *noteText(uint16_t note) {
              "charger's LOAD terminals it cannot program the charger: power it from the battery.";
     case NOTE_TIME_LIMIT:
       return "The charger answered so slowly that the run reached its time limit and was cut short. Past it "
-             "nothing more is written, and a charger that was written to is still sent its restart.";
+             "nothing more is written. A charger that was written to is still sent its restart command, "
+             "unless a reply so slow left no time even for that: then the look that follows sends it if the "
+             "charger still waits for it.";
     case NOTE_NOT_ANSWERED:
       return "The charger did not answer when the client looked at it after its own restart, so it is not "
              "known whether the charger waits for a restart.";
@@ -1735,7 +1737,8 @@ struct Journal {
   uint32_t waitingId;    // the request that waits, or runs and has not reached a commit point; 0 for none
   bool reportDue;        // `report` has yet to go to the server
   uint32_t reportId;     // the request it answers
-  uint32_t reportEpoch;  // when it came about, in whole seconds; 0 when the client's clock was not set
+  uint32_t reportEpoch;  // when it came about, in whole seconds; while the client's clock was not set,
+                         // 0 until it goes out, and then the time it went out with (reportSending())
   ProgramResult report;
   bool lookDue;          // `look` has yet to go to the server: the result of a look for request 0
   uint32_t lookEpoch;    // when it came about, as reportEpoch
@@ -2089,8 +2092,9 @@ class Supervisor {
 
   // A result waits to be sent to the server: the request it answers (0 for a look, which answers
   // none), the client's millis() when it came about, and that moment as a time when the clock
-  // was set then (0 otherwise, or after a restart of the client: the time of reportMillis() is
-  // the best that is known). A newer result of the same request takes the place of one that was
+  // was set then (0 otherwise, until it goes out: reportSending(); before that, the time of
+  // reportMillis() is the best that is known, and after a restart of the client, that is the
+  // moment of the restart). A newer result of the same request takes the place of one that was
   // not sent yet, and so does the result of a newer request. A result of an older request never
   // does: the server keeps the newest request's anyway. A look has a place of its own, as at the
   // server, and only a newer look takes it. When both wait, the one that came about first goes
@@ -2115,21 +2119,33 @@ class Supervisor {
   // out with: the Notecard may take the result and the client restart before reportTaken() is in
   // flash, and a later result of the same request, or a later look, must still go out with a later
   // time. A newer result that takes the place of this one before it goes out keeps that time
-  // too. The result stays due until reportTaken(). Returns false when flash did not take the
-  // journal: a restart may then lose the time, as it would lose the result. Nothing is written
-  // when the journal in flash holds that time already.
+  // too. The result stays due until reportTaken(). A result that came about while the clock was
+  // not set has no time of its own (reportEpoch() is 0): from here on that time is its own, in
+  // the journal with it. A restart before reportTaken() then sends it again with the time it went
+  // out with, a second later (sendEpoch()), and not with the time of that restart: a later
+  // result of the same request, which went out meanwhile and which flash did not take, stays the
+  // later one at the server. Returns false when flash did not take the journal: a restart may
+  // then lose the time, as it would lose the result. Nothing is written when the journal in flash
+  // holds that time already.
   bool reportSending(uint32_t sentEpoch, uint32_t nowMs) {
     if (lookFirst()) {
-      if (journal_.lookSentEpoch == sentEpoch && !journalUnsaved_) {
+      if (journal_.lookSentEpoch == sentEpoch && journal_.lookEpoch != 0 && !journalUnsaved_) {
         return true;
       }
       journal_.lookSentEpoch = sentEpoch;
+      if (journal_.lookEpoch == 0) {
+        journal_.lookEpoch = sentEpoch;
+      }
     } else if (journal_.reportDue) {
-      if (journal_.sentId == journal_.reportId && journal_.sentEpoch == sentEpoch && !journalUnsaved_) {
+      if (journal_.sentId == journal_.reportId && journal_.sentEpoch == sentEpoch && journal_.reportEpoch != 0 &&
+          !journalUnsaved_) {
         return true;
       }
       journal_.sentId = journal_.reportId;
       journal_.sentEpoch = sentEpoch;
+      if (journal_.reportEpoch == 0) {
+        journal_.reportEpoch = sentEpoch;
+      }
     } else {
       return true;
     }

@@ -5686,6 +5686,81 @@ static void testSendTimeFirst() {
   }
 }
 
+// A result that came about while the client's clock was not set takes the time it first goes out
+// with as its own, in the journal with it (Supervisor::reportSending()). The Notecard does not
+// take it. The recovery that settles the run follows and reaches the Notecard while flash takes
+// nothing, and the client restarts an hour later. The first result comes back from flash and
+// goes out again with its own time, a second later, not with the time of the restart: the server
+// keeps the recovery. The client looks again, as its flash says it owes, and that result is the
+// latest. A look for no request the same way.
+static void testReplayKeepsItsTime() {
+  for (int look = 0; look < 2; ++look) {
+    Desk desk;
+    desk.flash = look == 1 ? ss::cautiousJournal() : journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.powered = false;
+    desk.notecardDown = true;  // nothing goes out by itself: this test sends
+    desk.clockSet = false;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.pass(supervisor));  // the look: the controller does not answer
+    CHECK(supervisor.reportDue() && supervisor.report().followUp);
+    CHECK_EQ(supervisor.reportRequestId(), look == 1 ? 0u : kRequestId);
+    CHECK_EQ(supervisor.reportEpoch(), 0u);
+    // The clock comes. The result goes out with the time worked out from millis(), as the client
+    // works it out (sendDueChargerProgramReport()), and the Notecard does not take it.
+    desk.advance(60000);
+    desk.clockSet = true;
+    const double at = desk.clock() - (double)(uint32_t)(desk.millisNow() - supervisor.reportMillis()) / 1000.0;
+    const uint32_t first = supervisor.sendEpoch(at >= 1.0 ? (uint32_t)at : 1u);
+    CHECK(supervisor.reportSending(first, desk.millisNow()));
+    CHECK_EQ(supervisor.reportEpoch(), first);
+    CHECK_EQ(look == 1 ? desk.flash.lookEpoch : desk.flash.reportEpoch, first);
+    // Once in flash, it is not written again.
+    size_t saves = desk.saves.size();
+    CHECK(supervisor.reportSending(first, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves);
+    // The controller answers again, and flash takes nothing from here: the recovery settles the
+    // run, and its result reaches the Notecard.
+    desk.sim.powered = true;
+    desk.failFrom = desk.saves.size();
+    desk.advance(ss::DUTY_RETRY_MS);
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.reportDue() && !supervisor.report().followUp);
+    const uint32_t settled = supervisor.sendEpoch(supervisor.reportEpoch());
+    CHECK(settled > first + 1);
+    CHECK(!supervisor.reportSending(settled, desk.millisNow()));
+    supervisor.reportTaken(settled, desk.millisNow());
+    CHECK(!supervisor.reportDue());
+    // Flash holds the first result, due, with its time, and the duty.
+    CHECK(look == 1 ? desk.flash.lookDue && desk.flash.lookEpoch == first
+                    : desk.flash.reportDue && desk.flash.reportEpoch == first && desk.flash.sentEpoch == first);
+    CHECK(desk.flash.phase == ss::JOURNAL_WRITING);
+    // The client restarts an hour later.
+    desk.failFrom = kNever;
+    desk.advance(3600000);
+    desk.notecardDown = false;
+    desk.floorFirst = true;
+    ss::Supervisor restarted;
+    desk.boot(restarted);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK(desk.reports[0].result.followUp);
+    CHECK_EQ(desk.reports[0].sent, first + 1);
+    CHECK(!ss::resultFollows((double)settled, settled, (double)desk.reports[0].sent, desk.reports[0].sent));
+    CHECK(look == 1 || !ss::programResultReplaces(true, kRequestId, (double)settled, settled, kRequestId,
+                                                  (double)desk.reports[0].sent, desk.reports[0].sent));
+    // The look the journal says is owed: the controller restarted already, and it settles again,
+    // later than either.
+    desk.advance(ss::DUTY_RETRY_MS);
+    desk.loopFor(restarted, 2 * ss::DUTY_RETRY_MS);
+    CHECK(!restarted.dutyOwed());
+    CHECK(desk.reports.size() >= 2);
+    CHECK(!desk.reports.back().result.followUp);
+    CHECK(desk.reports.back().sent > settled);
+    CHECK(ss::resultFollows((double)settled, settled, (double)desk.reports.back().sent, desk.reports.back().sent));
+  }
+}
+
 // Supervisor::wantsLine() in the plain cases. Desk::pass() checks it against service() in every
 // pass of every other test.
 static void testWantsLine() {
@@ -7513,6 +7588,8 @@ static void testText() {
     }
   }
   CHECK(has(ss::noteText(0), "no text for"));
+  // A run cut short by its time limit promises its restart command only where the time allowed it.
+  CHECK(has(ss::noteText(ss::NOTE_TIME_LIMIT), "then the look that follows sends it"));
   // The bits are where a server of another version expects them.
   CHECK_EQ(ss::REFUSE_PROFILE, 1u);
   CHECK_EQ(ss::REFUSE_NO_RESTART, 0x80u);
@@ -8391,6 +8468,7 @@ int main() {
   testSupervisor();
   testWantsLine();
   testSendTimeFirst();
+  testReplayKeepsItsTime();
   testWithdraw();
   testJournalKeeps();
   testJournalMaintenance();
