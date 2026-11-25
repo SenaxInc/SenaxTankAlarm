@@ -346,6 +346,17 @@ inline bool have(const Snapshot &snapshot, uint8_t index) {
   return index < ITEM_COUNT && snapshot.status[index] == SSIO_OK;
 }
 
+// A stored setting answered: an EEPROM register (one below SETTING_ITEMS). A pass completes
+// without one when the controller refuses them all.
+inline bool anySettingRead(const Snapshot &snapshot) {
+  for (uint8_t i = 0; i < SETTING_ITEMS; ++i) {
+    if (have(snapshot, i)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Reads the registers a few at a time, so that the caller's loop keeps running in between: one
 // register takes one request, and a request can take as long as the Modbus timeout.
 //
@@ -810,10 +821,14 @@ struct Evaluation {
 // to a raw word. The client's no-charge alert allows for it too (TankAlarm_Solar.cpp).
 static const double SETPOINT_TOLERANCE_VOLTS = 0.005;
 
+// A stored voltage under its range.
+inline bool belowRange(uint16_t raw, uint8_t scale, const VoltRange &range) {
+  return voltsFromRaw(raw, scale) < range.low - SETPOINT_TOLERANCE_VOLTS;
+}
+
 // One stored voltage against its range.
 inline bool outsideRange(uint16_t raw, uint8_t scale, const VoltRange &range) {
-  const double volts = voltsFromRaw(raw, scale);
-  return volts < range.low - SETPOINT_TOLERANCE_VOLTS || volts > range.high + SETPOINT_TOLERANCE_VOLTS;
+  return belowRange(raw, scale, range) || voltsFromRaw(raw, scale) > range.high + SETPOINT_TOLERANCE_VOLTS;
 }
 
 inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluation *out) {
@@ -917,6 +932,17 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
     const uint16_t ceiling = haveCeiling ? snapshot.raw[I_EVB_REF_LIM] : (uint16_t)0;
     if (!haveCeiling) {
       findings |= FINDING_NOT_READ;
+    }
+    // A ceiling under a range holds the battery under it in both banks whatever their voltages
+    // are (a float voltage of 0 leaves the battery at the absorption voltage, under the ceiling
+    // too), so it tells also when those did not answer.
+    if (judged && ceiling != 0) {
+      if (belowRange(ceiling, out->settingsScale.scale, absorb)) {
+        findings |= FINDING_ABSORB_RANGE;
+      }
+      if (belowRange(ceiling, out->settingsScale.scale, floating)) {
+        findings |= FINDING_FLOAT_RANGE;
+      }
     }
     const uint8_t setpoints[4] = {I_EV_REG, I_EV_REG2, I_EV_FLOAT, I_EV_FLOAT2};
     for (uint8_t i = 0; i < 4; ++i) {

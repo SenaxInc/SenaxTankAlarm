@@ -11,7 +11,8 @@
  * The compact report
  * ------------------
  *   lay   the layout of "r": sunsaver::REPORT_LAYOUT
- *   r     every register of the check, four hex digits each, in sunsaver::ItemIndex order
+ *   r     the registers of the check, four hex digits each, in sunsaver::ItemIndex order, up to
+ *         the last one the client asked
  *   nr    indexes of the registers that gave no value: the controller refused them or did not
  *         answer (left out when there are none)
  *   ch    Chemistry the settings were judged against
@@ -25,7 +26,8 @@
  *
  * Items are only ever added at the end of ItemIndex, so a report from a newer client decodes on
  * an older server (the extra registers are ignored) and the other way round (the registers the
- * older client did not read count as not read).
+ * older client did not read count as not read). The server keeps a report as it came: one from
+ * an older client stays as short (encodeReport()).
  *
  * Copyright (c) 2025-2026 Senax Inc. All rights reserved.
  */
@@ -42,18 +44,26 @@ namespace sunsaver {
 static const size_t REPORT_HEX_CHARS = (size_t)ITEM_COUNT * 4u;
 
 // Writes the compact report into `out`. Members that `out` already holds are left alone.
+//
+// The registers go up to the last one asked. A client asks them all, but a report the server
+// keeps from an older client, which knew fewer (decodeReport()), stays as short as it came: in
+// "nr" the registers that client did not ask would read back as refused.
 inline void encodeReport(const Snapshot &snapshot, const Evaluation &evaluation, JsonObject out) {
+  uint8_t asked = ITEM_COUNT;
+  while (asked > 1 && snapshot.status[asked - 1] == SSIO_NOT_READ) {
+    --asked;
+  }
   // A char array (not a pointer to const) makes every version of ArduinoJson 7 copy the text.
   char hex[REPORT_HEX_CHARS + 1];
   Text text(hex, sizeof(hex));
-  for (uint8_t i = 0; i < ITEM_COUNT; ++i) {
+  for (uint8_t i = 0; i < asked; ++i) {
     text.addHex16(have(snapshot, i) ? snapshot.raw[i] : (uint16_t)0);
   }
   out["lay"] = REPORT_LAYOUT;
   out["r"] = hex;
   bool anyMissing = false;
   JsonArray missing;
-  for (uint8_t i = 0; i < ITEM_COUNT; ++i) {
+  for (uint8_t i = 0; i < asked; ++i) {
     if (have(snapshot, i)) {
       continue;
     }
