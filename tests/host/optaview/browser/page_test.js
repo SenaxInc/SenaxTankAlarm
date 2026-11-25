@@ -537,7 +537,9 @@ async function settingsView(win, profile) {
   asked = await question(win);
   checkHas(asked, 'new  13.25 V', 'the reconnect voltage');
   checkHasnt(asked, 'must be above', 'the pair is in order with this value');
-  checkHas(asked, "('profile' repeats the notes on writing.)", 'the notes on writing are shown once');
+  checkHas(asked, "Before you write:\n  - Every EEPROM write raises the controller's 'EEPROM setting edit' fault",
+           'the notes on writing come with every question');
+  checkHasnt(asked, 'repeats the notes', 'in full');
   await yes(win);
   checkHas(await result(win), 'Written and read back: EV_lvr = 13.25 V [0x10F6]', 'the second write');
   await close(win);
@@ -1178,6 +1180,44 @@ async function neverPauses(preview) {
   check(performance.now() - asked < 2000, 'and the console answers again at once');
 }
 
+// The preview takes its terminal a line at a time and gives the web server its turn after each
+// one, as the Opta's loop() takes the USB port: lines that wait, as a paste does, must not keep
+// the page waiting until the last of them has run. A request that arrives while a slow command
+// runs is answered between the lines that wait behind it.
+async function lineAtATime(preview) {
+  const timeout = /Reply timeout: (\d+) ms\r\n/;
+  const timeoutBefore = (await preview.line('timeout', timeout))[1];
+  await preview.line('timeout 4000', /Reply timeout: 4000 ms\r\n/);
+  await preview.line('sim delay 1500', /sim: replies take 1500 ms\n/);
+  const answered = /(\d+) requests? answered since power-up\r\n/;
+  const before = Number((await preview.line('web', answered))[1]);
+  const from = preview.out.length;
+  preview.child.stdin.write('get adc_vb_f\nweb\nweb\nweb\n');  // a slow command, and three lines behind it
+  await pause(300);
+  const socket = net.connect(preview.port, '127.0.0.1');
+  let answer = '';
+  socket.on('connect', () => socket.write(`GET /api/session HTTP/1.1\r\nHost: 127.0.0.1:${preview.port}\r\n\r\n`));
+  socket.on('data', (data) => { answer += data.toString(); });
+  socket.on('error', () => {});
+  const closed = new Promise((resolve) => socket.on('close', resolve));
+  const counts = [];
+  let at = from;
+  for (let i = 0; i < 3; ++i) {
+    const found = await preview.waitFor(answered, at);
+    counts.push(Number(found[1]));
+    at += found.index + found[0].length;
+  }
+  await closed;
+  checkHas(answer, 'HTTP/1.1 200 ', 'the request that came while the slow command ran is answered');
+  checkHas(preview.out.slice(from, at), 'adc_vb_f ', 'the slow command ran first');
+  // The web server takes a connection on one turn and reads it on the next, so the request may
+  // be answered after the first of the lines that waited, but not after the last of them.
+  check(counts[0] >= before && counts[2] === before + 1,
+        `and it was answered before the last of the lines that waited behind that command: the counts were ${counts.join(', ')}, from ${before}`);
+  await preview.line('sim delay 20', /sim: replies take 20 ms\n/);
+  await preview.line(`timeout ${timeoutBefore}`, timeout);
+}
+
 // The preview reads its options and its "sim" lines whole. strtol took "--port 8080typo" as port
 // 8080 and "--port nope" as 0, any free port, so a mistyped option could start it on another port
 // than the one asked for; a "sim" line with a word too many, half a number or a NUL changes nothing.
@@ -1213,6 +1253,13 @@ async function previewInput(preview) {
     await preview.line(line, nul);
   }
   checkEq((await preview.line('timeout', timeout))[1], timeoutBefore, 'the timeout is as it was');
+  // Of a line longer than the console takes, the terminal keeps the start only, which is no
+  // command: it goes to the console whatever it starts with, which refuses it whole. Here
+  // 'sim delay 100' must not run without its 'ms'.
+  const tooLong = /That line is longer than the console takes \(159 characters and 24 words\)\. Nothing was done\.\r\n/;
+  await preview.line('sim delay 100' + ' '.repeat(147) + 'ms', tooLong);
+  await preview.line('sim delay 20' + ' '.repeat(148), tooLong);  // 160 characters: one too many
+  await preview.line('sim delay 20' + ' '.repeat(147), /sim: replies take 20 ms\n/);
   await preview.line('set EV_lvd 13.00', /Type yes to write it\./);
   await preview.line('yes\0', /Cancelled\. Nothing was sent\.\r\n/);
   await preview.line('yes', /Nothing is waiting for a yes or a no\./);
@@ -1254,6 +1301,8 @@ async function main() {
     await desktop.context.close();
     scenario = 'a sender that never pauses';
     await neverPauses(fresh);
+    scenario = 'the preview takes a line at a time';
+    await lineAtATime(fresh);
     scenario = 'the preview reads its input whole';
     await previewInput(fresh);
 

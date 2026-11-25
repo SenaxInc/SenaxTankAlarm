@@ -3689,7 +3689,7 @@ static void testWebConsole() {
     CHECK(w.console("yes", expert).text == kNotOpen);
     CHECK(w.console("yes", id).text == kNotOpen);
     CHECK_HAS(w.console("status").text, "expert off, trace off");
-    CHECK_HAS(w.console("set EV_lvd 12.60").text, "Before you write:");  // and the notes once more
+    CHECK_HAS(w.console("set EV_lvd 12.60").text, "Before you write:");  // as with every question
     CHECK_EQ(w.rig.sent(0x06), 6);
     // The same when the session is ended from the USB side, or runs out.
     const std::string open = str(w.console("set EV_lvd 12.60").json["question"]);

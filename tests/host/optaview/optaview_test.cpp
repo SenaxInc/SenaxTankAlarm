@@ -7,6 +7,10 @@
 
 #include "test_support.h"
 
+#include <sys/ioctl.h>
+
+#include "preview_terminal.h"
+
 // ============================================================================
 // Modbus master
 // ============================================================================
@@ -2817,6 +2821,29 @@ static std::string typeInto(OvLineEditor &editor, StringOut &echo, const std::st
   return lines;
 }
 
+// Characters that wait at a port. Once they are used up, read() says that none is waiting; an
+// endless one starts over instead, as a program at the other end that never stops sending.
+struct StringKeys : OvKeys {
+  std::string keys;
+  size_t at;
+  bool endless;
+  size_t reads;  // calls of read(), the ones that found nothing included
+
+  explicit StringKeys(const std::string &text, bool forEver = false)
+      : keys(text), at(0), endless(forEver), reads(0) {}
+
+  int read() override {
+    ++reads;
+    if (at == keys.size()) {
+      if (!endless || keys.empty()) {
+        return -1;
+      }
+      at = 0;
+    }
+    return (unsigned char)keys[at++];
+  }
+};
+
 static void testLineEditor() {
   {  // Nothing is typed until a character that counts arrives, and again after each Enter.
     OvLineEditor editor;
@@ -2910,6 +2937,68 @@ static void testLineEditor() {
     editor.lineFeedTaken();  // the sketch took the LF while a command ran
     CHECK(typeInto(editor, echo, "\n") == "|");
   }
+  {  // take(): what waits at the port, as far as the end of a line. The sketch runs that line and
+     // gives the web page its turn before it takes more.
+    OvLineEditor editor;
+    StringOut echo;
+    StringKeys keys("live\r\nprobe\n\nstatus");
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "live");
+    CHECK_EQ(keys.at, 5);  // up to the CR: the LF waits, as it did while a command ran
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "probe");  // the LF was the other half of that Enter
+    CHECK_EQ(keys.at, 12);
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "");
+    CHECK_EQ(keys.at, 13);
+    CHECK(!editor.take(keys, echo));  // "status" has no end yet
+    CHECK_EQ(keys.at, keys.keys.size());
+    CHECK(!editor.empty());
+    const size_t looks = keys.reads;
+    CHECK(!editor.take(keys, echo));  // nothing waits: one look, and back
+    CHECK_EQ(keys.reads, looks + 1);
+    keys.keys += "\n";
+    CHECK(editor.take(keys, echo));
+    CHECK(std::string(editor.line()) == "status");
+    CHECK(echo.text == "live\r\nprobe\r\n\r\nstatus\r\n");
+  }
+  {  // A port that never stops sending gives OV_KEYS_PER_TAKE characters to each take(), and one
+     // line at most, however short its lines are.
+    OvLineEditor editor;
+    StringOut echo;
+    StringKeys endless("x", true);
+    CHECK(!editor.take(endless, echo));
+    CHECK_EQ(endless.reads, OV_KEYS_PER_TAKE);
+    CHECK(!editor.take(endless, echo));
+    CHECK_EQ(endless.reads, 2 * OV_KEYS_PER_TAKE);
+    CHECK_EQ(echo.text.size(), 2 * OV_KEYS_PER_TAKE);
+    OvLineEditor other;
+    StringKeys lines("ab\n", true);
+    for (size_t i = 1; i <= 3; ++i) {
+      CHECK(other.take(lines, echo));
+      CHECK(std::string(other.line()) == "ab");
+      CHECK_EQ(lines.reads, 3 * i);
+    }
+    // A line longer than one take() ends in a later one.
+    OvLineEditor third;
+    StringKeys longer(std::string(OV_KEYS_PER_TAKE + 10, 'y') + "\n");
+    CHECK(!third.take(longer, echo));
+    CHECK_EQ(longer.at, OV_KEYS_PER_TAKE);
+    CHECK(third.take(longer, echo));
+    CHECK(std::string(third.line()) == std::string(OV_KEYS_PER_TAKE + 10, 'y'));
+  }
+  {  // Through the console: a paste of a question and its answer, a line per take().
+    Rig rig;
+    OvLineEditor editor;
+    StringKeys keys("set EV_lvd 13.10\r\nyes\r\n");
+    CHECK(editor.take(keys, rig.out));
+    CHECK_HAS(rig.run(editor.line()), "Type yes to write it.");
+    CHECK_EQ(rig.sent(0x06), 0);
+    CHECK(editor.take(keys, rig.out));
+    CHECK_HAS(rig.run(editor.line()), "Written and read back: EV_lvd = 13.10 V");
+    CHECK(!editor.take(keys, rig.out));
+    CHECK_EQ(keys.at, keys.keys.size());
+  }
   {  // Through the console: what a terminal session looks like, CR LF line ends included.
     Rig rig;
     OvLineEditor editor;
@@ -2926,6 +3015,115 @@ static void testLineEditor() {
     CHECK_HAS(rig.out.text, "Written and read back: EV_lvd = 13.10 V [0x10C5]");
     CHECK_EQ(rig.sim.regs[0xE022], 0x10C5);
   }
+}
+
+// The PC preview's terminal (preview_terminal.h), which stands for the USB port there, on a pipe.
+static void testPreviewTerminal() {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    CHECK_MSG(false, "no pipe: %s", strerror(errno));
+    return;
+  }
+  const auto put = [&](const std::string &text) {
+    CHECK_EQ(write(fds[1], text.data(), text.size()), text.size());
+  };
+  const auto unread = [&]() {
+    int count = -1;
+    CHECK_EQ(ioctl(fds[0], FIONREAD, &count), 0);
+    return count;
+  };
+  const size_t chunk = PreviewTerminal::CHUNK;
+  std::string line;
+  {  // Lines end with LF or CR LF; a line without its end counts as a key press, not as a line.
+    PreviewTerminal terminal(fds[0]);
+    CHECK(!terminal.takeLine(&line));
+    CHECK(!terminal.inputPending());
+    put("live\r\nprobe\n\nstatus");
+    CHECK(terminal.takeLine(&line) && line == "live");
+    CHECK_EQ(terminal.waiting(), 2);
+    CHECK(terminal.takeLine(&line) && line == "probe");
+    CHECK(terminal.takeLine(&line) && line.empty());
+    CHECK(!terminal.takeLine(&line));
+    CHECK(terminal.inputPending());
+    put("\n");
+    CHECK(terminal.takeLine(&line) && line == "status");
+    CHECK(!terminal.inputPending());
+    CHECK(terminal.open());
+  }
+  {  // It reads a chunk at a time, and only when no whole line waits: what a terminal sends
+     // without a pause stays in the pipe while the lines that came first are run.
+    PreviewTerminal terminal(fds[0]);
+    std::string text;
+    for (int i = 0; i < 300; ++i) {
+      text += "ab\n";
+    }
+    put(text);
+    CHECK(terminal.takeLine(&line) && line == "ab");
+    CHECK_EQ(unread(), text.size() - chunk);
+    CHECK_EQ(terminal.waiting(), chunk / 3 - 1);  // the whole lines of the chunk, but the one taken
+    for (size_t i = 0; i + 1 < chunk / 3; ++i) {
+      CHECK(terminal.takeLine(&line) && line == "ab");
+    }
+    CHECK_EQ(unread(), text.size() - chunk);  // none of those read more
+    CHECK(terminal.inputPending());           // a key press is there, and it took nothing
+    CHECK_EQ(unread(), text.size() - chunk);
+    size_t lines = chunk / 3;
+    while (terminal.takeLine(&line)) {
+      CHECK(line == "ab");
+      ++lines;
+    }
+    CHECK_EQ(lines, 300);
+    CHECK_EQ(unread(), 0);
+  }
+  {  // Of a line that does not end it keeps OV_LINE_MAX characters, one more than the console
+     // takes, so that the line is still too long when it ends.
+    PreviewTerminal terminal(fds[0]);
+    put(std::string(5000, 'x'));
+    for (int i = 0; i < 30; ++i) {
+      CHECK(!terminal.takeLine(&line));
+    }
+    CHECK_EQ(unread(), 0);
+    put("y\r\nok\r\n");
+    CHECK(terminal.takeLine(&line));
+    CHECK(line == std::string(OV_LINE_MAX, 'x'));
+    CHECK(terminal.takeLine(&line) && line == "ok");
+    put(std::string(OV_LINE_MAX - 1, 'z') + "\r\n");  // as long as a console line can be
+    CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX - 1, 'z'));
+    put(std::string(OV_LINE_MAX, 'z') + "\r\n");      // one more: its CR is not kept, and it is too long
+    CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX, 'z'));
+  }
+  {  // A NUL is kept: the preview gives that line to the console, which refuses it whole.
+    PreviewTerminal terminal(fds[0]);
+    put(std::string("sim\0delay 100\n", 14));
+    CHECK(terminal.takeLine(&line) && line == std::string("sim\0delay 100", 13));
+  }
+  {  // The key press that stops a command takes along what came with it, but not without end.
+    PreviewTerminal terminal(fds[0]);
+    put("stop\nlive\npart");
+    terminal.discardInput();
+    CHECK(!terminal.takeLine(&line));
+    CHECK(!terminal.inputPending());
+    put(std::string(chunk * (PreviewTerminal::DISCARD_CHUNKS + 2), '\n'));
+    terminal.discardInput();
+    CHECK_EQ(unread(), 2 * chunk);
+    size_t lines = 0;
+    while (terminal.takeLine(&line)) {
+      ++lines;
+    }
+    CHECK_EQ(lines, 2 * chunk);
+  }
+  {  // When the other end closes, the terminal is gone; the preview still serves the page.
+    PreviewTerminal terminal(fds[0]);
+    put("last\n");
+    close(fds[1]);
+    CHECK(terminal.takeLine(&line) && line == "last");
+    CHECK(terminal.open());
+    CHECK(!terminal.takeLine(&line));
+    CHECK(!terminal.open());
+    CHECK(!terminal.inputPending());
+    terminal.discardInput();
+  }
+  close(fds[0]);
 }
 
 static void testConsoleBasics() {
@@ -3223,8 +3421,13 @@ static void testConsoleSet() {
     CHECK_HAS(second, "\r\n  the LVD in effect.\r\n  now  ");
     CHECK_HAS(lineWith(second, "  new  "), "[0x10C5]");
     CHECK_HASNT(second, "Careful: Low voltage reconnect");  // 13.10 is below the new LVR
-    CHECK_HASNT(second, "Before you write:");               // the notes were shown once
-    CHECK_HAS(second, "'profile' repeats the notes on writing");
+    // The notes on writing come with every question: each write raises the EEPROM fault, and
+    // the Opta has to be powered from the battery for each one.
+    CHECK_HAS(second, "Before you write:");
+    CHECK_HAS(second, "'EEPROM setting edit' fault");
+    CHECK_HAS(second, "Power this Opta from the battery");
+    CHECK_HAS(second, "DIP switch 2 ON.\r\nType yes to write it.");
+    CHECK_HASNT(second, "repeats the notes");
     CHECK_HAS(rig.run("YES"), "Written and read back: EV_lvd = 13.10 V [0x10C5]");
     CHECK_EQ(rig.sim.regs[0xE022], 0x10C5);
     CHECK_HAS(rig.run("status"), "Settings were changed in this session");
@@ -4370,8 +4573,28 @@ static void testConsoleRawAndExpert() {
   CHECK_HAS(rig.run("status"), "expert on");
   const std::string ask = rig.run("raw 1 6 0xE022 0x10C5");
   CHECK_HAS(ask, "Write 0x10C5 to address 0xE022 on slave 1 with function 6?");
+  // A register is a setting: the notes on writing come before the question, as with 'set', and
+  // every time.
+  const std::string notes =
+      "  Before you write:\r\n"
+      "  - Every EEPROM write raises the controller's 'EEPROM setting edit' fault until the controller is\r\n";
+  const std::string unchecked = "No limits apply and nothing is checked first.\r\n" + notes;
+  CHECK_HAS(ask, unchecked.c_str());
+  CHECK_HAS(ask, "DIP switch 2 ON.\r\nType yes to send it.");
   CHECK_EQ(rig.sim.requests.size(), before);
   CHECK_HAS(rig.run("nope"), "Cancelled");
+  CHECK_HAS(rig.run("raw 1 16 0xE022 1"), unchecked.c_str());
+  rig.run("no");
+  CHECK_HAS(rig.run("raw 1 6 0xE022 0x10C5"), notes.c_str());
+  rig.run("no");
+  // A request OptaView cannot read may write one as well. A coil switches and stores nothing.
+  CHECK_HAS(rig.run("raw 1 0x2B 0E 01 00"), ("nothing is checked.\r\n" + notes).c_str());
+  rig.run("no");
+  const std::string coilAsk = rig.run("raw 1 5 1 0xFF00");
+  CHECK_HAS(coilAsk, "No limits apply and nothing is checked first.\r\nType yes to send it.");
+  CHECK_HASNT(coilAsk, "Before you write");
+  rig.run("no");
+  CHECK_EQ(rig.sim.requests.size(), before);
   CHECK_EQ(rig.sim.regs[0xE022], 0x0EB8);
   // In expert mode too, neither the address nor the value of a write wraps round into range.
   CHECK_HAS(rig.run("raw 1 6 0x1E022 0x10C5"), "Usage: raw");
@@ -6114,7 +6337,7 @@ static void testTwoConsoles() {
     CHECK(rig.master.trace == &web.console);
     CHECK(web.console.traceOn());
     CHECK_HAS(lineWith(web.run("status"), "Modes"), "expert on, trace on");
-    CHECK_HASNT(web.run("set EV_lvd 12.00"), "Before you write:");
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");  // the notes come every time
     CHECK(web.console.awaitingConfirmation());
     web.console.newVisitor();
     CHECK(!web.console.awaitingConfirmation());
@@ -6122,7 +6345,7 @@ static void testTwoConsoles() {
     CHECK(rig.master.trace == nullptr);
     CHECK_HAS(web.run("yes"), "Nothing is waiting for a yes or a no.");
     CHECK_HAS(web.run("raw 1 6 0xE022 0x1000"), "Only functions 1 to 4 are open here.");
-    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");  // the notes on writing, once more
+    CHECK_HAS(web.run("set EV_lvd 12.00"), "Before you write:");
     web.run("no");
     CHECK_HAS(web.run("live"), "not confirmed on this controller");
     web.console.newVisitor();
@@ -6261,6 +6484,7 @@ int main() {
   testReadsAndFallback();
   testProbe();
   testLineEditor();
+  testPreviewTerminal();
   testConsoleBasics();
   testConsoleReads();
   testConsoleSet();
