@@ -781,7 +781,8 @@ async function toolsView(win, profile) {
   const commands = win.requests.length;
   await page.fill('#consoleLine', 'get adc_vb_f' + ' '.repeat(150) + '1');
   await page.press('#consoleLine', 'Enter');
-  await page.waitForFunction(() => document.querySelector('#toast').classList.contains('show'));
+  await page.waitForFunction(() => document.querySelector('#toast').classList.contains('show'), null,
+    { timeout: 3000 }).catch(() => {});  // the check below says what came instead
   checkEq(await toast(win), 'A command is one line of plain text, at most 159 characters.', 'a line too long is refused');
   checkEq(win.requests.length, commands, 'and not sent in part');
   await page.fill('#consoleLine', '');

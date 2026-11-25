@@ -3161,6 +3161,12 @@ static void testPreviewTerminal() {
     terminal.discardInput();          // a key press whose line had not ended: its end is its own
     put("\nstatus\n");
     CHECK(terminal.takeLine(&line) && line == "status");
+    put(std::string(limit + 10, 'z'));
+    terminal.discardInput();
+    put(std::string(limit, 'z') + "\nlive\n");
+    terminal.discardInput();          // a second key press before the rest of that line was in:
+    CHECK_EQ(unread(), 16);           // all it read was more of that line, and so is what is left
+    CHECK(terminal.takeLine(&line) && line == "live");
   }
   {  // When the other end closes, the terminal is gone; the preview still serves the page.
     PreviewTerminal terminal(fds[0]);
