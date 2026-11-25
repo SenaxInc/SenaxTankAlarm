@@ -843,7 +843,10 @@ struct MonitorRuntime {
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
-  bool lastLoopPowerOk;         // result of the last loop power-up (v2.1.0: DAC loop-power config)
+  bool sampleStandsIn;          // True when this cycle's reading is a pulse monitor's from before a
+                                // charger programming run: neither a measurement nor a failed read
+                                // (readPulseSensor(), sampleMonitors())
+  bool lastLoopPowerOk;        // result of the last loop power-up (v2.1.0: DAC loop-power config)
   bool clipSuspected;           // v2.1.3: last mA reading may be supply-voltage clipped (see assessLoopClipping)
   float lastSupplyVoltage;      // v2.1.3: loop supply voltage used for the clip assessment (0 = unknown)
   float lastReportedValue;   // Last value pushed via change-based telemetry (monitor's own unit)
@@ -1220,7 +1223,7 @@ static bool gRpmAccumulatedInitialized[MAX_MONITORS] = {false};
 // (restartPulseCountsAfterChargerRun()).
 static bool gRpmAccumulatedCutByRun[MAX_MONITORS] = {false};
 // From a charger programming run that cut into a monitor's count until a count that started after
-// the run gives its result: the monitor reads as before the run, and that reading is not a new
+// the run measures something: the monitor reads as before the run, and that reading is not a new
 // measurement (readPulseSensor()).
 static bool gRpmReadingBeforeRun[MAX_MONITORS] = {false};
 
@@ -1367,7 +1370,8 @@ struct PulseSamplerContext {
   // Result
   float resultRpm;
   bool resultReady;
-  bool resultStandsIn;  // the result is the last reading: a run cut into the count
+  bool resultStandsIn;  // the result is the last reading, and measures nothing: a run cut into the
+                        // count, or a count of the time between two pulses saw no second one
 };
 
 static PulseSamplerContext gPulseSampler[MAX_MONITORS];
@@ -1532,7 +1536,9 @@ static bool pollPulseSampler(uint8_t idx) {
       ctx.lastPinState = lastState;
     }
 
-    // Early exit if we got both pulses, or time is up
+    // Early exit if we got both pulses, or time is up. Without a period the last reading stands
+    // in for a result: it measures nothing (resultStandsIn), which readPulseSensor() heeds after a
+    // charger programming run.
     if (ctx.secondPulseDetected || timeUp) {
       if (ctx.secondPulseDetected) {
         unsigned long period = ctx.secondPulseTime - ctx.firstPulseTime;
@@ -1540,9 +1546,11 @@ static bool pollPulseSampler(uint8_t idx) {
           ctx.resultRpm = MS_PER_MINUTE / ((float)period * (float)ctx.pulsesPerRev);
         } else {
           ctx.resultRpm = gRpmLastReading[idx];
+          ctx.resultStandsIn = true;
         }
       } else {
         ctx.resultRpm = gRpmLastReading[idx]; // Keep last reading
+        ctx.resultStandsIn = true;
       }
       ctx.resultReady = true;
       ctx.state = PULSE_STATE_COMPLETE;
@@ -1959,6 +1967,7 @@ void setup() {
     gMonitorState[i].currentSensorVoltage = 0.0f;
     gMonitorState[i].lastReadingEpoch = 0.0;
     gMonitorState[i].sampleReused = false;
+    gMonitorState[i].sampleStandsIn = false;
     gMonitorState[i].lastReportedValue = -9999.0f;
     gMonitorState[i].lastDailySentValue = -9999.0f;
     gMonitorState[i].highAlarmLatched = false;
@@ -6565,13 +6574,17 @@ static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx) {
   pollPulseSampler(idx);
 
   // A charger programming run cut into this monitor's count: until a count that started after the
-  // run gives its result, the reading is the one from before the run, and is not a new measurement
-  // (restartPulseCountsAfterChargerRun()). Nor is the result of the count the run cut into.
+  // run measures something, the reading is the one from before the run, and is not a new
+  // measurement (restartPulseCountsAfterChargerRun()). Nor is a result that only stands in for one
+  // (resultStandsIn): that of the count the run cut into, and that of a count of the time between
+  // two pulses that saw no second one, which is the reading from before the run again.
+  // sampleMonitors() neither validates such a reading nor takes it for an unload (sampleStandsIn).
   if (gRpmReadingBeforeRun[idx]) {
     if (pctx.resultReady && !pctx.resultStandsIn) {
       gRpmReadingBeforeRun[idx] = false;
     } else {
       gMonitorState[idx].sampleReused = true;
+      gMonitorState[idx].sampleStandsIn = true;
     }
   }
 
@@ -6590,6 +6603,7 @@ static float readMonitorSensor(uint8_t idx) {
 
   // Default to fresh each cycle; specific sensor paths mark reuse when needed.
   gMonitorState[idx].sampleReused = false;
+  gMonitorState[idx].sampleStandsIn = false;
 
   const MonitorConfig &cfg = gConfig.monitors[idx];
 
@@ -6643,7 +6657,13 @@ static void sampleMonitors() {
     float inches = readMonitorSensor(i);
 
     // Validate sensor reading
-    if (!validateSensorReading(i, inches)) {
+    if (gMonitorState[i].sampleStandsIn) {
+      // A pulse monitor's reading from before a charger programming run (readPulseSensor()): no new
+      // measurement, and no failed read either. It is not validated, so it counts towards no stuck
+      // sensor, no failure and no recovery, and the last valid value stands. Marked reused, it
+      // keeps its time and evaluateAlarms() holds its counters; the unload is not evaluated.
+      inches = gMonitorState[i].currentValue;
+    } else if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
       inches = gMonitorState[i].currentValue;
       gMonitorState[i].sampleReused = true;
@@ -6657,7 +6677,7 @@ static void sampleMonitors() {
     if (!deferPublishes) {
       // No current-loop monitor present: keep the original interleaved evaluate + publish.
       evaluateAlarms(i);
-      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed) {
+      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleStandsIn) {
         evaluateUnload(i);
       }
       if (gConfig.monitors[i].enableServerUpload && !gMonitorState[i].sensorFailed) {
@@ -6686,8 +6706,9 @@ static void sampleMonitors() {
     const float inches = gMonitorState[i].currentValue;
     evaluateAlarms(i);
 
-    // Evaluate tank unload if tracking is enabled for this tank
-    if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed) {
+    // Evaluate tank unload if tracking is enabled for this tank (not for a pulse monitor's reading
+    // from before a charger programming run, see Phase A)
+    if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleStandsIn) {
       evaluateUnload(i);
     }
 
@@ -8128,7 +8149,8 @@ static void keepChargerLookAfterLostFiles() {
 // before it writes another). A journal, or such a .tmp, that is there and does not open or does
 // not read (readChargerJournalFile() tries three times), or runs out of memory as it is read, is
 // kept aside (keepUnreadChargerJournal()), and the charger gets a look. So it does for a file that
-// holds no journal (which is not kept: it never reads as more than that), when there is no flash
+// holds no journal (which is not kept: it never reads as more than that; the look goes to the
+// controller the config names, also when a journal kept aside owes another one), when there is no flash
 // to read it from, and when the flash lost its files at this start (keepChargerLookAfterLostFiles()
 // writes the cautious journal for it). The cautious journal also says that the record of the
 // requests answered was lost at this start, so that a request asked for before it is refused,
@@ -8207,9 +8229,19 @@ static sunsaver::Journal loadChargerJournal() {
     return takeKeptChargerJournal(cautious, false);
   }
   sunsaver::Journal journal = sunsaver::cautiousJournal();
-  const bool readable = parsed == DeserializationError::Ok;
+  const bool readable = parsed == DeserializationError::Ok && sunsaver::holdsJournal(doc.as<JsonObjectConst>());
   if (readable) {
     journal = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
+  } else {
+    // A file that holds no journal (text that does not parse, or one that is not a journal) is
+    // not kept aside: it never reads as more than that. The cautious look stands for it, and so is
+    // owed to the controller the config names, as for a journal that does not read beside one kept
+    // aside (above). A look that a journal kept aside at an earlier start owes another controller
+    // then follows this one (sunsaver::keptDutyLeftOut(), takeKeptChargerDuty()), and does not take
+    // its place, which would leave the controller the config names waiting for its restart. The
+    // cautious journal that keepUnreadChargerJournal() writes names no controller, and reads as
+    // such: it stands for the journal it kept aside, whose look takes its place once that one reads.
+    journal.controller = gConfig.solarCharger.modbusSlaveId;
   }
 #if TANKALARM_SUNSAVER_PROGRAMMING
   if (journal.phase != sunsaver::JOURNAL_IDLE) {
@@ -8597,9 +8629,11 @@ static bool chargerRunWouldHoldSample() {
 // read low, which could raise a low alarm. So a count of pulses or of the time between them that
 // is under way is started again by the sample that follows, and an accumulated count gives no
 // result this once: the last reading stands, and the next count starts as after any result.
-// Until a count that started after the run gives its result, the monitor reads as before the run,
-// and that reading is marked reused, as one that is not a new measurement: it neither latches nor
-// clears an alarm, and does not count as a reading taken now (readPulseSensor()).
+// Until a count that started after the run measures something (a count of the time between two
+// pulses that sees no second one gives the last reading again), the monitor reads as before the
+// run, and that reading is marked reused, as one that is not a new measurement: it neither latches
+// nor clears an alarm, counts towards no stuck sensor, failure or recovery and no unload, and does
+// not count as a reading taken now (readPulseSensor(), sampleMonitors()).
 // takeSampleDueAfterChargerRun() calls this only after a run that held up a sample: one that held
 // up none took no such moment.
 static void restartPulseCountsAfterChargerRun() {

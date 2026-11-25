@@ -3244,6 +3244,15 @@ static JsonDocument parsed(const std::string &json) {
   return doc;
 }
 
+// A journal as its file holds it.
+static std::string journalText(const ss::Journal &journal) {
+  JsonDocument doc;
+  ss::encodeJournal(journal, doc.to<JsonObject>());
+  std::string text;
+  serializeJson(doc, text);
+  return text;
+}
+
 // "solarCharger.program" as the config generator sends it for the recommended values, with one
 // member replaced, or left out when `replacement` is null.
 static std::string requestJson(const char *replaceKey = nullptr, const char *replacement = nullptr) {
@@ -3676,7 +3685,9 @@ static void testRequestJson() {
       CHECK_MSG(length + 64 > ss::JOURNAL_JSON_MAX, "the longest journal is %zu characters: the bound is loose", length);
     }
 
-    // A file that is no journal: the client may owe the controller a restart.
+    // A file that is no journal: the client may owe the controller a restart. It holds no journal
+    // (holdsJournal()), so the client owes that look to the controller its config names, beside a
+    // journal kept aside too (its loadChargerJournal()).
     static const char *const kNoJournals[] = {"{}",
                                               "{\"req\":5}",
                                               "{\"ph\":1}",
@@ -3695,9 +3706,35 @@ static void testRequestJson() {
       const ss::Journal in = ss::decodeJournal(file.as<JsonObjectConst>());
       CHECK_MSG(in.phase == ss::JOURNAL_WRITING && in.requestId == 0, "%s reads as phase %u of request %u", kNoJournals[i],
                 (unsigned)in.phase, (unsigned)in.requestId);
+      CHECK_MSG(!ss::holdsJournal(file.as<JsonObjectConst>()), "%s holds a journal", kNoJournals[i]);
+      CHECK_MSG(journalText(in) == journalText(ss::cautiousJournal()), "%s reads as more than the cautious journal",
+                kNoJournals[i]);
     }
+    CHECK(!ss::holdsJournal(JsonObjectConst()));
     JsonDocument idle = parsed("{\"req\":0,\"ph\":0,\"more\":true}");
     CHECK_EQ(ss::decodeJournal(idle.as<JsonObjectConst>()).phase, ss::JOURNAL_IDLE);
+    CHECK(ss::holdsJournal(idle.as<JsonObjectConst>()));
+    // Every journal that encodeJournal() writes holds one, the cautious journal among them: the
+    // client's keepUnreadChargerJournal() writes that one for a journal it kept aside, and it names
+    // no controller, so that the kept one's look takes its place once that one reads.
+    {
+      ss::Journal busy = ss::emptyJournal();
+      busy.requestId = kRequestId;
+      busy.phase = ss::JOURNAL_RESTARTING;
+      busy.controller = 7;
+      const ss::Journal kinds[] = {ss::emptyJournal(), ss::cautiousJournal(), busy};
+      for (const ss::Journal &kind : kinds) {
+        const std::string text = journalText(kind);
+        JsonDocument file = parsed(text);
+        CHECK_MSG(ss::holdsJournal(file.as<JsonObjectConst>()), "%s holds no journal", text.c_str());
+        CHECK_MSG(journalText(ss::decodeJournal(file.as<JsonObjectConst>())) == text, "%s reads as another journal",
+                  text.c_str());
+      }
+      for (uint32_t phase = 0; phase <= ss::JOURNAL_PHASE_LAST + 1u; ++phase) {
+        JsonDocument file = parsed("{\"req\":5,\"ph\":" + std::to_string(phase) + "}");
+        CHECK_EQ(ss::holdsJournal(file.as<JsonObjectConst>()), phase <= ss::JOURNAL_PHASE_LAST);
+      }
+    }
   }
 
   // The values as a person reads them.

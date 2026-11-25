@@ -636,13 +636,20 @@ inline void encodeJournal(const Journal &journal, JsonObject out) {
   }
 }
 
-// A file that is no journal reads as cautiousJournal(): the client may owe the controller a
-// restart, and finds out by asking it. A result in it that this code cannot read is left out:
-// the rest of the journal still holds. A record of the requests answered ("ans", "hf") that does
-// not read is lost as the cautious journal's is: the start that reads it stands for the time.
+// Whether `in` holds a journal: one decodeJournal() reads, and does not take for a file that is
+// no journal. A journal that encodeJournal() wrote holds one, the cautious journal among them.
+inline bool holdsJournal(JsonObjectConst in) {
+  return !in.isNull() && in["req"].is<uint32_t>() && in["ph"].is<uint32_t>() &&
+         in["ph"].as<uint32_t>() <= JOURNAL_PHASE_LAST;
+}
+
+// A file that is no journal (holdsJournal()) reads as cautiousJournal(): the client may owe the
+// controller a restart, and finds out by asking it. A result in it that this code cannot read is
+// left out: the rest of the journal still holds. A record of the requests answered ("ans", "hf")
+// that does not read is lost as the cautious journal's is: the start that reads it stands for the
+// time.
 inline Journal decodeJournal(JsonObjectConst in) {
-  if (in.isNull() || !in["req"].is<uint32_t>() || !in["ph"].is<uint32_t>() ||
-      in["ph"].as<uint32_t>() > JOURNAL_PHASE_LAST) {
+  if (!holdsJournal(in)) {
     return cautiousJournal();
   }
   Journal journal = emptyJournal();

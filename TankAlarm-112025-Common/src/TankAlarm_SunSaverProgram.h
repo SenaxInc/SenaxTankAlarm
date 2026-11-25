@@ -1791,8 +1791,11 @@ inline Journal cautiousJournal() {
 // A journal that a start could not read and kept aside (the client's keepUnreadChargerJournal()),
 // which reads at a later start, taken into `journal`, the one written since. What it holds that
 // `journal` does not comes in:
-//   - the duty to the controller its run talked to, where `journal` owes none, or owes the
-//     cautious look, which went to the controller the config names. A duty that `journal` owes a
+//   - the duty to the controller its run talked to, where `journal` owes none, or owes a look to
+//     no controller it names: the cautious look that stands for this kept journal, which went to
+//     the controller the config names. (A cautious look that stands for another journal, one that
+//     does not read at this start or holds no journal, the client gives the controller the config
+//     names before it calls this: its loadChargerJournal().) A duty that `journal` owes a
 //     known controller stays: it is newer, and a journal holds one. When that is another
 //     controller, the kept duty is left out (keptDutyLeftOut()): the client keeps the kept file,
 //     and takes its duty up once the one owed now is settled (Supervisor::takeKeptDuty());
