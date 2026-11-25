@@ -214,6 +214,12 @@ static inline float roundTo(float val, int decimals) { return tankalarm_roundTo(
 #define FIRMWARE_MARKER_FILE "/cfg/fw_marker.json"
 #endif
 
+// The time of the last charger report tried, {"e": seconds}, so that a report after a restart
+// is still dated after it: see keepChargerReportTime().
+#ifndef CHARGER_REPORT_TIME_FILE
+#define CHARGER_REPORT_TIME_FILE "/cfg/charger_report.json"
+#endif
+
 // ============================================================================
 // Client Notefile Names — Outbound (.qo) and Inbound (.qi)
 // These override the common header where client perspective differs.
@@ -932,7 +938,8 @@ static bool gChargerReportWaited = false;              // it could not go out wh
 static bool gChargerReportTried = false;               // nothing would take it at the last try
 static unsigned long gChargerReportTryMillis = 0;      // which was then
 // What the server may hold besides the last report that went out: see sendDueChargerReport().
-static uint32_t gChargerReportLastEpoch = 0;           // the time of the last report tried this run, 0 for none
+static uint32_t gChargerReportLastEpoch = 0;           // the time of the last report tried, also before a restart, 0 for none
+static uint32_t gChargerReportEpochKept = 0;           // the one flash holds, as far as this start knows
 static bool gChargerReportUnsure = false;              // a try has failed since a report last went out
 
 // Charger programming: a config can ask the client to write a LiFePO4 charging profile and the
@@ -1735,6 +1742,8 @@ static void keepClock();
 static uint8_t configuredPackVolts();
 static uint8_t chargerCheckChemistry();
 static void sendDueChargerReport(unsigned long now);
+static void loadChargerReportTime();
+static void keepChargerReportTime(uint32_t epoch);
 static sunsaver::Journal loadChargerJournal();
 static bool saveChargerJournal(const sunsaver::Journal &journal);
 #if defined(POSIX_FILE_IO_AVAILABLE)
@@ -1905,6 +1914,7 @@ void setup() {
 
   initializeStorage();
   ensureConfigLoaded();
+  loadChargerReportTime();
   printConfigSummary();
 
 #if defined(SOLAR_HW_TEST_SERIAL) && defined(SOLAR_HW_TEST_FORCE_SOLAR_CONFIG)
@@ -8255,14 +8265,14 @@ static void sendDueChargerReport(unsigned long now) {
     const double checkedAt =
         nowEpoch - (double)gChargerReportAgeSeconds - (double)(millis() - gChargerReportAgedMillis) / 1000.0;
     uint32_t epoch = checkedAt >= 1.0 ? (uint32_t)checkedAt : 1u;  // whole seconds: see below
-    // And later than the last report tried this run, which the server may hold. After the
-    // Notecard has set the clock back (syncTimeFromNotecard()), a report from before the clock
-    // is back where it was would be older, and the server would drop it while the client counts
-    // it as sent. It then takes the second after that one, no further off than that one's time
-    // was. Not after a time a day or more ahead of its own: that came from a clock wrong by as
-    // much, which the server does not take as a time (sunsaver::reportCheckTime()), and the
-    // report keeps its own. The time is kept for this run only: the first report after a
-    // restart has its own, which a report dated ahead before it would still outrank.
+    // And later than the last report tried, which the server may hold. After the Notecard has
+    // set the clock back (syncTimeFromNotecard()), or a restart has set it from the Notecard
+    // anew, a report from before the clock is back where it was would be older, and the server
+    // would drop it while the client counts it as sent. It then takes the second after that
+    // one, no further off than that one's time was. Not after a time a day or more ahead of its
+    // own: that came from a clock wrong by as much, which the server does not take as a time
+    // (sunsaver::reportCheckTime()), and the report keeps its own. The time of the last report
+    // tried outlasts a restart in flash (keepChargerReportTime()).
     const uint32_t last = gChargerReportLastEpoch;
     if (epoch <= last && last < 0xFFFFFFFFu && last - epoch < (uint32_t)sunsaver::REPORT_CLOCK_AHEAD_SECONDS) {
       epoch = last + 1u;
@@ -8282,6 +8292,7 @@ static void sendDueChargerReport(unsigned long now) {
   body["epoch"] = gChargerReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
   sunsaver::encodeReport(gChargerReportSnapshot, gChargerReportEvaluation, body);
   gChargerReportLastEpoch = gChargerReportEpoch;  // before the try: one that fails may still get through
+  keepChargerReportTime(gChargerReportEpoch);     // and in flash, for the reports after a restart
   if (!publishNoteToNotecard(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow)) {
     // The Notecard did not take it, or took it and its answer was lost. It stays due, with
     // everything that keeps a report from being sent twice left as it was, and until a report
@@ -8304,6 +8315,75 @@ static void sendDueChargerReport(unsigned long now) {
   gChargerReportStale = false;
   gChargerReportSyncNow = false;
   gChargerReportUnsure = false;  // the newest report the server can hold is this one
+}
+
+// The time of the last charger report tried, as an earlier start kept it in flash, read once in
+// setup(). Without it (no file, or one that does not read) the first report after this start has
+// the time of its own pass, as when no report was ever tried.
+static void loadChargerReportTime() {
+#ifdef FILESYSTEM_AVAILABLE
+  if (!isStorageAvailable()) {
+    return;
+  }
+  char buf[48];
+  size_t len = 0;
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    FILE *file = fopen(CHARGER_REPORT_TIME_FILE, "r");
+    if (!file) {
+      return;
+    }
+    len = fread(buf, 1, sizeof(buf) - 1, file);
+    fclose(file);
+  #else
+    if (!LittleFS.exists(CHARGER_REPORT_TIME_FILE)) {
+      return;
+    }
+    File file = LittleFS.open(CHARGER_REPORT_TIME_FILE, "r");
+    if (!file) {
+      return;
+    }
+    len = file.readBytes(buf, sizeof(buf) - 1);
+    file.close();
+  #endif
+  buf[len] = '\0';
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) == DeserializationError::Ok && doc["e"].is<uint32_t>()) {
+    gChargerReportLastEpoch = doc["e"].as<uint32_t>();
+    gChargerReportEpochKept = gChargerReportLastEpoch;
+  }
+#endif
+}
+
+// Keeps the time of the report about to be tried in flash, before the try: one that fails may
+// still get through. The client's clock is set from the Notecard at every start, and when it ran
+// ahead before a restart, a report after it would otherwise be dated before the one the server
+// holds, which would drop it while the client counts it as sent, and an unchanged result would
+// not go again for a week. Written only when the time changes, so the retries of a report write
+// nothing. A report goes out also when flash does not take its time: within this run the client
+// still knows it, and the write is tried again at the next try.
+static void keepChargerReportTime(uint32_t epoch) {
+#ifdef FILESYSTEM_AVAILABLE
+  if (epoch == gChargerReportEpochKept || !isStorageAvailable()) {
+    return;
+  }
+  char buf[24];
+  const int len = snprintf(buf, sizeof(buf), "{\"e\":%lu}", (unsigned long)epoch);
+  if (len <= 0 || (size_t)len >= sizeof(buf)) {
+    return;
+  }
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    const bool kept = tankalarm_posix_write_file_atomic(CHARGER_REPORT_TIME_FILE, buf, (size_t)len);
+  #else
+    const bool kept = tankalarm_littlefs_write_file_atomic(CHARGER_REPORT_TIME_FILE, (const uint8_t *)buf, (size_t)len);
+  #endif
+  if (kept) {
+    gChargerReportEpochKept = epoch;
+  } else {
+    Serial.println(F("Charger check: flash did not take the report's time"));
+  }
+#else
+  (void)epoch;
+#endif
 }
 
 // ============================================================================
