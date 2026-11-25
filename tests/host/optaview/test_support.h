@@ -286,7 +286,7 @@ struct Rig {
   std::string run(const std::string &line) {
     out.text.clear();
     try {
-      console.handleLine(line.c_str());
+      console.handleLine(line.c_str(), line.size());  // all of it, a NUL in it as well
     } catch (const std::runtime_error &stuck) {
       // The simulator's clock or the output gave up on a command that would not end. That is
       // one failed check, and the tests carry on.

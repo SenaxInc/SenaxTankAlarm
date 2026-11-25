@@ -465,10 +465,14 @@ int main(int argc, char **argv) {
   for (;;) {
     std::string line;
     while (terminal.takeLine(&line)) {
-      if (line.compare(0, 3, "sim") == 0 && (line.size() == 3 || line[3] == ' ' || line[3] == '\t')) {
+      // A NUL would end the line early for everything that reads it as text ("sim delay 100",
+      // then "ms" left out), so a line that holds one goes to the console whatever it starts
+      // with: the console refuses it whole, and as the answer to a question it cancels it.
+      const bool plain = line.find('\0') == std::string::npos;
+      if (plain && line.compare(0, 3, "sim") == 0 && (line.size() == 3 || line[3] == ' ' || line[3] == '\t')) {
         simCommand(sim, line);
       } else {
-        console.handleLine(line.c_str());
+        console.handleLine(line.c_str(), line.size());
       }
       console.prompt();
       fflush(stdout);

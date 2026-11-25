@@ -303,9 +303,13 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   // One line from the user. Two things are settled here because they hold for every command
   // alike: the note about late replies, and what 'scalecheck' found once the link may reach
   // another controller.
-  void handleLine(const char *line) {
+  void handleLine(const char *line) { handleLine(line, strlen(line)); }
+
+  // The same for a line of `length` bytes, which may hold a NUL. The USB line editor and the web
+  // page never pass one on; the PC preview reads its terminal as it comes.
+  void handleLine(const char *line, size_t length) {
     const uint32_t lateBefore = device_.master().stats.lateArrivals;
-    runLine(line);
+    runLine(line, length);
     if (device_.master().stats.lateArrivals != lateBefore) {
       lateNotice();
     }
@@ -315,16 +319,17 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   }
 
  private:
-  void runLine(const char *line) {
+  void runLine(const char *line, size_t length) {
     char buffer[OV_LINE_MAX];
-    // A line is run whole or not at all. One that does not fit here, or that has more words than
-    // any command takes, is refused rather than run without its end, which may have been half
-    // of a number.
-    const bool fits = strlen(line) < sizeof(buffer);
+    // A line is run whole or not at all. One that does not fit here, that holds a NUL (read as
+    // text, it would end there), or that has more words than any command takes, is refused
+    // rather than run without its end, which may have been half of a number.
+    const bool plain = memchr(line, '\0', length) == nullptr;
+    const bool fits = length < sizeof(buffer);
     ovCopy(buffer, sizeof(buffer), line);
     char *argv[OV_MAX_ARGS];
     const int argc = split(buffer, argv, OV_MAX_ARGS);
-    const bool whole = fits && argc <= OV_MAX_ARGS;
+    const bool whole = plain && fits && argc <= OV_MAX_ARGS;
 
     device_.beginBatch();
     stopped_ = false;
@@ -342,6 +347,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       } else {
         out_.println("Cancelled. Nothing was sent.");
       }
+      return;
+    }
+    if (!plain) {
+      out_.println("That line holds a NUL byte, which no command takes. Nothing was done.");
       return;
     }
     if (!whole) {
@@ -2025,7 +2034,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(check.above->name);
       out_.print(" = ");
       printQuantity(*check.above, above);
-      out_.println(". Put the other one right before you 'reset'.");
+      out_.println(".");
+      // On a line of its own: with long register names the line above is long enough already.
+      out_.println("    Put the other one right before you 'reset'.");
       if (result == OV_CHECK_ZERO) {
         printZeroInPair(check, below, above);
       }

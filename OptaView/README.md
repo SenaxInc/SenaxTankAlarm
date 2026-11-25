@@ -269,9 +269,11 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 Long commands stop when you press a key. The console of the web page takes the same commands,
 except `watch`, `net` and `web`.
 
-A command runs with all its words or not at all. A word that it does not take, or a line longer
-than 159 characters, is refused and nothing is done: `timeout 1000 0` does not set 1000 ms, and
-`set EV_lvd 13 .10` writes nothing.
+A command runs with all its words or not at all. A word that it does not take, a line longer
+than 159 characters, or a line with a NUL in it, is refused and nothing is done: `timeout 1000 0`
+does not set 1000 ms, and `set EV_lvd 13 .10` writes nothing. As the answer to a question, such a
+line cancels it. (Only the PC preview's terminal passes a NUL on: the USB console leaves control
+characters out as they are typed, and the web page's console refuses them.)
 
 ## What keeps a session safe
 
@@ -295,11 +297,14 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   register or the coil reads afterwards decides. When that cannot be read either, OptaView says
   that it does not know, and it keeps saying that a restart may be due until the register has
   been read again.
-- Pairs that must stay in order (reconnect above disconnect) are checked when you `set` one of
-  them and again before `reset`. A 0 switches a pair off only where it switches the setting
-  off, as in the high voltage disconnects. A reconnect cannot be 0: the battery never falls to
-  0 V, so the output would not come back. `set` refuses that, and a 0 that the controller
-  already holds there stands in the way of `reset`.
+- Pairs that must stay in order are checked when you `set` one of them and again before
+  `reset`: each reconnect on its side of its disconnect, and every charge voltage of both banks
+  (absorption, float, equalize) below the battery's high voltage disconnect, which would stop
+  charging before the battery got there. A 0 switches a pair off only where it switches the
+  setting off, as in the high voltage disconnects and a float or equalize stage at 0. A
+  reconnect cannot be 0: the battery never falls to 0 V, so the output would not come back.
+  `set` refuses that, and a 0 that the controller already holds there stands in the way of
+  `reset`.
 - A restart counts only when it shows: after the reset command the controller misses a request
   and then answers again. One that answers every request for the profile's `resetWaitMs`
   (3 s) was not seen to restart, and OptaView keeps saying that a restart is due. A single
@@ -469,7 +474,8 @@ a word: no lower limit, slave 1, no pair checks. Nor is anything cut short: `dec
 `scaleCheck.alternates` holds at most 4 numerators, `scaleCheck.settings.setpoints` at most 24
 registers and `scaleCheck.live.regulating` at most 8 states, and a longer list is refused. An
 address or raw value written as text is decimal digits, or `0x` and hex digits, and nothing else
-(no sign, space or `_`).
+(no sign, space or `_`). A text that holds a NUL, which JSON can carry as an escape, is refused
+too: the sketch reads its texts as C text, which would end at the NUL.
 
 `check_profile.py` reads the file as the sketch's JSON parser does (no `NaN` or `Infinity`, a
 number of at most 63 characters, lists and objects at most 10 deep) and adds house rules of its
@@ -513,9 +519,9 @@ console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
 next three replies are lost on the way), `sim random off` (the Opta's random number generator
 fails and the clock stands in for it). Add
 `PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. A port
-or a `sim` line that is not written whole (`--port 80x`, `sim drop 2.5`) is refused. The
-simulated controller answers as the specification says, so the preview shows the page and not
-how a real SunSaver behaves.
+or a `sim` line that is not written whole (`--port 80x`, `sim drop 2.5`, a NUL in it) is
+refused. The simulated controller answers as the specification says, so the preview shows the
+page and not how a real SunSaver behaves.
 
 ```bash
 npm install playwright@1.63.0 && npx playwright install chromium    # once, in a folder of your choice
