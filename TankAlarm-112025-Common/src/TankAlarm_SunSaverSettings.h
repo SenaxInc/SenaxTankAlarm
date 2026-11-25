@@ -922,6 +922,28 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
   }
 }
 
+// What a firmware that decodes voltages with firmwareScale reads for a battery, per volt, when the
+// controller reports its live readings with liveScale. While liveScale is not known, the lower of
+// the candidates: a voltage multiplied by it is never above what the firmware reads for a battery
+// at that voltage. 1 for a firmwareScale that is not known, which then decodes as it pleases.
+inline double readingFactor(uint8_t liveScale, uint8_t firmwareScale) {
+  if (firmwareScale == SCALE_UNKNOWN) {
+    return 1.0;
+  }
+  const double firmware = scaleNumerator(firmwareScale);
+  if (liveScale != SCALE_UNKNOWN) {
+    return firmware / scaleNumerator(liveScale);
+  }
+  double factor = 0.0;
+  for (uint8_t c = 0; c < SCALE_CANDIDATES; ++c) {
+    const double candidate = firmware / scaleNumerator(candidateScale(c));
+    if (c == 0 || candidate < factor) {
+      factor = candidate;
+    }
+  }
+  return factor;
+}
+
 // The voltage at which the charger holds a full battery, as a firmware that decodes voltages
 // with firmwareScale reads that battery. The client's no-charge alert compares the battery with
 // it. 0 means "not known", and the caller falls back on a default.
@@ -992,18 +1014,7 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
   if (evaluation.systemVolts == 24) {
     lowest *= 2.0;
   }
-  const double firmware = scaleNumerator(firmwareScale);
-  if (evaluation.liveScale != SCALE_UNKNOWN) {
-    return lowest * firmware / scaleNumerator(evaluation.liveScale);
-  }
-  double factor = 1.0;
-  for (uint8_t c = 0; c < SCALE_CANDIDATES; ++c) {
-    const double candidate = firmware / scaleNumerator(candidateScale(c));
-    if (candidate < factor) {
-      factor = candidate;
-    }
-  }
-  return lowest * factor;
+  return lowest * readingFactor(evaluation.liveScale, firmwareScale);
 }
 
 // A number that changes when the stored settings, the DIP switches or the judgement change, and

@@ -984,6 +984,10 @@ static bool gTimeSyncDue = false;  // the clock was set 6 hours ago or more: see
 // Asking the Notecard again for its device UID: see loop() and lookUpDeviceUid().
 #define DEVICE_UID_RETRY_MS (10UL * 60UL * 1000UL)
 static unsigned long gDeviceUidAskedMillis = 0;
+static bool gDeviceUidFromNotecard = false;  // the Notecard gave gDeviceUID at this start
+// Firmware before this one kept the UID in the config in 32 bytes, and strlcpy() cut a longer UID
+// to 31 characters there. A kept UID of that length may be the start of another: see deviceUidKnown().
+#define LEGACY_DEVICE_UID_MAX_CHARS 31
 static double gNextDailyReportEpoch = 0.0;
 
 // DFU (Device Firmware Update) state tracking
@@ -4270,6 +4274,7 @@ static bool lookUpDeviceUid() {
         strlcpy(gConfig.deviceUid, uid, sizeof(gConfig.deviceUid));
         gConfigDirty = true;
       }
+      gDeviceUidFromNotecard = true;
       kept = true;
     }
   }
@@ -5108,11 +5113,14 @@ static void applyConfigUpdate(const JsonDocument &doc) {
     initBatteryConfig(&gConfig.batteryMonitor, bt, nominalV);
     gConfig.batteryMonitor.enabled = batEnabled && (bt != BATTERY_TYPE_NONE);
     gSolarManager.setPackVolts(configuredPackVolts());
-    if (prevType != bt || prevNominal != nominalV || prevEnabled != gConfig.batteryMonitor.enabled) {
+    // The voltage as initBatteryConfig() keeps it: the server sends 0 for no battery, which is
+    // kept as 12, and the same config sent again would otherwise ask for a charger check each time.
+    if (prevType != bt || prevNominal != gConfig.batteryMonitor.nominalVoltage ||
+        prevEnabled != gConfig.batteryMonitor.enabled) {
       Serial.print(F("Battery config updated: type="));
       Serial.print(batteryTypeLabel(bt));
       Serial.print(F(" nominalV="));
-      Serial.print(nominalV);
+      Serial.print(gConfig.batteryMonitor.nominalVoltage);
       Serial.print(F(" enabled="));
       Serial.println(gConfig.batteryMonitor.enabled ? F("yes") : F("no"));
       // The charger's settings are judged against the battery: judge them again, and send the
@@ -7579,7 +7587,7 @@ static void finishChargerCheck(unsigned long endedAt) {
   sunsaver::evaluate(snapshot, want, &evaluation);
 
   gSolarManager.setFloatReference(
-      (float)sunsaver::floatReferenceVolts(snapshot, evaluation, (uint8_t)SS_VOLTAGE_SCALE_ID));
+      (float)sunsaver::floatReferenceVolts(snapshot, evaluation, (uint8_t)SS_VOLTAGE_SCALE_ID), evaluation.liveScale);
 
   const uint32_t fingerprint = sunsaver::settingsFingerprint(snapshot, evaluation);
   const bool changed = !gChargerReportSent || fingerprint != gChargerReportFingerprint;
@@ -7653,9 +7661,15 @@ static void finishChargerCheck(unsigned long endedAt) {
 // isValidClientUid()), or keeps a report under when the label starts with "dev:" too: the client
 // would then count the report as sent, and the server would not see it under the client's id
 // for a week. loop() asks the Notecard again every 10 minutes (lookUpDeviceUid()), and so does
-// checkNotecardHealth() once the Notecard is back.
+// checkNotecardHealth() once the Notecard is back. A UID the config kept with exactly
+// LEGACY_DEVICE_UID_MAX_CHARS characters counts only once the Notecard has given it at this start:
+// an earlier firmware may have cut a longer one to that length, and a report sent under it would
+// go to another client. A shorter one was kept whole, and so was a longer one, by this firmware.
 static bool deviceUidKnown() {
-  return strncmp(gDeviceUID, "dev:", 4) == 0 && strcmp(gDeviceUID, gConfig.deviceUid) == 0;
+  if (strncmp(gDeviceUID, "dev:", 4) != 0 || strcmp(gDeviceUID, gConfig.deviceUid) != 0) {
+    return false;
+  }
+  return gDeviceUidFromNotecard || strlen(gDeviceUID) != LEGACY_DEVICE_UID_MAX_CHARS;
 }
 
 // The age of a report that is due and has no time yet, brought up to date: the whole seconds of
@@ -9149,7 +9163,8 @@ static bool publishNoteToNotecard(const char *fileName, JsonDocument &doc, bool 
 }
 
 // publishNote() with `mayBuffer`, and publishNoteToNotecard() without: whether a note that the
-// Notecard does not take goes into the note buffer.
+// Notecard does not take goes into the note buffer. Without it the caller keeps the note and tries
+// again, and so gets false for a document that ran out of memory (see below).
 static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool mayBuffer) {
   // Build serialized payload once for both live send and buffering
   // fileName is already a plain .qo notefile name (e.g., "telemetry.qo")
@@ -9163,11 +9178,17 @@ static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool
   doc["fv"] = FIRMWARE_VERSION;
 
   // A document that ran out of memory while it was filled in still serializes, without the members
-  // that did not fit. Such a note would say less than it seems to (a charger report would be
-  // dropped as sent), so none is made, and the caller may try again.
+  // that did not fit. A caller that keeps its note and tries again (publishNoteToNotecard(): the
+  // charger report) gets false: as sent, the report would say less than it seems to and would not
+  // go again. Every other note goes out with what fit, as it did before: its caller keeps no copy
+  // to try again with, and ignores the result (publishAlarmNote() among them, which has already
+  // cleared the alarm's pending edge), so an alarm that is not sent here is lost.
   if (doc.overflowed()) {
-    Serial.println(F("publishNote: out of memory while the note was filled in, dropping it"));
-    return false;
+    if (!mayBuffer) {
+      Serial.println(F("publishNote: out of memory while the note was filled in, kept for a new try"));
+      return false;
+    }
+    Serial.println(F("publishNote: out of memory while the note was filled in, sending what fit"));
   }
 
   // Measure JSON first to handle oversized payloads via dynamic allocation
