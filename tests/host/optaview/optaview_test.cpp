@@ -655,16 +655,17 @@ static void testLateReplies() {
               (unsigned long long)(b.sim.requestTimes[2] - gaveUp));
   }
   {  // Two senders on the bus at once garble each other, and neither frame is taken: here the
-     // late reply and the answer to the next request, which begins at the same moment or while
-     // the late reply is still going out. At 115200 baud a reply of seven bytes takes 0.7 ms, so
-     // two that begin in the same millisecond are on the wire together, and two that begin a
-     // millisecond apart do not touch: then the answer is taken, behind the late reply.
+     // late reply and the answer to the next request, which begins at the same moment, while the
+     // late reply is still going out, or just before it and runs into it. At 115200 baud a reply
+     // of seven bytes takes 0.7 ms, so two that begin in the same millisecond are on the wire
+     // together, and two that begin a millisecond apart do not touch: then the answer is taken,
+     // behind the late reply.
     struct Case {
       uint32_t baud;
-      uint32_t laterMs;  // how long after the late reply the answer begins
+      int32_t offsetMs;  // when the answer begins, after the late reply (before it if negative)
       bool taken;
     };
-    const Case cases[] = {{9600, 0, false}, {9600, 5, false}, {115200, 0, false}, {115200, 1, true}};
+    const Case cases[] = {{9600, 0, false}, {9600, 5, false}, {9600, -5, false}, {115200, 0, false}, {115200, 1, true}};
     for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); ++k) {
       const Case &c = cases[k];
       Bare b;
@@ -676,18 +677,17 @@ static void testLateReplies() {
       CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
       // Both requests are 8 bytes long, and the next goes out once the bus has been quiet for
       // the gap between frames.
-      b.sim.responseDelayMs = (uint32_t)(b.sim.requestTimes[0] + 1200 + c.laterMs - b.sim.elapsedMs() -
-                                         b.master.interFrameGapMs);
+      const int64_t lateBegins = (int64_t)b.sim.requestTimes[0] + 1200;
+      b.sim.responseDelayMs =
+          (uint32_t)(lateBegins + c.offsetMs - (int64_t)b.sim.elapsedMs() - b.master.interFrameGapMs);
       const MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
-      CHECK_EQ(b.sim.requestTimes[1] + b.sim.responseDelayMs, b.sim.requestTimes[0] + 1200 + c.laterMs);
+      CHECK_EQ(b.sim.requestTimes[1] + b.sim.responseDelayMs, lateBegins + c.offsetMs);
       if (c.taken) {
-        CHECK_MSG(r.status == MB_OK, "%u baud, %u ms later: %s", (unsigned)c.baud, (unsigned)c.laterMs,
-                  mbStatusText(r.status));
+        CHECK_MSG(r.status == MB_OK, "%u baud, %d ms: %s", (unsigned)c.baud, (int)c.offsetMs, mbStatusText(r.status));
         CHECK_EQ(word, b.sim.regs[0xE022]);
         CHECK_EQ(r.noiseBytes, 7);
       } else {
-        CHECK_MSG(r.status != MB_OK, "%u baud, %u ms later: %s", (unsigned)c.baud, (unsigned)c.laterMs,
-                  mbStatusText(r.status));
+        CHECK_MSG(r.status != MB_OK, "%u baud, %d ms: %s", (unsigned)c.baud, (int)c.offsetMs, mbStatusText(r.status));
         CHECK_EQ(word, 0xAAAA);
       }
     }
@@ -733,6 +733,15 @@ static void testLateReplies() {
     CHECK_EQ(b.sim.read(), 0x34);
     CHECK_EQ(b.sim.read(), 0x78);
     CHECK_EQ(b.sim.read(), -1);
+    // The same when the byte put on the bus later is due first: the 0x22 is in 1 ms before the
+    // 0x11, while the 0x11 is already going out.
+    Bare first;
+    first.sim.inject(20, bytes({0x11}));
+    first.sim.inject(19, bytes({0x22}));
+    first.sim.advance(25);
+    CHECK_EQ(first.sim.read(), 0xDD);
+    CHECK_EQ(first.sim.read(), 0xEE);
+    CHECK_EQ(first.sim.read(), -1);
     // Where a character takes less than a millisecond, injected bytes still come one a
     // millisecond.
     Bare fast;
