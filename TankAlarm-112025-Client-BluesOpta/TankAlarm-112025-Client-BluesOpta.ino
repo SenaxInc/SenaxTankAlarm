@@ -931,6 +931,9 @@ static bool gChargerJournalInTmp = false;
 // The journal could not be read at this start, nor kept aside (keepUnreadChargerJournal()):
 // nothing is written over it until the next start.
 static bool gChargerJournalHeld = false;
+// The journal kept aside was taken in (takeKeptChargerJournal()) and its file is still there:
+// saveChargerJournal() removes it once flash holds a journal that says so.
+static bool gChargerKeptToRemove = false;
 // What readChargerJournalFile() found.
 static const uint8_t CHARGER_JOURNAL_READ = 0;    // the file's text
 static const uint8_t CHARGER_JOURNAL_ABSENT = 1;  // no such file
@@ -1557,6 +1560,8 @@ static void triggerRemoteRelays(const char *targetClient, uint8_t relayMask, boo
 static int getRelayPin(uint8_t relayIndex);
 static float readVinDividerVoltage();
 static void checkRelayMomentaryTimeout(unsigned long now);
+static const char *relayTimeUp(uint8_t r, unsigned long now);
+static void switchOffRelaysTimeUp();
 static bool fetchNotecardLocation(float &latitude, float &longitude);
 static void resetRelayForMonitor(uint8_t idx);
 static void initializeClearButton();
@@ -1591,6 +1596,8 @@ static bool saveChargerJournal(const sunsaver::Journal &journal);
 static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size);
 static void keepUnreadChargerJournal(const char *path);
 static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent);
+static uint32_t keptChargerJournalCheck(const char *text);
+static void removeKeptChargerJournal();
 #endif
 static void keepChargerLookAfterLostFiles();
 static void handleChargerProgramRequest(JsonObjectConst program);
@@ -1943,6 +1950,8 @@ void setup() {
   // owed a look. A request is run only once a poll in loop() has worked. The look goes to the
   // charger that run talked to, and needs no poll when none speaks for that charger.
   gSolarManager.beginChargerProgramming(loadChargerJournal(), saveChargerJournal);
+  // A run holds loop() for up to a minute, and a relay's time does not wait for it.
+  gSolarManager.setChargerRunHook(switchOffRelaysTimeUp);
 
   // Initialize battery voltage monitoring
   // Fix 11: source is auto-picked by getEffectiveBatteryVoltage() (SunSaver MPPT preferred,
@@ -7878,6 +7887,7 @@ static sunsaver::Journal loadChargerJournal() {
 #if defined(POSIX_FILE_IO_AVAILABLE)
   gChargerJournalInTmp = false;
   gChargerJournalHeld = false;
+  gChargerKeptToRemove = false;
   if (!isStorageAvailable()) {
     // The journal may say that a run was cut short, and nothing can show otherwise. Without flash
     // nothing can be kept either, so saveChargerJournal() fails and no request is taken on: the
@@ -8027,13 +8037,22 @@ static void keepUnreadChargerJournal(const char *path) {
 // does not comes into it (sunsaver::mergeKeptJournal()): above all the look owed to the controller
 // its run talked to, which the cautious look of that start did not reach when the config names
 // another one now, and the requests it answered. Where no journal was found (`absent`) it is the
-// journal. That goes to flash, and the kept file is removed once it is there. One that still does
-// not read, or runs out of memory as it is read, stays, and owes a look while no journal speaks
-// for this client.
+// journal. The journal says that it took this one in, by the check value of its text
+// (sunsaver::Journal::keptTaken), and goes to flash; the kept file is removed once a journal that
+// says so is there (saveChargerJournal()). A start whose journal says so already, because that
+// removal did not go through, removes the file and takes nothing in again: it may have settled
+// the look since. One that still does not read, or runs out of memory as it is read, stays, and
+// owes a look while no journal speaks for this client.
 static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent) {
   static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
   const uint8_t read = readChargerJournalFile(CHARGER_JOURNAL_KEPT_FILE, buf, sizeof(buf));
   if (read == CHARGER_JOURNAL_ABSENT) {
+    return journal;
+  }
+  const uint32_t check = read == CHARGER_JOURNAL_READ ? keptChargerJournalCheck(buf) : 0;
+  if (!absent && check != 0 && journal.keptTaken == check) {
+    Serial.println(F("Charger programming: a journal kept aside was taken in at an earlier start, and is removed now"));
+    removeKeptChargerJournal();
     return journal;
   }
   JsonDocument doc;
@@ -8049,12 +8068,32 @@ static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool 
   const sunsaver::Journal kept =
       parsed == DeserializationError::Ok ? sunsaver::decodeJournal(doc.as<JsonObjectConst>()) : sunsaver::cautiousJournal();
   journal = absent ? kept : sunsaver::mergeKeptJournal(journal, kept);
+  journal.keptTaken = check;
   Serial.println(F("Charger programming: a journal kept aside at an earlier start reads now, and what it says is owed is taken up"));
   addSerialLog("Charger programming: a journal kept aside at an earlier start reads now");
-  if (saveChargerJournal(journal)) {
-    remove(CHARGER_JOURNAL_KEPT_FILE);
-  }
+  gChargerKeptToRemove = true;
+  saveChargerJournal(journal);  // which removes the kept file once flash has the journal
   return journal;
+}
+
+// The check value of a kept journal's text (32-bit FNV-1a), never 0: 0 stands for none.
+static uint32_t keptChargerJournalCheck(const char *text) {
+  uint32_t hash = 2166136261u;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; ++p) {
+    hash = (hash ^ *p) * 16777619u;
+  }
+  return hash != 0 ? hash : 1u;
+}
+
+// Removes the kept journal that was taken in. Tried again after each journal that flash takes
+// while it stays (gChargerKeptToRemove).
+static void removeKeptChargerJournal() {
+  errno = 0;
+  if (remove(CHARGER_JOURNAL_KEPT_FILE) == 0 || errno == ENOENT) {
+    gChargerKeptToRemove = false;
+    return;
+  }
+  gChargerKeptToRemove = true;
 }
 #endif
 
@@ -8085,7 +8124,13 @@ static bool saveChargerJournal(const sunsaver::Journal &journal) {
     }
     gChargerJournalInTmp = false;
   }
-  return tankalarm_posix_write_file_atomic(CHARGER_JOURNAL_FILE, buf, len);
+  if (!tankalarm_posix_write_file_atomic(CHARGER_JOURNAL_FILE, buf, len)) {
+    return false;
+  }
+  if (gChargerKeptToRemove && journal.keptTaken != 0) {
+    removeKeptChargerJournal();  // flash holds a journal that took it in
+  }
+  return true;
 #else
   (void)journal;
   return false;
@@ -8144,7 +8189,8 @@ static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestI
   const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
   const uint32_t refusals = chargerProgramClientRefusals();
   if (!gSolarManager.requestChargerProgram(requestId, profile, profileErrors, refusals,
-                                           sunsaver::readLoadAllowed(program), currentEpoch())) {
+                                           sunsaver::readLoadAllowed(program), currentEpoch(),
+                                           sunsaver::readRequestAt(program))) {
     return;  // the config again: this request has had its answer, or waits already
   }
   Serial.print(F("Charger programming: request "));
@@ -8180,7 +8226,28 @@ static void withdrawUnsuitedChargerProgram() {
 // not: a run reads the battery first and refuses one below the new LVR, and a charger that
 // waits for its restart after a run that was cut short should not wait any longer. Returns true
 // when it talked to the charger.
+//
+// A request runs only once the config is in flash: the config that carried it may have come in
+// this pass, and is saved at its end (persistConfigIfDirty()). A restart during the run, or a
+// config that flash does not take, would leave the charger on values that the config this client
+// starts with next does not ask for. So the config is saved first, and a request whose config
+// flash does not take is refused (REFUSE_CONFIG_UNSAVED). A look that a run cut short left owed
+// does not wait for the config: it writes nothing, and goes first anyway.
 static bool serviceChargerProgramming(unsigned long now, bool allowed) {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  if (gConfigDirty && programming.requestWaiting()) {
+    persistConfigIfDirty();
+    const uint32_t waitingId = programming.waitingRequestId();
+    if (gConfigDirty &&
+        gSolarManager.withdrawChargerProgram(sunsaver::REFUSE_CONFIG_UNSAVED | chargerProgramClientRefusals(),
+                                             currentEpoch())) {
+      char line[112];
+      snprintf(line, sizeof(line), "Charger programming: request %lu refused: flash did not take the config that carried it",
+               (unsigned long)waitingId);
+      Serial.println(line);
+      addSerialLog(line);
+    }
+  }
   const bool talked = gSolarManager.serviceChargerProgramming(currentEpoch(), allowed && !gDfuInProgress);
   if (talked) {
     // The charger may hold other settings now: check them again, and send that report at once.
@@ -8291,6 +8358,14 @@ static void sendDueChargerProgramReport(unsigned long now) {
   }
   if (gChargerProgramReportTried && (now - gChargerProgramReportTryMillis) < CHARGER_PROGRAM_REPORT_RETRY_MS) {
     return;
+  }
+  // The time goes into the journal before the result goes out: the Notecard may take it, and this
+  // client restart before the journal says so, and a later result of the same request (a later
+  // look) must go out later still. When flash does not take it, the result goes out all the
+  // same, as it would without flash: it is all a person learns of the run, and may be the
+  // refusal that says flash failed. A restart would lose that result anyway.
+  if (!gSolarManager.chargerProgramReportSending(gChargerProgramReportEpoch) && !gChargerProgramReportTried) {
+    Serial.println(F("Charger programming: flash did not take the time the result goes out with"));
   }
 
   // On the config-ack notefile, as the charger report: the server tells it by the "chg-" status.
@@ -10668,75 +10743,94 @@ static void triggerRemoteRelays(const char *targetClient, uint8_t relayMask, boo
 // Check and deactivate relays that have exceeded their individual momentary timeout
 // or the safety max-on timeout for MANUAL_RESET mode.
 // Each relay is tracked independently via gRelayRuntime[].
-static void checkRelayMomentaryTimeout(unsigned long now) {
-  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
-    if (!gRelayRuntime[r].active) continue;
-    
-    uint8_t monIdx = gRelayRuntime[r].ownerMonitor;
-    uint32_t elapsedMs = now - gRelayRuntime[r].activatedAt;
-    
-    bool expired = false;
-    const char *reason = nullptr;
-    bool hasOwner = (monIdx < gConfig.monitorCount);
-    
-    if (hasOwner) {
-      const MonitorConfig &cfg = gConfig.monitors[monIdx];
-      
-      // Check momentary mode timeout
-      if (cfg.relayMode == RELAY_MODE_MOMENTARY) {
-        uint16_t seconds = cfg.relayMomentarySeconds[r];
-        if (seconds == 0) {
-          seconds = DEFAULT_RELAY_MOMENTARY_SECONDS;
-        }
-        uint32_t durationMs = (uint32_t)seconds * 1000UL;
-        if (elapsedMs >= durationMs) {
-          expired = true;
-          reason = "momentary timeout";
-        }
+// Why relay `r` is to go off now, or nullptr while it stays on: the time of a momentary relay
+// is up, or the safety limit of one that stays on until it is reset, or the duration a manual
+// command gave a relay that no monitor owns.
+static const char *relayTimeUp(uint8_t r, unsigned long now) {
+  if (!gRelayRuntime[r].active) {
+    return nullptr;
+  }
+  const uint8_t monIdx = gRelayRuntime[r].ownerMonitor;
+  const uint32_t elapsedMs = now - gRelayRuntime[r].activatedAt;
+  if (monIdx < gConfig.monitorCount) {
+    const MonitorConfig &cfg = gConfig.monitors[monIdx];
+
+    // Check momentary mode timeout
+    if (cfg.relayMode == RELAY_MODE_MOMENTARY) {
+      uint16_t seconds = cfg.relayMomentarySeconds[r];
+      if (seconds == 0) {
+        seconds = DEFAULT_RELAY_MOMENTARY_SECONDS;
       }
-      
-      // Check manual-reset safety timeout (relayMaxOnSeconds or custom duration)
-      if (!expired && (cfg.relayMode == RELAY_MODE_MANUAL_RESET || gRelayRuntime[r].source == RELAY_SRC_MANUAL)) {
-        uint32_t limit = gRelayRuntime[r].customDurationSec;
-        if (limit == 0) limit = cfg.relayMaxOnSeconds;
-        if (limit > 0) {
-          uint32_t elapsedSec = elapsedMs / 1000UL;
-          if (elapsedSec >= limit) {
-            expired = true;
-            reason = "safety max-on timeout";
-          }
-        }
-      }
-    } else if (gRelayRuntime[r].source == RELAY_SRC_MANUAL && gRelayRuntime[r].customDurationSec > 0) {
-      // Ownerless manual relay with explicit duration — still honor the timeout
-      uint32_t elapsedSec = elapsedMs / 1000UL;
-      if (elapsedSec >= gRelayRuntime[r].customDurationSec) {
-        expired = true;
-        reason = "manual duration timeout";
+      uint32_t durationMs = (uint32_t)seconds * 1000UL;
+      if (elapsedMs >= durationMs) {
+        return "momentary timeout";
       }
     }
-    
-    if (expired) {
-      Serial.print(F("Relay "));
-      Serial.print(r + 1);
-      Serial.print(F(": "));
-      Serial.print(reason);
-      Serial.print(F(" after "));
-      Serial.print(elapsedMs / 1000UL);
-      Serial.print(F("s for monitor "));
-      Serial.println(monIdx);
-      
-      // Deactivate the single relay
-      if (hasOwner && gConfig.monitors[monIdx].relayTargetClient[0] != '\0') {
-        triggerRemoteRelays(gConfig.monitors[monIdx].relayTargetClient, 1 << r, false);
+
+    // Check manual-reset safety timeout (relayMaxOnSeconds or custom duration)
+    if (cfg.relayMode == RELAY_MODE_MANUAL_RESET || gRelayRuntime[r].source == RELAY_SRC_MANUAL) {
+      uint32_t limit = gRelayRuntime[r].customDurationSec;
+      if (limit == 0) limit = cfg.relayMaxOnSeconds;
+      if (limit > 0) {
+        uint32_t elapsedSec = elapsedMs / 1000UL;
+        if (elapsedSec >= limit) {
+          return "safety max-on timeout";
+        }
       }
-      deactivateRelayForMonitor(monIdx, 1 << r);
-      
-      // Send timeout notification through alarm pipeline for safety timeouts
-      // (only when we have an owning monitor to route the alarm through)
-      if (hasOwner && strcmp(reason, "safety max-on timeout") == 0) {
-        sendAlarm(monIdx, "relay_timeout", gMonitorState[monIdx].currentValue);
-      }
+    }
+  } else if (gRelayRuntime[r].source == RELAY_SRC_MANUAL && gRelayRuntime[r].customDurationSec > 0) {
+    // Ownerless manual relay with explicit duration — still honor the timeout
+    uint32_t elapsedSec = elapsedMs / 1000UL;
+    if (elapsedSec >= gRelayRuntime[r].customDurationSec) {
+      return "manual duration timeout";
+    }
+  }
+  return nullptr;
+}
+
+static void checkRelayMomentaryTimeout(unsigned long now) {
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    const char *reason = relayTimeUp(r, now);
+    if (reason == nullptr) continue;
+
+    uint8_t monIdx = gRelayRuntime[r].ownerMonitor;
+    uint32_t elapsedMs = now - gRelayRuntime[r].activatedAt;
+    bool hasOwner = (monIdx < gConfig.monitorCount);
+
+    Serial.print(F("Relay "));
+    Serial.print(r + 1);
+    Serial.print(F(": "));
+    Serial.print(reason);
+    Serial.print(F(" after "));
+    Serial.print(elapsedMs / 1000UL);
+    Serial.print(F("s for monitor "));
+    Serial.println(monIdx);
+
+    // Deactivate the single relay
+    if (hasOwner && gConfig.monitors[monIdx].relayTargetClient[0] != '\0') {
+      triggerRemoteRelays(gConfig.monitors[monIdx].relayTargetClient, 1 << r, false);
+    }
+    deactivateRelayForMonitor(monIdx, 1 << r);
+
+    // Send timeout notification through alarm pipeline for safety timeouts
+    // (only when we have an owning monitor to route the alarm through)
+    if (hasOwner && strcmp(reason, "safety max-on timeout") == 0) {
+      sendAlarm(monIdx, "relay_timeout", gMonitorState[monIdx].currentValue);
+    }
+  }
+}
+
+// While a charger programming run holds loop() (up to a minute: sunsaver::RUN_LIMIT_MS),
+// checkRelayMomentaryTimeout() does not run. The run calls this before each of its requests and
+// while it rests (SolarManager::setChargerRunHook()): the output of a relay whose time is up goes
+// off at once. The rest waits for checkRelayMomentaryTimeout() in the next pass of loop(), which
+// finds the relay still due: the command that switches a remote relay off and the alarm of a
+// safety timeout, which go through the Notecard, and the relay's bookkeeping.
+static void switchOffRelaysTimeUp() {
+  const unsigned long now = millis();
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    if (gRelayState[r] && relayTimeUp(r, now) != nullptr) {
+      setRelayState(r, false);
     }
   }
 }

@@ -584,10 +584,11 @@ enum Refusal : uint32_t {
   REFUSE_NOT_LIFEPO4 = 1ul << 10,    // the client's battery is not configured as 12 V LiFePO4
   REFUSE_NO_CHARGER = 1ul << 11,     // the charger is not enabled, or did not answer in time
   REFUSE_JOURNAL = 1ul << 12,        // the client could not record the run in its flash
-  REFUSE_WITHDRAWN = 1ul << 13       // a newer config no longer asked for it while it waited
+  REFUSE_WITHDRAWN = 1ul << 13,      // a newer config no longer asked for it while it waited
+  REFUSE_CONFIG_UNSAVED = 1ul << 14  // the client could not save the config that carried it in its flash
 };
 
-static const uint8_t REFUSAL_BITS = 14;
+static const uint8_t REFUSAL_BITS = 15;
 
 inline const char *refusalText(uint32_t refusal) {
   switch (refusal) {
@@ -618,6 +619,9 @@ inline const char *refusalText(uint32_t refusal) {
     case REFUSE_WITHDRAWN:
       return "A newer config for this client no longer asked for these values while the request waited, so "
              "they were not written.";
+    case REFUSE_CONFIG_UNSAVED:
+      return "The client could not save the config that asked for these values in its flash memory, so they "
+             "were not written: after a restart it would go by the config it had before.";
     default: return "A reason this firmware has no text for.";
   }
 }
@@ -1698,7 +1702,10 @@ class Programmer {
 //     server keeps the two apart as well (programResultReplaces());
 //   - the time the last result of a request went out with, and the last look: a later result of
 //     the same request, or a later look, goes out with a later time, whatever the client's clock
-//     did in between (sendEpoch()).
+//     did in between (sendEpoch()). That time is in flash before the result goes out
+//     (reportSending());
+//   - which journal kept aside at an earlier start it has taken in, if any (the client's
+//     takeKeptChargerJournal()), so that a later start does not take that one in again.
 //
 // Each of these is in flash before the client goes on: a request before the config that carries
 // it is acknowledged, a commit point before the run passes it, a result before the journal
@@ -1733,9 +1740,10 @@ struct Journal {
   bool lookDue;          // `look` has yet to go to the server: the result of a look for request 0
   uint32_t lookEpoch;    // when it came about, as reportEpoch
   ProgramResult look;
-  uint32_t sentId;       // the request of the last result that went out (not a look), 0 for none
+  uint32_t sentId;       // the request of the last result that went out (not a look), or goes out now; 0 for none
   uint32_t sentEpoch;    // the time that result went out with, 0 for none
   uint32_t lookSentEpoch;  // the time the last look went out with, 0 for none
+  uint32_t keptTaken;    // the check value of a journal kept aside that this one took in, 0 for none
 };
 
 // The journal of a client that owes nothing and has answered nothing.
@@ -1765,6 +1773,7 @@ inline Journal cautiousJournal() {
 //     newer one, or sent one; and its look, while `journal` has none and sent none;
 //   - the times its last result and its last look went out with, where they are later: a later
 //     result of the same request, and a later look, go out later still (Supervisor::sendEpoch()).
+// `keptTaken` stays as `journal` has it: the caller sets it to the check value of the kept file.
 inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
   uint32_t answered = journal.answeredId;
   if (answered < journal.requestId) {
@@ -1932,9 +1941,12 @@ static const uint8_t DUTY_FAST_TRIES = 3;
 static const uint32_t JOURNAL_RETRY_MS = 600000ul;        // between two tries to write a journal that flash did not take
 static const uint16_t RUN_STEP_LIMIT = 2000;              // a run has under 400 steps: no run goes on beyond this
 
-// True for a request id that a client with the time `epochNow` may still act on.
-inline bool requestIsFresh(uint32_t requestId, double epochNow) {
-  const double asked = (double)requestId;
+// True for a request asked for at `askedAt`, the server's time then, that a client with the time
+// `epochNow` may still act on. That time travels with the request ("at", readRequestAt()), apart
+// from its id: the id only orders the requests, and goes on from the last one when the server's
+// clock went back. A request without it has its time as its id.
+inline bool requestIsFresh(uint32_t askedAt, double epochNow) {
+  const double asked = (double)askedAt;
   return epochNow >= CLOCK_SET_EPOCH && asked >= epochNow - REQUEST_MAX_AGE_SECONDS &&
          asked <= epochNow + REQUEST_MAX_AHEAD_SECONDS;
 }
@@ -1967,6 +1979,7 @@ class Supervisor {
     journalTryMs_ = nowMs;
     memset(&waitingProfile_, 0, sizeof(waitingProfile_));
     waitingLoadAllowed_ = false;
+    waitingAskedAt_ = 0;
     waitingSinceMs_ = nowMs;
     runId_ = 0;
     dutyForced_ = dutyOwed();
@@ -1987,12 +2000,14 @@ class Supervisor {
 
   // A config carried a request. `profileErrors` is what readProfile() found, `clientRefusals`
   // the Refusal bits the client found by itself (REFUSE_NOT_BUILT, REFUSE_NOT_LIFEPO4,
-  // REFUSE_NO_CHARGER). A request that is not newer than every one this client has answered or
-  // taken on is ignored: a config is sent again when its acknowledgement is lost. A new request
-  // takes the place of one that still waits. The request is in flash, or answered, on return.
-  // Returns false for a request that is ignored, true for one that waits now or was refused.
+  // REFUSE_NO_CHARGER). `askedAt` is the server's time when it was asked for (readRequestAt()),
+  // 0 for a request whose id is that time. A request that is not newer than every one this client
+  // has answered or taken on is ignored: a config is sent again when its acknowledgement is lost.
+  // A new request takes the place of one that still waits. The request is in flash, or answered,
+  // on return. Returns false for a request that is ignored, true for one that waits now or was
+  // refused.
   bool request(uint32_t requestId, const Profile &profile, uint16_t profileErrors, uint32_t clientRefusals,
-               bool loadCurrentAllowed, double epochNow, uint32_t nowMs) {
+               bool loadCurrentAllowed, double epochNow, uint32_t nowMs, uint32_t askedAt = 0) {
     if (requestId == 0 || requestId <= journal_.answeredId) {
       return false;
     }
@@ -2005,6 +2020,7 @@ class Supervisor {
       journal_.waitingId = requestId;
       waitingProfile_ = profile;
       waitingLoadAllowed_ = loadCurrentAllowed;
+      waitingAskedAt_ = askedAt != 0 ? askedAt : requestId;
       waitingSinceMs_ = nowMs;
       if (saveJournal(nowMs)) {
         dutyForced_ = true;  // a duty that is owed is tried now, and not at its next turn
@@ -2052,7 +2068,7 @@ class Supervisor {
     }
     // Both limits hold up to the moment the run starts.
     const bool clockSet = epochNow >= CLOCK_SET_EPOCH;
-    if (clockSet && !requestIsFresh(journal_.waitingId, epochNow)) {
+    if (clockSet && !requestIsFresh(waitingAskedAt_, epochNow)) {
       refuseWaiting(REFUSE_STALE, epochNow, nowMs);
       return false;
     }
@@ -2093,6 +2109,31 @@ class Supervisor {
     const uint32_t last = lookFirst() ? journal_.lookSentEpoch
                                       : (journal_.sentId == journal_.reportId ? journal_.sentEpoch : 0u);
     return last != 0 && last != 0xFFFFFFFFu && epoch <= last ? last + 1 : epoch;
+  }
+  // That result is about to go out with the time `sentEpoch` (sendEpoch()). The time goes into the
+  // journal first, as the time the last result of its request (the last look, for a look) went
+  // out with: the Notecard may take the result and the client restart before reportTaken() is in
+  // flash, and a later result of the same request, or a later look, must still go out with a later
+  // time. A newer result that takes the place of this one before it goes out keeps that time
+  // too. The result stays due until reportTaken(). Returns false when flash did not take the
+  // journal: a restart may then lose the time, as it would lose the result. Nothing is written
+  // when the journal in flash holds that time already.
+  bool reportSending(uint32_t sentEpoch, uint32_t nowMs) {
+    if (lookFirst()) {
+      if (journal_.lookSentEpoch == sentEpoch && !journalUnsaved_) {
+        return true;
+      }
+      journal_.lookSentEpoch = sentEpoch;
+    } else if (journal_.reportDue) {
+      if (journal_.sentId == journal_.reportId && journal_.sentEpoch == sentEpoch && !journalUnsaved_) {
+        return true;
+      }
+      journal_.sentId = journal_.reportId;
+      journal_.sentEpoch = sentEpoch;
+    } else {
+      return true;
+    }
+    return saveJournal(nowMs);
   }
   // The Notecard has that result, sent with the time `sentEpoch`. Not the client's note buffer:
   // that drops its oldest records once it grows too large, and the journal keeps the result until
@@ -2158,7 +2199,7 @@ class Supervisor {
     if (dutyOwed()) {
       return dutyTurn(nowMs);
     }
-    return journal_.waitingId != 0 && requestIsFresh(journal_.waitingId, epochNow) && !waitOver(nowMs);
+    return journal_.waitingId != 0 && requestIsFresh(waitingAskedAt_, epochNow) && !waitOver(nowMs);
   }
   // The controller may wait for a restart, and the client has yet to settle that.
   bool dutyOwed() const { return journal_.phase == JOURNAL_RESTARTING || journal_.phase == JOURNAL_WRITING; }
@@ -2203,6 +2244,7 @@ class Supervisor {
   uint32_t journalTryMs_;
   Profile waitingProfile_;
   bool waitingLoadAllowed_;
+  uint32_t waitingAskedAt_;  // when the request that waits was asked for (requestIsFresh())
   uint32_t waitingSinceMs_;
   uint32_t runId_;       // the request the run under way answers
   bool dutyForced_;      // try the duty at the next chance, whatever its timer says

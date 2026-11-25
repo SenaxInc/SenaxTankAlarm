@@ -3425,6 +3425,13 @@ static void testRequestJson() {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
       JsonDocument doc = parsed(requestJson("req", cases[i].text));
       CHECK_MSG(ss::readRequestId(doc.as<JsonObjectConst>()) == cases[i].id, "req as %s", cases[i].text != nullptr ? cases[i].text : "(left out)");
+      // When it was asked for reads the same way, and 0 stands for a request whose id is that time.
+      // It does not change the id.
+      const std::string withAt =
+          std::string("{\"req\":1795500000") + (cases[i].text != nullptr ? std::string(",\"at\":") + cases[i].text : "") + "}";
+      JsonDocument at = parsed(withAt);
+      CHECK_MSG(ss::readRequestAt(at.as<JsonObjectConst>()) == cases[i].id, "at as %s", cases[i].text != nullptr ? cases[i].text : "(left out)");
+      CHECK_EQ(ss::readRequestId(at.as<JsonObjectConst>()), 1795500000u);
     }
   }
 
@@ -3519,6 +3526,7 @@ static void testRequestJson() {
           out.sentEpoch = (uint32_t)kClientNow - 60;
         }
         out.lookSentEpoch = phase == 1 ? 0u : (uint32_t)kClientNow - 30 - phase;
+        out.keptTaken = due == 1 ? 0u : 0x9E3779B9u + phase;
         JsonDocument file;
         ss::encodeJournal(out, file.to<JsonObject>());
         std::string text;
@@ -3528,6 +3536,7 @@ static void testRequestJson() {
         CHECK_EQ(text.find("look") != std::string::npos, out.lookDue);
         CHECK_EQ(text.find("sep") != std::string::npos, out.sentEpoch != 0);
         CHECK_EQ(text.find("lep") != std::string::npos, out.lookSentEpoch != 0);
+        CHECK_EQ(text.find("\"kt\"") != std::string::npos, out.keptTaken != 0);
         JsonDocument back = parsed(text);
         const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
         CHECK_MSG(in.requestId == out.requestId && in.phase == out.phase && in.controller == out.controller &&
@@ -3547,16 +3556,22 @@ static void testRequestJson() {
         CHECK_EQ(in.sentId, out.sentId);
         CHECK_EQ(in.sentEpoch, out.sentEpoch);
         CHECK_EQ(in.lookSentEpoch, out.lookSentEpoch);
+        CHECK_EQ(in.keptTaken, out.keptTaken);
       }
     }
     // A look whose result this code cannot read is left out, and the rest still holds; times that
     // are not whole numbers read as none.
     {
       JsonDocument file = parsed("{\"req\":5,\"ph\":0,\"ans\":9,\"look\":{\"ep\":7,\"v\":99},"
-                                 "\"srq\":9,\"sep\":-3,\"lep\":\"8\"}");
+                                 "\"srq\":9,\"sep\":-3,\"lep\":\"8\",\"kt\":-1}");
       const ss::Journal in = ss::decodeJournal(file.as<JsonObjectConst>());
       CHECK(!in.lookDue && in.answeredId == 9 && in.phase == ss::JOURNAL_IDLE);
       CHECK(in.sentId == 0 && in.sentEpoch == 0 && in.lookSentEpoch == 0);
+      CHECK_EQ(in.keptTaken, 0u);
+      for (const char *kt : {"1.5", "\"7\"", "4294967296", "true"}) {
+        JsonDocument other = parsed((std::string("{\"req\":5,\"ph\":0,\"kt\":") + kt + "}").c_str());
+        CHECK_MSG(ss::decodeJournal(other.as<JsonObjectConst>()).keptTaken == 0u, "kt %s", kt);
+      }
     }
 
     // The longest journal there can be fits the client's buffer.
@@ -3602,6 +3617,7 @@ static void testRequestJson() {
       longest.sentId = 0xFFFFFFFFu;
       longest.sentEpoch = 0xFFFFFFFFu;
       longest.lookSentEpoch = 0xFFFFFFFFu;
+      longest.keptTaken = 0xFFFFFFFFu;
       JsonDocument file;
       ss::encodeJournal(longest, file.to<JsonObject>());
       CHECK(!file.overflowed());
@@ -4037,20 +4053,50 @@ static void testResultJson() {
     CHECK(sameResult(decoded, programmed));
   }
 
-  // Which result a server keeps for a client.
-  CHECK(ss::programResultReplaces(false, 0, 0.0, 0, 0.0));
-  CHECK(ss::programResultReplaces(false, 500, 9.0e9, 1, 0.0));
-  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 501, 1600000000.0));  // a newer request, whatever the times
-  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 501, 0.0));
-  CHECK(!ss::programResultReplaces(true, 500, 1700000000.0, 499, 1800000000.0));  // an older one, whatever the times
-  CHECK(!ss::programResultReplaces(true, 500, 0.0, 499, 1800000000.0));
-  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 500, 1700000600.0));  // the second report of a request
-  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 500, 1700000000.0));  // the same report again
-  CHECK(!ss::programResultReplaces(true, 500, 1700000600.0, 500, 1700000000.0)); // its first report, arriving late
-  CHECK(!ss::programResultReplaces(true, 500, 1700000600.0, 500, 0.0));          // one without a time
-  CHECK(ss::programResultReplaces(true, 500, 0.0, 500, 0.0));
-  CHECK(ss::programResultReplaces(true, 0xFFFFFFFEu, 0.0, 0xFFFFFFFFu, 0.0));
-  CHECK(!ss::programResultReplaces(true, 0xFFFFFFFFu, 0.0, 0, 9.0e9));
+  // Which result a server keeps for a client. Without the times the results came with (a file
+  // written before the server kept them), by the times the server took.
+  CHECK(ss::programResultReplaces(false, 0, 0.0, 0, 0, 0.0, 0));
+  CHECK(ss::programResultReplaces(false, 500, 9.0e9, 0, 1, 0.0, 0));
+  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 0, 501, 1600000000.0, 0));  // a newer request, whatever the times
+  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 0, 501, 0.0, 0));
+  CHECK(!ss::programResultReplaces(true, 500, 1700000000.0, 0, 499, 1800000000.0, 0));  // an older one, whatever the times
+  CHECK(!ss::programResultReplaces(true, 500, 0.0, 0, 499, 1800000000.0, 0));
+  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 0, 500, 1700000600.0, 0));  // the second report of a request
+  CHECK(ss::programResultReplaces(true, 500, 1700000000.0, 0, 500, 1700000000.0, 0));  // the same report again
+  CHECK(!ss::programResultReplaces(true, 500, 1700000600.0, 0, 500, 1700000000.0, 0)); // its first report, arriving late
+  CHECK(!ss::programResultReplaces(true, 500, 1700000600.0, 0, 500, 0.0, 0));          // one without a time
+  CHECK(ss::programResultReplaces(true, 500, 0.0, 0, 500, 0.0, 0));
+  CHECK(ss::programResultReplaces(true, 0xFFFFFFFEu, 0.0, 0, 0xFFFFFFFFu, 0.0, 0));
+  CHECK(!ss::programResultReplaces(true, 0xFFFFFFFFu, 0.0, 0, 0, 9.0e9, 0));
+  // With them. The client sends each later result of a request with a later time than the last:
+  // that time orders them while the one kept came with a time the server took.
+  {
+    const double t = 1700000000.0;
+    const uint32_t ut = 1700000000u;
+    // The server's clock went back by more than a day: the second result comes with a time it
+    // does not take (reportCheckTime() gives 0), and is the later one all the same.
+    CHECK(ss::programResultReplaces(true, 500, t, ut, 500, 0.0, ut + 1));
+    CHECK(ss::resultFollows(t, ut, 0.0, ut + 1));
+    CHECK(ss::resultFollows(t, ut, 0.0, ut));      // the same result again
+    CHECK(!ss::resultFollows(t, ut, 0.0, ut - 1)); // an earlier one, arriving late
+    CHECK(!ss::programResultReplaces(true, 500, t, ut, 500, t - 1.0, ut - 1));
+    CHECK(!ss::programResultReplaces(true, 500, t, ut, 500, 9.0e9, ut - 1));  // whatever the server takes its time for
+    CHECK(ss::programResultReplaces(true, 500, t, ut, 500, t + 600.0, ut + 600));
+    // A newer request, an older one: by the request, whatever the times.
+    CHECK(ss::programResultReplaces(true, 500, t, ut, 501, 0.0, 1));
+    CHECK(!ss::programResultReplaces(true, 500, t, ut, 499, t + 600.0, ut + 600));
+    // The one kept came with a time the server did not take: that time says nothing, and the
+    // times the server takes decide, so a clock that was wrong then holds nothing back.
+    CHECK(ss::resultFollows(0.0, 0xF0000000u, t, ut));
+    CHECK(ss::programResultReplaces(true, 500, 0.0, 0xF0000000u, 500, t, ut));
+    CHECK(ss::programResultReplaces(true, 500, 0.0, 0xF0000000u, 500, 0.0, 0xF0000001u));
+    // Either time missing: the times the server took.
+    CHECK(!ss::resultFollows(t, 0, 0.0, ut + 1));
+    CHECK(!ss::resultFollows(t, ut, 0.0, 0));
+    CHECK(ss::resultFollows(t, 0, t, 0));
+    CHECK(ss::resultFollows(t, ut, t + 1.0, 0));  // a later one by the server's times, sent without a whole second
+    CHECK(!ss::resultFollows(t, ut, t - 1.0, 0));
+  }
 
   // For a person: a run that went well.
   {
@@ -4315,6 +4361,8 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
   uint8_t pollFunction;             // the read function the poll found for that controller, 0 for none
   ss::FunctionChoice choice;        // what this pass reads with (ChargerProgramPort): set by pass()
   bool notecardDown;                // the Notecard takes no result: they wait
+  bool floorFirst;                  // the time goes into the journal before a result goes out (reportSending()),
+                                    // as the client does; most tests count the supervisor's own writes
   std::vector<Report> reports;
 
   Desk()
@@ -4337,7 +4385,8 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
         configured(-1),
         pollFunction(MB_FC_READ_INPUT),
         choice(MB_FC_READ_INPUT),
-        notecardDown(false) {
+        notecardDown(false),
+        floorFirst(false) {
     sim.configure(9600, MB_8N2);
     flash = ss::emptyJournal();
   }
@@ -4427,6 +4476,9 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
         epoch = at >= 1.0 ? (uint32_t)at : 1u;
       }
       const uint32_t sent = supervisor.sendEpoch(epoch);
+      if (floorFirst) {
+        supervisor.reportSending(sent, millisNow());
+      }
       const Report report = {supervisor.reportRequestId(), supervisor.reportMillis(), supervisor.reportEpoch(), sent,
                              supervisor.report()};
       reports.push_back(report);
@@ -5547,6 +5599,93 @@ static void checkAfterRestart(Desk &desk, const SimSunSaver &fresh, const ss::Pr
   CHECK(settledOn(desk.flash, kRequestId + 600));
 }
 
+// The time a result goes out with is in flash before it goes out (Supervisor::reportSending()).
+// The Notecard takes a result whose run its recovery could not settle, and the client restarts
+// before the journal says so. The client's clock is then an hour back: the result goes out
+// again, and the recovery that settles the run after it, each later than the one before. A look
+// for no request the same way.
+static void testSendTimeFirst() {
+  for (int look = 0; look < 2; ++look) {
+    Desk desk;
+    desk.flash = look == 1 ? ss::cautiousJournal() : journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.powered = false;
+    desk.notecardDown = true;  // nothing goes out by itself: this test sends
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.reportDue() && supervisor.report().followUp);
+    CHECK_EQ(supervisor.reportRequestId(), look == 1 ? 0u : kRequestId);
+    const uint32_t first = supervisor.sendEpoch(supervisor.reportEpoch());
+    CHECK(first != 0);
+    // Flash does not take it: the client is told so, and the result is still due.
+    desk.failSaves = 1;
+    size_t saves = desk.saves.size();
+    CHECK(!supervisor.reportSending(first, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves + 1);
+    CHECK(supervisor.journalUnsaved());
+    CHECK(look == 1 ? desk.flash.lookSentEpoch == 0 : desk.flash.sentEpoch == 0);
+    // It takes it the next time.
+    saves = desk.saves.size();
+    CHECK(supervisor.reportSending(first, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves + 1);
+    CHECK(!supervisor.journalUnsaved());
+    if (look == 1) {
+      CHECK_EQ(desk.flash.lookSentEpoch, first);
+      CHECK(desk.flash.lookDue);
+    } else {
+      CHECK_EQ(desk.flash.sentId, kRequestId);
+      CHECK_EQ(desk.flash.sentEpoch, first);
+      CHECK(desk.flash.reportDue);  // due until the Notecard has it
+    }
+    CHECK(supervisor.reportDue());
+    // Once in flash, it is not written again.
+    CHECK(supervisor.reportSending(first, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves + 1);
+    // Nothing is due: nothing is written.
+    {
+      Desk idle;
+      ss::Supervisor none;
+      idle.boot(none);
+      CHECK(none.reportSending(first, idle.millisNow()));
+      CHECK(idle.saves.empty());
+    }
+    // A later try of the recovery, with the clock an hour back, takes the place of that result
+    // before it goes out, and goes out later than it.
+    desk.epochBase -= 3600.0;
+    desk.advance(ss::DUTY_RETRY_MS);
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.reportDue() && supervisor.report().followUp);
+    CHECK(supervisor.reportEpoch() != 0 && supervisor.reportEpoch() < first);
+    const uint32_t second = supervisor.sendEpoch(supervisor.reportEpoch());
+    CHECK_EQ(second, first + 1);
+    CHECK(supervisor.reportSending(second, desk.millisNow()));
+    // The Notecard takes it, and the client restarts before the journal says so: the journal
+    // still holds it as due, and the time it went out with.
+    CHECK(look == 1 ? desk.flash.lookSentEpoch == second : desk.flash.sentEpoch == second);
+    desk.epochBase -= 3600.0;
+    desk.sim.powered = true;
+    desk.advance(20000);
+    desk.notecardDown = false;
+    desk.floorFirst = true;
+    ss::Supervisor restarted;
+    desk.boot(restarted);
+    CHECK_EQ(desk.reports.size(), 1);  // that result again, later than it went out before
+    CHECK(desk.reports[0].result.followUp);
+    CHECK_EQ(desk.reports[0].sent, second + 1);
+    CHECK(desk.pass(restarted));  // the recovery that settles the run
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK(!desk.reports[1].result.followUp);
+    CHECK_EQ(desk.reports[1].requestId, look == 1 ? 0u : kRequestId);
+    CHECK(desk.reports[1].epoch != 0 && desk.reports[1].epoch < first);  // by the client's clock
+    CHECK_EQ(desk.reports[1].sent, second + 2);
+    CHECK(look == 1 ? desk.flash.lookSentEpoch == second + 2 : desk.flash.sentEpoch == second + 2);
+    // The server keeps it, though its clock went back more than a day since it took the one before.
+    CHECK(ss::resultFollows((double)second, second, 0.0, desk.reports[1].sent));
+    CHECK(!restarted.dutyOwed());
+  }
+}
+
 // Supervisor::wantsLine() in the plain cases. Desk::pass() checks it against service() in every
 // pass of every other test.
 static void testWantsLine() {
@@ -5567,6 +5706,44 @@ static void testWantsLine() {
     CHECK(!supervisor.wantsLine((double)kRequestId - ss::REQUEST_MAX_AHEAD_SECONDS - 1.0, desk.millisNow()));
     CHECK(desk.pass(supervisor));
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));  // done
+  }
+  // A request is as fresh as the time it was asked for, which comes apart from its id: the
+  // server's clock went back after an earlier request, and its id goes on from that one's.
+  for (int askedLater = 0; askedLater < 2; ++askedLater) {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    const uint32_t ahead = kRequestId + 3 * 86400u;  // the earlier request was asked for three days "later"
+    const uint32_t at = askedLater == 1 ? kRequestId : 0u;
+    CHECK(supervisor.request(ahead + 1, ss::lifepo4Profile(), 0, 0, true, desk.clock(), desk.millisNow(), at));
+    desk.collect(supervisor);
+    // Without the time it was asked for, the id is that time: three days ahead of the client's clock.
+    CHECK_EQ(supervisor.wantsLine(desk.clock(), desk.millisNow()), askedLater == 1);
+    CHECK_EQ(supervisor.wantsLine((double)kRequestId + ss::REQUEST_MAX_AGE_SECONDS + 1.0, desk.millisNow()), false);
+    if (askedLater == 1) {
+      CHECK(supervisor.wantsLine((double)kRequestId + ss::REQUEST_MAX_AGE_SECONDS, desk.millisNow()));
+      CHECK(!supervisor.wantsLine((double)kRequestId - ss::REQUEST_MAX_AHEAD_SECONDS - 1.0, desk.millisNow()));
+    }
+    CHECK_EQ(desk.pass(supervisor), askedLater == 1);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().requestId, ahead + 1);
+    CHECK_EQ(desk.reports.back().result.outcome, askedLater == 1 ? ss::OUTCOME_PROGRAMMED : ss::OUTCOME_REFUSED);
+    CHECK_EQ(desk.reports.back().result.refusals, askedLater == 1 ? 0u : (uint32_t)ss::REFUSE_STALE);
+  }
+  {
+    // And a request whose id looks fresh is stale by the time it was asked for.
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(supervisor.request(kRequestId, ss::lifepo4Profile(), 0, 0, true, desk.clock(), desk.millisNow(),
+                             kRequestId - 2 * 86400u));
+    CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
+    CHECK(!desk.pass(supervisor));
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().result.refusals, (uint32_t)ss::REFUSE_STALE);
+    // A newer request takes its own time, not the one before.
+    CHECK(supervisor.request(kRequestId + 1, ss::lifepo4Profile(), 0, 0, true, desk.clock(), desk.millisNow()));
+    CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
   }
   {
     // Waiting for the charger: both limits still hold, up to the moment the run would start.
@@ -7683,8 +7860,9 @@ static void testResultsApart() {
     CHECK_EQ(desk.reports[1].requestId, kRequestId);
     CHECK(desk.reports[1].epoch != 0 && desk.reports[1].epoch < first);  // by the client's clock
     CHECK_EQ(desk.reports[1].sent, first + 1);
-    CHECK(ss::programResultReplaces(true, kRequestId, first, kRequestId, desk.reports[1].sent));
-    CHECK(!ss::programResultReplaces(true, kRequestId, first, kRequestId, desk.reports[1].epoch));
+    CHECK(ss::programResultReplaces(true, kRequestId, first, 0, kRequestId, desk.reports[1].sent, 0));
+    CHECK(!ss::programResultReplaces(true, kRequestId, first, 0, kRequestId, desk.reports[1].epoch, 0));
+    CHECK(ss::programResultReplaces(true, kRequestId, first, first, kRequestId, 0.0, desk.reports[1].sent));
     CHECK_EQ(desk.flash.sentEpoch, first + 1);
     // The result of a newer request goes out with its own time.
     CHECK(desk.ask(now, kRequestId + 1, profile, 0, ss::REFUSE_NOT_LIFEPO4));
@@ -7838,6 +8016,15 @@ static void testKeptJournal() {
   {
     // Its duty comes into a journal that owes none, or owes the cautious look: that went to the
     // controller the config names. One that a journal owes a known controller stays.
+    // Which kept journal the journal took in stays as the journal has it: the client sets it.
+    {
+      ss::Journal own = ss::emptyJournal();
+      own.keptTaken = 0x12345678u;
+      ss::Journal other = cut;
+      other.keptTaken = 0x9ABCDEF0u;
+      CHECK_EQ(ss::mergeKeptJournal(own, other).keptTaken, 0x12345678u);
+      CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), other).keptTaken, 0u);
+    }
     const ss::Journal idle = ss::mergeKeptJournal(ss::emptyJournal(), cut);
     CHECK_EQ(idle.phase, ss::JOURNAL_WRITING);
     CHECK_EQ(idle.controller, 7);
@@ -8203,6 +8390,7 @@ int main() {
   testResultJson();
   testSupervisor();
   testWantsLine();
+  testSendTimeFirst();
   testWithdraw();
   testJournalKeeps();
   testJournalMaintenance();

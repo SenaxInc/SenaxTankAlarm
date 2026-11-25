@@ -314,6 +314,8 @@ public:
   // Writes the journal of charger programming to the client's flash. True only once the file
   // holds it whole. See beginChargerProgramming().
   typedef bool (*ChargerJournalWriter)(const sunsaver::Journal &journal);
+  // What the client does while a programming run holds its loop. See setChargerRunHook().
+  typedef void (*ChargerRunHook)();
 
   SolarManager();
   
@@ -439,10 +441,17 @@ public:
   // writes it.
   void beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer);
 
+  // A run holds loop() for as long as it takes (see serviceChargerProgramming()), and calls
+  // `hook` wherever it feeds the watchdog: before every request and while it rests between them,
+  // at least every 100 ms of a rest. The client does there what cannot wait for the run's end. A
+  // hook must not talk to the charger, and is quick. nullptr for none.
+  void setChargerRunHook(ChargerRunHook hook) { _runHook = hook; }
+
   // A config carried a request. See sunsaver::Supervisor::request(): false for a request that
-  // this client has dealt with already. The request is in flash, or answered, on return.
+  // this client has dealt with already. `askedAt` is when it was asked for (sunsaver::readRequestAt(),
+  // 0 when its id is that time). The request is in flash, or answered, on return.
   bool requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
-                             uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow);
+                             uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow, uint32_t askedAt = 0);
 
   // A request that waits is given up (see sunsaver::Supervisor::withdraw()). False when none
   // waits.
@@ -470,6 +479,9 @@ public:
   // reportEpoch(), sendEpoch(), resultOnlyInRam()), the journal, and whether a request or a duty
   // is open.
   const sunsaver::Supervisor& chargerProgramming() const { return _programming; }
+  // The result that is due is about to go out with the time `sentEpoch`: the time goes into the
+  // journal first (sunsaver::Supervisor::reportSending()). False when flash did not take it.
+  bool chargerProgramReportSending(uint32_t sentEpoch);
   // The Notecard has the result, sent with the time `sentEpoch` (not the note buffer, which may
   // drop it: see sunsaver::Supervisor::reportTaken()).
   void chargerProgramReportTaken(uint32_t sentEpoch);
@@ -498,6 +510,7 @@ private:
   };
   sunsaver::Supervisor _programming;
   JournalFile _journalFile;
+  ChargerRunHook _runHook;
   
   // Modbus communication
   bool startModbusLink();  // ModbusRTUClient on the RS-485 port, as _config says: false when it does not start

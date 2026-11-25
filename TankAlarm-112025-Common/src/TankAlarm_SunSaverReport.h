@@ -373,6 +373,11 @@ inline bool readLoadAllowed(JsonObjectConst in) { return in["loadOk"].is<bool>()
 // The id of the request, or 0 when the config asks for nothing to be written.
 inline uint32_t readRequestId(JsonObjectConst in) { return in["req"].is<uint32_t>() ? in["req"].as<uint32_t>() : 0; }
 
+// When a request was asked for: the server's time then ("at"), apart from its id, which goes on
+// from the last one when the server's clock went back (see requestIsFresh()). 0 for a request
+// without it, whose id is that time.
+inline uint32_t readRequestAt(JsonObjectConst in) { return in["at"].is<uint32_t>() ? in["at"].as<uint32_t>() : 0; }
+
 // ---------------------------------------------------------------------------------------------
 // Programming: the result of a run
 // ---------------------------------------------------------------------------------------------
@@ -557,9 +562,11 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
 //                  and "ep", when it came about (0: not known)
 //   look           the look for no request that has yet to go to the server (left out when there
 //                  is none): the same, without "rq"
-//   srq, sep       the request of the last result that went out and the time it went out with
-//                  (left out while none has)
+//   srq, sep       the request of the last result that went out, or goes out now, and the time
+//                  it went out with (left out while none has)
 //   lep            the time the last look went out with (left out while none has)
+//   kt             the check value of a journal kept aside that this one took in (left out for
+//                  none: see the client's takeKeptChargerJournal())
 // It is written whole, as a new file that takes the place of the old one, and is no longer than
 // JOURNAL_JSON_MAX.
 
@@ -591,6 +598,9 @@ inline void encodeJournal(const Journal &journal, JsonObject out) {
   }
   if (journal.lookSentEpoch != 0) {
     out["lep"] = journal.lookSentEpoch;
+  }
+  if (journal.keptTaken != 0) {
+    out["kt"] = journal.keptTaken;
   }
 }
 
@@ -630,6 +640,7 @@ inline Journal decodeJournal(JsonObjectConst in) {
     journal.sentEpoch = in["sep"].as<uint32_t>();
   }
   journal.lookSentEpoch = in["lep"].is<uint32_t>() ? in["lep"].as<uint32_t>() : 0;
+  journal.keptTaken = in["kt"].is<uint32_t>() ? in["kt"].as<uint32_t>() : 0;
   return journal;
 }
 
@@ -637,18 +648,35 @@ inline Journal decodeJournal(JsonObjectConst in) {
 // Programming: the result the server keeps, and the result for a person
 // ---------------------------------------------------------------------------------------------
 
+// Whether a result of the same request as the one the server keeps, or a look when it keeps a
+// look, came after it. A client sends each one with a later time ("epoch") than the last one it
+// sent (Supervisor::sendEpoch()), whatever its clock did, and has that time in flash before the
+// result goes out (Supervisor::reportSending()). That time as it came, `keptSent` and `newSent`,
+// orders the two while the one kept came with a time the server took: a later one may come with
+// a time reportCheckTime() does not take, as when the server's clock went back by more than a
+// day, and it came later all the same. When the one kept came with a time the server did not take,
+// or either time is missing (a file written before the server kept it), the times the server took
+// decide, `keptTime` and `newTime`, as they do for charger reports (reportReplaces()): a time that
+// was never right then does not hold back the results that follow it.
+inline bool resultFollows(double keptTime, uint32_t keptSent, double newTime, uint32_t newSent) {
+  if (keptTime > 0.0 && keptSent != 0 && newSent != 0) {
+    return newSent >= keptSent;
+  }
+  return newTime >= keptTime;
+}
+
 // Whether a result that arrives takes the place of the one the server keeps for a client. The
-// result of a newer request does, and so does a later result of the same request: a client
-// reports twice when it had to look at the controller again. The times are reportCheckTime()s.
-// The server keeps a result for request 0 apart, by its time alone (reportReplaces()): a look
-// that a client made when it could not tell from its flash what was owed answers no request, and
-// takes the place of none.
-inline bool programResultReplaces(bool haveKept, uint32_t keptRequestId, double keptTime, uint32_t newRequestId,
-                                  double newTime) {
+// result of a newer request does, and so does a later result of the same request
+// (resultFollows()): a client reports twice when it had to look at the controller again. The
+// times are reportCheckTime()s, and the times the client sent them with. The server keeps a
+// result for request 0 apart, by resultFollows() alone: a look that a client made when it could
+// not tell from its flash what was owed answers no request, and takes the place of none.
+inline bool programResultReplaces(bool haveKept, uint32_t keptRequestId, double keptTime, uint32_t keptSent,
+                                  uint32_t newRequestId, double newTime, uint32_t newSent) {
   if (!haveKept || newRequestId > keptRequestId) {
     return true;
   }
-  return newRequestId == keptRequestId && newTime >= keptTime;
+  return newRequestId == keptRequestId && resultFollows(keptTime, keptSent, newTime, newSent);
 }
 
 // The result for a person.

@@ -616,18 +616,21 @@ struct ClientMetadata {
   // the client's result, a "chg-prog" report on the config-ack notefile
   // (handleChargerProgramResult()). Kept in CHARGER_PROGRAMS_PATH, not in the metadata cache.
   uint32_t chargerProgramAsked;                  // the id of the newest request sent, 0 = none
+  uint32_t chargerProgramAskedAt;                // the server's time when it was asked for ("at")
   sunsaver::Profile chargerProgramAskedProfile;  // the values it asked for
   bool chargerProgramAskedLoadOk;                // and whether it allowed current from the LOAD terminals
-  bool chargerProgramValid;                      // the three fields below hold a result
+  bool chargerProgramValid;                      // the four fields below hold a result
   uint32_t chargerProgramRequestId;              // the request it answers
   double chargerProgramEpoch;                    // when the client made it, 0 = not known
+  uint32_t chargerProgramSent;                   // the time it came with, as it came (sunsaver::resultFollows())
   sunsaver::ProgramResult chargerProgram;
   // And the last look at the charger that answers no request (request 0): a client makes one
   // after a start at which it could not read its journal, or its flash had lost its files, since
   // a run may have been cut short then. Kept apart from the result of a request, which it neither
   // answers nor takes the place of.
-  bool chargerLookValid;                         // the two fields below hold one
+  bool chargerLookValid;                         // the three fields below hold one
   double chargerLookEpoch;                       // when the client made it, 0 = not known
+  uint32_t chargerLookSent;                      // the time it came with, as it came
   sunsaver::ProgramResult chargerLook;
 };
 
@@ -2432,7 +2435,7 @@ function table(head,rows,kv){return '<table'+(kv?' class="cc-kv"':'')+'>'+(head?
 function resultHtml(r,waiting){
 let h='';const name=String(r.outcome||'');const t=when(r.e);
 h+='<p><span class="cc-verdict '+(outcomeBadge[r.o]||'cc-bad')+'">'+esc(name.charAt(0).toUpperCase()+name.slice(1))+'</span>'+esc(r.text)+'</p>';
-h+='<p class="cc-note">'+esc((r.summary&&r.summary!==r.outcome?r.summary+'. ':'')+(r.req?'For the request sent '+when(r.req)+'.':'For a run that a restart of the client may have cut short: the client could not tell from its flash, so it looked at the charger.')+(t?' Reported '+t+'.':''))+'</p>';
+h+='<p class="cc-note">'+esc((r.summary&&r.summary!==r.outcome?r.summary+'. ':'')+(r.req?'For the request sent '+when(r.at||r.req)+'.':'For a run that a restart of the client may have cut short: the client could not tell from its flash, so it looked at the charger.')+(t?' Reported '+t+'.':''))+'</p>';
 if(r.followUp)h+='<p class="cc-note">The client looks at the charger again once it answers, and sends another result.</p>';
 const facts=[];if(r.restart)facts.push(['Restart',r.restart]);if(r.battery)facts.push(['Battery when the run began',r.battery]);
 if(facts.length)h+=table(null,facts,true);
@@ -2450,7 +2453,7 @@ if(!p){box.className='empty-state';box.innerHTML='This client has not been asked
 box.className='';let h='';
 const waiting=!!(p.asked&&!p.answered);
 if(waiting){
-h+='<p><span class="cc-verdict cc-none">Waiting</span>Request sent '+esc(when(p.asked))+'. '+esc(p.fresh?'The client writes the values once it has the config, its clock is set and the charger answers. Its result shows here.':'It is more than a day old now, so the client refuses it if it gets it. To ask again, save the config with "Write these values to the charger" ticked.')+'</p>';
+h+='<p><span class="cc-verdict cc-none">Waiting</span>Request sent '+esc(when(p.askedAt||p.asked))+'. '+esc(p.fresh?'The client writes the values once it has the config, its clock is set and the charger answers. Its result shows here.':'It is more than a day old now, so the client refuses it if it gets it. To ask again, save the config with "Write these values to the charger" ticked.')+'</p>';
 h+='<h3>Values asked for</h3>'+table(null,p.values,true)+'<p class="cc-note">'+esc(p.loadOk?'The request allows current to flow from the LOAD terminals during the run.':'The client refuses to begin while current flows from the LOAD terminals: the request does not allow it.')+'</p>';
 }
 const r=p.result,lk=p.look;
@@ -13008,20 +13011,23 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
 }
 
 // The charger programming of a client for /api/charger, when it has any:
-//   asked     the id of the newest request sent (the server's time when it was asked for), 0 = none
+//   asked     the id of the newest request sent, 0 = none
+//   askedAt   the server's time when it was asked for
 //   answered  the client has sent a result for it
 //   fresh     a client could still act on it now: under a day old (sunsaver::requestIsFresh())
 //   loadOk    it allowed current from the LOAD terminals during the run
 //   values    [[label, value], ...]: what it asked for
-//   result    the last result: "req" the request it answers, "e" when the client made it (0 = not
-//             known), and the members of sunsaver::describeProgramResult()
+//   result    the last result: "req" the request it answers, "at" when that was asked for (when
+//             it is the newest one sent), "e" when the client made it (0 = not known), and the
+//             members of sunsaver::describeProgramResult()
 //   look      the last look at the charger that answers no request (ClientMetadata::chargerLook):
 //             "e", and the members of sunsaver::describeProgramResult()
 static void describeChargerProgram(const ClientMetadata &meta, JsonObject out) {
   if (meta.chargerProgramAsked != 0) {
     out["asked"] = meta.chargerProgramAsked;
+    out["askedAt"] = meta.chargerProgramAskedAt;
     out["answered"] = chargerProgramAnswered(meta);
-    out["fresh"] = sunsaver::requestIsFresh(meta.chargerProgramAsked, currentEpoch());
+    out["fresh"] = sunsaver::requestIsFresh(meta.chargerProgramAskedAt, currentEpoch());
     out["loadOk"] = meta.chargerProgramAskedLoadOk;
     JsonArray values = out["values"].to<JsonArray>();
     for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
@@ -13036,6 +13042,9 @@ static void describeChargerProgram(const ClientMetadata &meta, JsonObject out) {
   if (meta.chargerProgramValid) {
     JsonObject result = out["result"].to<JsonObject>();
     result["req"] = meta.chargerProgramRequestId;
+    if (meta.chargerProgramRequestId == meta.chargerProgramAsked && meta.chargerProgramAskedAt != 0) {
+      result["at"] = meta.chargerProgramAskedAt;  // when it was asked for: its id may run ahead of that
+    }
     result["e"] = (uint32_t)meta.chargerProgramEpoch;
     sunsaver::describeProgramResult(meta.chargerProgram, result);
   }
@@ -13357,6 +13366,7 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
   const bool apply = program["apply"].is<bool>() && program["apply"].as<bool>();
   program.remove("apply");
   program.remove("req");
+  program.remove("at");
   sunsaver::Profile profile;
   const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
   const bool loadOk = sunsaver::readLoadAllowed(program);
@@ -13372,7 +13382,8 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
     if (meta && meta->chargerProgramAsked != 0 && !chargerProgramAnswered(*meta) && profileErrors == 0 &&
         configSuitsChargerProgram(config) && sameChargerProfile(profile, meta->chargerProgramAskedProfile) &&
         loadOk == meta->chargerProgramAskedLoadOk) {
-      if (!program["req"].set(meta->chargerProgramAsked)) {
+      if (!program["req"].set(meta->chargerProgramAsked) ||
+          (meta->chargerProgramAskedAt != 0 && !program["at"].set(meta->chargerProgramAskedAt))) {
         text.add(NO_MEMORY);
         return 503;
       }
@@ -13410,10 +13421,12 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
   uint32_t requestId = (uint32_t)now;
   if (meta && requestId <= meta->chargerProgramAsked) {
     // The server's clock went back. The client takes only a newer id, and the config that carries
-    // it has a newer time too (nextConfigDispatchEpoch()).
+    // it has a newer time too (nextConfigDispatchEpoch()). The id is then no longer the time it was
+    // asked for, which goes with it ("at"): a client refuses a request by its age, and an id that
+    // runs ahead of its clock would read as a request from the future (sunsaver::requestIsFresh()).
     requestId = meta->chargerProgramAsked + 1;
   }
-  if (!program["req"].set(requestId)) {
+  if (!program["req"].set(requestId) || !program["at"].set((uint32_t)now)) {
     text.add(NO_MEMORY);
     return 503;
   }
@@ -13434,6 +13447,8 @@ static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantCons
   sunsaver::readProfile(program, &meta->chargerProgramAskedProfile);
   meta->chargerProgramAskedLoadOk = sunsaver::readLoadAllowed(program);
   meta->chargerProgramAsked = requestId;
+  const uint32_t askedAt = sunsaver::readRequestAt(program);
+  meta->chargerProgramAskedAt = askedAt != 0 ? askedAt : requestId;
   gChargerReportsDirty = true;
   saveChargerReportsIfDirty(true);
 
@@ -13490,13 +13505,17 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
   }
   const uint32_t requestId = doc["req"].is<uint32_t>() ? doc["req"].as<uint32_t>() : 0;
   // Ordered by request, and within one request by the client's time of the result, which is
-  // read as the time of a charger check is (see handleChargerReport()). A look for request 0 is
-  // kept apart, by its time alone (ClientMetadata::chargerLook).
+  // read as the time of a charger check is (see handleChargerReport()), and by that time as it
+  // came while the one kept came with a time this server took (sunsaver::resultFollows()). A look
+  // for request 0 is kept apart, by its time alone (ClientMetadata::chargerLook).
   const double madeAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
+  const uint32_t sent = doc["epoch"].is<uint32_t>() ? doc["epoch"].as<uint32_t>() : 0;
   const bool look = requestId == 0;
-  if (look ? !sunsaver::reportReplaces(meta->chargerLookValid, meta->chargerLookEpoch, madeAt)
+  if (look ? meta->chargerLookValid &&
+                 !sunsaver::resultFollows(meta->chargerLookEpoch, meta->chargerLookSent, madeAt, sent)
            : !sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId,
-                                              meta->chargerProgramEpoch, requestId, madeAt)) {
+                                              meta->chargerProgramEpoch, meta->chargerProgramSent, requestId, madeAt,
+                                              sent)) {
     Serial.print(F("Charger programming result from "));
     Serial.print(clientUid);
     Serial.println(F(" is older than the one this server holds: not kept"));
@@ -13505,11 +13524,13 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
   if (look) {
     meta->chargerLookValid = true;
     meta->chargerLookEpoch = madeAt;
+    meta->chargerLookSent = sent;
     meta->chargerLook = result;
   } else {
     meta->chargerProgramValid = true;
     meta->chargerProgramRequestId = requestId;
     meta->chargerProgramEpoch = madeAt;
+    meta->chargerProgramSent = sent;
     meta->chargerProgram = result;
   }
   gChargerReportsDirty = true;
@@ -13527,11 +13548,12 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
   addServerSerialLog(line, sunsaver::outcomeIsGood(result.outcome) ? "info" : "warn", "charger");
 }
 
-// The charger programming of each client that has any: the newest request sent ("a", its values
-// "ap" in the order of sunsaver::profileField(), "al" when it allowed current from the LOAD
-// terminals), the last result ("r" the request it answers, "e" when the client made it, and
-// the members of sunsaver::encodeProgramResult()) and the last look for no request ("l": "e" and
-// the members of sunsaver::encodeProgramResult()). True once the file holds them.
+// The charger programming of each client that has any: the newest request sent ("a", "aa" when
+// it was asked for, its values "ap" in the order of sunsaver::profileField(), "al" when it
+// allowed current from the LOAD terminals), the last result ("r" the request it answers, "e" when
+// the client made it, "s" the time it came with, and the members of
+// sunsaver::encodeProgramResult()) and the last look for no request ("l": "e", "s" and the members
+// of sunsaver::encodeProgramResult()). True once the file holds them.
 static bool saveChargerPrograms() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
@@ -13550,6 +13572,7 @@ static bool saveChargerPrograms() {
       obj["c"] = meta.clientUid;
       if (meta.chargerProgramAsked != 0) {
         obj["a"] = meta.chargerProgramAsked;
+        obj["aa"] = meta.chargerProgramAskedAt;
         JsonArray values = obj["ap"].to<JsonArray>();
         for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
           values.add(sunsaver::profileField(meta.chargerProgramAskedProfile, field));
@@ -13561,11 +13584,13 @@ static bool saveChargerPrograms() {
       if (meta.chargerProgramValid) {
         obj["r"] = meta.chargerProgramRequestId;
         obj["e"] = (uint32_t)meta.chargerProgramEpoch;
+        obj["s"] = meta.chargerProgramSent;
         sunsaver::encodeProgramResult(meta.chargerProgram, obj);
       }
       if (meta.chargerLookValid) {
         JsonObject look = obj["l"].to<JsonObject>();
         look["e"] = (uint32_t)meta.chargerLookEpoch;
+        look["s"] = meta.chargerLookSent;
         sunsaver::encodeProgramResult(meta.chargerLook, look);
       }
     }
@@ -13656,6 +13681,10 @@ static void loadChargerPrograms() {
           const sunsaver::Profile profile = {fields[0], fields[1], fields[2], fields[3],
                                              fields[4], fields[5], fields[6]};
           meta->chargerProgramAsked = asked;
+          // A file written before the time was kept apart from the id: the id was the time.
+          meta->chargerProgramAskedAt = obj["aa"].is<uint32_t>() && obj["aa"].as<uint32_t>() != 0
+                                            ? obj["aa"].as<uint32_t>()
+                                            : asked;
           meta->chargerProgramAskedProfile = profile;
           meta->chargerProgramAskedLoadOk = obj["al"].is<bool>() && obj["al"].as<bool>();
           any = true;
@@ -13666,6 +13695,7 @@ static void loadChargerPrograms() {
         meta->chargerProgramValid = true;
         meta->chargerProgramRequestId = obj["r"].is<uint32_t>() ? obj["r"].as<uint32_t>() : 0;
         meta->chargerProgramEpoch = obj["e"] | 0.0;
+        meta->chargerProgramSent = obj["s"].is<uint32_t>() ? obj["s"].as<uint32_t>() : 0;
         meta->chargerProgram = result;
         any = true;
       }
@@ -13673,6 +13703,7 @@ static void loadChargerPrograms() {
       if (!look.isNull() && sunsaver::decodeProgramResult(look, &result)) {
         meta->chargerLookValid = true;
         meta->chargerLookEpoch = look["e"] | 0.0;
+        meta->chargerLookSent = look["s"].is<uint32_t>() ? look["s"].as<uint32_t>() : 0;
         meta->chargerLook = result;
         any = true;
       }

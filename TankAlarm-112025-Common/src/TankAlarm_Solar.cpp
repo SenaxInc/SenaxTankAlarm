@@ -304,7 +304,8 @@ static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, ui
 
 SolarManager::SolarManager() 
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
+    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false),
+    _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -1087,11 +1088,14 @@ class ChargerCheckBus : public sunsaver::Reader {
 // or 0 when it is not known: the port finds it out then (sunsaver::FunctionChoice). Before every
 // request it sends, the second request of a read that looks for its function too, it leaves the
 // line silent for the frame gap at `baud` (keepFrameGap()), since a run that goes well sends its
-// requests with no rest between them.
+// requests with no rest between them. Wherever it feeds the watchdog, before every request and
+// while it rests, it calls `hook` too (SolarManager::setChargerRunHook()).
 class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionReader {
  public:
-  ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs, uint32_t baud)
-      : _function(functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs), _gapUs(modbusFrameGapUs(baud)) {}
+  ChargerProgramPort(uint8_t slaveId, uint8_t functionCode, uint16_t timeoutMs, uint32_t baud,
+                     SolarManager::ChargerRunHook hook)
+      : _function(functionCode), _slaveId(slaveId), _timeoutMs(timeoutMs), _gapUs(modbusFrameGapUs(baud)),
+        _hook(hook) {}
 
   uint16_t timeoutMs() const override { return _timeoutMs; }
 
@@ -1110,7 +1114,7 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
   // good CRC, not which address and value it names. The run goes by what the register reads
   // back, not by the acknowledgement (see sunsaver::Bus).
   sunsaver::IoStatus writeRegister(uint16_t addr, uint16_t raw) override {
-    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    tick();
     KeptPollDiagnostics kept;
     keepFrameGap(_gapUs);
     drainRS485Rx();
@@ -1125,7 +1129,7 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
   }
 
   sunsaver::IoStatus writeCoil(uint16_t addr) override {
-    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    tick();
     KeptPollDiagnostics kept;
     keepFrameGap(_gapUs);
     drainRS485Rx();
@@ -1146,7 +1150,7 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
     }
     const unsigned long start = millis();
     for (;;) {
-      TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+      tick();
       const unsigned long waited = (unsigned long)(millis() - start);
       if (waited >= wait) {
         break;
@@ -1162,14 +1166,23 @@ class ChargerProgramPort : public sunsaver::Port, private sunsaver::FunctionRead
 
  private:
   sunsaver::IoStatus readWith(uint8_t function, uint16_t addr, uint16_t *raw) override {
+    tick();  // ChargerCheckBus feeds the watchdog as well
     keepFrameGap(_gapUs);
     return ChargerCheckBus(_slaveId, function).readRegister(addr, raw);
+  }
+
+  void tick() {
+    TANKALARM_WATCHDOG_KICK(Watchdog::get_instance());
+    if (_hook != nullptr) {
+      _hook();
+    }
   }
 
   sunsaver::FunctionChoice _function;
   uint8_t _slaveId;
   uint16_t _timeoutMs;
   uint32_t _gapUs;
+  SolarManager::ChargerRunHook _hook;
 };
 #endif  // TANKALARM_SUNSAVER_PROGRAMMING
 
@@ -1227,12 +1240,13 @@ void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, Cha
 }
 
 bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
-                                         uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow) {
+                                         uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow,
+                                         uint32_t askedAt) {
 #if !TANKALARM_SUNSAVER_PROGRAMMING
   clientRefusals |= sunsaver::REFUSE_NOT_BUILT;  // whatever the caller says: such a request never waits
 #endif
   return _programming.request(requestId, profile, profileErrors, clientRefusals, loadCurrentAllowed, epochNow,
-                              (uint32_t)millis());
+                              (uint32_t)millis(), askedAt);
 }
 
 bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
@@ -1242,6 +1256,10 @@ bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
 
 void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
   _programming.reportTaken(sentEpoch, (uint32_t)millis());
+}
+
+bool SolarManager::chargerProgramReportSending(uint32_t sentEpoch) {
+  return _programming.reportSending(sentEpoch, (uint32_t)millis());
 }
 
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
@@ -1259,7 +1277,7 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   ChargerProgramPort port(_programming.controllerToUse(_config.modbusSlaveId),
                           _programming.readFunctionToUse(_config.modbusSlaveId,
                                                          line.pollAnswered ? _cachedHoldingFC : (uint8_t)0),
-                          _config.modbusTimeoutMs, _config.modbusBaudRate);
+                          _config.modbusTimeoutMs, _config.modbusBaudRate, _runHook);
   // No poll runs, so the link is down (the charger is off in the config, or the link did not
   // start). It is started for a duty whose turn has come, on the settings the config holds, and
   // stopped again after it. Then service() talks only on a link started for it: a turn that comes
@@ -1303,7 +1321,8 @@ bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
 // Stub implementation for non-RS485 platforms
 SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false) {
+    _floatReferenceV(0.0f), _chargerCheckStepMillis(0), _chargerCheckGapMs(0), _chargerSettingsRead(false),
+    _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }
@@ -1352,16 +1371,20 @@ void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, Cha
   _programming.begin(journal, &_journalFile, (uint32_t)millis());
 }
 bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
-                                         uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow) {
+                                         uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow,
+                                         uint32_t askedAt) {
   // No RS-485 here: refused as a charger that is not there.
   return _programming.request(requestId, profile, profileErrors, clientRefusals | sunsaver::REFUSE_NO_CHARGER,
-                              loadCurrentAllowed, epochNow, (uint32_t)millis());
+                              loadCurrentAllowed, epochNow, (uint32_t)millis(), askedAt);
 }
 bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
   return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
 }
 void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
   _programming.reportTaken(sentEpoch, (uint32_t)millis());
+}
+bool SolarManager::chargerProgramReportSending(uint32_t sentEpoch) {
+  return _programming.reportSending(sentEpoch, (uint32_t)millis());
 }
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   (void)epochNow;
