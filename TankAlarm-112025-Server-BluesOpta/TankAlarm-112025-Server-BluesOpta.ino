@@ -635,6 +635,9 @@ struct ClientMetadata {
   double chargerLookEpoch;                       // when the client made it, 0 = not known
   uint32_t chargerLookSent;                      // the time it came with, as it came
   sunsaver::ProgramResult chargerLook;
+  // The client was in the metadata cache at this start, and the file of charger programming,
+  // which may hold an entry for it, has not been read yet (see loadChargerPrograms()).
+  bool chargerProgramUnread;
 };
 
 struct SerialLogEntry {
@@ -1404,7 +1407,10 @@ static unsigned long gChargerReportsTryMillis = 0;  // when it was last written 
 // be read. Until then nothing writes it: a write would replace the reports it holds with those in
 // RAM. See loadChargerReports().
 static bool gChargerReportsLoaded = false;
-static unsigned long gChargerReportsReadMillis = 0;  // when it was last read or tried
+// The same for the file of charger programming (loadChargerPrograms()). The two are written
+// together, so neither is written until both have been read.
+static bool gChargerProgramsLoaded = false;
+static unsigned long gChargerReportsReadMillis = 0;  // when they were last read or tried
 #define CHARGER_REPORTS_RETRY_MS 300000UL           // after a write or a read that failed
 static unsigned long gLastStaleCheckMillis = 0;
 
@@ -2824,7 +2830,9 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
 static void noteChargerProgramRequestSent(const char *clientUid, JsonVariantConst config);
 static void recoverChargerProgramRequests();
 static bool saveChargerPrograms();
+static void beginChargerPrograms();
 static void loadChargerPrograms();
+static void setChargerProgramsAside(const char *why);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static void handleTelemetryRequestPost(EthernetClient &client, const String &body);
@@ -4714,7 +4722,7 @@ void setup() {
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
   beginChargerReports();      // and each client's last charger check
-  loadChargerPrograms();      // and its charger programming
+  beginChargerPrograms();     // and its charger programming
   recoverChargerProgramRequests();  // with any request its cached config holds and the record does not
   printHardwareRequirements();
 
@@ -13225,18 +13233,23 @@ static bool saveChargerReports() {
 // three writes worked. gClientMetadataDirty cannot tell: other savers clear it after a write
 // that failed.
 //
-// Until the file has been read at this start (gChargerReportsLoaded), neither is written from
-// here: the file is read again instead, every CHARGER_REPORTS_RETRY_MS, and once that works what
-// came in meanwhile is written at once.
+// Until both files have been read at this start (gChargerReportsLoaded, gChargerProgramsLoaded),
+// none of the three is written from here: what is still unread is read again instead, every
+// CHARGER_REPORTS_RETRY_MS, and once that works what came in meanwhile is written at once.
 static void saveChargerReportsIfDirty(bool force) {
   const unsigned long nowMs = millis();
-  if (!gChargerReportsLoaded) {
+  if (!gChargerReportsLoaded || !gChargerProgramsLoaded) {
     if (!gClientMetadataLoaded || (nowMs - gChargerReportsReadMillis) < CHARGER_REPORTS_RETRY_MS) {
       return;
     }
     gChargerReportsReadMillis = nowMs;
-    loadChargerReports();
     if (!gChargerReportsLoaded) {
+      loadChargerReports();
+    }
+    if (!gChargerProgramsLoaded) {
+      loadChargerPrograms();
+    }
+    if (!gChargerReportsLoaded || !gChargerProgramsLoaded) {
       return;
     }
     force = true;
@@ -13517,6 +13530,14 @@ static int stampChargerProgramRequest(const char *clientUid, JsonVariant config,
              "few minutes.");
     return 503;
   }
+  if (!gChargerProgramsLoaded) {
+    // The id has to be newer than that of the last request sent to this client, which is in the
+    // file (loadChargerPrograms()).
+    text.add("The server has not been able to read its record of charger programming since it started, and a "
+             "request needs the id of the last one. It tries again every 5 minutes. If this message stays, "
+             "restart the server.");
+    return 503;
+  }
   uint32_t requestId = (uint32_t)now;
   if (meta && requestId <= meta->chargerProgramAsked) {
     // The server's clock went back. The client takes only a newer id, and the config that carries
@@ -13717,102 +13738,181 @@ static bool saveChargerPrograms() {
   return true;  // no file system in this build: nothing to keep it in
 }
 
-// Call after loadClientMetadataCache(), as loadChargerReports(), which says why an entry for a
-// client the cache does not hold is written out at the next save.
-static void loadChargerPrograms() {
-#ifdef FILESYSTEM_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS || !posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
-      return;
-    }
-    FILE *fp = fopen("/fs" CHARGER_PROGRAMS_PATH, "r");
-    if (!fp) {
-      posix_log_error("fopen", "/fs" CHARGER_PROGRAMS_PATH);
-      return;
-    }
-    // An entry is under 1600 bytes of JSON with two full plans of registers (the result and the
-    // look) and the longest client id.
-    const long fileSize = posix_file_size(fp);
-    if (fileSize <= 0 || fileSize > (long)MAX_CLIENT_METADATA * 1600L + 64L) {
-      fclose(fp);
-      Serial.println(F("Charger programming file size invalid"));
-      return;
-    }
-    fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)fileSize + 1);
-    if (!buf) {
-      fclose(fp);
-      Serial.println(F("ERROR: Cannot allocate charger programming load buffer"));
-      return;
-    }
-    const size_t bytesRead = fread(buf, 1, (size_t)fileSize, fp);
-    fclose(fp);
-    buf[bytesRead] = '\0';
+// At a start, after loadClientMetadataCache(): every client the metadata cache holds may have an
+// entry in the file.
+static void beginChargerPrograms() {
+  for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+    gClientMetadata[i].chargerProgramUnread = true;
+  }
+  gChargerReportsReadMillis = millis();
+  loadChargerPrograms();
+}
 
-    JsonDocument doc;
-    const DeserializationError err = deserializeJson(doc, buf);
+// The file has been read, or need not be: it may be written from now on.
+static void chargerProgramsRead() {
+  gChargerProgramsLoaded = true;
+  for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+    gClientMetadata[i].chargerProgramUnread = false;
+  }
+}
+
+// Read as loadChargerReports() reads its file, which says why an entry for a client the cache does
+// not hold is written out at the next save, and what becomes of a file that cannot be read now or
+// can never be (this one is kept as CHARGER_PROGRAMS_PATH ".bad"). A read later than the start
+// takes an entry only for a client the metadata cache held at the start (chargerProgramUnread),
+// and of it only what this server would have kept, had it read the file at the start: the request
+// when its id is higher than that of the one recorded since (stampChargerProgramRequest() gives
+// no new id while the file is unread, and recoverChargerProgramRequests() may have recorded the
+// one in the cached config), the result unless the one that came in since would have replaced it
+// (sunsaver::programResultReplaces()), and the look unless the one that came in since follows it
+// (sunsaver::resultFollows()).
+static void loadChargerPrograms() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) {
+    return;  // nothing is written either
+  }
+  if (!gClientMetadataLoaded) {
+    Serial.println(F("Charger programming not read: the client metadata could not be read at this start"));
+    return;
+  }
+  if (!posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
+    chargerProgramsRead();
+    return;
+  }
+  FILE *fp = fopen("/fs" CHARGER_PROGRAMS_PATH, "r");
+  if (!fp) {
+    posix_log_error("fopen", "/fs" CHARGER_PROGRAMS_PATH);
+    Serial.println(F("ERROR: Charger programming file did not open, trying again in 5 minutes"));
+    return;
+  }
+  // An entry is under 1600 bytes of JSON with two full plans of registers (the result and the
+  // look) and the longest client id.
+  const long fileSize = posix_file_size(fp);
+  if (fileSize < 0) {
+    fclose(fp);
+    Serial.println(F("ERROR: Charger programming file size not read, trying again in 5 minutes"));
+    return;
+  }
+  if (fileSize == 0 || fileSize > (long)MAX_CLIENT_METADATA * 1600L + 64L) {
+    fclose(fp);
+    setChargerProgramsAside("its size");
+    return;
+  }
+  fseek(fp, 0, SEEK_SET);
+  char *buf = (char *)malloc((size_t)fileSize + 1);
+  if (!buf) {
+    fclose(fp);
+    Serial.println(F("ERROR: Cannot allocate charger programming load buffer, trying again in 5 minutes"));
+    return;
+  }
+  const size_t bytesRead = fread(buf, 1, (size_t)fileSize, fp);
+  fclose(fp);
+  if (bytesRead != (size_t)fileSize) {
     free(buf);
-    if (err) {
-      Serial.print(F("ERROR: Charger programming parse failed: "));
-      Serial.println(err.c_str());
-      return;
+    Serial.println(F("ERROR: Charger programming file read failed, trying again in 5 minutes"));
+    return;
+  }
+  buf[bytesRead] = '\0';
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, buf);
+  free(buf);
+  if (err == DeserializationError::NoMemory) {
+    Serial.println(F("ERROR: Out of memory for the charger programming file, trying again in 5 minutes"));
+    return;
+  }
+  if (err) {
+    setChargerProgramsAside(err.c_str());
+    return;
+  }
+  if (!doc.is<JsonArrayConst>()) {
+    setChargerProgramsAside("not a list");
+    return;
+  }
+  uint8_t loaded = 0;
+  for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
+    ClientMetadata *meta = findClientMetadata(obj["c"] | "");
+    if (!meta || !meta->chargerProgramUnread) {
+      gChargerReportsDirty = true;  // its client is gone, or came (back) since: the next save leaves it out
+      continue;
     }
-    uint8_t loaded = 0;
-    for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
-      ClientMetadata *meta = findClientMetadata(obj["c"] | "");
-      if (!meta) {
-        if (gClientMetadataLoaded) {
-          gChargerReportsDirty = true;  // saveChargerPrograms() leaves it out
-        }
-        continue;
+    bool any = false;
+    const uint32_t asked = obj["a"].is<uint32_t>() ? obj["a"].as<uint32_t>() : 0;
+    JsonArrayConst values = obj["ap"].as<JsonArrayConst>();
+    if (asked > meta->chargerProgramAsked && values.size() == sunsaver::PROFILE_FIELDS) {
+      uint16_t fields[sunsaver::PROFILE_FIELDS];
+      bool whole = true;
+      for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
+        whole = whole && values[field].is<uint32_t>() && values[field].as<uint32_t>() <= 0xFFFFu;
+        fields[field] = whole ? (uint16_t)values[field].as<uint32_t>() : (uint16_t)0;
       }
-      bool any = false;
-      const uint32_t asked = obj["a"].is<uint32_t>() ? obj["a"].as<uint32_t>() : 0;
-      JsonArrayConst values = obj["ap"].as<JsonArrayConst>();
-      if (asked != 0 && values.size() == sunsaver::PROFILE_FIELDS) {
-        uint16_t fields[sunsaver::PROFILE_FIELDS];
-        bool whole = true;
-        for (uint8_t field = 0; field < sunsaver::PROFILE_FIELDS; ++field) {
-          whole = whole && values[field].is<uint32_t>() && values[field].as<uint32_t>() <= 0xFFFFu;
-          fields[field] = whole ? (uint16_t)values[field].as<uint32_t>() : (uint16_t)0;
-        }
-        if (whole) {
-          const sunsaver::Profile profile = {fields[0], fields[1], fields[2], fields[3],
-                                             fields[4], fields[5], fields[6]};
-          meta->chargerProgramAsked = asked;
-          // A file written before the time was kept apart from the id: the id was the time.
-          meta->chargerProgramAskedAt = obj["aa"].is<uint32_t>() && obj["aa"].as<uint32_t>() != 0
-                                            ? obj["aa"].as<uint32_t>()
-                                            : asked;
-          meta->chargerProgramAskedProfile = profile;
-          meta->chargerProgramAskedLoadOk = obj["al"].is<bool>() && obj["al"].as<bool>();
-          any = true;
-        }
+      if (whole) {
+        const sunsaver::Profile profile = {fields[0], fields[1], fields[2], fields[3],
+                                           fields[4], fields[5], fields[6]};
+        meta->chargerProgramAsked = asked;
+        // A file written before the time was kept apart from the id: the id was the time.
+        meta->chargerProgramAskedAt = obj["aa"].is<uint32_t>() && obj["aa"].as<uint32_t>() != 0
+                                          ? obj["aa"].as<uint32_t>()
+                                          : asked;
+        meta->chargerProgramAskedProfile = profile;
+        meta->chargerProgramAskedLoadOk = obj["al"].is<bool>() && obj["al"].as<bool>();
+        any = true;
       }
-      sunsaver::ProgramResult result;
-      if (!obj["play"].isNull() && sunsaver::decodeProgramResult(obj, &result)) {
+    }
+    sunsaver::ProgramResult result;
+    if (!obj["play"].isNull() && sunsaver::decodeProgramResult(obj, &result)) {
+      const uint32_t requestId = obj["r"].is<uint32_t>() ? obj["r"].as<uint32_t>() : 0;
+      const double madeAt = obj["e"] | 0.0;
+      const uint32_t sent = obj["s"].is<uint32_t>() ? obj["s"].as<uint32_t>() : 0;
+      if (!meta->chargerProgramValid ||
+          !sunsaver::programResultReplaces(true, requestId, madeAt, sent, meta->chargerProgramRequestId,
+                                           meta->chargerProgramEpoch, meta->chargerProgramSent)) {
         meta->chargerProgramValid = true;
-        meta->chargerProgramRequestId = obj["r"].is<uint32_t>() ? obj["r"].as<uint32_t>() : 0;
-        meta->chargerProgramEpoch = obj["e"] | 0.0;
-        meta->chargerProgramSent = obj["s"].is<uint32_t>() ? obj["s"].as<uint32_t>() : 0;
+        meta->chargerProgramRequestId = requestId;
+        meta->chargerProgramEpoch = madeAt;
+        meta->chargerProgramSent = sent;
         meta->chargerProgram = result;
         any = true;
       }
-      JsonObjectConst look = obj["l"].as<JsonObjectConst>();
-      if (!look.isNull() && sunsaver::decodeProgramResult(look, &result)) {
+    }
+    JsonObjectConst look = obj["l"].as<JsonObjectConst>();
+    if (!look.isNull() && sunsaver::decodeProgramResult(look, &result)) {
+      const double madeAt = look["e"] | 0.0;
+      const uint32_t sent = look["s"].is<uint32_t>() ? look["s"].as<uint32_t>() : 0;
+      if (!meta->chargerLookValid ||
+          !sunsaver::resultFollows(madeAt, sent, meta->chargerLookEpoch, meta->chargerLookSent)) {
         meta->chargerLookValid = true;
-        meta->chargerLookEpoch = look["e"] | 0.0;
-        meta->chargerLookSent = look["s"].is<uint32_t>() ? look["s"].as<uint32_t>() : 0;
+        meta->chargerLookEpoch = madeAt;
+        meta->chargerLookSent = sent;
         meta->chargerLook = result;
         any = true;
       }
-      if (any) {
-        ++loaded;
-      }
     }
-    Serial.print(F("Charger programming loaded: "));
-    Serial.println(loaded);
-  #endif
+    if (any) {
+      ++loaded;
+    }
+  }
+  chargerProgramsRead();
+  Serial.print(F("Charger programming loaded: "));
+  Serial.println(loaded);
+#else
+  chargerProgramsRead();  // no file of charger programming in this build
+#endif
+}
+
+// A file of charger programming that can never be read, as setChargerReportsAside() does.
+static void setChargerProgramsAside(const char *why) {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  Serial.print(F("ERROR: Charger programming file cannot be read ("));
+  Serial.print(why);
+  if (rename("/fs" CHARGER_PROGRAMS_PATH, "/fs" CHARGER_PROGRAMS_PATH ".bad") != 0) {
+    Serial.println(F("), and could not be set aside: trying again in 5 minutes"));
+    return;
+  }
+  Serial.println(F("): kept as " CHARGER_PROGRAMS_PATH ".bad"));
+  chargerProgramsRead();
+#else
+  (void)why;
 #endif
 }
 
