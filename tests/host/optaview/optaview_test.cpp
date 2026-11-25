@@ -992,6 +992,24 @@ static std::string fixed(double value, uint8_t decimals) {
   return std::string(text);
 }
 
+// OPTAVIEW_TEST_SECONDS is read whole: digits only, 0 to 86400. Anything else stops the tests
+// with a message instead of leaving the limit at ten minutes.
+static void testTestSeconds() {
+  unsigned long seconds = 7;
+  CHECK(ovTestSecondsFrom(nullptr, &seconds) && seconds == 600);  // not set
+  seconds = 7;
+  CHECK(ovTestSecondsFrom("", &seconds) && seconds == 600);
+  CHECK(ovTestSecondsFrom("0", &seconds) && seconds == 0);
+  CHECK(ovTestSecondsFrom("600", &seconds) && seconds == 600);
+  CHECK(ovTestSecondsFrom("86400", &seconds) && seconds == 86400);
+  CHECK(ovTestSecondsFrom("0086400", &seconds) && seconds == 86400);
+  const char *const wrong[] = {"86401", "O", "-1", "+5", " 5", "5 ", "5s", "0x10", "1e3", "99999999999999999999"};
+  for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); ++i) {
+    seconds = 7;
+    CHECK_MSG(!ovTestSecondsFrom(wrong[i], &seconds) && seconds == 7, "'%s' was taken", wrong[i]);
+  }
+}
+
 static void testText() {
   CHECK(fixed(13.68, 2) == "13.68");
   CHECK(fixed(0.125, 2) == "0.13");  // half rounds away from zero
@@ -1366,7 +1384,12 @@ static void testBuiltinProfile() {
     CHECK(check.state == profile.findRegister("charge_state"));
     CHECK_EQ(check.regulatingCount, 3);
     // Every voltage setting 'set' can write is on the settings scale, and nothing that the
-    // controller measures is: a multimeter must never decide how a setpoint is encoded.
+    // controller measures is: a multimeter must never decide how a setpoint is encoded. In RAM only
+    // va_ref_fixed is on it. The controller copies EVa_ref_fixed_init there at start-up, as it is
+    // ("On start-up, the value in this register is copied to the volatile RAM register 0x0039"),
+    // and a copy decoded on another scale than its setting would show another voltage for the
+    // same target. The LVD in effect is worked out for comparing with the battery, and stays with
+    // the readings, as do the measurements that the controller keeps in its EEPROM.
     for (size_t i = 0; i < profile.registerCount(); ++i) {
       const OvRegister &reg = profile.reg(i);
       if (reg.scale == nullptr || strcmp(reg.scale->units, "V") != 0) {
@@ -1376,9 +1399,50 @@ static void testBuiltinProfile() {
         CHECK_MSG(reg.scale == check.settingsScale, "%s is a writable voltage on scale %s", reg.name, reg.scale->name);
       }
       if (reg.addr < 0xE000) {
-        CHECK_MSG(reg.scale != check.settingsScale, "%s is a reading on the settings scale", reg.name);
+        CHECK_MSG((reg.scale == check.settingsScale) == (strcmp(reg.name, "va_ref_fixed") == 0),
+                  "%s is a RAM voltage on scale %s", reg.name, reg.scale->name);
       }
     }
+    {
+      const OvRegister *fixed = profile.findRegister("va_ref_fixed");
+      const OvRegister *fixedInit = profile.findRegister("EVa_ref_fixed_init");
+      CHECK(fixed->scale == fixedInit->scale && fixed->type == fixedInit->type && fixed->words == fixedInit->words);
+      CHECK(!fixed->writable && !fixedInit->writable);
+      CHECK_HAS(fixed->note, "The controller copies EVa_ref_fixed_init here at start-up, as it is, so this is on the "
+                             "scale of the stored settings.");
+      CHECK_HAS(fixedInit->note, "Copied to va_ref_fixed at start-up");
+      const OvRegister *pct = profile.findRegister("va_ref_fixed_pct");
+      CHECK(pct->scale == profile.findRegister("EVa_ref_fixed_pct_init")->scale);
+      CHECK_HAS(pct->note, "The controller copies EVa_ref_fixed_pct_init here at start-up.");
+      const char *const kept[] = {"V_lvd", "EVb_min", "EVb_max", "EVa_max"};
+      for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); ++i) {
+        CHECK_MSG(profile.findRegister(kept[i])->scale == check.liveScale, "%s", kept[i]);
+      }
+    }
+
+    // What a setting or a switch does besides, as the specification says it, is in its label or
+    // its note, where 'get', 'set', 'coils', 'coil' and the page show it. The load current
+    // compensation lowers the LVD and moves the LED thresholds too (specification, "Load Mode").
+    const OvRegister *icomp = profile.findRegister("ER_icomp");
+    CHECK(strstr(icomp->label, "LVD and LED thresholds") != nullptr);
+    CHECK_HAS(icomp->note, "It lowers the LVD in proportion to the load current");
+    CHECK_HAS(icomp->note, "the LED thresholds are compensated the same way");
+    CHECK_HAS(icomp->note, "V_lvd shows the LVD in effect.");
+    CHECK_HAS(profile.findRegister("EV_lvd")->note, "When ER_icomp is not 0, the controller lowers it in proportion");
+    const char *const kLeds[] = {"EV_soc_y2g", "EV_soc_g2y", "EV_soc_y2r0", "EV_soc_r2y"};
+    for (const char *name : kLeds) {
+      CHECK_HAS(profile.findRegister(name)->note, "When ER_icomp is not 0, the controller also compensates the LED");
+    }
+    CHECK(profile.findRegister("EV_lvr")->note[0] == '\0');  // the reconnect is not compensated
+    CHECK_HAS(profile.findRegister("Et_lvd_warn")->note, "How long the load stays on after the battery has fallen");
+    // A start-up target that is not 0 stops the MPPT, and the voltage overrides the percentage.
+    CHECK(strstr(profile.findRegister("va_ref_fixed")->label, "(0 = none)") != nullptr);
+    CHECK_HAS(profile.findRegister("va_ref_fixed")->note, "Not 0: MPPT sweeping and tracking stop");
+    CHECK(strstr(profile.findRegister("EVa_ref_fixed_init")->label, "(0 = none)") != nullptr);
+    CHECK_HAS(profile.findRegister("EVa_ref_fixed_init")->note, "not 0 stops MPPT sweeping and tracking");
+    CHECK_HAS(profile.findRegister("EVa_ref_fixed_pct_init")->note, "EVa_ref_fixed_init overrides it when that is not 0.");
+    // An equalize started by hand restarts the count of days to the next one.
+    CHECK_HAS(profile.findCoil("equalize")->note, "the controller resets the equalize calendar");
 
     // Loading again replaces the profile without leaking; clear() empties it.
     const long live = gAllocLive;
@@ -2764,13 +2828,41 @@ static void testLineEditor() {
     CHECK(!editor.feed(256 + 'a', echo));
     CHECK(typeInto(editor, echo, "\n") == "|");
   }
-  {  // A line longer than the console takes keeps its start; the echo shows where it stopped.
+  {  // A line longer than the console takes keeps one character more than a console line can
+     // have, so that the console refuses it whole; the echo shows where it stopped.
     OvLineEditor editor;
     StringOut echo;
     const std::string lines = typeInto(editor, echo, std::string(500, 'x') + "\n");
-    CHECK_EQ(lines.size(), OV_LINE_MAX);  // OV_LINE_MAX - 1 characters and the '|'
-    CHECK_EQ(echo.text.size(), OV_LINE_MAX - 1 + 2);
+    CHECK_EQ(lines.size(), OV_LINE_MAX + 1);  // OV_LINE_MAX characters and the '|'
+    CHECK_EQ(echo.text.size(), OV_LINE_MAX + 2);
     CHECK(typeInto(editor, echo, "ok\n") == "ok|");
+  }
+  {  // Through the console, a typed line that was too long is refused, not run without its end,
+     // which here was the 0 of 13.10. A line as long as the console takes runs.
+    Rig rig;
+    OvLineEditor editor;
+    std::string keys = "set EV_lvd 13.1";
+    keys += std::string(OV_LINE_MAX - keys.size(), ' ');
+    keys += "0\r";
+    std::string said;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (editor.feed((unsigned char)keys[i], rig.out)) {
+        said = rig.run(editor.line());
+      }
+    }
+    CHECK(said == "That line is longer than the console takes (159 characters and 24 words). Nothing was done.\r\n");
+    CHECK(!rig.console.awaitingConfirmation());
+    keys = "set EV_lvd 13.1";
+    keys += std::string(OV_LINE_MAX - 1 - keys.size(), ' ');
+    keys += "\r";
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (editor.feed((unsigned char)keys[i], rig.out)) {
+        said = rig.run(editor.line());
+      }
+    }
+    CHECK_HAS(said, "new  13.10 V");
+    CHECK(rig.console.awaitingConfirmation());
+    rig.run("no");
   }
   {  // clear() forgets a half-typed line and a pending line feed.
     OvLineEditor editor;
@@ -2818,15 +2910,21 @@ static void testConsoleBasics() {
   CHECK(rig.run("") == "");
   CHECK(rig.run("   \t  ") == "");
   CHECK_HAS(rig.run("frobnicate"), "Unknown command 'frobnicate'");
-  // An overlong line is cut, not overrun, and only the start of it is repeated back.
-  CHECK_HAS(rig.run(std::string(400, 'x')), "Unknown command 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...'. 'help'");
+  // A word as long as a line can be is repeated back only in part. A longer line is refused
+  // whole: not overrun, and not cut and run without its end.
+  CHECK_HAS(rig.run(std::string(OV_LINE_MAX - 1, 'x')), "Unknown command 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...'. 'help'");
+  const std::string tooLong =
+      "That line is longer than the console takes (159 characters and 24 words). Nothing was done.\r\n";
+  CHECK(rig.run(std::string(OV_LINE_MAX, 'x')) == tooLong);
+  CHECK(rig.run(std::string(400, 'x')) == tooLong);
+  CHECK(rig.run(std::string(400, ' ')) == tooLong);
   CHECK_HAS(rig.run("yes"), "Nothing is waiting for a yes or a no.");
   CHECK_HAS(rig.run("NO"), "Nothing is waiting for a yes or a no.");
   std::string many = "raw";
   for (int i = 0; i < 60; ++i) {
     many += " 1";
   }
-  rig.run(many);  // more words than the console keeps
+  CHECK(rig.run(many) == tooLong);  // more words than the console keeps
 
   // Every command the help text names is a command.
   const std::string help = rig.run("help");
@@ -2955,7 +3053,8 @@ static void testConsoleReads() {
     CHECK_HASNT(other.run("get charge_state"), "Note: voltages are shown");
     CHECK_HASNT(other.run("get Vb_ref"), "Note: voltages are shown");  // the target's scale is not one of the two
     const std::string setting = other.run("get EV_lvd");
-    CHECK_HAS(setting, "'set' accepts from 9.00 V to 15.00 V.\r\n"
+    CHECK_HAS(setting, "'set' accepts from 9.00 V to 15.00 V.\r\n    When ER_icomp is not 0, the controller lowers it");
+    CHECK_HAS(setting, "\r\n    the LVD in effect.\r\n"
                        "Note: voltages are shown with a scale that is not confirmed on this controller\r\n"
                        "      (stored settings x100/32768). 'scalecheck' tests it.");
     CHECK_HASNT(other.run("get EV_lvr"), "Note: voltages are shown");
@@ -3039,6 +3138,8 @@ static void testConsoleReads() {
   CHECK_HAS(coils, "Clear the total Ah counters\r\n        It also sets vb_min and vb_max,");
   CHECK_HAS(coils, "Clear the resettable Ah counters\r\n        It also sets vb_min and vb_max,");
   CHECK_EQ(countOf(coils, "It also sets vb_min"), 3U);
+  // An equalize started by hand restarts the count of days to the next one (specification).
+  CHECK_HAS(coils, "Equalize triggered\r\n        Once the equalize is done, the controller resets the equalize calendar");
   rig.sim.coils[0x0001] = true;
   CHECK_HAS(lineWith(rig.run("coils"), "load_disconnect"), "on ");
   rig.sim.coils.erase(0x0002);
@@ -3056,7 +3157,7 @@ static void testConsoleSet() {
     Rig rig;
     // The whole flow for the setting this project is after: LVD 13.10 V, LVR 13.25 V.
     const std::string ask = rig.run("set EV_lvr 13.25");
-    CHECK_HAS(ask, "EV_lvr: Low voltage reconnect");
+    CHECK_HAS(ask, "EV_lvr: Low voltage reconnect\r\n  now  ");  // no note: the values come next
     CHECK_HAS(lineWith(ask, "  now  "), "12.60 V");
     CHECK_HAS(lineWith(ask, "  now  "), "[0x1021]");
     CHECK_HAS(lineWith(ask, "  new  "), "13.25 V");
@@ -3083,6 +3184,11 @@ static void testConsoleSet() {
           SimSunSaver::frame(bytes({0x01, 0x06, 0xE0, 0x23, 0x10, 0xF6})));
 
     const std::string second = rig.run("set ev_lvd 13.10");
+    // The setting's note comes with the question, before the values: the LVD in effect may be
+    // lower under load than the one written.
+    const size_t lvdNote = second.find("EV_lvd: Low voltage disconnect\r\n  When ER_icomp is not 0, the controller lowers it");
+    CHECK_MSG(lvdNote != std::string::npos && lvdNote < second.find("  now  "), "%s", second.c_str());
+    CHECK_HAS(second, "\r\n  the LVD in effect.\r\n  now  ");
     CHECK_HAS(lineWith(second, "  new  "), "[0x10C5]");
     CHECK_HASNT(second, "Careful: Low voltage reconnect");  // 13.10 is below the new LVR
     CHECK_HASNT(second, "Before you write:");               // the notes were shown once
@@ -3092,6 +3198,28 @@ static void testConsoleSet() {
     CHECK_HAS(rig.run("status"), "Settings were changed in this session");
     // The controller now shows its "EEPROM changed" fault.
     CHECK_HAS(lineWith(rig.run("live"), "array_fault"), "EEPROM setting edit (reset required)");
+  }
+  {  // What else a setting does is said before the question: the load current compensation
+     // moves the LVD and the LED thresholds, and a raw write is asked the same way.
+    Rig rig;
+    for (const char *command : {"set ER_icomp 0.01", "set ER_icomp raw 519"}) {
+      const std::string ask = rig.run(command);
+      const size_t note = ask.find("ER_icomp: Load current compensation of the LVD and LED thresholds (0 = off)\r\n"
+                                   "  It lowers the LVD in proportion to the load current, so that a battery under load");
+      CHECK_MSG(note != std::string::npos && note < ask.find("  now  "), "%s: %s", command, ask.c_str());
+      CHECK_HAS(ask, "The specification says the LED thresholds\r\n  are compensated the same way");
+      CHECK_HAS(lineWith(ask, "  new  "), "0.0100 ohm");
+      CHECK_HAS(ask, "Type yes to write it.");
+      CHECK_HAS(rig.run("no"), "Cancelled. Nothing was sent.");
+    }
+    // And a note that says something else as well: the one byte of the temperature compensation.
+    CHECK_HAS(rig.run("set EV_tempcomp 0.03"), "EV_tempcomp: Temperature compensation per C (0 = off)\r\n"
+                                               "  Only the low byte is used");
+    rig.run("no");
+    // A setting that cannot be written still says why, with its note, and asks nothing.
+    CHECK_HAS(rig.run("set EVa_ref_fixed_init 0"), "not 0 stops MPPT sweeping");
+    CHECK(!rig.console.awaitingConfirmation());
+    CHECK_EQ(rig.sent(0x06), 0);
   }
   {
     Rig rig;
@@ -3739,7 +3867,8 @@ static void testConsoleCoilsAndReset() {
     CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
     CHECK_EQ(rig.sim.triggered.size(), 1);
     CHECK_EQ(rig.sim.triggered[0], 0x0012);
-    rig.run("coil equalize on");
+    CHECK_HAS(rig.run("coil equalize on"), "equalize: Equalize triggered\r\n"
+                                           "  Once the equalize is done, the controller resets the equalize calendar");
     CHECK_HAS(rig.run("n"), "Cancelled");
     CHECK(!rig.sim.coils[0x0000]);
     rig.sim.coils.erase(0x0002);
@@ -3960,9 +4089,11 @@ static void testConsoleCoilsAndReset() {
     CHECK_EQ(countOf(lower, "Could not check"), 1);
     CHECK_HAS(lower, "Put that right first, or use 'reset anyway'.");
     CHECK(!rig.console.awaitingConfirmation());
-    // Only the word 'anyway' overrides that.
-    CHECK_HAS(rig.run("reset now"), "Put that right first, or use 'reset anyway'.");
+    // Only the word 'anyway' overrides that, and another word is not taken for no word at all.
+    const size_t asked = rig.sim.requests.size();
+    CHECK(rig.run("reset now") == "Usage: reset   or   reset anyway (which restarts although a pair check fails)\r\n");
     CHECK(!rig.console.awaitingConfirmation());
+    CHECK_EQ(rig.sim.requests.size(), asked);
     CHECK_HAS(rig.run("reset anyway"), "Type yes to restart it.");
     rig.run("no");
     CHECK_EQ(rig.sim.resets, 0);
@@ -4298,8 +4429,13 @@ static void testScaleCheck() {
     const size_t before = rig.sim.requests.size();
     CHECK_HAS(rig.run("scalecheck nope 13.70"), "There is no register called nope. 'dump' lists them.");
     CHECK_HAS(rig.run("scalecheck adc_vb_f 13.68"),
-              "adc_vb_f is not a stored voltage setting on the scale vset, so it cannot test that scale.");
-    CHECK_HAS(rig.run("scalecheck Et_float 9000"), "Et_float is not a stored voltage setting");
+              "adc_vb_f cannot test the scale vset: it is not a setting on it that 'set' can change.");
+    CHECK_HAS(rig.run("scalecheck Et_float 9000"), "Et_float cannot test the scale vset:");
+    // Nor a register on that scale that 'set' cannot change: va_ref_fixed holds a copy of
+    // EVa_ref_fixed_init, which is read-only here, and neither is a setting MSView lists.
+    CHECK_HAS(rig.run("scalecheck va_ref_fixed 13.70"),
+              "va_ref_fixed cannot test the scale vset: it is not a setting on it that 'set' can change.");
+    CHECK_HAS(rig.run("scalecheck EVa_ref_fixed_init 13.70"), "EVa_ref_fixed_init cannot test the scale vset:");
     CHECK_EQ(rig.sim.requests.size(), before);  // refused before anything was read
     // Both at once, in either order, and names in any case.
     const std::string both = rig.run("scalecheck 13.68 ev_float 13.70");
@@ -4999,10 +5135,16 @@ static void testScaleCheck() {
     CHECK(!report.live.meterGiven);
     // It was read from the controller, not taken from the round test's reads: one more request.
     CHECK_EQ(rig.sim.requests.size() - sent, (size_t)(14 + 3 + 1));
-    // A register on another scale is not used (the console refuses it before this).
+    // A register on another scale is not used (the console refuses it before this), nor one on
+    // that scale that 'set' cannot change.
     CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("adc_vb_f"), 13.68, &report));
     CHECK(report.settings.known == nullptr);
     CHECK_EQ(report.settings.verdict, -1);
+    rig.sim.regs[0x0039] = rig.sim.regs[0xE001];  // as if the float voltage were the fixed target
+    CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("va_ref_fixed"), 13.70, &report));
+    CHECK(report.settings.known == nullptr);
+    CHECK_EQ(report.settings.verdict, -1);
+    rig.sim.regs[0x0039] = 0;
     // An override becomes candidate 0; the file's own number stays in the list.
     rig.profile.findScale("vlive")->num = 98.5;
     CHECK(rig.device.scaleCheck(0.0, nullptr, 0.0, &report));
@@ -5196,6 +5338,159 @@ static void testScaleCheck() {
     CHECK_HAS(rig.run("live"), "a ");
     CHECK_HAS(rig.run("wires"), "This profile has no wiring notes.");
   }
+}
+
+// The controller copies EVa_ref_fixed_init to va_ref_fixed at start-up, as it is. Both show the
+// same target whatever the scales say: only the scale of the stored settings moves them, and a
+// multimeter's verdict on the readings does not.
+static void testSettingsCopies() {
+  {
+    Rig rig;
+    rig.sim.regs[0xE036] = rig.sim.setVolts(30.00);
+    rig.sim.regs[0xE037] = 179;
+    CHECK_EQ(rig.sim.regs[0x0039], 0);  // until the controller starts again
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK_EQ(rig.sim.regs[0x0039], rig.sim.regs[0xE036]);
+    CHECK_EQ(rig.sim.regs[0x003A], 179);
+    const std::string copy = rig.run("get va_ref_fixed");
+    CHECK_HAS(lineWith(copy, "va_ref_fixed "), "30.00 V");
+    CHECK_HAS(copy, "(stored settings x100/32768)");
+    CHECK_HASNT(copy, "live readings");
+    CHECK_HAS(lineWith(rig.run("get EVa_ref_fixed_init"), "EVa_ref_fixed_init "), "30.00 V");
+    CHECK_HAS(lineWith(rig.run("get va_ref_fixed_pct"), "va_ref_fixed_pct "), "69.9 %");
+    rig.run("scale vset 96.667");
+    CHECK_HAS(lineWith(rig.run("get va_ref_fixed"), "va_ref_fixed "), "29.00 V");
+    CHECK_HAS(lineWith(rig.run("get EVa_ref_fixed_init"), "EVa_ref_fixed_init "), "29.00 V");
+    rig.run("scale vset 100");
+    rig.run("scale vlive 96.667");
+    CHECK_HAS(lineWith(rig.run("get va_ref_fixed"), "va_ref_fixed "), "30.00 V");
+    CHECK_HAS(lineWith(rig.run("get adc_vb_f"), "adc_vb_f "), "13.23 V");  // 13.68 V at x100
+  }
+  {  // A controller that stores its settings at x96.667 and measures at x100: once the scale of
+     // the stored settings is right, the copy shows the voltage that was set.
+    Rig rig(100.0, OV_BUILTIN_PROFILE, 96.667);
+    rig.sim.regs[0xE036] = rig.sim.setVolts(30.00);
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK_HAS(lineWith(rig.run("get va_ref_fixed"), "va_ref_fixed "), "31.03 V");
+    rig.run("scale vset 96.667");
+    CHECK_HAS(lineWith(rig.run("get va_ref_fixed"), "va_ref_fixed "), "30.00 V");
+    CHECK_HAS(lineWith(rig.run("get EVa_ref_fixed_init"), "EVa_ref_fixed_init "), "30.00 V");
+    CHECK_HAS(lineWith(rig.run("get adc_vb_f"), "adc_vb_f "), "13.68 V");
+  }
+  {  // Firmware before v08 has neither, and a restart does not make them.
+    Rig rig;
+    rig.sim.makeOldFirmware();
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(rig.sim.regs.find(0x0039) == rig.sim.regs.end());
+    CHECK(rig.sim.regs.find(0x003A) == rig.sim.regs.end());
+  }
+}
+
+// A command is run with all its words or not at all. A word it does not take is refused, and
+// nothing is done: "timeout 1000 0" is as likely a slip for 10000 as anything, and running
+// "timeout 1000" would act on half of what was typed.
+static void testWholeLines() {
+  Rig rig;
+  const char *const shows[] = {"link", "timeout", "blocks", "trace", "expert", "scale"};
+  std::string before[sizeof(shows) / sizeof(shows[0])];
+  for (size_t i = 0; i < sizeof(shows) / sizeof(shows[0]); ++i) {
+    before[i] = rig.run(shows[i]);
+  }
+  const char *const lines[][2] = {{"status x", "status"},
+                                  {"probe x", "probe"},
+                                  {"scan 1 2 x", "scan [first] [last]"},
+                                  {"id x", "id"},
+                                  {"wires x", "wires"},
+                                  {"live x", "live"},
+                                  {"read x", "read"},
+                                  {"watch 5 x", "watch [seconds]"},
+                                  {"dump mppt x", "dump [group]"},
+                                  {"groups x", "groups"},
+                                  {"get 0x0008 1 x", "get <name>' or 'get <address> [count]"},
+                                  {"coils x", "coils"},
+                                  {"snapshot x", "snapshot"},
+                                  {"scale vset 96 .667", "scale [name] [x]"},
+                                  {"set EV_lvd raw 4293 x", "set <name> <value>' or 'set <name> raw <n>"},
+                                  {"coil equalize on x", "coil <name> on|off"},
+                                  {"reset anyway x", "reset' or 'reset anyway"},
+                                  {"link 9600 8N1 x", "link <baud> [format]"},
+                                  {"slave 2 47", "slave <n>"},
+                                  {"fc 3 x", "fc <3|4>"},
+                                  {"timeout 1000 0", "timeout <ms>"},
+                                  {"blocks off x", "blocks <auto|on|off>"},
+                                  {"profile x", "profile"},
+                                  {"trace on x", "trace on|off"},
+                                  {"expert on x", "expert on|off"},
+                                  {"sniff 200 x", "sniff [ms]"},
+                                  {"LIVE x", "live"}};
+  const size_t sent = rig.sim.requests.size();
+  for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); ++i) {
+    const std::string out = rig.run(lines[i][0]);
+    CHECK_MSG(out == std::string("Too many words for '") + lines[i][1] + "'. Nothing was done.\r\n", "'%s' gave %s",
+              lines[i][0], out.c_str());
+    CHECK_MSG(!rig.console.awaitingConfirmation(), "'%s' asks a question", lines[i][0]);
+  }
+  CHECK_EQ(rig.sim.requests.size(), sent);
+  for (size_t i = 0; i < sizeof(shows) / sizeof(shows[0]); ++i) {
+    CHECK_MSG(rig.run(shows[i]) == before[i], "'%s' changed", shows[i]);
+  }
+
+  // Each of them still takes as many words as it has.
+  const char *const full[] = {"scan 1 1",  "get 0x0008 1", "dump mppt",   "scale vset 100", "link 9600 8N2",
+                              "slave 1",   "fc 4",         "timeout 1000", "trace off",     "expert off",
+                              "sniff 100", "blocks on",    "id",          "live",           "read"};
+  for (size_t i = 0; i < sizeof(full) / sizeof(full[0]); ++i) {
+    CHECK_HASNT(rig.run(full[i]), "Too many words");
+  }
+  rig.run("blocks auto");
+  const char *const asking[] = {"set EV_lvd raw 4293", "coil equalize on", "reset anyway"};
+  for (size_t i = 0; i < sizeof(asking) / sizeof(asking[0]); ++i) {
+    CHECK_HASNT(rig.run(asking[i]), "Too many words");
+    CHECK_MSG(rig.console.awaitingConfirmation(), "'%s' asks", asking[i]);
+    rig.run("no");
+  }
+
+  // The commands that count their own words: four words for 'set' only with 'raw', no count for
+  // a register by name, exactly four after 'raw' for a read or a write.
+  const size_t quiet = rig.sim.requests.size();
+  CHECK(rig.run("set EV_lvd 13.10 x") == "Usage: set <name> <value>   or   set <name> raw <number>\r\n");
+  CHECK(rig.run("set EV_lvd 13 .10") == "Usage: set <name> <value>   or   set <name> raw <number>\r\n");
+  CHECK(!rig.console.awaitingConfirmation());
+  CHECK(rig.run("get EV_lvd 1") ==
+        "A count goes with an address, not with a name: get <name>   or   get <address> [count]\r\n");
+  CHECK_HAS(rig.run("raw 1 4 0x0008 1 x"), "Usage: raw");
+  rig.run("expert on");
+  CHECK_HAS(rig.run("raw 1 6 0xE022 4293 x"), "Usage: raw");
+  CHECK(!rig.console.awaitingConfirmation());
+  CHECK_EQ(rig.sim.requests.size(), quiet);
+  // A frame of other bytes takes as many as the line holds, 24 words in all, and no more.
+  std::string frame = "raw 1 7";
+  for (int i = 0; i < 21; ++i) {
+    frame += " 0A";
+  }
+  CHECK_HAS(rig.run(frame), "Send function 7 to slave 1 with the bytes");
+  CHECK(rig.console.awaitingConfirmation());
+  CHECK(rig.run("no") == "Cancelled. Nothing was sent.\r\n");
+  CHECK_HAS(rig.run(frame + " 0A"), "That line is longer than the console takes (159 characters and 24 words).");
+  CHECK(!rig.console.awaitingConfirmation());
+  rig.run("expert off");
+  // 'help' shows the same whatever follows it.
+  CHECK(rig.run("help set") == rig.run("help"));
+
+  // A line as long as the console takes runs; one character more and it is refused.
+  CHECK_HAS(rig.run("status" + std::string(OV_LINE_MAX - 1 - 6, ' ')), "Link");
+  CHECK(rig.run("status" + std::string(OV_LINE_MAX - 6, ' ')) ==
+        "That line is longer than the console takes (159 characters and 24 words). Nothing was done.\r\n");
+  // A question open: a yes that is too long cancels it, as any other answer does.
+  const uint16_t lvd = rig.sim.regs[0xE022];
+  rig.run("set EV_lvd 13.10");
+  CHECK(rig.run("yes" + std::string(OV_LINE_MAX - 3, ' ')) == "Cancelled. Nothing was sent.\r\n");
+  CHECK_EQ(rig.sim.regs[0xE022], lvd);
+  rig.run("set EV_lvd 13.10");
+  CHECK_HAS(rig.run("yes" + std::string(OV_LINE_MAX - 4, ' ')), "Written and read back: EV_lvd = 13.10 V");
 }
 
 static void testSnapshot() {
@@ -5790,6 +6085,7 @@ int main() {
   testLateReplies();
   testBitsDeviceIdAndRaw();
   testText();
+  testTestSeconds();
   testExactDecimals();
   testBuiltinProfile();
   testProfileCodec();
@@ -5805,6 +6101,8 @@ int main() {
   testConsoleCoilsAndReset();
   testConsoleRawAndExpert();
   testScaleCheck();
+  testSettingsCopies();
+  testWholeLines();
   testSnapshot();
   testWatchSniffTrace();
   testTwoConsoles();

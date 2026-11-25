@@ -10,18 +10,21 @@ The header is generated: edit web/index.html, then run this script. The host tes
 request.
 
 The page is one file with one <style> and one <script>. The header also carries the page's
-Content-Security-Policy, which names those two blocks by their hashes: the browser then runs
-that style sheet and that script and nothing else, whatever ends up in the page. This script
-therefore refuses a page that needs more than the policy allows (an inline event handler, a
-style attribute, a style sheet it imports, a font, a script file, any file but a data: image),
-because such a page would work when opened from disk and fail when the Opta serves it. It reads
-the page the way a browser does where the two could differ: each tag attribute by attribute, with
-character references decoded (&#32; is a space), tag names in any case, a block ending at the
-first "</script" or "</style", and the escapes of the style sheet (@\\69mport is @import) and of
-the script's names (\\u0065val is eval). Past that it reads the style sheet and the script as
-text, so what the script puts together while it runs is left to the browser test, which runs the
-page under the policy. The self-test adds one forbidden thing at a time to the page and checks
-that it is refused, and that the page as it is passes.
+Content-Security-Policy, which names those two blocks by their hashes: the browser then runs that
+style sheet and that script and nothing else, whatever ends up in the page. This script therefore
+refuses a page that needs more than the policy allows (an inline event handler, a style attribute,
+a style sheet it imports, a font, a script file, any file but a data: image, a string run as
+code), because such a page would work when opened from disk and fail when the Opta serves it. It
+reads the page the way a browser does where the two could differ: each tag attribute by attribute,
+with character references decoded (&#32; is a space), tag names in any case, a srcset split where
+a browser splits it, a block ending at the first "</script" or "</style", and the escapes of the
+style sheet (@\\69mport is @import) and of the script's names (\\u0065val is eval) and strings
+('\\x6aava\\script:' is javascript:). HTML names and the schemes of addresses count in any case,
+as in a browser (setAttribute('STYLE') sets the style attribute). Past that it reads the style
+sheet and the script as text: a name reached through a variable, or a string the script puts
+together while it runs, is left to the browser test, which runs the page under the policy. The
+self-test adds one forbidden thing at a time to the page and checks that it is refused, and that
+the page as it is passes.
 """
 
 import base64
@@ -49,23 +52,48 @@ STYLE_RULES = [
     (r"\burl\((?!\s*[\"']?\s*data:)", "a file named by url() (the policy allows only data: images)"),
     (r"image-set\(", "an image-set() (the policy allows only data: images; use url(data:...))"),
 ]
+
+
+def named_in_call(call, names):
+    """call("name", ...) or callNS(namespace, "name", ...), the name one of names in any case: a
+    browser reads HTML names in any case, so setAttribute("STYLE", ...) sets the style."""
+    quoted = r"[\"'`](?i:%s)[\"'`]" % names
+    return r"\b%s\(\s*%s|\b%sNS\(\s*[^,()]*,\s*%s" % (call, quoted, call, quoted)
+
+
+# A javascript: address in any case, with the tabs and newlines that a browser drops from it.
+JAVASCRIPT = "(?i:" + r"[\t\n\r]*".join("javascript:") + ")"
+
 SCRIPT_RULES = [
     (r"\b(?:inner|outer)HTML\b", "innerHTML (text from the controller goes in with textContent)"),
     (r"\binsertAdjacentHTML\b", "insertAdjacentHTML (text from the controller goes in with textContent)"),
     (r"\bdocument\.write", "document.write"),
-    (r"\beval\s*\(", "eval (the policy blocks it)"),
-    (r"\bnew\s+Function\b", "new Function (the policy blocks it)"),
-    (r"setAttribute\(\s*[\"']style[\"']", "a style attribute (the policy blocks it; use a class)"),
-    (r"(?:https?|wss?)://", "an address on another server"),
-    (r"[\"'`]//[^/\s\"'`]", "an address on another server"),
-    (r"javascript:", "a javascript: address"),
-    (r"\bnew\s+(?:Shared)?Worker\b|\bimportScripts\b|\bimport\s*\(|\bserviceWorker\b"
-     r"|createElement\(\s*[\"']script[\"']", "a script file (the policy runs this script and no other)"),
+    # A string run as code. The names count wherever they stand, not only before a "(":
+    # (0, eval)(code), Function(code) without new and Reflect.construct(Function, [code]) all run it.
+    (r"\beval\b", "eval (the policy blocks it)"),
+    (r"\bFunction\b", "the Function constructor (the policy blocks it)"),
+    (r"\.\s*constructor\b|\[\s*[\"'`]constructor[\"'`]\s*\]",
+     "a .constructor, the way to the Function constructor without its name (the policy blocks it)"),
+    (r"\bWebAssembly\b", "WebAssembly (the policy blocks compiling it)"),
     (r"\bset(?:Timeout|Interval)\s*\(\s*[\"'`]", "a string run as code (the policy blocks it)"),
-    (r"\.src(?:set)?\s*=(?!=)(?!\s*[\"'`]data:)"
-     r"|setAttribute\(\s*[\"']src(?:set)?[\"']\s*,(?!\s*[\"'`]data:)",
+    # Addresses, their schemes in any case (HTTPS: is https:).
+    (r"(?i:https?|wss?)://", "an address on another server"),
+    (r"[\"'`]//[^/\s\"'`]", "an address on another server"),
+    (JAVASCRIPT, "a javascript: address"),
+    # A CSS url() in a string, for a style the script sets. new URL() makes an address and loads
+    # nothing.
+    (r"(?<![\w.$])(?<!new )(?i:url)\((?!\s*[\"'`]?\s*(?:(?i:data):|#))",
+     "a file named by url() (the policy allows only data: images)"),
+    # Element and attribute names, in any case.
+    (named_in_call("setAttribute", "style"), "a style attribute (the policy blocks it; use a class)"),
+    (named_in_call("setAttribute", "on[a-z]+"),
+     "an inline event handler (the policy blocks it; use addEventListener)"),
+    (r"\.src(?:set)?\s*=(?!=)(?!\s*[\"'`](?i:data):)|(?:%s)\s*,(?!\s*[\"'`](?i:data):)"
+     % named_in_call("setAttribute", "src(?:set)?"),
      "a file named by the script (the policy allows only data: images)"),
-    (r"createElement\(\s*[\"'](?:style|link|iframe|frame|object|embed|base)[\"']",
+    (r"\bnew\s+(?:Shared)?Worker\b|\bimportScripts\b|\bimport\s*\(|\bserviceWorker\b|"
+     + named_in_call("createElement", "script"), "a script file (the policy runs this script and no other)"),
+    (named_in_call("createElement", "style|link|iframe|frame|frameset|object|embed|applet|base"),
      "an element the policy blocks (made by the script)"),
 ]
 
@@ -79,6 +107,13 @@ IMAGE_ATTRIBUTES = {("img", "src"), ("img", "srcset"), ("source", "srcset"), ("i
                     ("video", "poster"), ("image", "href"), ("image", "xlink:href"),
                     ("feimage", "href"), ("feimage", "xlink:href")}
 ICON_LINKS = ("icon", "shortcut icon")
+# The SVG elements that change an attribute while the page runs, and the attributes that hold an
+# address: <set attributeName="href" to="logo.png"> loads logo.png into the image around it.
+ANIMATIONS = ("set", "animate", "animatemotion", "animatetransform", "animatecolor")
+ADDRESS_NAMES = {attribute.rsplit(":", 1)[-1] for attribute in FILE_ATTRIBUTES}
+# A file named by url() in an attribute that SVG reads as CSS (fill, filter, mask, clip-path...).
+# A part of the page (url(#gradient)) loads nothing.
+URL_FUNCTION = re.compile(r"\burl\((?!\s*[\"']?\s*(?:data:|#))", re.IGNORECASE)
 # How a browser reads a tag (start_tags()).
 TAG_NAME = re.compile(r"[a-zA-Z][^\s/>]*")
 ATTRIBUTE_NAME = re.compile(r"[^\s/>][^\s/>=]*")
@@ -92,7 +127,9 @@ URL_ENDS = "".join(chr(code) for code in range(0x21))
 URL_DROPPED = re.compile(r"[\t\n\r]")
 # The escapes the browser reads before the rules could see the words they spell.
 CSS_ESCAPE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\f\r]?|(\n)|(.))", re.DOTALL)
-JS_ESCAPE = re.compile(r"\\u(?:([0-9a-fA-F]{4})|\{([0-9a-fA-F]{1,6})\})")
+JS_ESCAPE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|u\{([0-9a-fA-F]{1,6})\}|x([0-9a-fA-F]{2})"
+                       r"|(\n)|(.))", re.DOTALL)
+JS_SINGLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "0": "\0"}
 
 
 def fail(message):
@@ -130,10 +167,17 @@ def css_unescaped(text):
 
 
 def js_unescaped(text):
-    """The script with each \\u escape replaced by its character, as in a name it stands for it."""
+    """The script with each escape replaced by what it stands for, in a name as in a string: an
+    escaped letter is that letter ('\\s' is 's'), and a backslash at the end of a line continues
+    the string."""
     def one(match):
-        code = int(match.group(1) or match.group(2), 16)
-        return chr(code) if code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "\ufffd"
+        code = match.group(1) or match.group(2) or match.group(3)
+        if code:
+            value = int(code, 16)
+            return chr(value) if value <= 0x10FFFF and not 0xD800 <= value <= 0xDFFF else "\ufffd"
+        if match.group(4):
+            return ""
+        return JS_SINGLE.get(match.group(5), match.group(5))
     return JS_ESCAPE.sub(one, text)
 
 
@@ -191,21 +235,34 @@ def start_tags(markup):
 
 def srcset_addresses(value):
     """The addresses in a srcset, by the HTML rules: an address runs to the next space (a tab, a
-    newline, a form feed or a carriage return too), and a comma at its end or after its sizes
-    ends that candidate."""
+    newline, a form feed or a carriage return too). A comma at its end ends that candidate, and
+    otherwise its sizes follow up to the next comma outside parentheses: in "a.png 1x(,b.png),
+    c.png" the second address is c.png. Each address counts, also one whose sizes are wrong and
+    that the browser therefore skips."""
     addresses = []
-    rest = value
+    at = 0
     while True:
-        rest = rest.lstrip(HTML_SPACE + ",")
-        if not rest:
+        while at < len(value) and (value[at] in HTML_SPACE or value[at] == ","):
+            at += 1
+        if at >= len(value):
             return addresses
-        address = re.match(r"[^ \t\n\f\r]*", rest).group(0)
-        rest = rest[len(address):]
+        start = at
+        while at < len(value) and value[at] not in HTML_SPACE:
+            at += 1
+        address = value[start:at]
+        addresses.append(address.rstrip(","))
         if address.endswith(","):
-            addresses.append(address.rstrip(","))
-        else:
-            addresses.append(address)
-            rest = rest.split(",", 1)[1] if "," in rest else ""
+            continue
+        inside = False  # within parentheses, where a comma ends nothing
+        while at < len(value):
+            char = value[at]
+            at += 1
+            if char == "(":
+                inside = True
+            elif char == ")":
+                inside = False
+            elif char == "," and not inside:
+                break
 
 
 def markup_problem(markup):
@@ -224,6 +281,8 @@ def markup_problem(markup):
                 return "a form action (the policy sends no form; the script sends it)", text
             if key == "ping":
                 return "a ping (the policy lets the page send only what its script sends)", text
+            if URL_FUNCTION.search(value) or URL_FUNCTION.search(css_unescaped(value)):
+                return "a file named by url() (the policy allows only data: images)", text
             address = url_of(value)
             if "javascript:" in address.lower():
                 return "a javascript: address", text
@@ -244,6 +303,10 @@ def markup_problem(markup):
             for each in addresses:
                 if not (image and each[:5].lower() == "data:"):
                     return "a file the policy blocks (it allows only data: images)", text
+        if name in ANIMATIONS:
+            target = next((value for key, value in attributes if key == "attributename"), "")
+            if target.strip().lower().rsplit(":", 1)[-1] in ADDRESS_NAMES:
+                return "an animation of an address (the page may then load a file the policy blocks)", text
     return None
 
 
@@ -419,6 +482,7 @@ SELFTEST_REFUSED = [
      "a file the policy blocks"),
     ("markup", '<img alt="" srcset="data:image/png;base64,AAAA&#12;1x,&#13;logo.png&#10;2x">',
      "a file the policy blocks"),
+    ("markup", '<img alt="" srcset="data:,a&#12;1x,logo.png">', "a file the policy blocks"),
     ("markup", '<img src="&#32;logo.png" alt="">', "a file the policy blocks"),
     ("markup", '<img src="&#32;//elsewhere.example/a.png" alt="">', "a file from another server"),
     # A no-break space is not one of the spaces an address loses at its ends.
@@ -467,7 +531,7 @@ SELFTEST_REFUSED = [
     ("script", "x.insertAdjacentHTML('beforeend', y);", "insertAdjacentHTML"),
     ("script", "document.write(y);", "document.write"),
     ("script", "eval(y);", "eval"),
-    ("script", "new Function(y);", "new Function"),
+    ("script", "new Function(y);", "the Function constructor"),
     ("script", "x.setAttribute('style', y);", "a style attribute"),
     ("script", "fetch('https://elsewhere.example/');", "an address on another server"),
     ("script", "new WebSocket('wss://elsewhere.example/');", "an address on another server"),
@@ -491,6 +555,57 @@ SELFTEST_REFUSED = [
     ("script", "document.createElement('object');", "an element the policy blocks"),
     ("script", "document.createElement('embed');", "an element the policy blocks"),
     ("script", "document.createElement('base');", "an element the policy blocks"),
+    # A string run as code by any name, also without new and without a call.
+    ("script", "Function('return 1')();", "the Function constructor"),
+    ("script", "globalThis.Function(y)();", "the Function constructor"),
+    ("script", "Reflect.construct(Function, [y]);", "the Function constructor"),
+    ("script", "(0, eval)(y);", "eval"),
+    ("script", "window['eval'](y);", "eval"),
+    ("script", "(function () {}).constructor(y)();", "a .constructor"),
+    ("script", "x['constructor'](y);", "a .constructor"),
+    ("script", "WebAssembly.instantiate(bytes);", "WebAssembly"),
+    # Schemes and HTML names in any case, and escapes in strings.
+    ("script", "fetch('HTTPS://elsewhere.example/');", "an address on another server"),
+    ("script", "new WebSocket('Wss://elsewhere.example/');", "an address on another server"),
+    ("script", "fetch('\\x2f/elsewhere.example/');", "an address on another server"),
+    ("script", "fetch('/\\\n/elsewhere.example/');", "an address on another server"),
+    ("script", "location = 'JavaScript:go()';", "a javascript: address"),
+    ("script", "location = 'java\\tscript:go()';", "a javascript: address"),
+    ("script", "location = '\\x6aava\\script:go()';", "a javascript: address"),
+    ("script", "x.setAttribute('STYLE', y);", "a style attribute"),
+    ("script", 'x.setAttribute("Style", y);', "a style attribute"),
+    ("script", "x.setAttributeNS(null, 'style', y);", "a style attribute"),
+    ("script", "x.setAttribute('onclick', 'go()');", "an inline event handler"),
+    ("script", "x.setAttributeNS(null, `ONLOAD`, y);", "an inline event handler"),
+    ("script", "image.setAttribute('SRC', name);", "a file named by the script"),
+    ("script", "image.setAttributeNS(null, 'srcset', name);", "a file named by the script"),
+    ("script", "document.createElement('SCRIPT');", "a script file"),
+    ("script", "document.createElementNS(svg, 'script');", "a script file"),
+    ("script", "document.createElement('IFrame');", "an element the policy blocks"),
+    ("script", "document.createElement('frameset');", "an element the policy blocks"),
+    ("script", "document.createElement('applet');", "an element the policy blocks"),
+    # A file named by url() in a style the script sets.
+    ("script", "x.style.backgroundImage = 'url(logo.png)';", "a file named by url()"),
+    ("script", "x.style.setProperty('mask', 'URL(\"m.svg\")');", "a file named by url()"),
+    # A comma in parentheses ends no candidate of a srcset: the browser skips the first one here
+    # (its sizes are wrong) and loads logo.png.
+    ("markup", '<img alt="" srcset="data:,a 1x(,data:,b),logo.png">', "a file the policy blocks"),
+    ("markup", '<img alt="" srcset="data:,a 1x (,data:,b),logo.png 2x">', "a file the policy blocks"),
+    # An SVG animation can set an address while the page runs.
+    ("markup", '<svg><image href="data:,"><set attributeName="href" to="logo.png"/></image></svg>',
+     "an animation of an address"),
+    ("markup", '<svg><image href="data:,"><animate attributeName="href" values="data:,;logo.png" dur="1s"/>'
+     '</image></svg>', "an animation of an address"),
+    ("markup", '<svg><image xlink:href="data:,"><set attributeName="xlink:href" to="logo.png"/>'
+     '</image></svg>', "an animation of an address"),
+    ("markup", '<svg><image href="data:,"><SET attributeName=" Href " to="logo.png"/></image></svg>',
+     "an animation of an address"),
+    # So can an SVG attribute that holds a url().
+    ("markup", '<svg><rect fill="url(paint.svg#g)"/></svg>', "a file named by url()"),
+    ("markup", '<svg><rect><set attributeName="fill" to="url(paint.svg#g)"/></rect></svg>',
+     "a file named by url()"),
+    ("markup", '<svg><rect filter="URL(&#39;f.svg#f&#39;)"/></svg>', "a file named by url()"),
+    ("markup", '<svg><rect mask="\\75rl(m.svg#m)"/></svg>', "a file named by url()"),
 ]
 SELFTEST_ALLOWED = [
     ("style", ".x { background: url(data:image/png;base64,AAAA); }"),
@@ -518,6 +633,18 @@ SELFTEST_ALLOWED = [
     ("script", "image.src = 'data:image/png;base64,AAAA';"),
     ("script", "image.setAttribute('src', 'data:image/png;base64,AAAA');"),
     ("script", "if (image.src == other) { setTimeout(go, 10); } // see //notes"),
+    ("script", "image.src = 'DATA:image/png;base64,AAAA';"),
+    ("script", "image.setAttribute('src', 'Data:image/png;base64,AAAA');"),
+    ("script", "x.setAttribute('data-style', y); x.setAttribute('aria-label', 'onclick');"),
+    ("script", "var n = x.constructorName + readFunction + evaluated;"),
+    ("script", "var u = new URL(location.href);"),
+    ("script", "x.style.backgroundImage = 'url(data:image/png;base64,AAAA)';"),
+    ("script", "var t = 'a \\\\x6aavascript: b';"),
+    ("markup", '<img alt="" srcset="data:,a 1x(,b)">'),
+    ("markup", '<img alt="" srcset="data:,a,data:,b 2x">'),
+    ("markup", '<svg><rect fill="url(#g)"/><set attributeName="fill" to="url( #h)"/></svg>'),
+    ("markup", '<svg><rect><animate attributeName="width" values="1;2" dur="1s"/></rect></svg>'),
+    ("markup", '<svg><rect cursor="url(data:image/png;base64,AAAA), auto"/></svg>'),
 ]
 SELFTEST_REPLACED = [
     ([("<script>", "<SCRIPT>")], "there must be exactly one <script>"),

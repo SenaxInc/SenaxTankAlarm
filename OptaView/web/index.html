@@ -944,8 +944,9 @@ function drawLink() {
   $('scaleText').textContent = lines.join(' ');
 }
 
-// The stored settings that can be checked against a value the user knows: one-word registers
-// on the scale of stored settings. Built once the register map and that scale's name are known.
+// The stored settings that can be checked against a value the user knows: one-word settings on
+// the scale of stored settings that 'set' can change, as the console takes them. Built once the
+// register map and that scale's name are known.
 function buildKnownPick() {
   var pick = $('knownName');
   var scale = state && state.scales && state.scales.settings;
@@ -956,7 +957,7 @@ function buildKnownPick() {
   none.value = '';
   add(pick, none);
   profile.registers.forEach(function (reg) {
-    if (reg.scale !== scale.name || reg.type === 'u32') { return; }
+    if (reg.scale !== scale.name || reg.type === 'u32' || !reg.writable) { return; }
     var option = el('option', '', reg.name + ': ' + reg.label);
     option.value = reg.name;
     add(pick, option);

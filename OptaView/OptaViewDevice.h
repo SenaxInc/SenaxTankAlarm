@@ -1131,7 +1131,8 @@ class OvDevice {
     }
     ovJudgeSetpoints(report, raws, used, den, check.grid);
 
-    if (known != nullptr && knownVolts > 0.0 && known->scale == check.settingsScale && known->words == 1) {
+    if (known != nullptr && knownVolts > 0.0 && known->scale == check.settingsScale && known->words == 1 &&
+        known->writable) {
       uint16_t words[2] = {0, 0};
       OvWordStatus status;
       report->known = known;

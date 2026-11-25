@@ -16,8 +16,11 @@
  *            holds when an address from DHCP is lost: the cable may have moved to a laptop.
  *            The stack cannot tell "no cable" from "no DHCP server" while DHCP is waiting, but
  *            it can once a fixed address is set, so a cable that is only out for a while still
- *            ends up back on DHCP (unless it goes back in within 3 s of the fixed address, when
- *            it looks like a cable that was in all along).
+ *            ends up back on DHCP. That one more try needs the link to be seen missing 3 s or
+ *            more after the fixed address was set. A cable that goes back in sooner looks like
+ *            one that was in all along, and so does one that goes in while a long command (a
+ *            scan, a sniff) holds the loop from before those 3 s are up: the link it finds then
+ *            may have been there all along.
  *   dhcp     DHCP only, for as long as it takes. The mode for a network that always has DHCP:
  *            in auto mode a router that takes longer than 20 s to hand out addresses again, as
  *            after a power cut, leaves the Opta on the fixed address.
@@ -248,7 +251,7 @@ constexpr const char *ovNetConfigTextProblem(const char *mode, const char *ip, c
 }
 
 static const uint32_t OV_NET_DHCP_WAIT_MS = 20000;  // auto mode: how long DHCP gets
-static const uint32_t OV_NET_PLUG_MS = 3000;        // a link that comes up later than this was plugged in since
+static const uint32_t OV_NET_PLUG_MS = 3000;        // no link this long after a fixed address is set: no cable
 static const uint32_t OV_NET_CHECK_MS = 1000;
 
 class OvNet : public OvConsoleExtra {
@@ -262,6 +265,7 @@ class OvNet : public OvConsoleExtra {
         fallback_(false),
         dhcpWorked_(false),
         retried_(false),
+        missed_(false),
         reapplied_(0),
         mismatch_(false),
         changed_(false) {
@@ -307,11 +311,16 @@ class OvNet : public OvConsoleExtra {
         break;
       case STATE_STATIC_WAIT:
         if (!up) {
+          if ((uint32_t)(now - sinceMs_) >= OV_NET_PLUG_MS) {
+            missed_ = true;  // no cable: a link from here on means that it has gone in since
+          }
           break;
         }
-        if (fallback_ && !retried_ && (uint32_t)(now - sinceMs_) >= OV_NET_PLUG_MS) {
-          // The link came up long after the fixed address was set, so the cable has gone in
-          // since. The DHCP attempt before that was made on no network at all: try this one.
+        if (fallback_ && !retried_ && missed_) {
+          // The cable has gone in since the fixed address was set, so the DHCP attempt before
+          // that was made on no network at all: try this one. Only a link that was seen missing
+          // counts. A link seen for the first time long after the fixed address was set may have
+          // been there all along, while a long command held the loop.
           retried_ = true;
           driver_.stop();
           startDhcp();
@@ -486,6 +495,7 @@ class OvNet : public OvConsoleExtra {
   bool fallback_;       // the fixed address is in use because DHCP did not answer (auto mode)
   bool dhcpWorked_;     // DHCP has given an address since the mode was chosen
   bool retried_;        // the one extra DHCP try of auto mode is used up
+  bool missed_;         // the link was missing OV_NET_PLUG_MS or more after the fixed address was set
   uint8_t reapplied_;   // times the fixed address had to be set again
   bool mismatch_;       // the address in use is not the fixed one, and setting it again did not help
   bool changed_;
@@ -523,6 +533,7 @@ class OvNet : public OvConsoleExtra {
 
   void startStatic(bool fallback) {
     fallback_ = fallback;
+    missed_ = false;
     driver_.startStatic(config_.ip, config_.mask, config_.gateway);
     state_ = STATE_STATIC_WAIT;
     sinceMs_ = clock_.nowMs();
