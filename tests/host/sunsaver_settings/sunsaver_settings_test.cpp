@@ -1337,6 +1337,24 @@ static void testLiveScale() {
     CHECK_EQ(scale, ss::SCALE_UNKNOWN);
   }
   {
+    // A 24 V system doubles the figures, and the rounding with them: EV_lvd 3051 with the same
+    // compensation can come back as V_lvd 5895 (twice 2947.5), 17.3906 V with x96.667, which is
+    // within twice the room below 18.0012 V. With x100 it reads 17.99 V, inside too.
+    SimSunSaver sim(96.667, 96.667);
+    makeLiFePO4(sim);
+    sim.regs[0xE022] = 3051;
+    sim.regs[0xE026] = 1037;
+    sim.regs[0x0008] = sim.volts(26.80);
+    sim.regs[0x001C] = 5895;
+    CHECK_EQ(ss::systemVolts(snapshotOf(sim)), 24);
+    CHECK(ss::voltsFromRaw(5895, ss::SCALE_96667) <
+          2.0 * ss::voltsFromRaw(3051, ss::SCALE_96667) - 2.0 * ss::LVD_COMPENSATION_ROOM_VOLTS - ss::LVD_ROUNDING_ROOM_VOLTS);
+    uint8_t scale = 99, source = 99;
+    ss::judgeLiveScale(snapshotOf(sim), ss::SCALE_96667, &scale, &source);
+    CHECK_EQ(scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(source, ss::LIVE_SOURCE_NONE);
+  }
+  {
     // A write to the EEPROM, and no restart yet. The controller keeps the LVD it started with,
     // and both fault words report the edit until it restarts. An x100 controller that still uses
     // 11.50 V after its stored LVD went to 11.30 V reports a word that reads 11.12 V with x96.667,
