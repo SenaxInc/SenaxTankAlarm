@@ -50,6 +50,15 @@
 #define SS_REG_CHARGE_CURRENT       0x000B  // adc_ic_f: filtered charge current
 #define SS_REG_LOAD_CURRENT         0x000C  // adc_il_f: filtered load current
 
+// The temperature, status and daily registers below are not where the SunSaver MPPT MODBUS
+// Specification v11 has them. There 0x001B is load_fault and 0x001C V_lvd, 0x002B and 0x002C are
+// the lowest and highest battery voltage of the day, 0x002E and 0x002F the day's load Ah and
+// array faults, 0x0034 the highest battery voltage since the last reset and 0x0038 a lighting
+// flag, and the register table ends at 0x003A, so 0x003D and 0x003E hold nothing. The poll reads
+// them only with SOLAR_ENABLE_UNVERIFIED_REGISTERS (TankAlarm_Solar.cpp). The charger check reads
+// the specification's own (charge_state 0x0011, array_fault 0x0012, load_fault 0x001B:
+// TankAlarm_SunSaverSettings.h).
+
 // Temperature
 #define SS_REG_HEATSINK_TEMP        0x001B  // Register 28: Heatsink Temperature (°C, signed)
 #define SS_REG_BATTERY_TEMP         0x001C  // Register 29: Battery Temperature (°C, signed, if RTS connected)
@@ -72,10 +81,11 @@
 // What the controller has stored (its charging profile, LVD and LVR, the DIP
 // switches) is read by the charger check: TankAlarm_SunSaverSettings.h has the
 // registers and the rules, and SolarManager::startChargerCheck() below runs it.
-// The settings are in EEPROM at 0xE000 and up. Registers 0x0033, 0x0035 and
-// 0x0036, which this file used to read as "setpoints", are the controller's
-// lowest and highest battery voltage and a reserved word (SunSaver MPPT MODBUS
-// Specification v11).
+// The settings are in EEPROM at 0xE000 and up. Of the registers this file used
+// to read as "setpoints", 0x0033 is the controller's lowest battery voltage since
+// its counters were last reset (vb_min; the highest, vb_max, is 0x0034), and the
+// register table of the SunSaver MPPT MODBUS Specification v11 has nothing at
+// 0x0035 or 0x0036.
 
 // ============================================================================
 // Scaling Factors for 12V System
@@ -403,7 +413,10 @@ public:
   // The registers of the last pass. Complete only when chargerCheckDone().
   const sunsaver::Snapshot& chargerSnapshot() const { return _chargerCheck.snapshot(); }
 
-  // True once a pass has completed since begin(): every register answered or was refused.
+  // True once a pass has completed since begin(): it asked every register on the list. That does
+  // not mean every one answered: a register that stayed silent through both of its requests is in
+  // the snapshot as such (SSIO_NO_REPLY). A pass completes with up to four requests unanswered,
+  // and the fifth fails it (sunsaver::SnapshotReader::MISSES_PER_PASS).
   bool chargerCheckCompleted() const { return _chargerCheckCompleted; }
 
   // True once a pass that completed since begin() read a stored setting: one completes without

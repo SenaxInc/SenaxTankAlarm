@@ -1143,7 +1143,10 @@ See [Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md) for detailed network diagn
 - Includes last seen, firmware version, configuration summary
 
 **`GET /api/charger?client=<device UID>`**
-- Returns the client's last charger check (JSON): `have` (false when none has arrived), `vd` and `verdict`, `battery`, `system` (12 or 24 as measured), `findings` (text `t`, and `p` true when it makes the settings wrong for the battery) and `groups` of registers as `[name, description, value, raw]`
+- Returns the client's last charger check (JSON): `c` (the device UID), `site` and `fv` (firmware version) when the server knows them, and `have` (false when no check has arrived: then nothing else follows)
+- With a check: `e` (its time in Unix seconds, 0 when not known), `vd` and `verdict` (the verdict: 0 `not judged`, 1 `ok`, 2 `mismatch`, 3 `cannot tell`), `battery` (the chemistry the settings were judged against: `LiFePO4`, `Li-ion`, `sealed lead-acid`, `flooded lead-acid` or `not judged`), `system` (12 or 24 as measured, 0 when not known), `settingsScale` and `liveScale` (one line each on how the stored voltages and the live readings are encoded), `findings` (text `t`, and `p` true when it makes the settings wrong for the battery) and `groups`: one object per group of registers, `{"title": ..., "rows": [[name, description, value, raw], ...]}`, with `value` "no answer" and `raw` empty for a register that did not answer
+- `now` is added when the battery in the config the server holds for the client is judged as another chemistry than `battery` (named the same way): the check is pending, as on the badge
+- Answers 500 when the server runs out of memory for it, so that a verdict is never shown without its findings, or as current when the config could not be read
 - Needs a session, like every `/api/` route
 
 ### POST Endpoints
