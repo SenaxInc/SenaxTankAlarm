@@ -1496,30 +1496,110 @@ static void testNetPolicy() {
     CHECK(n.port.log == "dhcp;");  // and it is left alone
     CHECK_EQ(n.changes, 1);
 
-    // The cable comes out: the address is gone, and DHCP is waited for, for as long as it takes.
-    // It answered on this network, so the fixed address is not the better guess any more.
+    // The cable comes out: the address is gone. DHCP is waited for as at the start, and after
+    // twenty seconds the fixed address is set. It waits for a link, and is not announced.
     n.port.plug(false);
     n.run(10);
     CHECK(!n.net.up());
     CHECK(n.address() == "0.0.0.0");
     CHECK_EQ(n.changes, 2);
     CHECK(n.status() ==
-          "Network   no link now, or no answer from DHCP (the address was 192.168.1.57). Is the cable in?\r\n");
+          "Network   no link now, or no answer from DHCP (the address was 192.168.1.57). Is the cable in? After 20 s "
+          "without an answer the fixed address 192.168.1.16 is used (0 s so far).\r\n");
     n.run(300000);
-    CHECK(n.port.log == "dhcp;");
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    CHECK(!n.net.up());
+    CHECK(n.status() == "Network   fixed address 192.168.1.16 (DHCP did not answer), but no link. Is the cable in?\r\n");
+    CHECK_EQ(n.changes, 2);
+    // Back in: DHCP gets its one more try on the network the cable leads to, and answers there.
     n.port.plug(true);
     n.run(2000);
     CHECK(n.net.up());
     CHECK(n.status() == "Network   address 192.168.1.57 from DHCP\r\n");
     CHECK_EQ(n.changes, 3);
+    const std::string once = std::string("dhcp;stop;") + kStaticStart + "stop;dhcp;";
+    CHECK(n.port.log == once);
 
     // A new lease with another address is noticed within a second or so.
     n.port.lease = ovIp4(192, 168, 1, 99);
     n.run(1100);
     CHECK(n.address() == "192.168.1.99");
     CHECK_EQ(n.changes, 4);
-    CHECK(n.port.log == "dhcp;");
+    CHECK(n.port.log == once);
+
+    // Out and in once more: every lost address gets the same chances, the extra try included.
+    n.port.plug(false);
+    n.run(60000);
+    CHECK(n.port.log == once + "stop;" + kStaticStart);
+    n.port.plug(true);
+    n.run(2000);
+    CHECK(n.address() == "192.168.1.99");
+    CHECK(n.port.log == once + "stop;" + kStaticStart + "stop;dhcp;");
+    CHECK_EQ(n.changes, 6);
     CHECK_EQ(n.port.startsWithoutStop, 0);
+  }
+  {
+    // Auto: an address from DHCP, then the cable moves to a laptop, which hands out none. Twenty
+    // seconds after the address was lost the fixed one is used, as when the Opta starts there.
+    NetRig n;
+    n.port.cable = true;
+    n.port.dhcpServer = true;
+    CHECK(n.net.begin(n.config(OV_NET_AUTO)));
+    n.run(2000);
+    CHECK(n.address() == "192.168.1.57");
+    n.port.plug(false);
+    n.port.dhcpServer = false;
+    n.run(5000);
+    n.port.plug(true);
+    n.run(11500);
+    CHECK(!n.net.up());
+    CHECK(n.status() ==
+          "Network   no link now, or no answer from DHCP (the address was 192.168.1.57). Is the cable in? After 20 s "
+          "without an answer the fixed address 192.168.1.16 is used (16 s so far).\r\n");
+    CHECK(n.port.log == "dhcp;");
+    n.run(3600);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    n.run(100);
+    CHECK(n.net.up());
+    CHECK(n.address() == "192.168.1.16");
+    CHECK(n.status() == "Network   address 192.168.1.16, the fixed one: DHCP did not answer\r\n");
+    n.run(60000);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    CHECK_EQ(n.port.startsWithoutStop, 0);
+  }
+  {
+    // Auto: the cable is out for less than twenty seconds. DHCP answers again, and the fixed
+    // address is never tried.
+    NetRig n;
+    n.port.cable = true;
+    n.port.dhcpServer = true;
+    CHECK(n.net.begin(n.config(OV_NET_AUTO)));
+    n.run(2000);
+    n.port.plug(false);
+    n.run(15000);
+    n.port.plug(true);
+    n.run(2000);
+    CHECK(n.address() == "192.168.1.57");
+    n.run(60000);
+    CHECK(n.port.log == "dhcp;");
+  }
+  {
+    // DHCP only: a lost address is waited for again, for as long as it takes.
+    NetRig n;
+    n.port.cable = true;
+    n.port.dhcpServer = true;
+    CHECK(n.net.begin(n.config(OV_NET_DHCP)));
+    n.run(2000);
+    CHECK(n.address() == "192.168.1.57");
+    n.port.plug(false);
+    n.run(600000);
+    CHECK(n.port.log == "dhcp;");
+    CHECK(n.status() ==
+          "Network   no link now, or no answer from DHCP (the address was 192.168.1.57). Is the cable in?\r\n");
+    n.port.plug(true);
+    n.run(2000);
+    CHECK(n.address() == "192.168.1.57");
+    CHECK(n.port.log == "dhcp;");
   }
   {
     // Auto, cable in, but nothing hands out addresses (a laptop on the other end): after twenty
@@ -1614,11 +1694,20 @@ static void testNetPolicy() {
     CHECK(n.net.up());
     CHECK(n.address() == "192.168.1.57");
     CHECK(n.status() == "Network   address 192.168.1.57 from DHCP\r\n");
-    // From here on it is a DHCP network: no falling back when the cable comes out.
+    // DHCP is in use from here on. The cable comes out: twenty seconds later the fixed address
+    // waits for a link, and when the cable goes back in DHCP gets its try again. That try was
+    // used up once already in this course of events (the cable went in in time), so this checks
+    // that a lost address brings it back.
     n.port.plug(false);
-    n.run(60000);
-    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart + "stop;dhcp;");
+    n.run(10000);
     CHECK(has(n.status(), "no link now, or no answer from DHCP (the address was 192.168.1.57)"));
+    n.run(50000);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart + "stop;dhcp;stop;" + kStaticStart);
+    CHECK(has(n.status(), "fixed address 192.168.1.16 (DHCP did not answer), but no link"));
+    n.port.plug(true);
+    n.run(2000);
+    CHECK(n.address() == "192.168.1.57");
+    CHECK(n.status() == "Network   address 192.168.1.57 from DHCP\r\n");
     CHECK_EQ(n.port.startsWithoutStop, 0);
   }
   {
@@ -1802,6 +1891,7 @@ struct FakeWebHost : OvWebHost {
   std::deque<FakeConn *> incoming;
   uint32_t state = 0x2545F491u;
   unsigned randomCalls = 0;
+  bool randomWorks = true;  // false: the board's random number generator fails
   bool networkUp = true;
   OvConn *accept() override {
     if (incoming.empty()) {
@@ -1811,12 +1901,18 @@ struct FakeWebHost : OvWebHost {
     incoming.pop_front();
     return conn;
   }
-  void random(uint8_t *out, size_t len) override {
+  bool random(uint8_t *out, size_t len) override {
     ++randomCalls;
+    if (!randomWorks) {
+      // The weakest stand-in there is: the same bytes every time.
+      memset(out, 0xA5, len);
+      return false;
+    }
     for (size_t i = 0; i < len; ++i) {
       state = state * 1664525u + 1013904223u;
       out[i] = (uint8_t)(state >> 24);
     }
+    return true;
   }
   bool address(char *out, size_t cap) override {
     if (!networkUp) {
@@ -2741,6 +2837,46 @@ static void testWebLogin() {
     }
     CHECK_EQ(w.host.randomCalls, 20);
   }
+  {
+    // A board whose random number generator fails still lets a browser in: OptaView is meant for
+    // a network that is trusted. The bytes the host gives in its place are used, and even from a
+    // source that gives the same bytes every time no two tokens are the same.
+    WebRig w;
+    w.host.randomWorks = false;
+    const Reply chosen = w.post("/api/pin", "{\"pin\":\"2468\"}");
+    CHECK_EQ(chosen.status, 200);
+    CHECK(!chosen.header("Set-Cookie").empty());
+    CHECK(w.web.pinSet());
+    CHECK(w.web.sessionOpen());
+    CHECK_EQ(w.get("/api/state").status, 200);
+    std::vector<std::string> seen;
+    seen.push_back(w.cookie);
+    for (int i = 0; i < 5; ++i) {
+      w.cookie.clear();
+      CHECK_EQ(w.post("/api/login", "{\"pin\":\"2468\"}").status, 200);
+      CHECK_EQ(w.cookie.size(), 32);
+      for (size_t k = 0; k < seen.size(); ++k) {
+        CHECK(seen[k] != w.cookie);
+      }
+      seen.push_back(w.cookie);
+    }
+    CHECK_EQ(w.host.randomCalls, 6);
+    // One browser at a time, and a wrong PIN is still a wrong PIN.
+    const std::string last = w.cookie;
+    w.cookie = seen[0];
+    CHECK_ERROR(w.get("/api/state"), 401, "login");
+    w.cookie.clear();
+    CHECK_ERROR(w.post("/api/login", "{\"pin\":\"1111\"}"), 401, "wrong-pin");
+    w.cookie = last;
+    CHECK_EQ(w.get("/api/state").status, 200);
+    // Once the generator answers again, its bytes are used as they come.
+    w.host.randomWorks = true;
+    w.idle(1100);
+    w.cookie.clear();
+    CHECK_EQ(w.post("/api/login", "{\"pin\":\"2468\"}").status, 200);
+    CHECK_EQ(w.cookie.size(), 32);
+    CHECK(w.cookie.find("a5a5a5a5") == std::string::npos);
+  }
 }
 
 // ============================================================================
@@ -2787,6 +2923,8 @@ static void testWebReading() {
 
     // It follows what happens on the USB console: the link, the scales, a restart that is due.
     w.rig.run("scalecheck 13.68");
+    CHECK(w.get("/api/state").json["scales"]["settings"]["confirmed"] == false);  // round setpoints only point
+    w.rig.run("scalecheck EV_float 13.70");
     w.rig.run("timeout 800");
     w.rig.run("blocks off");
     const Reply checked = w.get("/api/state");
@@ -3240,6 +3378,28 @@ static void testWebConsole() {
     CHECK_EQ(w.rig.sim.regs[0xE022], w.rig.sim.setVolts(12.10));
   }
   {
+    // When the board's random number generator fails, a question still gets an id, from the bytes
+    // the host gives in its place with a count mixed in. Two questions in a row get different ids
+    // even from a source that gives the same bytes every time, so only the newer one can be
+    // answered.
+    const unsigned writes = w.rig.sent(0x06);
+    w.host.randomWorks = false;
+    const Reply first = w.console("set EV_lvd 12.40");
+    CHECK(first.json["awaiting"] == true);
+    const std::string older = str(first.json["question"]);
+    const Reply second = w.console("set EV_lvd 12.30");
+    CHECK_HAS(second.text, "  new  12.30 V");
+    CHECK(second.json["awaiting"] == true);
+    const std::string newer = str(second.json["question"]);
+    CHECK_EQ(older.size(), 8);
+    CHECK_EQ(newer.size(), 8);
+    CHECK(older != newer);
+    CHECK(w.console("yes", older).text == kNotOpen);
+    CHECK(w.console("no", newer).text == "Cancelled. Nothing was sent.\r\n");
+    CHECK_EQ(w.rig.sent(0x06), writes);
+    w.host.randomWorks = true;
+  }
+  {
     // Only "yes" is a yes.
     std::string id = str(w.console("set EV_lvd 12.30").json["question"]);
     CHECK(w.console("no", id).text == "Cancelled. Nothing was sent.\r\n");
@@ -3332,6 +3492,23 @@ static void testWebConsole() {
     CHECK_HAS(switched.text, "Sent, but the controller did not acknowledge it (no reply).\r\n"
                              "load_disconnect now reads on: it was switched.\r\n");
     CHECK(switched.json["state"]["resetMaybe"] == false);
+  }
+  {
+    // A restart that the controller acknowledges and does not make. It answered all along, so
+    // the page is still told that the restart is due.
+    WebRig stuck;
+    stuck.login();
+    stuck.rig.sim.resetWorks = false;
+    const Reply ask = stuck.console("set EV_lvr 13.25");
+    CHECK_HAS(stuck.console("yes", str(ask.json["question"])).text, "Written and read back");
+    const Reply reset = stuck.console("reset");
+    const Reply done = stuck.console("yes", str(reset.json["question"]));
+    CHECK_EQ(stuck.rig.sim.resets, 0);
+    CHECK_HAS(done.text, "so it was not seen to restart.\r\n");
+    CHECK_HASNT(done.text, "answers again");
+    CHECK(done.json["state"]["resetNeeded"] == true);
+    CHECK(stuck.get("/api/state").json["resetNeeded"] == true);
+    CHECK(plainConsoleText(done.text));
   }
   {
     // A coil, and the restart.
@@ -3495,7 +3672,7 @@ static void testWebLongCommands() {
     const uint64_t start = w.now();
     const Reply done = w.console("yes", str(ask.json["question"]));
     CHECK_HAS(done.text, "The controller answers again after");
-    CHECK(done.heartbeats >= 4 && done.heartbeats <= 8);
+    CHECK(done.heartbeats >= 3 && done.heartbeats <= 8);  // a request missed takes two seconds
     CHECK(done.json["cut"] == false);
     CHECK(w.now() - start >= 6000);
     CHECK(plainConsoleText(done.text));
@@ -3716,6 +3893,24 @@ static void testWebUsbCommands() {
     CHECK_HASNT(w.get(everything[i]).body, "97531246");
   }
   CHECK_HASNT(w.console("status").body, "97531246");
+  // A random number generator that fails keeps nobody out, and the USB console says how often.
+  CHECK_HASNT(w.rig.run("status"), "random number generator");
+  w.host.randomWorks = false;
+  w.cookie.clear();
+  CHECK_EQ(w.post("/api/login", "{\"pin\":\"97531246\"}").status, 200);
+  CHECK_HAS(w.rig.run("web"),
+            "          The random number generator failed 1 time, so a session cookie or question id was made from timing\r\n"
+            "          alone. That is easier to guess: keep the Opta on a network you trust.\r\n");
+  const Reply asked = w.console("set EV_lvd 12.40");
+  CHECK(asked.json["awaiting"] == true);
+  CHECK_HAS(w.rig.run("status"),
+            "          The random number generator failed 2 times, so session cookies or question ids were made from timing\r\n"
+            "          alone. That is easier to guess: keep the Opta on a network you trust.\r\n");
+  w.host.randomWorks = true;
+  CHECK(w.console("no", str(asked.json["question"])).text == "Cancelled. Nothing was sent.\r\n");
+  w.cookie.clear();
+  CHECK_EQ(w.post("/api/login", "{\"pin\":\"97531246\"}").status, 200);
+  CHECK_HAS(w.rig.run("web"), "          The random number generator failed 2 times,");
 }
 
 int main() {

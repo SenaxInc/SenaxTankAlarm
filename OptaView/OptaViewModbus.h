@@ -65,6 +65,14 @@ inline const char *mbFormatName(uint8_t format) {
   }
 }
 
+// How long one character takes on the wire, in microseconds: a start bit, eight data bits, and
+// a parity bit and one stop bit or two stop bits (8N1 has neither the parity bit nor the second
+// stop bit). 1146 at 9600 baud 8N2, 36667 at 300.
+inline uint32_t mbCharMicros(uint32_t baud, uint8_t format) {
+  const uint32_t bits = format == MB_8N1 ? 10UL : 11UL;
+  return (bits * 1000000UL + (baud == 0 ? 1UL : baud) - 1UL) / (baud == 0 ? 1UL : baud);
+}
+
 enum MbStatus : uint8_t {
   MB_OK = 0,
   MB_TIMEOUT,         // nothing was received at all
@@ -119,7 +127,8 @@ static const size_t MB_MAX_FRAME = 256;     // Modbus RTU ADU limit
 static const uint16_t MB_MAX_READ_REGISTERS = 125;
 static const uint16_t MB_MAX_READ_BITS = 2000;
 static const uint16_t MB_MAX_WRITE_REGISTERS = 123;
-static const uint32_t MB_GRACE_MS = 400;    // extra time for a reply still arriving at the timeout
+static const uint32_t MB_GRACE_MS = 400;    // extra time for a reply still arriving at the timeout,
+                                            // on top of the time the reply itself takes on the wire
 
 // The silence that separates two frames: 3.5 characters of 11 bits (Modbus over Serial Line,
 // section 2.5.1.1). That is 4 ms at 9600 baud and 129 ms at 300. One millisecond is added, since
@@ -424,6 +433,7 @@ class ModbusMaster {
       : responseTimeoutMs(1000),
         quietMs(50),
         interFrameGapMs(5),
+        charMicros(1146),
         trace(nullptr),
         transport_(transport),
         lastTxLen_(0),
@@ -437,7 +447,8 @@ class ModbusMaster {
         lateSlave_(0),
         lateFunction_(0),
         lateSinceMs_(0),
-        lateWindowMs_(0) {
+        lateWindowMs_(0),
+        lateWireMs_(0) {
     memset(&stats, 0, sizeof(stats));
     memset(lastTx_, 0, sizeof(lastTx_));
     memset(rx_, 0, sizeof(rx_));
@@ -449,12 +460,13 @@ class ModbusMaster {
   uint16_t responseTimeoutMs;
   uint16_t quietMs;            // silence that ends a reply of unknown length (see mbQuietMs)
   uint16_t interFrameGapMs;    // minimum bus silence before a request (see mbInterFrameGapMs)
+  uint32_t charMicros;         // one character on the wire (see mbCharMicros)
   MbStats stats;
   MbTraceSink *trace;
 
   MbTransport &transport() { return transport_; }
 
-  // (Re)opens the link and sets the two times above, which depend on the baud rate. Whatever
+  // (Re)opens the link and sets the three times above, which depend on the baud rate. Whatever
   // changes the serial settings comes through here: the transport's own configure() would leave
   // the master with the pauses of the old baud rate.
   bool configure(uint32_t baud, uint8_t format) {
@@ -463,7 +475,27 @@ class ModbusMaster {
     }
     interFrameGapMs = mbInterFrameGapMs(baud);
     quietMs = mbQuietMs(baud);
+    charMicros = mbCharMicros(baud, format);
     return true;
+  }
+
+  // How long the longest reply that e allows takes on the wire, in whole milliseconds. A reply
+  // of 16 registers takes 43 ms at 9600 baud 8N2 and 1.36 s at 300, so at low baud rates a reply
+  // that starts in time can need far longer than MB_GRACE_MS to finish. A reply whose length
+  // the request does not fix is allowed the longest frame.
+  uint32_t replyWireMs(const MbExpect &e) const {
+    uint32_t bytes = (uint32_t)MB_MAX_FRAME;
+    if (e.kind == MB_REPLY_REGISTERS) {
+      bytes = 5UL + 2UL * e.quantity;
+    } else if (e.kind == MB_REPLY_BITS) {
+      bytes = 5UL + (e.quantity + 7UL) / 8UL;
+    } else if (e.kind == MB_REPLY_ECHO) {
+      bytes = 8UL;
+    }
+    if (bytes > (uint32_t)MB_MAX_FRAME) {
+      bytes = (uint32_t)MB_MAX_FRAME;
+    }
+    return (bytes * charMicros + 999UL) / 1000UL;
   }
 
   // FC03 / FC04. out receives `quantity` registers.
@@ -636,6 +668,7 @@ class ModbusMaster {
   uint8_t lateFunction_;
   uint32_t lateSinceMs_;  // when the master gave up on it
   uint32_t lateWindowMs_; // how long after that its reply is still expected
+  uint32_t lateWireMs_;   // how long that reply takes on the wire
 
   static bool validSlave(uint8_t slave) { return slave >= 1 && slave <= 247; }
 
@@ -697,10 +730,11 @@ class ModbusMaster {
             lastDrop = now;
           }
           const uint32_t waited = (uint32_t)(now - began);
-          // Done when the window is over, unless a late frame is still coming in. Noise that
-          // never stops must not hold the master for ever.
+          // Done when the window is over, unless a late frame is still coming in: it may go on
+          // for as long as it takes on the wire. Noise that never stops must not hold the
+          // master for ever.
           const bool arriving = dropped && (uint32_t)(now - lastDrop) < quietMs;
-          if (waited >= guardMs && (!arriving || waited >= guardMs + MB_GRACE_MS)) {
+          if (waited >= guardMs && (!arriving || waited >= guardMs + MB_GRACE_MS + lateWireMs_)) {
             break;
           }
           transport_.idle();
@@ -726,6 +760,7 @@ class ModbusMaster {
   // A request got no proper reply. Its reply may still arrive, for one more timeout from now.
   void noteUnanswered(const MbExpect &e, uint32_t now) {
     uint32_t window = responseTimeoutMs;
+    uint32_t wire = replyWireMs(e);
     bool any = false;
     if (lateOpen_) {
       const uint32_t since = (uint32_t)(now - lateSinceMs_);
@@ -736,6 +771,9 @@ class ModbusMaster {
         if (lateWindowMs_ - since > window) {
           window = lateWindowMs_ - since;
         }
+        if (lateWireMs_ > wire) {
+          wire = lateWireMs_;
+        }
       }
     }
     lateOpen_ = true;
@@ -744,6 +782,7 @@ class ModbusMaster {
     lateFunction_ = e.function;
     lateSinceMs_ = now;
     lateWindowMs_ = window;
+    lateWireMs_ = wire;
   }
 
   MbResult transact(const uint8_t *tx, size_t txLen, const MbExpect &e) {
@@ -760,6 +799,9 @@ class ModbusMaster {
     transport_.send(tx, txLen);
     ++stats.sent;
 
+    // A reply has to start within the timeout. One that has started may go on for the time it
+    // takes on the wire, and for MB_GRACE_MS more.
+    const uint32_t limitMs = (uint32_t)responseTimeoutMs + MB_GRACE_MS + replyWireMs(e);
     const uint32_t start = transport_.nowMs();
     uint32_t lastByte = start;
     MbLocation where = {false, 0, 0};
@@ -790,7 +832,7 @@ class ModbusMaster {
         break;
       } else if (quiet >= quietMs && (e.kind == MB_REPLY_UNKNOWN || elapsed >= responseTimeoutMs)) {
         break;
-      } else if (elapsed >= (uint32_t)responseTimeoutMs + MB_GRACE_MS) {
+      } else if (elapsed >= limitMs) {
         break;
       }
       transport_.idle();

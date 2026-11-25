@@ -280,8 +280,9 @@ static EthernetServer gServer(WEB_PORT);
 static bool gListening = false;
 
 // Stirred with the time of things that nobody can time from outside to the microsecond: each
-// key on the USB port, each connection. It is mixed into what the random number generator
-// gives, so that a generator that fails does not leave the session tokens guessable from nothing.
+// key on the USB port, each connection. It is mixed into what the random number generator gives,
+// as a second ingredient for a generator that answers with poor bytes, and it stands in alone for
+// a generator that does not answer (see random()).
 static uint64_t gJitter = 0x4F70746156696577ULL;
 
 static void stir(uint32_t value) {
@@ -314,14 +315,25 @@ class EthernetWebHost : public optaview::OvWebHost {
     return nullptr;
   }
 
-  void random(uint8_t *out, size_t len) override {
-    size_t got = 0;
-    memset(out, 0, len);
-    mbedtls_hardware_poll(nullptr, out, len, &got);
+  // The processor's random number generator, asked a few times at most until it has given every
+  // byte, with the jitter mixed in. False when it fails or falls short: the bytes it did not give
+  // then come from the jitter alone. The web server uses them all the same, and the USB console
+  // says that it had to.
+  bool random(uint8_t *out, size_t len) override {
+    size_t filled = 0;
+    for (int tries = 0; tries < 4 && filled < len; ++tries) {
+      size_t got = 0;
+      if (mbedtls_hardware_poll(nullptr, out + filled, len - filled, &got) != 0) {
+        break;
+      }
+      filled += got < len - filled ? got : len - filled;
+    }
+    memset(out + filled, 0, len - filled);
     for (size_t i = 0; i < len; ++i) {
       stir(micros());
       out[i] ^= (uint8_t)(gJitter >> 56);
     }
+    return filled == len;
   }
 
   bool address(char *out, size_t cap) override {

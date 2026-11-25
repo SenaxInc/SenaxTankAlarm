@@ -10119,19 +10119,31 @@ static void flushBufferedNotes() {
         fprintf(tmp, "%s\n", lineBuffer);
         continue;
       }
-      // A request that is not whole (see sendNote()) is not sent, and the note stays.
+      // A request that is not whole (see sendNote()) is not sent, and the note stays. Checked
+      // before the body is parsed: note-c is then short of memory, the parse may fail as well,
+      // and a body that does not parse drops its line (below).
       bool whole = JAddStringToObject(req, "file", fileName) != nullptr;
       if (syncNow) {
         whole = JAddBoolToObject(req, "sync", true) != nullptr && whole;
       }
+      if (!whole) {
+        JDelete(req);
+        wroteFailures = true;
+        *tab1 = '\t'; *tab2 = '\t';  // restore tabs for re-serialization
+        fprintf(tmp, "%s\n", lineBuffer);
+        continue;
+      }
 
+      // JParse() gives nullptr both for a body that is not JSON and for one it has no memory
+      // for. The line is dropped, as it always was: kept, a line that is not JSON would stay in
+      // the buffer for ever.
       J *body = JParse(payload);
       if (!body) {
         JDelete(req);
         continue;
       }
       JAddItemToObject(req, "body", body);
-      if (!whole || JGetObject(req, "body") == nullptr) {
+      if (JGetObject(req, "body") == nullptr) {
         JDelete(req);
         wroteFailures = true;
         *tab1 = '\t'; *tab2 = '\t';  // restore tabs for re-serialization
@@ -10241,19 +10253,31 @@ static void flushBufferedNotes() {
         tmp.println(lineBuffer);
         continue;
       }
-      // A request that is not whole (see sendNote()) is not sent, and the note stays.
+      // A request that is not whole (see sendNote()) is not sent, and the note stays. Checked
+      // before the body is parsed: note-c is then short of memory, the parse may fail as well,
+      // and a body that does not parse drops its line (below).
       bool whole = JAddStringToObject(req, "file", fileName) != nullptr;
       if (syncNow) {
         whole = JAddBoolToObject(req, "sync", true) != nullptr && whole;
       }
+      if (!whole) {
+        JDelete(req);
+        wroteFailures = true;
+        *tab1 = '\t'; *tab2 = '\t';  // restore tabs for re-serialization
+        tmp.println(lineBuffer);
+        continue;
+      }
 
+      // JParse() gives nullptr both for a body that is not JSON and for one it has no memory
+      // for. The line is dropped, as it always was: kept, a line that is not JSON would stay in
+      // the buffer for ever.
       J *body = JParse(payload);
       if (!body) {
         JDelete(req);
         continue;
       }
       JAddItemToObject(req, "body", body);
-      if (!whole || JGetObject(req, "body") == nullptr) {
+      if (JGetObject(req, "body") == nullptr) {
         JDelete(req);
         wroteFailures = true;
         *tab1 = '\t'; *tab2 = '\t';  // restore tabs for re-serialization

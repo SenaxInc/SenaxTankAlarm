@@ -179,7 +179,19 @@ inline bool ovIsSentinel(const OvRegister &reg, const uint16_t *words) {
 
 inline bool ovIsNumeric(const OvRegister &reg) { return reg.type != OV_ENUM && reg.type != OV_BITS; }
 
-// The value as text: "13.68 V", "FLOAT (7)", "SW2 ON: custom LVD/LVR, SW4 ON: MODBUS", "none".
+// The bits of a one-word register that the controller uses: the low byte of a u8 or i8, all
+// sixteen of anything else. Two words that agree in those bits hold the same value, whatever
+// the rest holds.
+inline uint16_t ovUsedBits(const OvRegister &reg) {
+  return (reg.type == OV_U8 || reg.type == OV_I8) ? (uint16_t)0x00FF : (uint16_t)0xFFFF;
+}
+
+inline bool ovSameValue(const OvRegister &reg, uint16_t a, uint16_t b) {
+  return ((uint16_t)(a ^ b) & ovUsedBits(reg)) == 0;
+}
+
+// The value as text: "13.68 V", "FLOAT (7)", "SW1: custom battery settings, SW2: custom LVD/LVR"
+// (the bits that are set), "none".
 inline void ovFormatValue(const OvRegister &reg, const uint16_t *words, char *out, size_t cap) {
   OvText text(out, cap);
   if (ovIsSentinel(reg, words)) {
@@ -236,9 +248,10 @@ enum OvEncodeStatus : uint8_t {
   OV_ENCODE_OUT_OF_RANGE  // does not fit the register
 };
 
-// Engineering value -> the raw word to write. Applies the profile's limits.
+// Engineering value -> the raw word to write. Applies the profile's limits. A u8 goes in the low
+// byte, with 0 in the high byte, which the controller does not use.
 inline OvEncodeStatus ovEncode(const OvRegister &reg, double value, uint16_t *raw) {
-  if (!reg.writable || reg.words != 1 || (reg.type != OV_U16 && reg.type != OV_I16)) {
+  if (!reg.writable || reg.words != 1 || (reg.type != OV_U16 && reg.type != OV_I16 && reg.type != OV_U8)) {
     return OV_ENCODE_NOT_WRITABLE;
   }
   if (value != value) {
@@ -260,7 +273,7 @@ inline OvEncodeStatus ovEncode(const OvRegister &reg, double value, uint16_t *ra
     }
     *raw = (uint16_t)(int16_t)rounded;
   } else {
-    if (rounded < 0.0 || rounded > 65535.0) {
+    if (rounded < 0.0 || rounded > (reg.type == OV_U8 ? 255.0 : 65535.0)) {
       return OV_ENCODE_OUT_OF_RANGE;
     }
     *raw = (uint16_t)rounded;
@@ -819,8 +832,8 @@ class OvProfile {
       if (r.hasMin && r.hasMax && r.minValue > r.maxValue) {
         return fail(error, errorCap, "\"min\" is above \"max\" on register", name);
       }
-      if (r.writable && (r.words != 1 || (r.type != OV_U16 && r.type != OV_I16))) {
-        return fail(error, errorCap, "only one-word u16 and i16 registers can be writable", name);
+      if (r.writable && (r.words != 1 || (r.type != OV_U16 && r.type != OV_I16 && r.type != OV_U8))) {
+        return fail(error, errorCap, "only one-word u16, i16 and u8 registers can be writable", name);
       }
 
       JsonVariantConst sentinel = v["sentinel"];
@@ -1028,6 +1041,11 @@ class OvProfile {
         }
         if (!namedRegister(live["meter"], &check.meter)) {
           return fail(error, errorCap, "scaleCheck.live.meter names no register");
+        }
+        if (check.meter == nullptr) {
+          // The regulation test only points (ovJudgeLive), so without a multimeter comparison
+          // nothing could ever confirm this scale.
+          return fail(error, errorCap, "scaleCheck.live.meter is needed: only a multimeter reading settles this scale");
         }
         if (!namedRegister(live["battery"], &check.battery)) {
           return fail(error, errorCap, "scaleCheck.live.battery names no register");

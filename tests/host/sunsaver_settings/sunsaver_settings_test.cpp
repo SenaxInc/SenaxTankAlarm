@@ -196,7 +196,7 @@ static void testTableAgainstProfile() {
       case ss::KIND_SECONDS: wantUnits = "s"; break;
       case ss::KIND_TENTHS: wantScale = "tenths"; break;
       case ss::KIND_DAYS: wantUnits = "days"; break;
-      case ss::KIND_TEMPCO: wantScale = "tempco"; break;
+      case ss::KIND_TEMPCO: wantScale = "tempco"; wantType = OV_U8; break;  // the low byte only
       case ss::KIND_OHMS: wantScale = "icomp"; break;
       case ss::KIND_CELSIUS: wantUnits = "C"; wantType = OV_I8; break;
       case ss::KIND_CHARGE_STATE: wantLabels = "charge_state"; wantType = OV_ENUM; break;
@@ -368,14 +368,14 @@ static void testValuesAgainstOptaView() {
       ss::Text text(mine, sizeof(mine));
       ss::describeValue(i, raw, ss::SCALE_100, ss::SCALE_100, &text);
       char theirs[400];
-      // The profile's note on EV_tempcomp says the controller uses only the low byte, and
-      // OptaView decodes the whole word; the text here is the value the controller uses.
-      const uint16_t shown = entry.kind == ss::KIND_TEMPCO ? (uint16_t)(raw & 0x00FFu) : raw;
-      const uint16_t pair[2] = {shown, 0};
+      // The controller uses only the low byte of EV_tempcomp, and both read only that: OptaView
+      // gets the whole word too.
+      const uint16_t pair[2] = {raw, 0};
       ovFormatValue(*reg, pair, theirs, sizeof(theirs));
+      const uint16_t used = entry.kind == ss::KIND_TEMPCO ? (uint16_t)(raw & 0x00FFu) : raw;
 
       std::string expected = theirs;
-      if ((entry.flags & ss::ITEM_ZERO_IS_OFF) != 0 && shown == 0) {
+      if ((entry.flags & ss::ITEM_ZERO_IS_OFF) != 0 && used == 0) {
         expected = "0 (off)";
       } else if (entry.kind == ss::KIND_SECONDS && raw >= 60) {
         expected = std::string(mine).substr(0, expected.size()) == expected ? std::string(mine) : expected;
@@ -1037,7 +1037,10 @@ static void testSettingsScale() {
       ovAddCandidate(&theirs.candidates, ss::scaleNumerator(ss::candidateScale(0)));
       ovAddCandidate(&theirs.candidates, ss::scaleNumerator(ss::candidateScale(1)));
       ovJudgeSetpoints(&theirs, raws, count, ss::VOLTS_DENOMINATOR, ss::SETPOINT_GRID_VOLTS);
-      const uint8_t expected = theirs.verdict < 0 ? (uint8_t)ss::SCALE_UNKNOWN : ss::candidateScale((uint8_t)theirs.verdict);
+      // OptaView's round-setpoint test. There it only points: its verdict on the stored scale needs
+      // a setting whose value the user knows from MSView.
+      const uint8_t expected =
+          theirs.roundVerdict < 0 ? (uint8_t)ss::SCALE_UNKNOWN : ss::candidateScale((uint8_t)theirs.roundVerdict);
       if (mine.scale != expected || mine.used != theirs.setpointsUsed || mine.fits[0] != theirs.fits[0] ||
           mine.fits[1] != theirs.fits[1]) {
         ++disagreements;
@@ -1060,11 +1063,12 @@ static void testSettingsScale() {
     CHECK_EQ(verdict.fits[0], 13);
     CHECK_EQ(verdict.scale, ss::SCALE_100);
 
-    // The same verdict as OptaView's 'scalecheck' reaches on that controller.
+    // OptaView's 'scalecheck' finds the same on that controller: its setpoints point at x100.
+    // There they only point, since its verdict needs a setting read in MSView.
     Rig rig;
     const std::string out = rig.run("scalecheck");
     CHECK_HAS(out, "13 of 13");
-    CHECK_HASNT(out, "cannot tell");
+    CHECK_HAS(out, "The setpoints point at x100, which OptaView uses now.");
 
     sim.regs[0xE01B] = 0xFFFF;  // a blank cell is not a setting somebody chose
     verdict = ss::judgeSettingsScale(snapshotOf(sim));

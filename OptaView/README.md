@@ -113,7 +113,7 @@ What to know before you rely on it:
   that takes longer than a minute is stopped, and so is one whose browser has gone.
 - **No connection can hold the Opta up.** A request has 6 seconds to arrive. A browser that
   takes nothing of an answer for 5 seconds is taken to be gone, and an answer that is still
-  not delivered after 30 seconds of sending is given up. The page is 49 KB and the Opta's
+  not delivered after 30 seconds of sending is given up. The page is 55 KB and the Opta's
   network stack sends about 1 KB per round trip, so the page needs a link whose round trip is
   well under half a second.
 - **Open it by its address.** A request that names the Opta in any other way than by its IP
@@ -127,9 +127,18 @@ What to know before you rely on it:
 
 | Mode | |
 |---|---|
-| `auto` (the default) | DHCP first. When no address has arrived after 20 s, the fixed address. If the cable only goes in after that, DHCP gets one more try |
+| `auto` (the default) | DHCP first. When no address has arrived after 20 s, the fixed address. If the cable only goes in after that, DHCP gets one more try. An address from DHCP that is lost starts all of this again |
 | `dhcp` | DHCP only, for as long as it takes |
 | `static` | The fixed address at once |
+
+While it waits for DHCP the Opta cannot tell a cable that is out from a network without DHCP.
+A cable that was out for more than 20 s therefore finds the fixed address in use when it goes
+back in, and DHCP gets its one more try then. (A cable that goes back in within 3 s of the
+change to the fixed address looks like one that was in all along, and keeps the fixed address.)
+A router that needs longer than 20 s to hand out addresses again, as after a power cut, can
+leave the Opta on the fixed address, so on a network that always has DHCP use `dhcp`. Once the
+fixed address is in use and the extra try is spent, a cable moved from a laptop to a network
+with DHCP keeps the fixed address until `net auto` or a restart.
 
 The fixed address is 192.168.1.16 with the mask 255.255.255.0, unless you set another. These
 commands of the USB console change things until power-off:
@@ -171,14 +180,20 @@ Controller view (7).
 3. `dump` reads every register in the profile. Lines marked `~` come from Morningstar's
    specification and have not been seen on our bench, so look for values that make no sense.
 4. `snapshot` prints every raw value as JSON. Copy it out of the terminal and keep it: it is the
-   record of how the controller was set before you changed anything.
-5. `scalecheck 13.42` (with your own multimeter reading) settles the voltage scales. See
+   record of how the controller was set before you changed anything. Download a snapshot on the
+   page saves the same JSON as a file. It saves nothing that broke off on the way, and asks
+   first when some registers could not be read.
+5. `scalecheck 13.42 EV_float 13.70` settles the voltage scales. The first figure is your own
+   multimeter reading at the battery terminals. `EV_float 13.70` is a setting with the value
+   that MSView (Morningstar's own program) shows for it on this controller. Read one before
+   you start: any voltage that `set` can write will do. See
    [The voltage scales](#the-voltage-scales). Do this before writing any voltage.
 6. `set EV_lvr 13.25`, then `set EV_lvd 13.10`: each shows the old and the new value and waits
    for `yes`. Raising the reconnect voltage first keeps it above the disconnect voltage at
    every step.
 7. `reset` restarts the controller so that it uses the new settings, waits for it to come
-   back and shows the status again. `dump load` then shows what is stored.
+   back and shows the status again. `dump load` then shows what is stored. If it says that the
+   controller answered all the time and was not seen to restart, the restart is still due.
 
 While you change settings, power the Opta from the battery and not from the SunSaver's LOAD
 terminals: the specification does not say whether the load output stays on between an EEPROM
@@ -230,7 +245,7 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 | `get <address> [count]` | Raw registers from an address |
 | `coils` | Coil states |
 | `snapshot` | Every raw value as JSON |
-| `scalecheck [volts]` | Test the voltage scales, with a multimeter reading if you have one |
+| `scalecheck [volts] [setting volts]` | Test the voltage scales. The live readings need a multimeter reading, the stored settings a setting whose value you know |
 | `set <name> <value>` | Write a setting, for example `set EV_lvd 13.10` |
 | `set <name> raw <n>` | The same with a raw register value |
 | `coil <name> on\|off` | Switch a coil |
@@ -273,10 +288,16 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   been read again.
 - Pairs that must stay in order (reconnect above disconnect) are checked when you `set` one of
   them and again before `reset`.
+- A restart counts only when it shows: after the reset command the controller misses a request
+  and then answers again. One that answers every request for the profile's `resetWaitMs`
+  (3 s) was not seen to restart, and OptaView keeps saying that a restart is due. A single
+  reply lost on a poor link looks like a restart too, so check that the "EEPROM setting edit"
+  fault is gone afterwards.
 - `raw` sends functions 1 to 4, which only read, as they are typed. Every other request needs
   `expert on` first and still asks for `yes`, because OptaView cannot tell what it would change.
 - Stored settings and live readings have a voltage scale each. `set` warns until the scale of
   the settings is confirmed, and a multimeter reading never changes how a setting is written.
+  A setting that OptaView wrote since it started cannot confirm the scale it was written with.
   What `scalecheck` found holds for the controller it talked to: another slave address or other
   serial settings make both scales unconfirmed again. A different controller on the same cable
   and settings looks the same to OptaView, so run `scalecheck` again after swapping one.
@@ -288,6 +309,11 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   that is logged in: it needs the session cookie, which scripts cannot read, and a header that
   a page from another site cannot send. The page itself is served with a policy that lets the
   browser run its one script and nothing else.
+- The session cookie and the id of each question come from the processor's random number
+  generator, mixed with the timing of key presses and connections. If the generator does not
+  answer, they come from that timing alone, which is easier to guess. The page works all the
+  same, because it is meant for a network you trust, and `web` and `status` on the USB console
+  say how often it happened. Two questions in a row never get the same id.
 
 ## The voltage scales
 
@@ -313,34 +339,54 @@ voltage scales, and each can be corrected on its own:
 OptaView starts with the specification's figures and says so until `scalecheck` has settled
 them. It tests the first two separately, each on its own evidence:
 
-- **Stored settings.** The setpoints in the controller are round numbers (14.40 V, 11.50 V)
-  only at the right scale. This needs no multimeter.
+- **Stored settings.** A setting whose value you know, given as `scalecheck EV_float 13.70`,
+  decides. Read it in MSView, which does not depend on OptaView's figures. It has to match
+  within 0.5 %, and the two candidates are 3.3 % apart. A setting that OptaView has written
+  since it started is refused: it went in at the scale under test, so it would read back as
+  right at that scale. The check also counts the setpoints that are round numbers (14.40 V,
+  11.50 V) at each scale, but that only points, because a setting looks round at whatever
+  scale wrote it, a wrong one included. When the two disagree, `scalecheck` goes by the
+  setting you gave and says that some setpoints were written with a wrong scale.
 - **Live readings.** A multimeter reading at the controller's battery terminals, given as
-  `scalecheck 13.42`, decides. Without one the check can still confirm the scale in use while
-  the controller is in absorption or float, because it then holds the battery at `Vb_ref`.
+  `scalecheck 13.42`, decides, and nothing else does. In absorption and float the check also
+  compares the battery with `Vb_ref`, the target the controller works towards, but that only
+  points: the battery is not always at its target (float goes on until `Et_float_exit_cum` runs
+  out, and the sun may be too weak to get there), and a battery 3.3 % below its target reads
+  as right on it at the other scale.
 
-A multimeter says nothing about how settings are stored, and round setpoints say nothing about
+A multimeter says nothing about how settings are stored, and a stored setting says nothing about
 the readings, so neither verdict is taken from the other's evidence. This is the simulator
 again, behaving as the specification says:
 
 ```text
-optaview> scalecheck 13.68
+optaview> scalecheck 13.68 EV_float 13.70
 Stored settings (scale vset, now x100/32768). Candidates: x100, x96.667.
-  1. Setpoints: 13 in use (14 of 14 read). Round settings only look round at the right scale.
+  1. Round setpoints: 13 in use (14 of 14 read). They look round at the scale that wrote them.
+     This only points: settings that OptaView or another tool wrote with a wrong scale look
+     round at that wrong scale.
        at x100, 13 of 13 are multiples of 0.05 V
        at x96.667, 1 of 13 is a multiple of 0.05 V
      -> x100
+  2. A setting you know: EV_float = 13.70 V, which with the raw value works out to x100.00.
+       EV_float reads 13.70 V at x100, 13.24 V at x96.667
+     -> x100
 Live readings (scale vlive, now x100/32768). Candidates: x100, x96.667.
-  2. Regulation: the controller is holding the battery at its target (Vb_ref = 13.70 V).
+  3. Regulation: in FLOAT (7) the controller works to hold the battery at Vb_ref = 13.70 V.
+     This only points: the battery is not always at its target in this state (too little sun
+     for the load), and one that is below it can read as on it at another scale.
        Vb_f reads 13.70 V at x100, 13.24 V at x96.667
      -> x100
-  3. Multimeter: 13.68 V measured, which with the register value works out to x99.99.
+  4. Multimeter: 13.68 V measured, which with the register value works out to x99.99.
        adc_vb_f reads 13.68 V at x100, 13.23 V at x96.667
      -> x100
 Verdict
   Stored settings: x100, which is what OptaView uses now.
   Live readings:   x100, which is what OptaView uses now.
 ```
+
+Without `EV_float 13.70` the verdict for stored settings is "cannot tell yet", followed by where
+the setpoints point. Either part can be run on its own: `scalecheck 13.68` or
+`scalecheck EV_float 13.70`.
 
 When a verdict differs from the scale in use, `scalecheck` prints the command that switches it
 for the session, such as `scale vlive 96.667`, and the fix belongs in
@@ -360,7 +406,8 @@ Not confirmed yet, and so the first things to try:
   tested with stand-ins for it, so all of this waits for an Opta: getting an address by DHCP,
   falling back to the fixed address, the listener on port 80, how quickly pages load (the
   library starts a thread for each connection), and the processor's random number generator
-  behind the session tokens.
+  behind the session tokens (if it does not answer, the page works all the same and `web` on
+  the USB console says so).
 - Every register marked `~`, including all the EEPROM settings.
 - Reading several registers in one request. OptaView tries it, and if the adapter does not
   answer blocks it falls back to single registers and says so.
@@ -369,7 +416,9 @@ Not confirmed yet, and so the first things to try:
   specification, so OptaView does not use it.
 - Which scales the voltages use (see above).
 - Which position of DIP switch 4 is MODBUS. The repository's notes disagree, so the texts only
-  say that it selects it.
+  say that it selects between MeterBus and MODBUS. A controller that answers OptaView is in
+  MODBUS mode, so the position of switch 4 on the bench settles it, and whether `live` then
+  lists SW4 shows whether a set bit in `dip_switch` means ON.
 
 ## The profile
 
@@ -392,10 +441,12 @@ The host tests fail when the header is out of date. A register entry looks like 
   "group": "load", "writable": true, "min": 9.0, "max": 15.0 }
 ```
 
-`type` is `u16` (the default), `i16`, `u8`, `i8`, `u32`, `enum` or `bits`. `"verified": "bench"`
-marks a register that was seen on our hardware; the others show `~` in the lists. Only
-one-word `u16` and `i16` registers can be writable. The limits are OptaView's own sanity limits
-for a 12 V system, not Morningstar's.
+`type` is `u16` (the default), `i16`, `u8`, `i8`, `u32`, `enum` or `bits`. A `u8` or `i8` is the
+low byte of its word: the high byte is not part of the value and is not compared, and `set`
+writes 0 there (a raw value for a `u8` is 0 to 255). `"verified": "bench"` marks a register that
+was seen on our hardware; the others show `~` in the lists. Only one-word `u16`, `i16` and `u8`
+registers can be writable. The limits are OptaView's own sanity limits for a 12 V system, not
+Morningstar's.
 
 ## Tests
 
@@ -406,7 +457,8 @@ make -C tests/host/optaview test ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 
 Two suites run the same headers the sketch compiles. `optaview_test` drives the console against
 a simulated SunSaver that can drop, cut, corrupt and delay replies, refuse blocks, answer at
-another address or speed, and restart. `optaview_web_test` writes HTTP requests as text and has
+another address or speed, and restart. Its bus times each byte to the microsecond, and two
+senders that are on the wire at once spoil each other's bytes. `optaview_web_test` writes HTTP requests as text and has
 the web server answer them on top of that simulation. It plays browsers that never stop
 sending or that take an answer a byte at a time, and it walks the address policy through
 cables that go in late and DHCP servers that never answer. Run
@@ -428,7 +480,8 @@ This builds the firmware's web server and console as a program for your PC, with
 SunSaver behind them, and serves the page at <http://127.0.0.1:8080/>. Its terminal is the USB
 console. Lines that start with `sim` change the simulation: `sim battery 12.4`,
 `sim power off`, `sim refuse on` (every write is refused), `sim delay 300`, `sim drop 3` (the
-next three replies are lost on the way). Add
+next three replies are lost on the way), `sim random off` (the Opta's random number generator
+fails and the clock stands in for it). Add
 `PREVIEW_ARGS="--port 9000 --pin 2468"` for another port and a PIN that is already set. The
 simulated controller answers as the specification says, so the preview shows the page and not
 how a real SunSaver behaves.
@@ -439,11 +492,12 @@ NODE_PATH=<that folder>/node_modules make -C tests/host/optaview browser-test AR
 ```
 
 This drives the page of the preview in Chromium: choosing a PIN, the readings, a change with
-Cancel and with Yes, a value outside its limits, the restart, the switches, the snapshot,
-wrong PINs, sessions that end, a window the size of a phone, and an Opta that goes away. It
-also fails if the browser blocks anything under the page's policy or if the page asks anything
-of another server. `BROWSER_TEST_ARGS="--shots <folder>"` saves the screenshots this README
-uses. CI runs it as the `optaview-page` check.
+Cancel and with Yes, a value outside its limits, the restart, the switches, the snapshot
+(whole, broken off and with registers missing), a login while the random number generator fails, wrong
+PINs, sessions that end, a window the size of a phone, and an Opta that goes away. It also
+fails if the browser blocks anything under the page's policy or if the page asks anything of
+another server. `BROWSER_TEST_ARGS="--shots <folder>"` saves the screenshots this README uses.
+CI runs it as the `optaview-page` check.
 
 The page is one file, `web/index.html`. After editing it:
 
@@ -453,7 +507,9 @@ python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
 
 The script also works out the hashes that the page's policy names for its style sheet and its
 script, and refuses a page that needs more than that policy allows (an inline event handler, a
-file from another server). The host tests fail when the header is out of date.
+style sheet brought in with `@import`, a font, any file but a `data:` image).
+`embed_web.py --selftest` shows that each of those rules refuses what it should. The host tests
+run it, and fail when the header is out of date.
 
 ## Files
 

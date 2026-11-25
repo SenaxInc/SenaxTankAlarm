@@ -21,6 +21,8 @@
 //   sim drop <n>           its next n replies are lost on the way (it does what was asked)
 //   sim skip <seconds>     this much time passes at once (a session ends after 30 minutes)
 //   sim writes             how many requests that change something it has received
+//   sim random off|on      the Opta's random number generator fails (the clock stands in for it),
+//                          or works again
 //   sim quit
 //
 // Options: --port <n> (default 8080; 0 takes any free port and prints it), --pin <digits>
@@ -178,6 +180,9 @@ class PcConn : public OvConn {
   int fd_;
 };
 
+// False while "sim random off" stands for an Opta whose random number generator fails.
+static bool gRandomWorks = true;
+
 class PcWebHost : public OvWebHost {
  public:
   PcWebHost() : listener_(-1), port_(0) {}
@@ -223,13 +228,25 @@ class PcWebHost : public OvWebHost {
     return nullptr;
   }
 
-  void random(uint8_t *out, size_t len) override {
+  bool random(uint8_t *out, size_t len) override {
+    if (!gRandomWorks) {
+      // What the Opta falls back on is the timing of events; here the clock stands in for it.
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      uint64_t mix = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+      for (size_t i = 0; i < len; ++i) {
+        mix = mix * 6364136223846793005ULL + 1442695040888963407ULL;
+        out[i] = (uint8_t)(mix >> 56);
+      }
+      return false;
+    }
     FILE *source = fopen("/dev/urandom", "rb");
     if (source == nullptr || fread(out, 1, len, source) != len) {
       fprintf(stderr, "optaview_preview: /dev/urandom cannot be read\n");
       exit(1);
     }
     fclose(source);
+    return true;
   }
 
   bool address(char *out, size_t cap) override {
@@ -322,7 +339,7 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
     sim.powered = on;
     printf("sim: the controller has %s\n", on ? "power" : "no power");
   } else if (what == "battery" && numeric && number >= 0.0 && number <= 40.0) {
-    sim.regs[0x0008] = sim.volts(number);
+    sim.setBattery(number);
     printf("sim: the battery is at %.2f V\n", number);
   } else if (what == "refuse" && isOnOff(value, &on)) {
     sim.refuseWrites = on;
@@ -338,13 +355,16 @@ static void simCommand(LiveSunSaver &sim, const std::string &line) {
     printf("sim: %u s have passed\n", (unsigned)number);
   } else if (what == "writes") {
     printf("sim: %u writes so far\n", sim.writes);
+  } else if (what == "random" && isOnOff(value, &on)) {
+    gRandomWorks = on;
+    printf("sim: the random number generator %s\n", on ? "works" : "fails");
   } else if (what == "quit") {
     printf("sim: bye\n");
     fflush(stdout);
     exit(0);
   } else {
     printf("sim: power off|on, battery <volts>, refuse on|off, delay <ms>, drop <replies>, skip <seconds>, writes, "
-           "quit\n");
+           "random off|on, quit\n");
   }
 }
 

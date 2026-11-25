@@ -951,7 +951,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         "                          one register by name, or raw registers from an address",
         "  coils                   coil states",
         "  snapshot                every raw value as JSON, to keep",
-        "  scalecheck [volts]      test the voltage scales; add a multimeter reading if you have one",
+        "  scalecheck [volts] [setting volts]",
+        "                          test the voltage scales: a multimeter reading at the battery settles",
+        "                          the live readings, a setting whose value you know (from MSView, say)",
+        "                          the stored settings. For example: scalecheck 13.42 EV_float 13.70",
         "Changing settings (each one asks for 'yes' first)",
         "  set <name> <value>      write a setting, for example: set EV_lvd 13.10",
         "  set <name> raw <n>      the same with a raw register value",
@@ -1041,8 +1044,14 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
                                                 : "Voltage   live readings: scale ");
       printScaleState(*check.liveScale, device_.liveScaleConfirmed(), device_.liveScaleFound());
     }
-    if (settingsScaleOpen() || liveScaleOpen()) {
-      out_.println("          'scalecheck' tests what is not confirmed.");
+    // Only a multimeter reading settles the live readings (see ovJudgeLive), and only a setting
+    // whose value is known settles the stored settings (see ovJudgeSettings).
+    if (liveScaleOpen()) {
+      out_.println("          'scalecheck <volts>', with a multimeter reading at the battery, tests the live readings.");
+    }
+    if (settingsScaleOpen()) {
+      out_.println("          'scalecheck <setting> <volts>', with a setting whose value you know (from MSView,");
+      out_.println("          say), tests the stored settings.");
     }
     out_.print("Modes     expert ");
     out_.print(expert_ ? "on" : "off");
@@ -1457,13 +1466,15 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
 
   void printSettingsTests(const OvScaleCheck &check, const OvSettingsScaleReport &report) {
     printScaleHeading("Stored settings", *check.settingsScale, report.candidates);
-    out_.print("  1. Setpoints: ");
+    out_.print("  1. Round setpoints: ");
     out_.printU(report.setpointsUsed);
     out_.print(" in use (");
     out_.printU(report.setpointsRead);
     out_.print(" of ");
     out_.printU(check.setpointCount);
-    out_.println(" read). Round settings only look round at the right scale.");
+    out_.println(" read). They look round at the scale that wrote them.");
+    out_.println("     This only points: settings that OptaView or another tool wrote with a wrong scale look");
+    out_.println("     round at that wrong scale.");
     for (uint8_t c = 0; c < report.candidates.count; ++c) {
       out_.print("       at ");
       printCandidate(report.candidates.num[c]);
@@ -1475,13 +1486,42 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.printFixed(check.grid, 2);
       out_.println(" V");
     }
-    printTestResult(report.candidates, report.verdict, "too few round setpoints to tell");
+    printTestResult(report.candidates, report.roundVerdict, "too few round setpoints to tell");
+
+    out_.print("  2. A setting you know: ");
+    if (report.known == nullptr) {
+      out_.println("none given.");
+      out_.println("     -> read one in MSView (Morningstar's own program), then: scalecheck <setting> <volts>");
+    } else if (!report.knownRead) {
+      out_.print(report.known->name);
+      out_.println(" could not be read.");
+    } else if (report.knownRaw == 0) {
+      out_.print(report.known->name);
+      out_.println(" reads 0, so there is nothing to compare the value with.");
+    } else if (!report.knownCompared) {
+      out_.print(report.known->name);
+      out_.print(" holds 0x");
+      out_.printHex(report.knownRaw, 4);
+      out_.println(", outside its limits at every candidate:");
+      out_.println("     no setting to compare the value with.");
+    } else {
+      out_.print(report.known->name);
+      out_.print(" = ");
+      out_.printFixed(report.knownGivenVolts, 2);
+      out_.print(" V, which with the raw value works out to x");
+      out_.printFixed(report.impliedNumerator, 2);
+      out_.println(".");
+      printReadings(*report.known, report.knownVolts, report.candidates);
+      printTestResult(report.candidates, report.knownVerdict,
+                      report.knownMatches == 0 ? "no candidate is within 0.5 % of that value"
+                                               : "more than one candidate is within 0.5 % of that value");
+    }
   }
 
   void printLiveTests(const OvScaleCheck &check, const OvLiveScaleReport &report) {
     printScaleHeading("Live readings", *check.liveScale, report.candidates);
 
-    out_.print("  2. Regulation: ");
+    out_.print("  3. Regulation: ");
     if (check.battery == nullptr || check.reference == nullptr || check.state == nullptr) {
       out_.println("not set up in this profile.");
     } else if (!report.regulationRead) {
@@ -1498,11 +1538,18 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.println("the battery or the target register reads 0.");
       out_.println("     -> cannot tell");
     } else {
-      out_.print("the controller is holding the battery at its target (");
+      char text[OV_VALUE_TEXT];
+      const uint16_t words[2] = {report.stateRaw, 0};
+      ovFormatValue(*check.state, words, text, sizeof(text));
+      out_.print("in ");
+      out_.print(text);
+      out_.print(" the controller works to hold the battery at ");
       out_.print(check.reference->name);
       out_.print(" = ");
       out_.printFixed(report.referenceVolts, 2);
-      out_.println(" V).");
+      out_.println(" V.");
+      out_.println("     This only points: the battery is not always at its target in this state (too little sun");
+      out_.println("     for the load), and one that is below it can read as on it at another scale.");
       printReadings(*check.battery, report.batteryVolts, report.candidates);
       printTestResult(report.candidates, report.regulationVerdict,
                       report.regulationMatches == 0 ? "no candidate matches the target"
@@ -1514,7 +1561,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       }
     }
 
-    out_.print("  3. Multimeter: ");
+    out_.print("  4. Multimeter: ");
     if (check.meter == nullptr) {
       out_.println("not set up in this profile.");
     } else if (!report.meterGiven) {
@@ -1567,9 +1614,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
   }
 
   // The multimeter and the regulation test point at different candidates. If the multimeter is
-  // right, the battery register is right too, and it is the target that is read with a wrong
-  // scale. While the controller regulates, the target equals the battery voltage, which says
-  // what the target's scale would have to be.
+  // right, the battery register is right too: either the battery is not at its target just now,
+  // or the target is read with a wrong scale. If it is at its target, the target equals the
+  // battery voltage, which says what the target's scale would have to be.
   void printTargetScaleHint(const OvScaleCheck &check, const OvLiveScaleReport &live) {
     const OvScale &target = *check.reference->scale;
     const double batteryVolts = live.batteryVolts[live.verdict];
@@ -1583,10 +1630,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         break;
       }
     }
-    out_.print("     The regulation test disagrees. If the multimeter is right, the target's own scale (");
+    out_.println("     The regulation test disagrees. If the multimeter is right, either the battery is not at its");
+    out_.print("     target just now, or the target's own scale (");
     out_.print(target.name);
-    out_.println(")");
-    out_.print("     is the one that is off: 'scale ");
+    out_.print(") is off: 'scale ");
     out_.print(target.name);
     out_.printChar(' ');
     if (exact) {
@@ -1595,10 +1642,77 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.printFixed(wanted, 2);
     }
     out_.print("' would put ");
-    out_.print(check.reference->name);
-    out_.println(" at the battery voltage.");
+    out_.println(check.reference->name);
+    out_.println("     at the battery voltage.");
   }
 
+
+  // What the stored settings' tests decide. Only a setting the user knows does: round setpoints
+  // look round at whatever scale wrote them, OptaView's own included.
+  void printSettingsVerdict(const OvScaleCheck &check, const OvSettingsScaleReport &settings) {
+    static const char kLabel[] = "  Stored settings: ";
+    const OvScale &scale = *check.settingsScale;
+    if (settings.verdict >= 0) {
+      printFoundScale(kLabel, scale, check.settingsFileNum, settings.candidates, settings.verdict);
+      // The device keeps what a test found. That either confirms the scale in use or shows it
+      // to be the wrong one; then the reminder after reads comes back until the scale is
+      // switched.
+      device_.setSettingsScaleFound(settings.candidates.num[settings.verdict]);
+      if (settings.conflict) {
+        out_.print("     The round setpoints point at ");
+        printCandidate(settings.candidates.num[settings.roundVerdict]);
+        out_.println(" instead. If the value you gave is right, some of them were");
+        out_.println("     written with a wrong scale: 'dump' shows them.");
+      }
+      return;
+    }
+    out_.print(kLabel);
+    if (settings.knownCompared && settings.knownMatches == 0) {
+      out_.println("the setting you gave fits none of the candidates, so this stays open.");
+      if (device_.settingsScaleFound() > 0.0) {
+        // The setting contradicts every candidate, the one an earlier check settled on included.
+        out_.print("     That takes back what an earlier check found (");
+        printCandidate(device_.settingsScaleFound());
+        out_.println(").");
+      }
+      device_.setSettingsScaleFound(0.0);
+      out_.print("     If the value is right, the scale is x");
+      out_.printFixed(settings.impliedNumerator, 2);
+      out_.print(": 'scale ");
+      out_.print(scale.name);
+      out_.printChar(' ');
+      out_.printFixed(settings.impliedNumerator, 2);
+      out_.println("' uses that.");
+      return;
+    }
+    if (settings.knownCompared) {
+      out_.println("the setting cannot separate candidates this close together.");
+      return;
+    }
+    if (settings.known != nullptr) {
+      out_.println("cannot tell: test 2 could not compare the setting you gave.");
+      return;
+    }
+    if (settings.roundVerdict < 0) {
+      out_.println("cannot tell yet, and the setpoints do not point anywhere.");
+    } else {
+      out_.print("cannot tell yet. The setpoints point at ");
+      printCandidate(settings.candidates.num[settings.roundVerdict]);
+      if (settings.roundVerdict == 0) {
+        out_.println(", which OptaView uses now.");
+      } else {
+        out_.print(", not the ");
+        printCandidate(settings.candidates.num[0]);
+        out_.println(" that OptaView uses now.");
+        out_.print("     If they were set at the factory or with MSView, 'scale ");
+        out_.print(scale.name);
+        out_.printChar(' ');
+        printNumber(settings.candidates.num[settings.roundVerdict]);
+        out_.println("' switches to that.");
+      }
+    }
+    out_.println("     A setting whose value you know settles it: scalecheck <setting> <volts>");
+  }
 
   void cmdScaleCheck(int argc, char **argv) {
     OvProfile &profile = device_.profile();
@@ -1607,13 +1721,62 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.println("This profile has no voltage scale check.");
       return;
     }
+    // A number alone is a multimeter reading; a name with a number after it is a setting whose
+    // value the user knows. Either may come first, and each at most once.
     double meterVolts = 0.0;
-    if (argc > 1 && (!ovParseDecimal(argv[1], &meterVolts) || !(meterVolts > 0.0))) {
-      out_.println("Usage: scalecheck [volts], for example: scalecheck 13.42");
+    const OvRegister *known = nullptr;
+    double knownVolts = 0.0;
+    const char *knownName = nullptr;
+    bool usage = false;
+    for (int i = 1; i < argc && !usage; ++i) {
+      double number = 0.0;
+      if (ovParseDecimal(argv[i], &number)) {
+        usage = meterVolts > 0.0 || !(number > 0.0);
+        meterVolts = number;
+      } else if (knownName == nullptr && i + 1 < argc && ovParseDecimal(argv[i + 1], &number) && number > 0.0) {
+        knownName = argv[i];
+        knownVolts = number;
+        ++i;
+      } else {
+        usage = true;
+      }
+    }
+    if (usage) {
+      out_.println("Usage: scalecheck [volts] [setting volts], for example: scalecheck 13.42 EV_float 13.70");
+      out_.println("  volts alone: a multimeter reading at the controller's battery terminals");
+      out_.println("  setting volts: a stored setting and the value you know it has (MSView shows it)");
       return;
     }
+    if (knownName != nullptr) {
+      known = profile.findRegister(knownName);
+      if (known == nullptr) {
+        out_.print("There is no register called ");
+        out_.print(knownName);
+        out_.println(". 'dump' lists them.");
+        return;
+      }
+      if (check.settingsScale == nullptr) {
+        out_.println("This profile has no test for stored settings, so the setting cannot be used.");
+        return;
+      }
+      if (known->scale != check.settingsScale || known->words != 1) {
+        out_.print(known->name);
+        out_.print(" is not a stored voltage setting on the scale ");
+        out_.print(check.settingsScale->name);
+        out_.println(", so it cannot test that scale.");
+        return;
+      }
+      if (device_.wroteRegister(known->addr)) {
+        // Its value came from OptaView, with the very scale this would test.
+        out_.print("OptaView has written ");
+        out_.print(known->name);
+        out_.println(" since it started, with the scale this would test, so it cannot test it.");
+        out_.println("Give a setting that MSView shows and that OptaView has not written.");
+        return;
+      }
+    }
     OvScaleReport report;
-    device_.scaleCheck(meterVolts, &report);
+    device_.scaleCheck(meterVolts, known, knownVolts, &report);
     if (device_.linkDown()) {
       afterReads();
       return;
@@ -1631,22 +1794,10 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
 
     // Each scale gets its own verdict from its own tests. A multimeter does not decide how
-    // settings are stored, and round setpoints do not decide what the readings mean.
+    // settings are stored, and a setting does not decide what the readings mean.
     out_.println("Verdict");
     if (settings.tested) {
-      static const char kLabel[] = "  Stored settings: ";
-      if (settings.verdict >= 0) {
-        printFoundScale(kLabel, *check.settingsScale, check.settingsFileNum, settings.candidates, settings.verdict);
-        // The device keeps what a test found. That either confirms the scale in use or shows it
-        // to be the wrong one; then the reminder after reads comes back until the scale is
-        // switched.
-        device_.setSettingsScaleFound(settings.candidates.num[settings.verdict]);
-      } else {
-        out_.print(kLabel);
-        out_.println("cannot tell from these setpoints.");
-        out_.println("     If you know what one of them was set to, "
-                     "'get <name>' shows whether this scale reads it right.");
-      }
+      printSettingsVerdict(check, settings);
     }
     if (live.tested) {
       static const char kLabel[] = "  Live readings:   ";
@@ -1676,6 +1827,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       } else if (live.meterCompared) {
         out_.print(kLabel);
         out_.println("the multimeter cannot separate candidates this close together.");
+      } else if (live.meterGiven) {
+        out_.print(kLabel);
+        out_.println("cannot tell: test 4 could not compare the multimeter reading.");
       } else {
         out_.print(kLabel);
         out_.println("cannot tell yet. A multimeter reading settles it: scalecheck <volts>");
@@ -1819,6 +1973,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         return;
       }
       raw = (uint16_t)number;
+      if ((raw & (uint16_t)~ovUsedBits(*reg)) != 0) {
+        out_.print(reg->name);
+        out_.println(" is one byte: its raw value is a whole number from 0 to 255, or 0x00 to 0xFF.");
+        return;
+      }
       // The limits apply to what the raw value means.
       const uint16_t words[2] = {raw, 0};
       uint16_t unused = 0;
@@ -1866,7 +2025,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.printPadded(text, 14);
     printRawWords(next, 1);
     out_.println();
-    if (now[0] == raw) {
+    if (ovSameValue(*reg, now[0], raw)) {
       out_.println("It already holds that value. Nothing to write.");
       return;
     }
@@ -1927,7 +2086,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(")");
     }
     if (outcome.readBack.status == MB_OK) {
-      const bool asBefore = outcome.readBackRaw == action.before;
+      const bool asBefore = ovSameValue(reg, outcome.readBackRaw, action.before);
       out_.print(acknowledged ? ", but " : ", and ");
       out_.print(reg.name);
       out_.print(asBefore ? " still reads " : " reads ");
@@ -2107,6 +2266,18 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     }
     if (outcome.aborted) {
       out_.println("Stopped waiting.");
+      return;
+    }
+    if (outcome.neverAway) {
+      // A restart shows as a pause in its answers. Without one, what was written may not be in
+      // use yet, and the device still says that a restart is due.
+      out_.print("The controller answered all the time for ");
+      out_.printFixed((double)outcome.backAfterMs / 1000.0, 1);
+      out_.println(" s, so it was not seen to restart.");
+      printLiveGroups();
+      out_.println("If a fault above still asks for a reset, it did not restart: try 'reset' again or");
+      out_.println("power-cycle it.");
+      afterReads();
       return;
     }
     if (!outcome.cameBack) {
@@ -2517,6 +2688,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       result = master.writeSingle(action.slave, action.function, action.addr, action.value);
     }
     device_.noteControllerChanged();
+    if (action.function != MB_FC_WRITE_COIL) {
+      device_.noteRegisterWritten(action.addr);
+    }
     printLastExchange(result);
     // Registers are what a restart is for. A coil switches at once.
     const bool setting = action.function != MB_FC_WRITE_COIL;

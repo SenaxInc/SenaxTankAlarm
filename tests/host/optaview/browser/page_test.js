@@ -325,7 +325,17 @@ async function firstVisit(win) {
   checkEq((await win.context.cookies()).length, 0, 'the cookie is gone after the logout');
   await page.reload();
   await page.waitForSelector('#view-login:not(.hidden)');
+
+  // Without the Opta's random number generator the login works all the same, because OptaView is
+  // meant for a network that is trusted. The USB console says that it happened.
+  await win.preview.line('sim random off', /sim: the random number generator fails/);
   await logIn(win, PIN);
+  check(await page.isVisible('#nav'), 'a login while the random number generator fails is let in');
+  const weak = await win.context.cookies();
+  check(weak.length === 1 && /^[0-9a-f]{32}$/.test(weak[0].value), 'with a cookie of 32 hex digits');
+  check(weak.length === 1 && weak[0].value !== cookies[0].value, 'that is not the one before');
+  await win.preview.line('web', /The random number generator failed 1 time, so a session cookie or question id was made/);
+  await win.preview.line('sim random on', /sim: the random number generator works/);
   await win.settle();
 }
 
@@ -346,6 +356,26 @@ async function liveView(win) {
   checkHas(await win.text(notice('scale')), 'has not been confirmed on this controller', 'the note on the voltage scale');
   check(/^Read at /.test(await win.text('#liveStamp')), 'when it was read');
   await shot(win, 'live');
+
+  // OptaView ends every answer by closing the connection, so one that broke off on the way still
+  // has its status 200. The page says that it did not arrive whole and keeps what it showed.
+  const stamp = await win.text('#liveStamp');
+  await page.route('**/api/read?*', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: '{"values": [{"name": "adc_vb_f", "raw": [44',
+  }));
+  await page.click('#liveBtn');
+  await page.waitForFunction(() => document.querySelector('#toast').classList.contains('show'));
+  checkEq(await toast(win), 'The answer from OptaView did not arrive whole, so nothing was taken from it. Try again.',
+          'an answer that broke off says so');
+  checkEq(await tile(win, 'adc_vb_f'), '13.68 V', 'and the reading it had stays');
+  checkEq(await win.text('#liveStamp'), stamp, 'with the time it was read');
+  await page.unroute('**/api/read?*');
+  await Promise.all([
+    page.waitForResponse((answer) => answer.url().includes('/api/read') && answer.status() === 200),
+    page.click('#liveBtn'),
+  ]);
 
   // It reads again by itself, and marks those requests so that they do not keep a session alive.
   await win.preview.line('sim battery 12.40', /sim: the battery is at 12\.40 V/);
@@ -621,6 +651,21 @@ async function controllerView(win, profile) {
   await dialogHidden(win);
   checkEq(await win.preview.writes(), before + 2, 'a cancelled action sent nothing');
 
+  // An action, carried out: the counter it clears reads 0 when it is read again.
+  const kwh = '#groupBox tr[data-register="kWhc"] td:nth-child(4)';
+  await page.selectOption('#groupPick', 'counters');
+  await page.click('#groupBtn');
+  await page.waitForSelector(kwh);
+  checkEq(await win.text(kwh), '8.5 kWh', 'the kWh counter before the action');
+  await page.click('#coilsBox tr[data-coil="clear_kwh"] button:has-text("Do it")');
+  await question(win);
+  await yes(win);
+  checkHas(await result(win), 'Sent and acknowledged.', 'the action was carried out');
+  await close(win);
+  checkEq(await win.preview.writes(), before + 3, 'and reached the controller');
+  await page.click('#groupBtn');
+  await page.waitForFunction((selector) => document.querySelector(selector).textContent === '0.0 kWh', kwh);
+
   // Any group, with addresses and raw values.
   await page.selectOption('#groupPick', 'load');
   await page.click('#groupBtn');
@@ -643,15 +688,34 @@ async function toolsView(win, profile) {
   checkEq((await win.text('#scaleText')).split('not confirmed').length - 1, 2, 'both scales start unconfirmed');
   checkHas(await win.text('#wiringText'), 'MRC-1 terminal B', 'the wiring checklist');
 
-  // The scale check with a multimeter reading.
+  // The scale check with a multimeter reading and a setting whose value is known.
   await page.fill('#meterVolts', '13,68');
   await page.click('#scaleForm button');
   checkHas(await toast(win), 'Give the multimeter reading as a number', 'a reading that is not a number');
+  const names = await page.$$eval('#knownName option', (options) => options.map((option) => option.value));
+  checkEq(names[0], '', 'the list of settings starts with none');
+  check(names.includes('EV_float') && names.includes('EV_lvd') && names.includes('EV_soc_r2y'),
+        'it lists the stored voltage settings');
+  check(!names.includes('adc_vb_f') && !names.includes('Et_float') && !names.includes('EV_tempcomp'),
+        'and nothing on another scale');
+  checkEq(names.length, 1 + profile.registers.filter((reg) => reg.scale === 'vset').length,
+          'every register on the scale of stored settings is offered');
   await page.fill('#meterVolts', '13.68');
+  await page.selectOption('#knownName', 'EV_float');
+  await page.fill('#knownVolts', '13.7 V');
+  await page.click('#scaleForm button');
+  checkHas(await toast(win), 'Give the value of EV_float as a number', 'a value that is not a number');
+  await page.selectOption('#knownName', '');
+  await page.fill('#knownVolts', '13.70');
+  await page.click('#scaleForm button');
+  checkHas(await toast(win), 'Pick the setting whose value you know', 'a value without a setting');
+  await page.selectOption('#knownName', 'EV_float');
   await page.click('#scaleForm button');
   const verdict = await result(win);
   checkHas(verdict, 'Multimeter: 13.68 V measured', 'the reading reached the console');
+  checkHas(verdict, 'A setting you know: EV_float = 13.70 V', 'and so did the setting');
   checkHas(verdict, 'Stored settings: x100, which is what OptaView uses now.', 'the verdict');
+  checkHas(verdict, 'Vb_f reads 13.68 V at x100', 'the slow battery reading follows the battery');
   await close(win);
   await page.waitForFunction(() => !document.querySelector('#scaleText').textContent.includes('not confirmed'));
   checkEq((await win.text('#scaleText')).split('confirmed on this controller').length - 1, 2, 'both scales are confirmed now');
@@ -666,6 +730,8 @@ async function toolsView(win, profile) {
   const snapshot = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
   checkEq(snapshot.profile, profile.id, 'the snapshot names the register map');
   check(JSON.stringify(snapshot).includes('"EV_lvd"'), 'and holds the settings');
+  checkEq(snapshot.missing, 0, 'and every register in it was read');
+  await snapshotChecks(win, snapshot);
 
   // The console: the same commands as on USB.
   await page.fill('#consoleLine', 'help');
@@ -741,6 +807,149 @@ async function toolsView(win, profile) {
   await close(win);
   win.allow = null;
   await win.settle();
+}
+
+// A snapshot is saved whole or not at all, and one with registers missing only when the person
+// wants it so. OptaView does not announce the length of a snapshot, so one that broke off ends
+// like one that did not. The test stands in the way of the answer to make the ones it needs, from
+// the whole one that `whole` holds.
+async function snapshotChecks(win, whole) {
+  const page = win.page;
+  let downloads = [];
+  const counter = (download) => downloads.push(download);
+  page.on('download', counter);
+  const serve = async (body, held) => {
+    await page.unroute('**/api/snapshot');
+    await page.route('**/api/snapshot', async (route) => {
+      if (held) { await held; }
+      await route.fulfill({ status: 200, contentType: 'application/json', body });
+    });
+  };
+  const toastSays = (text) => page.waitForFunction((wanted) => {
+    const node = document.querySelector('#toast');
+    return node.classList.contains('show') && node.textContent.includes(wanted);
+  }, text);
+  const copy = () => JSON.parse(JSON.stringify(whole));
+  const unread = (entry) => ({ addr: entry.addr, name: entry.name, error: 'no reply' });
+  const count = whole.registers.length;
+  check(count > 8, 'the snapshot has registers to take away');
+  // What the page has not saved by now, it does not save later.
+  const nothingSaved = async (what) => {
+    await pause(300);
+    checkEq(downloads.length, 0, what);
+  };
+
+  // Broken off, anywhere: not saved.
+  const text = JSON.stringify(whole, null, 2) + '\n';
+  for (const cut of [text.length - 3, Math.floor(text.length / 2), 1]) {
+    await serve(text.slice(0, cut));
+    await page.click('#snapBtn');
+    await toastSays('The snapshot did not arrive whole, so it was not saved. Try again.');
+    await nothingSaved(`a snapshot cut off after ${cut} of ${text.length} bytes is not saved`);
+    check(await page.isHidden('#dialog'), 'and asks nothing');
+    await page.waitForFunction(() => !document.querySelector('#snapBtn').disabled);
+  }
+  // Whole JSON that is not a snapshot: not saved either.
+  await serve('{"registers": []}');
+  await page.click('#snapBtn');
+  await toastSays('did not arrive whole');
+  await nothingSaved('JSON without its count of missing registers is not saved');
+
+  // Two registers could not be read. The page says so before it saves anything.
+  const two = copy();
+  two.registers[1] = unread(two.registers[1]);
+  two.registers[4] = unread(two.registers[4]);
+  two.missing = 2;
+  await serve(JSON.stringify(two));
+  await page.click('#snapBtn');
+  await page.waitForFunction(() => !document.querySelector('#dialogYes').classList.contains('hidden') &&
+                                   document.querySelector('#dialogYes').disabled);
+  const asked = await question(win);
+  check(!(await toastShown(win)), 'the message about the snapshot before is not left on top of the dialog');
+  checkEq(asked, '2 registers could not be read, so this snapshot is not a full record of how the controller is set. ' +
+          'Each one is marked with its "error".', 'a snapshot with registers missing is asked about');
+  checkEq(await win.text('#dialogTitle'), 'Snapshot', 'the dialog\'s title');
+  checkEq(await win.text('#dialogYes'), 'Save anyway', 'the button that saves it');
+  checkEq(await win.text('#dialogHint'), 'Save anyway keeps what was read. Cancel saves nothing.', 'what the buttons do');
+  checkEq(await page.evaluate(() => document.activeElement.id), 'dialogNo', 'Cancel has the focus');
+  await page.click('#dialogNo');
+  await dialogHidden(win);
+  await nothingSaved('Cancel saves nothing');
+  checkEq(await page.evaluate(() => document.activeElement.id), 'snapBtn', 'the focus is back on the button');
+  // Escape is Cancel.
+  await page.waitForFunction(() => !document.querySelector('#snapBtn').disabled);
+  await page.click('#snapBtn');
+  await question(win);
+  await page.keyboard.press('Escape');
+  await dialogHidden(win);
+  await nothingSaved('Escape saves nothing');
+  // Save anyway: the file is what OptaView sent.
+  await page.click('#snapBtn');
+  await question(win);
+  await yes(win);
+  await dialogHidden(win);
+  await page.waitForFunction(() => document.querySelector('#dialogYes').textContent === 'Yes');
+  for (let i = 0; i < 100 && downloads.length === 0; ++i) {
+    await pause(50);
+  }
+  checkEq(downloads.length, 1, 'Save anyway saves the snapshot');
+  checkEq(fs.readFileSync(await downloads[0].path(), 'utf8'), JSON.stringify(two), 'as OptaView sent it');
+  downloads = [];
+
+  // One register.
+  const one = copy();
+  one.registers[2] = unread(one.registers[2]);
+  one.missing = 1;
+  await serve(JSON.stringify(one));
+  await page.click('#snapBtn');
+  checkEq(await question(win), '1 register could not be read, so this snapshot is not a full record of how the ' +
+          'controller is set. It is marked with its "error".', 'one register missing');
+  await page.click('#dialogNo');
+  await dialogHidden(win);
+
+  // OptaView ran out of time: the registers it did not reach are counted, but not listed.
+  const late = copy();
+  late.registers = late.registers.slice(0, 5);
+  late.registers[4] = unread(late.registers[4]);
+  late.missing = count - 4;
+  await serve(JSON.stringify(late));
+  await page.click('#snapBtn');
+  checkEq(await question(win), `${count - 4} registers could not be read, so this snapshot is not a full record of ` +
+          `how the controller is set. OptaView ran out of time before it reached ${count - 5} of them.`,
+          'a snapshot that ran out of time');
+  await page.click('#dialogNo');
+  await dialogHidden(win);
+
+  // Nothing could be read.
+  const none = copy();
+  none.registers = none.registers.map(unread);
+  none.missing = count;
+  await serve(JSON.stringify(none));
+  await page.click('#snapBtn');
+  checkEq(await question(win), 'No register could be read, so this snapshot holds nothing of the controller. Is it ' +
+          'connected?', 'a snapshot without a single value');
+  await page.click('#dialogNo');
+  await dialogHidden(win);
+  await nothingSaved('none of them was saved');
+
+  // A command typed while the snapshot is read has its dialog open when the snapshot arrives:
+  // the page does not put a second one on top, and does not save it without asking either.
+  let release = null;
+  await serve(JSON.stringify(two), new Promise((resolve) => { release = resolve; }));
+  await page.click('#snapBtn');
+  await page.waitForFunction(() => document.querySelector('#snapBtn').disabled);
+  await page.fill('#consoleLine', 'help');
+  await page.press('#consoleLine', 'Enter');
+  await page.waitForSelector('#dialog:not(.hidden)');
+  release();
+  await toastSays('The snapshot is missing 2 of its registers, so it was not saved while another dialog was open. ' +
+                  'Try again.');
+  checkHas(await result(win), 'Changing settings', 'the command is answered after it');
+  await close(win);
+  await nothingSaved('and the snapshot was not saved');
+
+  await page.unroute('**/api/snapshot');
+  page.off('download', counter);
 }
 
 // A phone: nothing sticks out of the screen, and the dialog can be answered.

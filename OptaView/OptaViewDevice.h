@@ -94,6 +94,7 @@ static const uint16_t OV_MAX_SPAN_WORDS = MB_MAX_READ_REGISTERS;
 static const uint8_t OV_LINK_DOWN_AFTER = 3;      // failed requests in a row that end a batch
 static const uint16_t OV_PROBE_TIMEOUT_MS = 400;  // reply wait during the probe sweep and scans
 static const uint32_t OV_RESET_GIVE_UP_MS = 20000;
+static const uint32_t OV_RESET_POLL_MS = 250;     // at most one request this often while a restart is awaited
 
 // A run of registers at consecutive addresses.
 struct OvSpan {
@@ -147,9 +148,11 @@ struct OvWriteOutcome {
 struct OvResetOutcome {
   bool sent;             // the profile has a reset coil and the command went out
   MbResult command;      // a missing reply is normal here: the controller may restart first
-  bool cameBack;         // the controller answered again afterwards
+  bool wentAway;         // a request after the command went unanswered: the sign of a restart
+  bool cameBack;         // ...and the controller answered again after that
+  bool neverAway;        // it answered every request for the whole of the profile's resetWaitMs
   bool aborted;
-  uint32_t backAfterMs;  // from the command to that answer
+  uint32_t backAfterMs;  // from the command to the answer that ended the wait
 };
 
 enum OvCheckResult : uint8_t {
@@ -168,21 +171,33 @@ enum OvCheckResult : uint8_t {
 // it is told, and the profile gives the two their own scales:
 //
 //   Stored settings
-//     1. Setpoints. People and factories pick round numbers (14.00, 13.70, 11.50). Decoded with
-//        the right scale the setpoints land on a 0.05 V grid; with the wrong one they do not.
+//     1. Round setpoints. People and factories pick round numbers (14.00, 13.70, 11.50), and
+//        decoded with the scale they were written with the setpoints land on a 0.05 V grid. This
+//        test only points, and decides nothing: settings that OptaView, or any tool with a
+//        wrong scale, has written look round at that wrong scale, so the test would confirm the
+//        very scale that wrote them.
+//     2. A setting whose value the user knows from elsewhere (MSView shows it, say), typed in.
+//        It decides.
 //
 //   Live readings
-//     2. Regulation. In absorption, float or equalize the battery sits at the regulation target.
-//        The two registers only agree if the battery's scale is right relative to the target's.
-//        So this test can confirm the scale in use, but it cannot overturn it: when it points
-//        elsewhere, the target's own scale may be the one that is wrong.
-//     3. A multimeter reading typed in by the user. It decides.
+//     3. Regulation. In absorption, float or equalize the controller works to hold the battery at
+//        its regulation target, and the two registers agree only if the battery's scale is right
+//        relative to the target's. This test only points, and decides nothing: the battery need
+//        not be at the target in those states (with too little sun for the load it stays below
+//        it, and float goes on for a while below it, see Et_float_exit_cum), and a battery 3.3 %
+//        below its target reads as on target at the other scale. When it points away from the
+//        scale in use, the target's own scale may also be the one that is wrong.
+//     4. A multimeter reading typed in by the user. It decides.
 //
 // Neither verdict is borrowed for the other scale: a multimeter says nothing about how settings
-// are stored, and round setpoints say nothing about the readings.
+// are stored, and a setting says nothing about the readings.
 // ---------------------------------------------------------------------------------------------
 
 static const uint8_t OV_SCALE_CANDIDATES = 6;
+
+// How many registers OvDevice remembers having written. Beyond that it takes every register to
+// have been written.
+static const uint8_t OV_WRITTEN_MAX = 48;
 
 // The numerators one scale might have. [0] is the one in use now.
 struct OvScaleCandidates {
@@ -193,10 +208,25 @@ struct OvScaleCandidates {
 struct OvSettingsScaleReport {
   bool tested;  // the profile sets this half up
   OvScaleCandidates candidates;
+
   uint8_t setpointsRead;  // answered
   uint8_t setpointsUsed;  // answered and holding a setting (not 0, not a blank cell)
   uint8_t fits[OV_SCALE_CANDIDATES];
-  int8_t verdict;  // candidate index, or -1 when the setpoints cannot tell
+  int8_t roundVerdict;  // the candidate the round setpoints point at, or -1
+
+  const OvRegister *known;  // the setting the user knows, or nullptr when none was given
+  double knownGivenVolts;   // what the user says it holds
+  bool knownRead;           // the register answered
+  bool knownPlausible;      // and held a setting: not 0, and inside its limits at a candidate
+  bool knownCompared;       // so the comparison was made
+  uint16_t knownRaw;
+  double knownVolts[OV_SCALE_CANDIDATES];
+  double impliedNumerator;
+  uint8_t knownMatches;  // candidates that decode the register to the user's value
+  int8_t knownVerdict;   // the candidate, when exactly one does
+
+  int8_t verdict;  // candidate index, or -1 when the tests cannot tell
+  bool conflict;   // the setting and the round setpoints point at different candidates
 };
 
 struct OvLiveScaleReport {
@@ -258,7 +288,7 @@ inline void ovAddCandidate(OvScaleCandidates *list, double num) {
 inline void ovJudgeSetpoints(OvSettingsScaleReport *report, const uint16_t *raws, uint8_t count, double den,
                              double grid) {
   report->setpointsUsed = count;
-  report->verdict = -1;
+  report->roundVerdict = -1;
   for (uint8_t c = 0; c < report->candidates.count; ++c) {
     const double lsb = report->candidates.num[c] / den;
     uint8_t fits = 0;
@@ -287,11 +317,54 @@ inline void ovJudgeSetpoints(OvSettingsScaleReport *report, const uint16_t *raws
   // Most setpoints must fit, and at least twice as many as under any other candidate.
   if ((unsigned)report->fits[best] * 10u >= (unsigned)count * 6u &&
       (unsigned)runnerUp * 2u <= (unsigned)report->fits[best]) {
-    report->verdict = (int8_t)best;
+    report->roundVerdict = (int8_t)best;
   }
 }
 
-// Test 2. Call only while the controller is regulating.
+// Test 2. A candidate matches when it decodes the register to within 0.5 % of the value the user
+// gave. A setting is stored to within a step of 0.003 V, so the margin is for a value that was
+// read off a screen with fewer decimals; the usual candidates lie 3.4 % apart.
+inline void ovJudgeKnown(OvSettingsScaleReport *report, double den) {
+  report->knownVerdict = -1;
+  report->knownMatches = 0;
+  report->knownCompared = false;
+  report->impliedNumerator = 0.0;
+  if (report->knownRaw == 0 || !(report->knownGivenVolts > 0.0)) {
+    return;
+  }
+  report->knownCompared = true;
+  report->impliedNumerator = report->knownGivenVolts * den / (double)report->knownRaw;
+  int8_t match = -1;
+  uint8_t matches = 0;
+  for (uint8_t c = 0; c < report->candidates.count; ++c) {
+    report->knownVolts[c] = (double)report->knownRaw * report->candidates.num[c] / den;
+    const double gap = report->knownVolts[c] - report->knownGivenVolts;
+    const double allowed = report->knownGivenVolts * 0.005;
+    if (gap <= allowed && gap >= -allowed) {
+      match = (int8_t)c;
+      ++matches;
+    }
+  }
+  report->knownMatches = matches;
+  if (matches == 1) {
+    report->knownVerdict = match;
+  }
+}
+
+// The verdict for stored settings: a setting the user knows decides, also when it fits no
+// candidate (then the scale stays open). Without one there is no verdict, however round the
+// setpoints are.
+inline void ovJudgeSettings(OvSettingsScaleReport *report) {
+  report->verdict = -1;
+  report->conflict = false;
+  if (report->knownCompared) {
+    report->verdict = report->knownVerdict;
+    report->conflict = report->knownVerdict >= 0 && report->roundVerdict >= 0 &&
+                       report->roundVerdict != report->knownVerdict;
+  }
+}
+
+// Test 3. Call only while the controller is regulating.
 inline void ovJudgeRegulation(OvLiveScaleReport *report, double den) {
   report->regulationVerdict = -1;
   report->regulationMatches = 0;
@@ -311,7 +384,7 @@ inline void ovJudgeRegulation(OvLiveScaleReport *report, double den) {
   }
 }
 
-// Test 3. A candidate matches when it puts the register within 1.2 % of the multimeter.
+// Test 4. A candidate matches when it puts the register within 1.2 % of the multimeter.
 inline void ovJudgeMeter(OvLiveScaleReport *report, double den) {
   report->meterVerdict = -1;
   report->meterMatches = 0;
@@ -339,9 +412,8 @@ inline void ovJudgeMeter(OvLiveScaleReport *report, double den) {
   }
 }
 
-// The verdict for live readings. A multimeter comparison decides, also when it fits no
-// candidate: then the scale stays open, whatever the regulation test says. Without one, the
-// regulation test counts only when it confirms the scale in use (candidate 0).
+// The verdict for live readings: a multimeter comparison decides, also when it fits no candidate
+// (then the scale stays open). Without one there is no verdict, whatever the regulation test says.
 inline void ovJudgeLive(OvLiveScaleReport *report) {
   report->verdict = -1;
   report->conflict = false;
@@ -349,8 +421,6 @@ inline void ovJudgeLive(OvLiveScaleReport *report) {
     report->verdict = report->meterVerdict;
     report->conflict = report->meterVerdict >= 0 && report->regulationVerdict >= 0 &&
                        report->regulationVerdict != report->meterVerdict;
-  } else if (report->regulationVerdict == 0) {
-    report->verdict = 0;
   }
 }
 
@@ -377,7 +447,11 @@ class OvDevice {
         writeUnsettled_(false),
         unknownOpen_(false),
         unknownAddr_(0),
-        unknownBefore_(0) {
+        unknownBefore_(0),
+        unknownUsed_(0xFFFF),
+        writtenCount_(0),
+        writtenFull_(false) {
+    memset(written_, 0, sizeof(written_));
     link.slave = 1;
     link.baud = 9600;
     link.format = MB_8N2;
@@ -477,6 +551,32 @@ class OvDevice {
       ++liveEpoch_;
     }
     ++generation_;
+  }
+
+  // A register that OptaView has sent a write to since it started, whatever the outcome and the
+  // link. What it holds now came from OptaView, with the scale that was in use, so its value
+  // cannot tell whether that scale is right.
+  bool wroteRegister(uint16_t addr) const {
+    if (writtenFull_) {
+      return true;
+    }
+    for (uint8_t i = 0; i < writtenCount_; ++i) {
+      if (written_[i] == addr) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // For a register write that did not pass through writeRegister() ('raw').
+  void noteRegisterWritten(uint16_t addr) {
+    if (wroteRegister(addr)) {
+      return;
+    }
+    if (writtenCount_ < OV_WRITTEN_MAX) {
+      written_[writtenCount_++] = addr;
+    } else {
+      writtenFull_ = true;
+    }
   }
 
   // Settings were written and the controller has not restarted since: it does not use them yet.
@@ -790,13 +890,14 @@ class OvDevice {
     memset(&out, 0, sizeof(out));
     out.write = master_.writeRegister(link.slave, reg.addr, raw);
     ++generation_;
+    noteRegisterWritten(reg.addr);
     beginBatch();
     uint16_t stored = 0;
     readOne(reg.addr, &stored, &out.readBack);
     out.readBackRaw = stored;
     const bool read = out.readBack.status == MB_OK;
-    out.verified = read && stored == raw;
-    if (out.verified || out.write.status == MB_OK || (read && stored != before)) {
+    out.verified = read && ovSameValue(reg, stored, raw);
+    if (out.verified || out.write.status == MB_OK || (read && !ovSameValue(reg, stored, before))) {
       out.effect = OV_WRITE_TAKEN;
       resetNeeded_ = true;
     } else if (read || !mbIsLinkFailure(out.write.status)) {
@@ -810,6 +911,7 @@ class OvDevice {
         unknownOpen_ = true;
         unknownAddr_ = reg.addr;
         unknownBefore_ = before;
+        unknownUsed_ = ovUsedBits(reg);
       }
       // Otherwise this is a second write in doubt to the same register. What the register held
       // before the first of them stays the value to compare with: if the first was taken, the
@@ -833,7 +935,11 @@ class OvDevice {
     return master_.writeCoil(link.slave, coil.addr, on);
   }
 
-  // Restarts the controller through the profile's reset coil, waits, then asks until it answers.
+  // Restarts the controller through the profile's reset coil and waits for it to come back. A
+  // restart shows as a silence: asked all along, the controller misses a request and then answers
+  // again. Only then do the settings written count as in use. A controller that answers every
+  // request for the profile's resetWaitMs was not seen to restart (the command may not have
+  // reached it, or it may not act on it), so whatever said that a restart is due still says so.
   OvResetOutcome resetController(OvAbortCheck *abort) {
     OvResetOutcome out;
     memset(&out, 0, sizeof(out));
@@ -849,28 +955,35 @@ class OvDevice {
       return out;  // refused: it did not restart
     }
     const uint32_t start = transport.nowMs();
-    while ((uint32_t)(transport.nowMs() - start) < defaults.resetWaitMs) {
+    uint32_t askedAt = start;
+    bool asked = false;
+    for (;;) {
       if (abort != nullptr && abort->aborted()) {
         out.aborted = true;
-        return out;
+        break;
       }
-      transport.idle();
-    }
-    for (;;) {
+      if (asked && (uint32_t)(transport.nowMs() - askedAt) < OV_RESET_POLL_MS) {
+        transport.idle();  // a controller that answers at once is not asked without a pause
+        continue;
+      }
+      asked = true;
+      askedAt = transport.nowMs();
       uint16_t raw = 0;
       const MbResult r = master_.readRegisters(link.slave, link.readFunction, defaults.probeRegister->addr, 1, &raw);
-      if (r.status == MB_OK || r.status == MB_EXCEPTION) {
+      const uint32_t elapsed = (uint32_t)(transport.nowMs() - start);
+      if (r.status != MB_OK && r.status != MB_EXCEPTION) {
+        out.wentAway = true;
+        if (elapsed >= OV_RESET_GIVE_UP_MS) {
+          break;  // it has not come back
+        }
+      } else if (out.wentAway) {
         out.cameBack = true;
         resetNeeded_ = false;  // whatever was written, the controller uses it now
         writeUnsettled_ = false;
         unknownOpen_ = false;
         break;
-      }
-      if ((uint32_t)(transport.nowMs() - start) >= OV_RESET_GIVE_UP_MS) {
-        break;
-      }
-      if (abort != nullptr && abort->aborted()) {
-        out.aborted = true;
+      } else if (elapsed >= defaults.resetWaitMs) {
+        out.neverAway = true;
         break;
       }
     }
@@ -905,9 +1018,13 @@ class OvDevice {
   }
 
   // Reads what the scale check needs and judges it. meterVolts <= 0 means no multimeter value.
-  // Returns false when the profile has no scale check.
-  bool scaleCheck(double meterVolts, OvScaleReport *report) {
+  // known is a setting whose value the user knows to be knownVolts, or nullptr; it must be a
+  // one-word register on the scale of stored settings (the console checks that). Returns false
+  // when the profile has no scale check.
+  bool scaleCheck(double meterVolts, const OvRegister *known, double knownVolts, OvScaleReport *report) {
     memset(report, 0, sizeof(*report));
+    report->settings.roundVerdict = -1;
+    report->settings.knownVerdict = -1;
     report->settings.verdict = -1;
     report->live.regulationVerdict = -1;
     report->live.meterVerdict = -1;
@@ -917,7 +1034,7 @@ class OvDevice {
       return false;
     }
     if (check.settingsScale != nullptr) {
-      checkSettingsScale(check, &report->settings);
+      checkSettingsScale(check, known, knownVolts, &report->settings);
     }
     if (check.liveScale != nullptr) {
       checkLiveScale(check, meterVolts, &report->live);
@@ -942,6 +1059,10 @@ class OvDevice {
   bool unknownOpen_;        // a write of unknown outcome that the next read of its register settles
   uint16_t unknownAddr_;    // that register
   uint16_t unknownBefore_;  // what it held before the write
+  uint16_t unknownUsed_;    // the bits of it that the controller uses (ovUsedBits)
+  uint16_t written_[OV_WRITTEN_MAX];  // the registers written since OptaView started
+  uint8_t writtenCount_;
+  bool writtenFull_;        // more than that: every register counts as written
 
   static bool confirmed(const OvScale *scale, double found) {
     if (scale == nullptr || !(found > 0.0)) {
@@ -978,8 +1099,9 @@ class OvDevice {
     return false;
   }
 
-  // Test 1: how round the stored setpoints are.
-  void checkSettingsScale(const OvScaleCheck &check, OvSettingsScaleReport *report) {
+  // Tests 1 and 2: how round the stored setpoints are, and a setting the user knows.
+  void checkSettingsScale(const OvScaleCheck &check, const OvRegister *known, double knownVolts,
+                          OvSettingsScaleReport *report) {
     report->tested = true;
     const double den = check.settingsScale->den;
     listCandidates(check, *check.settingsScale, check.settingsFileNum, &report->candidates);
@@ -998,9 +1120,27 @@ class OvDevice {
       }
     }
     ovJudgeSetpoints(report, raws, used, den, check.grid);
+
+    if (known != nullptr && knownVolts > 0.0 && known->scale == check.settingsScale && known->words == 1) {
+      uint16_t words[2] = {0, 0};
+      OvWordStatus status;
+      report->known = known;
+      report->knownGivenVolts = knownVolts;
+      if (readRegister(*known, words, &status)) {
+        report->knownRead = true;
+        report->knownRaw = words[0];
+        // A blank or damaged cell is no setting, whatever the user believes it holds.
+        report->knownPlausible = words[0] != 0 && plausibleSetpoint(*known, words[0], report->candidates, den);
+        if (report->knownPlausible) {
+          ovJudgeKnown(report, den);
+        }
+      }
+    }
+
+    ovJudgeSettings(report);
   }
 
-  // Tests 2 and 3: the battery against the regulation target, and against a multimeter.
+  // Tests 3 and 4: the battery against the regulation target, and against a multimeter.
   void checkLiveScale(const OvScaleCheck &check, double meterVolts, OvLiveScaleReport *report) {
     report->tested = true;
     const double den = check.liveScale->den;
@@ -1083,7 +1223,7 @@ class OvDevice {
         link.slave == settled_.slave && link.baud == settled_.baud && link.format == settled_.format) {
       // The register of a write whose outcome was unknown has been read, on the same controller.
       unknownOpen_ = false;
-      if (out[unknownAddr_ - addr] != unknownBefore_) {
+      if (((uint16_t)(out[unknownAddr_ - addr] ^ unknownBefore_) & unknownUsed_) != 0) {
         resetNeeded_ = true;
       }
     }
