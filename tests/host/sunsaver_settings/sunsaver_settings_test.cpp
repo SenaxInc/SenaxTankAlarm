@@ -1692,6 +1692,93 @@ static void testEvaluate() {
     CHECK_EQ(e.verdict, ss::VERDICT_OK);
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_ABSORB_RANGE | ss::FINDING_FLOAT_RANGE);
   }
+  {
+    // The charger regulates to no more than its ceiling (Evb_ref_lim), so a voltage stored above
+    // it holds the battery at the ceiling. The reviewer's case: 14.20 V absorption and 13.50 V
+    // float, both held at 13.00 V, which is too low for LiFePO4 in either stage. Each voltage is
+    // judged as stored and as the ceiling leaves it, with either scale.
+    for (int s = 0; s < 2; ++s) {
+      SimSunSaver sim(100.0, s == 0 ? 100.0 : 96.667);
+      makeLiFePO4(sim);
+      CHECK_EQ(sim.regs[0xE01D], sim.setVolts(15.00));  // as it comes: above both
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).verdict, ss::VERDICT_OK);
+      sim.regs[0xE01D] = sim.setVolts(13.00);
+      ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_ABSORB_RANGE | ss::FINDING_FLOAT_RANGE);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      // Between the two: the absorption voltage is held too low, the float voltage is not touched.
+      for (double volts : {13.50, 13.75}) {
+        sim.regs[0xE01D] = sim.setVolts(volts);
+        e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+        CHECK_MSG(e.findings == ss::FINDING_ABSORB_RANGE && e.verdict == ss::VERDICT_MISMATCH,
+                  "ceiling %.2f V, scale %d: findings 0x%lX", volts, s, (unsigned long)e.findings);
+      }
+      // A ceiling in the absorption range holds the battery where it may be held, and so does one
+      // a word under it: the tolerance of a stored voltage. Two words under it are too low.
+      for (double volts : {13.80, 14.00, 14.20, 14.60, 15.00}) {
+        sim.regs[0xE01D] = sim.setVolts(volts);
+        e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+        CHECK_MSG(e.findings == kNone && e.verdict == ss::VERDICT_OK, "ceiling %.2f V, scale %d: findings 0x%lX",
+                  volts, s, (unsigned long)e.findings);
+      }
+      sim.regs[0xE01D] = (uint16_t)(sim.setVolts(13.80) - 1);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, kNone);
+      sim.regs[0xE01D] = (uint16_t)(sim.setVolts(13.80) - 2);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_ABSORB_RANGE);
+      // 0 is no ceiling.
+      sim.regs[0xE01D] = 0;
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).verdict, ss::VERDICT_OK);
+      // The ceiling holds both banks.
+      sim.regs[0xE00D] = sim.setVolts(14.60);
+      sim.regs[0xE00E] = sim.setVolts(13.90);
+      sim.regs[0xE01D] = sim.setVolts(14.40);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).verdict, ss::VERDICT_OK);
+      sim.regs[0xE01D] = sim.setVolts(13.85);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, kNone);  // 14.20 and 14.60 held at 13.85
+      sim.regs[0xE01D] = sim.setVolts(13.60);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_ABSORB_RANGE);
+      // A stored voltage outside the range is wrong under a ceiling that holds it inside: it is
+      // what the charger goes back to when the ceiling is raised.
+      SimSunSaver held(100.0, s == 0 ? 100.0 : 96.667);
+      makeLiFePO4(held);
+      held.regs[0xE000] = held.setVolts(15.00);
+      held.regs[0xE01D] = held.setVolts(14.40);
+      CHECK_EQ(judge(held, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_ABSORB_RANGE);
+      held.regs[0xE000] = held.setVolts(14.20);
+      held.regs[0xE00E] = held.setVolts(14.20);
+      held.regs[0xE01D] = held.setVolts(13.80);
+      CHECK_EQ(judge(held, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_FLOAT_RANGE);
+    }
+    // Li-ion: 12.60 V and 12.40 V under a ceiling of 12.00 V are held in both ranges, under one of
+    // 11.90 V the absorption voltage is not.
+    SimSunSaver sim;
+    makeLiFePO4(sim);
+    sim.regs[0xE000] = sim.regs[0xE00D] = sim.setVolts(12.60);
+    sim.regs[0xE001] = sim.regs[0xE00E] = sim.setVolts(12.40);
+    sim.regs[0xE01D] = sim.setVolts(12.00);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LI_ION).findings, kNone);
+    sim.regs[0xE01D] = sim.setVolts(11.90);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LI_ION).findings, ss::FINDING_ABSORB_RANGE);
+    // A sealed battery's voltages are not judged, under any ceiling.
+    sim.regs[0xE01D] = sim.setVolts(10.00);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
+    // Nor are voltages whose scale is not proven, nor those of a 24 V system.
+    SimSunSaver unproven;
+    makeLiFePO4(unproven);
+    for (uint8_t i = 0; i < ss::SETTING_ITEMS; ++i) {
+      if ((ss::item(i).flags & ss::ITEM_WITNESS) != 0 && unproven.regs[ss::item(i).addr] != 0) {
+        unproven.regs[ss::item(i).addr] = (uint16_t)(unproven.regs[ss::item(i).addr] + 7);
+      }
+    }
+    unproven.regs[0xE01D] = unproven.setVolts(13.00);
+    CHECK_EQ(judge(unproven, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_SCALE_UNPROVEN);
+    SimSunSaver system24;
+    makeLiFePO4(system24);
+    system24.regs[0x0008] = system24.volts(27.00);
+    system24.regs[0x001C] = system24.volts(26.20);
+    system24.regs[0xE01D] = system24.setVolts(13.00);
+    CHECK_EQ(judge(system24, ss::CHEMISTRY_LIFEPO4, 24).findings, ss::FINDING_SYSTEM_24V);
+  }
 
   // What leaves the judgement open.
   {
@@ -1785,8 +1872,8 @@ static void testEvaluate() {
     CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
   }
   {
-    // A register the judgement needs did not answer.
-    const uint16_t needed[] = {0x0025, 0xE007, 0xE014, 0xE01A, 0xE000, 0xE00D, 0xE001, 0xE00E};
+    // A register the judgement needs did not answer. The ceiling too: it could be anywhere.
+    const uint16_t needed[] = {0x0025, 0xE007, 0xE014, 0xE01A, 0xE000, 0xE00D, 0xE001, 0xE00E, 0xE01D};
     for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); ++i) {
       SimSunSaver sim;
       makeLiFePO4(sim);
@@ -1803,6 +1890,28 @@ static void testEvaluate() {
     sim.regs.erase(0x0010);
     sim.regs.erase(0xE002);
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).verdict, ss::VERDICT_OK);
+    // A sealed battery's judgement needs no ceiling.
+    {
+      SimSunSaver noCeiling;
+      makeLiFePO4(noCeiling);
+      noCeiling.regs.erase(0xE01D);
+      CHECK_EQ(judge(noCeiling, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
+      CHECK_EQ(judge(noCeiling, ss::CHEMISTRY_LEAD_SEALED).findings, kNone);
+      // A ceiling that did not answer takes nothing from a voltage that did answer and is wrong.
+      noCeiling.regs[0xE000] = noCeiling.setVolts(16.00);
+      ss::Evaluation e = judge(noCeiling, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      // And its word is not looked at, whatever its place in the snapshot holds.
+      noCeiling.regs[0xE000] = noCeiling.setVolts(14.20);
+      ss::Snapshot snapshot = snapshotOf(noCeiling);
+      snapshot.raw[ss::I_EVB_REF_LIM] = noCeiling.setVolts(13.00);
+      snapshot.status[ss::I_EVB_REF_LIM] = ss::SSIO_NO_REPLY;
+      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, 12, ss::SCALE_UNKNOWN};
+      ss::evaluate(snapshot, want, &e);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+    }
     // Nothing was read at all.
     ss::Snapshot empty;
     ss::clearSnapshot(&empty);

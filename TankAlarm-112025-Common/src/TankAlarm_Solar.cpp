@@ -767,17 +767,21 @@ bool SolarManager::readRegisters() {
     float floatThreshold = BATTERY_VOLTAGE_FLOAT * scale * packs * _readingFactor;
     // A battery the config names, whose float voltages the charger check knows (setPackChemistry()):
     // a charger set anywhere in that range holds it full, and a full battery at the lowest of them
-    // is no battery that needs charge. The default is then never more than 0.2 V above that
-    // voltage, the margin of the comparison below, for the pack and as this firmware reads it.
-    // That takes a Li-ion battery, full at 12.6 V and held as low as 11.7 V per 12 V, from
-    // lead-acid's 13.4 V to 11.9 V. A LiFePO4 battery, held from 13.2 V, keeps 13.4 V on a 12 V
-    // pack, and has 26.6 V in place of 26.8 V on a 24 V one.
+    // is no battery that needs charge. The default is then never more than 0.2 V, the margin of
+    // the comparison below, above the lowest reading of such a battery: at the lowest float
+    // voltage the check accepts (SETPOINT_TOLERANCE_VOLTS below the range), for the pack, as this
+    // firmware reads it, and one step of the reading lower, for a charger that reports a voltage
+    // between two of its steps as the lower. Read with this firmware's own scale, that takes a
+    // Li-ion battery, full at 12.6 V and held as low as 11.7 V per 12 V, from lead-acid's 13.4 V
+    // to 11.89 V. A LiFePO4 battery, held from 13.2 V, has 13.39 V in place of 13.4 V on a 12 V
+    // pack, and 26.59 V in place of 26.8 V on a 24 V one.
     sunsaver::VoltRange absorbRange = {0.0, 0.0};
     sunsaver::VoltRange floatRange = {0.0, 0.0};
     if (sunsaver::chargeRanges(_packChemistry, &absorbRange, &floatRange)) {
-      const float lowestFull = (float)floatRange.low * packs * _readingFactor + 0.2f;
-      if (floatThreshold > lowestFull) {
-        floatThreshold = lowestFull;
+      const float lowestHeld = (float)(floatRange.low - sunsaver::SETPOINT_TOLERANCE_VOLTS) * packs;
+      const float lowestRead = lowestHeld * _readingFactor - SS_SCALE_VOLTAGE_12V / SS_SCALE_DIVISOR;
+      if (floatThreshold > lowestRead + 0.2f) {
+        floatThreshold = lowestRead + 0.2f;
       }
     }
     if (_floatReferenceV > 8.0f) {

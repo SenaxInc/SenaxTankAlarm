@@ -4480,6 +4480,10 @@ static void initializeNotecard() {
 // and in the config, so that it holds across a start that finds the Notecard not ready (and the
 // client is not taken for another one). Only a UID that fits whole: one cut short could be
 // another client's id. True when the Notecard gave one that fits.
+// A UID too long to keep is still an answer: the UID the config kept from an earlier start is not
+// this Notecard's (it may be the one this Notecard replaced), so it is forgotten, and the client
+// goes by its device label, as when no UID is known (initializeNotecard()). What waits for the id
+// (deviceUidKnown()) goes on waiting, and nothing goes out under another client's id.
 static bool lookUpDeviceUid() {
   J *req = notecard.newRequest("hub.get");
   if (!req) {
@@ -4494,6 +4498,15 @@ static bool lookUpDeviceUid() {
   if (uid != nullptr && uid[0] != '\0') {
     if (strlen(uid) >= sizeof(gDeviceUID) || strlen(uid) >= sizeof(gConfig.deviceUid)) {
       Serial.println(F("Device UID too long to keep: not used"));
+      if (gConfig.deviceUid[0] != '\0') {
+        if (strcmp(gDeviceUID, gConfig.deviceUid) == 0) {
+          strlcpy(gDeviceUID, gConfig.deviceLabel, sizeof(gDeviceUID));
+        }
+        gConfig.deviceUid[0] = '\0';
+        gConfigDirty = true;
+        Serial.println(F("Device UID kept from an earlier start forgotten: not this Notecard's"));
+      }
+      gDeviceUidFromNotecard = false;
     } else {
       strlcpy(gDeviceUID, uid, sizeof(gDeviceUID));
       if (strcmp(gConfig.deviceUid, uid) != 0) {
