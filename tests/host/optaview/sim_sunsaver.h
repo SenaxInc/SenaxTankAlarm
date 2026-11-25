@@ -20,7 +20,6 @@
 #include <map>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "OptaViewModbus.h"
@@ -54,6 +53,11 @@ class SimSunSaver : public optaview::MbTransport {
   bool resetAcknowledged = true;     // false: the controller restarts without answering
   bool resetWorks = true;            // false: the reset coil is acknowledged but nothing restarts
   uint32_t responseDelayMs = 20;
+  // The controller answers one request at a time, in the order they came, as a Modbus RTU slave
+  // does: a reply starts only once the one before it is out, however much quicker it is. False:
+  // each reply comes at its own time, so a quick one overtakes a slow one, as a reply from
+  // another device on the bus could.
+  bool answersInOrder = true;
   uint32_t resetDownMs = 1500;       // silent for this long after a reset
   uint8_t leadingNoiseBytes = 0;     // 0x00 bytes in front of every reply (the DE-flip artifact)
   bool powered = true;               // false: nothing answers
@@ -65,6 +69,7 @@ class SimSunSaver : public optaview::MbTransport {
   double settingsNumerator = 100.0;    // the voltage settings in its EEPROM
   double referenceNumerator = 96.667;  // its regulation target, Vb_ref
   uint16_t storeMask = 0xFFFF;       // FC06 stores (value & storeMask): a controller that alters what it is given
+  uint16_t keepBits = 0;             // FC06 leaves these bits of the register as they were
   bool refuseWrites = false;         // FC06 gets exception 4
 
   // --- the log ---
@@ -105,9 +110,22 @@ class SimSunSaver : public optaview::MbTransport {
   void loadDefaults() {
     regs.clear();
     coils.clear();
-    for (uint16_t a = 0x0008; a <= 0x0034; ++a) regs[a] = 0;
-    for (uint16_t a = 0x0038; a <= 0x003A; ++a) regs[a] = 0;
-    for (uint16_t a = 0xE000; a <= 0xE04F; ++a) regs[a] = 0;
+    // The addresses that exist, as the specification lists them. They are written out here and
+    // not taken from the profile, so that a register the profile puts at a reserved address
+    // (0xE00B, say) is refused by this controller as it would be by a real one, and fails its
+    // test. Everything in between is reserved and answers exception 2.
+    static const uint16_t kExisting[][2] = {
+        {0x0008, 0x0034}, {0x0038, 0x003A},  // RAM: measurements, status, daily values
+        {0xE000, 0xE00A},                    // EEPROM: charge settings, battery bank 1
+        {0xE00D, 0xE017},                    //         a second set of the same settings
+        {0xE01A, 0xE01F},                    //         temperature compensation, HVD/HVR, limits
+        {0xE022, 0xE027},                    //         load: LVD/LVR, LHVD/LHVR, compensation, warning
+        {0xE030, 0xE038},                    //         LED thresholds, MODBUS and meter ids, current limit
+        {0xE040, 0xE04D},                    //         the stored totals
+        {0xE04F, 0xE04F}};
+    for (size_t i = 0; i < sizeof(kExisting) / sizeof(kExisting[0]); ++i) {
+      for (uint32_t a = kExisting[i][0]; a <= kExisting[i][1]; ++a) regs[(uint16_t)a] = 0;
+    }
 
     regs[0x0008] = volts(13.68);   // adc_vb_f
     regs[0x0009] = volts(17.45);   // adc_va_f
@@ -215,12 +233,35 @@ class SimSunSaver : public optaview::MbTransport {
     for (unsigned i = 0; i < times; ++i) faults_.push_back(fault);
   }
 
-  // Bytes that appear on the bus by themselves, `afterMs` from now.
+  // Bytes that appear on the bus by themselves, as from another device: the first can be read
+  // `afterMs` from now, and the others follow one every millisecond, or back to back where one
+  // character takes longer than that (1.15 ms at 9600 baud 8N2). Where they are on the wire at
+  // the same time as a reply, or as other injected bytes, both are spoiled (see putOnBus).
   void inject(uint32_t afterMs, const std::vector<uint8_t> &bytes) {
-    for (size_t i = 0; i < bytes.size(); ++i) incoming_.push_back(std::make_pair(now_ + afterMs + i, bytes[i]));
+    const uint64_t charUs = charMicros();
+    const uint64_t stepUs = charUs > 1000 ? charUs : 1000;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      const uint64_t dueUs = (now_ + afterMs) * 1000 + (uint64_t)i * stepUs;
+      putOnBus(dueUs > charUs ? dueUs - charUs : 0, dueUs, bytes[i]);
+    }
+  }
+
+  // The battery is at `v` volts: both of its filtered readings say so, and the lowest and highest
+  // voltage of the day and since the last reset take it in.
+  void setBattery(double v) {
+    const uint16_t raw = volts(v);
+    regs[0x0008] = raw;  // adc_vb_f
+    regs[0x0013] = raw;  // Vb_f: the slow filter, settled
+    const uint16_t lows[] = {0x002B, 0x0033};   // Vb_min_daily, vb_min
+    const uint16_t highs[] = {0x002C, 0x0034};  // Vb_max_daily, vb_max
+    for (size_t i = 0; i < 2; ++i) {
+      if (raw < regs[lows[i]]) regs[lows[i]] = raw;
+      if (raw > regs[highs[i]]) regs[highs[i]] = raw;
+    }
   }
 
   uint64_t elapsedMs() const { return now_; }
+  size_t incomingCount() const { return incoming_.size(); }  // bytes not read yet, due or on their way
   void advance(uint32_t ms) { now_ += ms; }
 
   static std::vector<uint8_t> frame(std::vector<uint8_t> body) {
@@ -245,7 +286,7 @@ class SimSunSaver : public optaview::MbTransport {
   void send(const uint8_t *data, size_t len) override {
     requests.push_back(std::vector<uint8_t>(data, data + len));
     requestTimes.push_back(now_);
-    now_ += len;  // about a millisecond per byte at 9600 baud
+    now_ += wireMs(len);  // the request goes out at the port's baud rate
     if (!powered || now_ < downUntil_) return;
     if (linkBaud_ != deviceBaud) return;
     if (!anyFormat && linkFormat_ != deviceFormat) return;
@@ -311,17 +352,67 @@ class SimSunSaver : public optaview::MbTransport {
         break;
     }
 
-    uint64_t at = now_ + responseDelayMs;
-    if (!incoming_.empty() && incoming_.back().first >= at) at = incoming_.back().first + 1;
-    for (uint8_t i = 0; i < leadingNoiseBytes; ++i) incoming_.push_back(std::make_pair(at++, (uint8_t)0x00));
-    for (size_t i = 0; i < reply.size(); ++i) incoming_.push_back(std::make_pair(at++, reply[i]));
+    // The reply starts responseDelayMs after the request, or once the reply before it is out
+    // (see answersInOrder). Its bytes go out back to back, one character time each at the baud
+    // rate and format of the link (1.15 ms at 9600 baud 8N2, 96 microseconds at 115200, 36.7 ms
+    // at 300), and each can be read once its last bit is in.
+    const uint64_t charUs = charMicros();
+    uint64_t atUs = (now_ + responseDelayMs) * 1000;
+    if (answersInOrder && busyUntilUs_ > atUs) atUs = busyUntilUs_;
+    std::vector<uint8_t> wire((size_t)leadingNoiseBytes, (uint8_t)0x00);
+    wire.insert(wire.end(), reply.begin(), reply.end());
+    for (size_t i = 0; i < wire.size(); ++i) {
+      putOnBus(atUs + (uint64_t)i * charUs, atUs + (uint64_t)(i + 1) * charUs, wire[i]);
+    }
+    const uint64_t endUs = atUs + (uint64_t)wire.size() * charUs;
+    if (endUs > busyUntilUs_) busyUntilUs_ = endUs;
   }
 
+  // Puts one byte on the bus: it is on the wire from startUs, and can be read from dueUs, when
+  // its last bit is in. The bus keeps the bytes in the order they are due, each behind those due
+  // no later. Two transmitters on one RS-485 pair at once garble each other, so a byte that
+  // shares any time on the wire with another is spoiled, and so is the other. One sender's own
+  // bytes follow one another and never share it. The master's requests are not on this wire:
+  // the real port does not listen while it sends (see OptaView.ino), and the echo that some
+  // adapters give back is the request itself, heard as it goes out.
+  void putOnBus(uint64_t startUs, uint64_t dueUs, uint8_t value) {
+    OnWire byte;
+    byte.startUs = startUs;
+    byte.dueUs = dueUs;
+    byte.value = value;
+    byte.garbled = false;
+    std::deque<OnWire>::iterator at = incoming_.end();
+    while (at != incoming_.begin() && (at - 1)->dueUs > dueUs) --at;
+    // In front of it: the bytes that are not yet in when it starts.
+    for (std::deque<OnWire>::iterator it = at; it != incoming_.begin() && (it - 1)->dueUs > startUs; --it) {
+      (it - 1)->garbled = true;
+      byte.garbled = true;
+    }
+    // Behind it: the bytes that start before it is in.
+    for (std::deque<OnWire>::iterator it = at; it != incoming_.end(); ++it) {
+      if (it->startUs < dueUs) {
+        it->garbled = true;
+        byte.garbled = true;
+      }
+    }
+    incoming_.insert(at, byte);
+  }
+
+  // One character on the wire at the link's baud rate and format, in microseconds.
+  uint64_t charMicros() const {
+    return optaview::mbCharMicros(linkBaud_ == 0 ? 9600 : linkBaud_, linkFormat_);
+  }
+
+  // How long `bytes` characters take on the wire, rounded up to the millisecond clock.
+  uint64_t wireMs(size_t bytes) const { return ((uint64_t)bytes * charMicros() + 999) / 1000; }
+
+  // A spoiled byte arrives with its bits inverted: whatever the receiver makes of two senders at
+  // once, it is not what either of them sent.
   int read() override {
-    if (incoming_.empty() || incoming_.front().first > now_) return -1;
-    const uint8_t b = incoming_.front().second;
+    if (incoming_.empty() || incoming_.front().dueUs > now_ * 1000) return -1;
+    const OnWire byte = incoming_.front();
     incoming_.pop_front();
-    return b;
+    return byte.garbled ? (uint8_t)~byte.value : byte.value;
   }
 
   // The clock starts just below the 32-bit wrap, so every test crosses it.
@@ -344,7 +435,14 @@ class SimSunSaver : public optaview::MbTransport {
   uint32_t linkBaud_ = 0;
   uint8_t linkFormat_ = 0;
   std::deque<Fault> faults_;
-  std::deque<std::pair<uint64_t, uint8_t> > incoming_;
+  struct OnWire {
+    uint64_t startUs;  // its start bit goes out (microseconds on the clock of elapsedMs)
+    uint64_t dueUs;    // its last bit is in: from then it can be read
+    uint8_t value;     // what its sender sent
+    bool garbled;      // another byte was on the wire at the same time
+  };
+  std::deque<OnWire> incoming_;  // in the order they are due
+  uint64_t busyUntilUs_ = 0;     // when the last byte of the controller's last reply is in
 
   static std::vector<uint8_t> exception(const uint8_t *request, uint8_t code) {
     std::vector<uint8_t> body;
@@ -352,6 +450,30 @@ class SimSunSaver : public optaview::MbTransport {
     body.push_back((uint8_t)(request[1] | 0x80));
     body.push_back(code);
     return frame(body);
+  }
+
+  uint32_t u32HiLo(uint16_t addr) { return ((uint32_t)regs[addr] << 16) | regs[(uint16_t)(addr + 1)]; }
+
+  // What an action coil does, as the specification names it. The stored totals at 0xE040 on
+  // change only when the running totals are stored (force_eeprom_update): when a real
+  // controller stores them by itself is not known, and this one never does.
+  void act(uint16_t coil) {
+    if (coil == 0x0010) {         // clear_ah_resettable
+      setU32HiLo(0x0015, 0);      // Ahc_r
+      setU32HiLo(0x001D, 0);      // Ahl_r
+    } else if (coil == 0x0011) {  // clear_ah_total
+      setU32HiLo(0x0017, 0);      // Ahc_t
+      setU32HiLo(0x001F, 0);      // Ahl_t
+    } else if (coil == 0x0012) {  // clear_kwh
+      regs[0x0019] = 0;           // kWhc
+    } else if (coil == 0x0016) {  // force_eeprom_update: the running totals, low word first
+      setU32LoHi(0xE040, u32HiLo(0x0021));  // Ehourmeter
+      setU32LoHi(0xE042, u32HiLo(0x001D));  // EAhl_r
+      setU32LoHi(0xE044, u32HiLo(0x001F));  // EAhl_t
+      setU32LoHi(0xE046, u32HiLo(0x0015));  // EAhc_r
+      setU32LoHi(0xE048, u32HiLo(0x0017));  // EAhc_t
+      regs[0xE04A] = regs[0x0019];          // EkWhc
+    }
   }
 
   void restart() {
@@ -446,7 +568,10 @@ class SimSunSaver : public optaview::MbTransport {
         return true;
       }
       if (addr >= 0x0010) {  // action coils do their thing and read back off
-        if (value == 0xFF00) triggered.push_back(addr);
+        if (value == 0xFF00) {
+          triggered.push_back(addr);
+          act(addr);
+        }
         return true;
       }
       coils[addr] = value == 0xFF00;
@@ -463,7 +588,7 @@ class SimSunSaver : public optaview::MbTransport {
         *reply = exception(request, 4);
         return true;
       }
-      regs[addr] = (uint16_t)(value & storeMask);
+      regs[addr] = (uint16_t)((regs[addr] & keepBits) | (value & storeMask & ~keepBits));
       regs[0x0012] = (uint16_t)(regs[0x0012] | (1u << 5));  // "EEPROM setting edit" until a reset
       regs[0x001B] = (uint16_t)(regs[0x001B] | (1u << 6));
       reply->assign(request, request + len);

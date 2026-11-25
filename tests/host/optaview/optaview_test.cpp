@@ -141,6 +141,27 @@ static void testReplyValidation() {
     CHECK_EQ(b.master.stats.exceptions, 1);
     CHECK(!mbIsLinkFailure(r.status));
   }
+  {  // The simulated controller has the specification's addresses and no others. A reserved one
+     // in the middle of the EEPROM is refused like the gap after the RAM registers: alone, in a
+     // block that touches it, and for a write. (A profile that maps a register there fails
+     // testSpans, and its reads fail.)
+    Bare b;
+    const uint16_t reserved[] = {0xE00B, 0xE00C, 0xE018, 0xE019, 0xE020, 0xE021,
+                                 0xE028, 0xE02F, 0xE039, 0xE03F, 0xE04E, 0xE050};
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i) {
+      uint16_t word = 0xAAAA;
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, reserved[i], 1, &word);
+      CHECK_MSG(r.status == MB_EXCEPTION && r.exception == 2, "0x%04X can be read", (unsigned)reserved[i]);
+      const MbResult w = b.master.writeRegister(1, reserved[i], 5);
+      CHECK_MSG(w.status == MB_EXCEPTION && w.exception == 2, "0x%04X can be written", (unsigned)reserved[i]);
+      CHECK_EQ(b.sim.regs.count(reserved[i]), 0);
+    }
+    uint16_t words[4];
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE009, 4, words).status, MB_EXCEPTION);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE009, 2, words).status, MB_OK);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE00D, 4, words).status, MB_OK);
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE04F, 1, words).status, MB_OK);
+  }
   {  // A write acknowledged with another value is not a success.
     Bare b;
     b.sim.failNext(SimSunSaver::FAULT_WRONG_ECHO);
@@ -320,10 +341,92 @@ static void testTimeouts() {
     Bare b;
     b.sim.responseDelayMs = 990;
     uint16_t words[16];
-    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0xE000, 16, words);
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 16, words);
     CHECK_EQ(r.status, MB_OK);
     CHECK_MSG(r.elapsedMs > 1000 && r.elapsedMs < 1100, "elapsedMs %u", (unsigned)r.elapsedMs);
-    CHECK_EQ(words[0], b.sim.regs[0xE000]);
+    CHECK_EQ(words[0], b.sim.regs[0x0008]);
+  }
+  {  // One character on the wire: a start bit, eight data bits, and parity or a second stop bit.
+    CHECK_EQ(mbCharMicros(9600, MB_8N2), 1146);
+    CHECK_EQ(mbCharMicros(9600, MB_8E1), 1146);
+    CHECK_EQ(mbCharMicros(9600, MB_8O1), 1146);
+    CHECK_EQ(mbCharMicros(9600, MB_8N1), 1042);
+    CHECK_EQ(mbCharMicros(300, MB_8N2), 36667);
+    CHECK_EQ(mbCharMicros(300, MB_8N1), 33334);
+    CHECK_EQ(mbCharMicros(115200, MB_8N1), 87);
+    CHECK_EQ(mbCharMicros(0, MB_8N2), 11000000UL);  // no division by zero
+    Bare b;
+    CHECK_EQ(b.master.charMicros, 1146);  // the master starts at 9600 baud 8N2
+    CHECK(b.master.configure(300, MB_8N1));
+    CHECK_EQ(b.master.charMicros, 33334);
+    CHECK(!b.master.configure(299, MB_8N2));
+    CHECK_EQ(b.master.charMicros, 33334);  // a refused rate changes nothing
+    CHECK(b.master.configure(9600, MB_8N2));
+    CHECK_EQ(b.master.charMicros, 1146);
+  }
+  {  // How long the longest reply a request allows takes on the wire, rounded up to the
+     // millisecond: address, function, byte count, data and CRC.
+    Bare b;
+    MbExpect e;
+    memset(&e, 0, sizeof(e));
+    e.kind = MB_REPLY_REGISTERS;
+    e.quantity = 1;
+    CHECK_EQ(b.master.replyWireMs(e), 9U);  // 7 bytes of 1.146 ms
+    e.quantity = 16;
+    CHECK_EQ(b.master.replyWireMs(e), 43U);  // 37 bytes
+    e.quantity = 200;
+    CHECK_EQ(b.master.replyWireMs(e), 294U);  // no more than the longest frame, 256 bytes
+    e.kind = MB_REPLY_BITS;
+    e.quantity = 1;
+    CHECK_EQ(b.master.replyWireMs(e), 7U);  // 6 bytes
+    e.quantity = 8;
+    CHECK_EQ(b.master.replyWireMs(e), 7U);  // eight bits in one byte
+    e.quantity = 9;
+    CHECK_EQ(b.master.replyWireMs(e), 9U);  // 7 bytes
+    e.quantity = 16;
+    CHECK_EQ(b.master.replyWireMs(e), 9U);
+    e.kind = MB_REPLY_ECHO;
+    CHECK_EQ(b.master.replyWireMs(e), 10U);  // 8 bytes
+    e.kind = MB_REPLY_DEVICE_ID;
+    CHECK_EQ(b.master.replyWireMs(e), 294U);  // its length is not known in advance
+    e.kind = MB_REPLY_UNKNOWN;
+    CHECK_EQ(b.master.replyWireMs(e), 294U);
+    CHECK(b.master.configure(300, MB_8N2));
+    e.kind = MB_REPLY_REGISTERS;
+    e.quantity = 16;
+    CHECK_EQ(b.master.replyWireMs(e), 1357U);  // 37 bytes of 36.667 ms
+  }
+  {  // At 300 baud a reply of 20 registers takes 1.65 s on the wire, longer than the timeout and
+     // its grace together. It started in time, so it is allowed to finish.
+    Bare b;
+    b.sim.deviceBaud = 300;
+    CHECK(b.master.configure(300, MB_8N2));
+    uint16_t words[20];
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 20, words);
+    CHECK_MSG(r.status == MB_OK, "%s", mbStatusText(r.status));
+    CHECK_MSG(r.elapsedMs >= 1670 && r.elapsedMs < 1700, "elapsedMs %u", (unsigned)r.elapsedMs);
+    CHECK_EQ(words[0], b.sim.regs[0x0008]);
+    CHECK_EQ(words[19], b.sim.regs[0x001B]);
+    // So is one of 16 registers whose first byte is in just before the timeout (a character takes
+    // 37 ms at this rate) and that needs 1.32 s more.
+    b.sim.responseDelayMs = 950;
+    uint16_t block[16];
+    const MbResult late = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 16, block);
+    CHECK_MSG(late.status == MB_OK, "%s", mbStatusText(late.status));
+    CHECK_MSG(late.elapsedMs >= 2307 && late.elapsedMs < 2350, "elapsedMs %u", (unsigned)late.elapsedMs);
+    CHECK_EQ(block[15], b.sim.regs[0x0017]);
+  }
+  {  // The wait still has an end: the timeout, the grace and the longest reply's time on the wire
+     // (1357 ms for 16 registers at 300 baud 8N2), even while bytes keep coming.
+    Bare b;
+    b.sim.deviceBaud = 300;
+    CHECK(b.master.configure(300, MB_8N2));
+    b.sim.responseDelayMs = 900;
+    b.sim.leadingNoiseBytes = 20;  // the reply would end 2.99 s after the request
+    uint16_t words[16];
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 16, words);
+    CHECK(r.status != MB_OK);
+    CHECK_MSG(r.elapsedMs >= 2757 && r.elapsedMs <= 2760, "elapsedMs %u", (unsigned)r.elapsedMs);
   }
   {  // A reply that arrives after the master gave up is thrown away before the next request,
      // so it cannot be taken for the answer to that one.
@@ -524,6 +627,147 @@ static void testLateReplies() {
     CHECK_EQ(word, b.sim.regs[0xE022]);
     CHECK_EQ(r.noiseBytes, 7);  // the late reply to the function 4 read
   }
+  {  // The other order. One controller answers in turn, so above the late reply always comes in
+     // first. A reply from another device on the bus, or from a controller that does not keep to
+     // its turn, can come after the quick answer to the next request instead. That answer is
+     // taken as it is, and the late reply, which then arrives while nothing waits for it, is
+     // still kept from the next request of its own kind.
+    Bare b;
+    b.sim.answersInOrder = false;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    b.sim.responseDelayMs = 20;
+    MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
+    CHECK(b.sim.requestTimes[1] <= gaveUp + 10);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0xE022]);
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_EQ(b.sim.incomingCount(), 7U);  // the late reply is still on its way
+    r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
+    CHECK_EQ(r.status, MB_OK);
+    CHECK_EQ(word, b.sim.regs[0x0009]);
+    CHECK(word != b.sim.regs[0x0008]);
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
+    CHECK_MSG(b.sim.requestTimes[2] >= gaveUp + 1000 && b.sim.requestTimes[2] <= gaveUp + 1010, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[2] - gaveUp));
+  }
+  {  // Two senders on the bus at once garble each other, and neither frame is taken: here the
+     // late reply and the answer to the next request, which begins at the same moment, while the
+     // late reply is still going out, or just before it and runs into it. At 115200 baud a reply
+     // of seven bytes takes 0.7 ms, so two that begin in the same millisecond are on the wire
+     // together, and two that begin a millisecond apart do not touch: then the answer is taken,
+     // behind the late reply.
+    struct Case {
+      uint32_t baud;
+      int32_t offsetMs;  // when the answer begins, after the late reply (before it if negative)
+      bool taken;
+    };
+    const Case cases[] = {{9600, 0, false}, {9600, 5, false}, {9600, -5, false}, {115200, 0, false}, {115200, 1, true}};
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); ++k) {
+      const Case &c = cases[k];
+      Bare b;
+      b.sim.deviceBaud = c.baud;
+      CHECK(b.master.configure(c.baud, MB_8N2));
+      b.sim.answersInOrder = false;
+      b.sim.responseDelayMs = 1200;
+      uint16_t word = 0xAAAA;
+      CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+      // Both requests are 8 bytes long, and the next goes out once the bus has been quiet for
+      // the gap between frames.
+      const int64_t lateBegins = (int64_t)b.sim.requestTimes[0] + 1200;
+      b.sim.responseDelayMs =
+          (uint32_t)(lateBegins + c.offsetMs - (int64_t)b.sim.elapsedMs() - b.master.interFrameGapMs);
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
+      CHECK_EQ(b.sim.requestTimes[1] + b.sim.responseDelayMs, lateBegins + c.offsetMs);
+      if (c.taken) {
+        CHECK_MSG(r.status == MB_OK, "%u baud, %d ms: %s", (unsigned)c.baud, (int)c.offsetMs, mbStatusText(r.status));
+        CHECK_EQ(word, b.sim.regs[0xE022]);
+        CHECK_EQ(r.noiseBytes, 7);
+      } else {
+        CHECK_MSG(r.status != MB_OK, "%u baud, %d ms: %s", (unsigned)c.baud, (int)c.offsetMs, mbStatusText(r.status));
+        CHECK_EQ(word, 0xAAAA);
+      }
+    }
+    // The same with bytes from elsewhere in the middle of a reply.
+    Bare c;
+    uint16_t word = 0xAAAA;
+    c.sim.inject(20, std::vector<uint8_t>(40, 0xFF));
+    CHECK(c.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status != MB_OK);
+    CHECK_EQ(word, 0xAAAA);
+  }
+  {  // One byte from elsewhere that is on the wire with the first byte of a reply spoils the
+     // reply. One that is in just as the reply begins only stands in front of it. At 9600 baud
+     // 8N2 a character takes 1.15 ms, so a byte that can be read 1 ms after the reply begins
+     // went out before the reply did.
+    for (uint32_t late = 0; late <= 1; ++late) {
+      Bare b;
+      uint16_t word = 0xAAAA;
+      const uint64_t t0 = b.sim.elapsedMs();
+      // A fresh master sends at once, its request takes 10 ms, and the reply begins after the
+      // controller's delay.
+      b.sim.inject(10 + b.sim.responseDelayMs + late, bytes({0x55}));
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word);
+      CHECK_EQ(b.sim.requestTimes[0], t0);
+      if (late == 0) {
+        CHECK_MSG(r.status == MB_OK, "%s", mbStatusText(r.status));
+        CHECK_EQ(r.noiseBytes, 1);
+        CHECK_EQ(word, 0x1183);
+      } else {
+        CHECK_MSG(r.status != MB_OK, "%s", mbStatusText(r.status));
+        CHECK_EQ(word, 0xAAAA);
+      }
+    }
+  }
+  {  // On the simulated bus itself: bytes on the wire at the same time arrive spoiled, each with
+     // its bits inverted, and bytes that only follow one another arrive as they were sent.
+    Bare b;
+    b.sim.inject(10, bytes({0x12, 0x34}));  // at 9600 baud: in 10 ms and 11.15 ms from now
+    b.sim.inject(10, bytes({0x56}));        // on the wire with the 0x12, and in as the 0x34 starts
+    b.sim.inject(13, bytes({0x78}));        // starts 0.7 ms after the 0x34 is in
+    b.sim.advance(20);
+    CHECK_EQ(b.sim.read(), 0xED);
+    CHECK_EQ(b.sim.read(), 0xA9);
+    CHECK_EQ(b.sim.read(), 0x34);
+    CHECK_EQ(b.sim.read(), 0x78);
+    CHECK_EQ(b.sim.read(), -1);
+    // The same when the byte put on the bus later is due first: the 0x22 is in 1 ms before the
+    // 0x11, while the 0x11 is already going out.
+    Bare first;
+    first.sim.inject(20, bytes({0x11}));
+    first.sim.inject(19, bytes({0x22}));
+    first.sim.advance(25);
+    CHECK_EQ(first.sim.read(), 0xDD);
+    CHECK_EQ(first.sim.read(), 0xEE);
+    CHECK_EQ(first.sim.read(), -1);
+    // Where a character takes less than a millisecond, injected bytes still come one a
+    // millisecond.
+    Bare fast;
+    CHECK(fast.master.configure(115200, MB_8N2));
+    fast.sim.inject(10, bytes({0x9A, 0xBC, 0xDE}));
+    fast.sim.advance(11);
+    CHECK_EQ(fast.sim.read(), 0x9A);
+    CHECK_EQ(fast.sim.read(), 0xBC);
+    CHECK_EQ(fast.sim.read(), -1);
+    fast.sim.advance(1);
+    CHECK_EQ(fast.sim.read(), 0xDE);
+  }
+  {  // The bus keeps every byte in time order, whenever it was put there: bytes from elsewhere
+     // that are due before a reply already on its way come in first.
+    Bare b;
+    b.sim.responseDelayMs = 1200;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+    CHECK_EQ(b.sim.incomingCount(), 7U);  // the late reply, still on its way
+    b.sim.inject(50, bytes({0xAA, 0xBB}));
+    b.sim.advance(100);
+    CHECK_EQ(b.sim.read(), 0xAA);
+    CHECK_EQ(b.sim.read(), 0xBB);
+    CHECK_EQ(b.sim.read(), -1);  // the late reply is not due yet
+    CHECK_EQ(b.sim.incomingCount(), 7U);
+  }
   {  // Two unanswered requests of different kinds, the second given up while the reply to the
      // first could still arrive (the probe does this when it shortens the timeout). One record
      // cannot name both, so until both waits are over every request waits, whatever its kind.
@@ -573,12 +817,12 @@ static void testLateReplies() {
     CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
     const uint64_t gaveUp = b.sim.elapsedMs();
     const std::vector<uint8_t> late = SimSunSaver::frame(bytes({0x01, 0x04, 0x02, 0x11, 0x83}));
-    b.sim.inject(997, late);  // its seven bytes arrive from 997 to 1003 ms: across the end of the wait
+    b.sim.inject(997, late);  // its seven bytes arrive from 997 to 1004 ms: across the end of the wait
     const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
     CHECK_EQ(r.status, MB_OK);
     CHECK_EQ(word, b.sim.regs[0x0009]);
     CHECK_EQ(r.noiseBytes, 0);
-    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1003 + b.master.quietMs, "sent %llu ms after",
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1004 + b.master.quietMs, "sent %llu ms after",
               (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
   }
   {  // Noise that never stops does not hold the master for ever.
@@ -589,8 +833,53 @@ static void testLateReplies() {
     const uint64_t gaveUp = b.sim.elapsedMs();
     b.sim.inject(900, std::vector<uint8_t>(5000, 0xFF));
     b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
-    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1000 && b.sim.requestTimes[1] <= gaveUp + 1000 + MB_GRACE_MS + 10,
+    // 9 ms: the late reply's own seven bytes on the wire at 9600 baud 8N2.
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1000 && b.sim.requestTimes[1] <= gaveUp + 1000 + MB_GRACE_MS + 9 + 1,
               "sent %llu ms after", (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+  }
+  {  // At 300 baud a late reply of 16 registers lasts 1.36 s. The next request waits until all of
+     // it is in, instead of talking over the controller while it still sends.
+    Bare b;
+    b.sim.deviceBaud = 300;
+    CHECK(b.master.configure(300, MB_8N2));
+    b.sim.responseDelayMs = 1200;
+    uint16_t words[16];
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 16, words).status, MB_TIMEOUT);
+    const uint64_t gaveUp = b.sim.elapsedMs();
+    b.sim.responseDelayMs = 20;
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0018, 16, words);
+    CHECK_MSG(r.status == MB_OK, "%s", mbStatusText(r.status));
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_EQ(words[0], b.sim.regs[0x0018]);
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
+    // The late reply began about 200 ms after the master gave up and ended 1357 ms later; the
+    // line was then quiet for 129 ms before the request went out.
+    const uint64_t lateEnd = gaveUp + 200 + 1357;
+    CHECK_MSG(b.sim.requestTimes[1] >= lateEnd + b.master.quietMs, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+    CHECK_MSG(b.sim.requestTimes[1] <= lateEnd + b.master.quietMs + 50, "sent %llu ms after",
+              (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
+  }
+  {  // The same when a short request goes unanswered while that long reply is still due: the
+     // wait that covers both allows for the longer of the two replies on the wire.
+    Bare b;
+    b.sim.deviceBaud = 300;
+    CHECK(b.master.configure(300, MB_8N2));
+    b.sim.responseDelayMs = 1800;  // its reply begins only after the short request is given up
+    uint16_t words[16];
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 16, words).status, MB_TIMEOUT);
+    b.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    b.master.responseTimeoutMs = 300;
+    uint16_t word = 0;
+    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word).status, MB_TIMEOUT);
+    CHECK_EQ(b.sim.incomingCount(), 37U);  // nothing of the long reply has arrived yet
+    b.master.responseTimeoutMs = 1000;
+    b.sim.responseDelayMs = 20;
+    const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0018, 16, words);
+    CHECK_MSG(r.status == MB_OK, "%s", mbStatusText(r.status));
+    CHECK_EQ(r.noiseBytes, 0);
+    CHECK_EQ(words[0], b.sim.regs[0x0018]);
+    CHECK_EQ(b.master.stats.lateArrivals, 1);
   }
   {  // Stray bytes between two answered requests are dropped as before, and are not counted as
      // late: only what arrives while a late reply is waited for is.
@@ -1121,10 +1410,27 @@ static void testProfileCodec() {
   CHECK(formatted(*profile.findRegister("T_amb"), 0xFFEC) == "-20 C");
   CHECK(formatted(*profile.findRegister("T_rts"), 0x0080) == "not connected");
   CHECK(formatted(*profile.findRegister("T_rts"), 0x0019) == "25 C");
-  // An unsigned byte is the low byte as well. (This profile has none.)
+  // An unsigned byte is the low byte as well.
   OvRegister unsignedByte = *profile.findRegister("T_hs");
   unsignedByte.type = OV_U8;
   CHECK(formatted(unsignedByte, 0xFFEC) == "236 C");
+  // The temperature compensation is one: the controller uses only the low byte, so a stored
+  // 0x0114 is 0.0305 V/C, not the 0.4211 V/C of the whole word.
+  const OvRegister &tempcomp = *profile.findRegister("EV_tempcomp");
+  CHECK_EQ(tempcomp.type, OV_U8);
+  CHECK(formatted(tempcomp, 0x0114) == "0.0305 V/C");
+  CHECK(formatted(tempcomp, 0x0014) == "0.0305 V/C");
+  CHECK(formatted(tempcomp, 0xFF1E) == "0.0458 V/C");
+  // Two words hold the same value when they agree in the bits that are used.
+  CHECK_EQ(ovUsedBits(tempcomp), 0x00FF);
+  CHECK_EQ(ovUsedBits(*profile.findRegister("T_hs")), 0x00FF);  // a signed byte
+  CHECK_EQ(ovUsedBits(*profile.findRegister("EV_lvd")), 0xFFFF);
+  CHECK(ovSameValue(tempcomp, 0x0114, 0x0014));
+  CHECK(ovSameValue(tempcomp, 0xFF14, 0x0014));
+  CHECK(!ovSameValue(tempcomp, 0x0114, 0x0115));
+  CHECK(!ovSameValue(tempcomp, 0x0114, 0x0194));
+  CHECK(!ovSameValue(*profile.findRegister("EV_lvd"), 0x0114, 0x0014));
+  CHECK(ovSameValue(*profile.findRegister("EV_lvd"), 0x0114, 0x0114));
   // Two-word counters: high word first in RAM, low word first in EEPROM.
   CHECK(formatted(*profile.findRegister("Ahc_t"), 0x0001, 0x1170) == "7000.0 Ah");
   CHECK(formatted(*profile.findRegister("EAhc_t"), 0x1170, 0x0001) == "7000.0 Ah");
@@ -1139,7 +1445,7 @@ static void testProfileCodec() {
   CHECK(formatted(*profile.findRegister("array_fault"), 0x0009) == "Overcurrent, Battery HVD");
   CHECK(formatted(*profile.findRegister("array_fault"), 0x8000) == "bit 15");
   CHECK(formatted(*profile.findRegister("load_fault"), 0x0040) == "EEPROM setting edit (reset required)");
-  CHECK(formatted(*profile.findRegister("dip_switch"), 0x000A) == "SW2: custom LVD/LVR, SW4: MODBUS");
+  CHECK(formatted(*profile.findRegister("dip_switch"), 0x000A) == "SW2: custom LVD/LVR, SW4: MeterBus/MODBUS selector");
   CHECK(formatted(*profile.findRegister("alarm"), 0x0000, 0x0001) == "RTS open");  // bit 0 = low word
   CHECK(formatted(*profile.findRegister("alarm"), 0x0001, 0x0000) == "P12");       // bit 16
   // Other scales.
@@ -1183,6 +1489,20 @@ static void testProfileCodec() {
   CHECK_EQ(raw, 0x7FFF);
   CHECK_EQ(ovEncode(offset, 32768, &raw), OV_ENCODE_OUT_OF_RANGE);
   CHECK_EQ(ovEncode(offset, -32769, &raw), OV_ENCODE_OUT_OF_RANGE);
+  // An unsigned byte is written in the low byte, with 0 in the high byte, and stops at 255.
+  CHECK_EQ(ovEncode(tempcomp, 0.0458, &raw), OV_ENCODE_OK);
+  CHECK_EQ(raw, 0x001E);
+  CHECK_EQ(ovEncode(tempcomp, 0.0, &raw), OV_ENCODE_OK);  // off
+  CHECK_EQ(raw, 0);
+  CHECK_EQ(ovEncode(tempcomp, 0.11, &raw), OV_ENCODE_ABOVE_MAX);
+  OvRegister byteSetting = tempcomp;
+  byteSetting.hasMax = false;
+  CHECK_EQ(ovEncode(byteSetting, 0.389, &raw), OV_ENCODE_OK);  // 254.9
+  CHECK_EQ(raw, 0x00FF);
+  CHECK_EQ(ovEncode(byteSetting, 0.39, &raw), OV_ENCODE_OUT_OF_RANGE);  // 255.6
+  // A signed byte cannot be written.
+  byteSetting.type = OV_I8;
+  CHECK_EQ(ovEncode(byteSetting, 0.0458, &raw), OV_ENCODE_NOT_WRITABLE);
   // Only one word can be written, whatever the register says about itself.
   OvRegister wide = absorbTime;
   wide.words = 2;
@@ -1315,6 +1635,8 @@ static void testScaleCheckRejects() {
                           "\"meter\":\"batt\",\"battery\":\"slow\",", ""),
                  "must be two scales");
   expectRejected(replaced(good, "\"meter\":\"batt\"", "\"meter\":\"nope\""), "scaleCheck.live.meter names no register");
+  // The regulation test only points, so without a multimeter nothing could confirm the scale.
+  expectRejected(replaced(good, "\"meter\":\"batt\",", ""), "scaleCheck.live.meter is needed");
   expectRejected(replaced(good, "\"battery\":\"slow\"", "\"battery\":\"nope\""),
                  "scaleCheck.live.battery names no register");
   expectRejected(replaced(good, "\"reference\":\"target\"", "\"reference\":\"nope\""),
@@ -1355,15 +1677,15 @@ static void testProfileRejects() {
     CHECK_EQ(profile.findRegister("b")->type, OV_ENUM);
     CHECK_EQ(profile.findRegister("c")->type, OV_U32);
   }
-  {  // Each type name gives its own type, and of the one-word types only the two plain 16-bit
-     // numbers may be writable.
+  {  // Each type name gives its own type, and of the one-word types only the plain 16-bit numbers
+     // and the unsigned byte may be writable.
     const struct {
       const char *json;
       uint8_t type;
       bool mayBeWritable;
     } kinds[] = {{"\"type\":\"u16\"", OV_U16, true},
                  {"\"type\":\"i16\"", OV_I16, true},
-                 {"\"type\":\"u8\"", OV_U8, false},
+                 {"\"type\":\"u8\"", OV_U8, true},
                  {"\"type\":\"i8\"", OV_I8, false},
                  {"\"type\":\"enum\",\"labels\":\"st\"", OV_ENUM, false},
                  {"\"type\":\"bits\",\"labels\":\"st\"", OV_BITS, false}};
@@ -1387,7 +1709,7 @@ static void testProfileRejects() {
         }
       }
       if (!kinds[i].mayBeWritable) {
-        expectRejected(writable, "only one-word u16 and i16 registers can be writable");
+        expectRejected(writable, "only one-word u16, i16 and u8 registers can be writable");
       }
     }
   }
@@ -1630,7 +1952,7 @@ static void testReadsAndFallback() {
     CHECK_HAS(lineWith(out, "adc_vb_f"), "13.68 V");
     CHECK_HAS(lineWith(out, "adc_vb_f"), "[0x1183]");
     CHECK_HAS(lineWith(out, "charge_state"), "FLOAT (7)");
-    CHECK_HAS(lineWith(out, "dip_switch"), "SW2: custom LVD/LVR, SW4: MODBUS");
+    CHECK_HAS(lineWith(out, "dip_switch"), "SW2: custom LVD/LVR, SW4: MeterBus/MODBUS selector");
     CHECK_HAS(lineWith(out, "T_rts"), "not connected");
     CHECK_HAS(lineWith(out, "alarm"), "[0x0000 0x0000]");
     CHECK(!rig.device.blocksFailed());
@@ -1704,11 +2026,11 @@ static void testReadsAndFallback() {
   }
   {  // A long read is cut into blocks of the size the profile allows: 16 for the SunSaver.
     Rig rig;
-    const std::string out = rig.run("get 0xE000 40");
-    CHECK_HAS(out, "0xE027  ");
+    const std::string out = rig.run("get 0x0008 40");
+    CHECK_HAS(out, "0x002F  ");
     CHECK_EQ(countOf(out, "--"), 0);
     CHECK_EQ(rig.sim.requests.size(), 3);
-    const uint16_t starts[] = {0xE000, 0xE010, 0xE020};
+    const uint16_t starts[] = {0x0008, 0x0018, 0x0028};
     const uint16_t counts[] = {16, 16, 8};
     for (size_t i = 0; i < 3 && i < rig.sim.requests.size(); ++i) {
       CHECK_EQ((rig.sim.requests[i][2] << 8) | rig.sim.requests[i][3], starts[i]);
@@ -2319,11 +2641,25 @@ static void testConsoleBasics() {
   CHECK_HAS(rig.run("HELP"), "Finding the controller");  // commands ignore case
   CHECK_HAS(rig.run("?"), "Finding the controller");
 
-  // 'scalecheck' ran in that loop against a controller at the profile's scales.
+  // 'scalecheck' ran in that loop against a controller at the profile's scales. With neither a
+  // multimeter reading nor a setting it settles nothing, and 'status' says what each scale needs.
+  const std::string unsettled = rig.run("status");
+  CHECK_HAS(unsettled, "Voltage   stored settings: scale vset = x100/32768, not confirmed on this controller\r\n"
+                       "          live readings:   scale vlive = x100/32768, not confirmed on this controller\r\n"
+                       "          'scalecheck <volts>', with a multimeter reading at the battery, tests the live "
+                       "readings.\r\n"
+                       "          'scalecheck <setting> <volts>', with a setting whose value you know (from MSView,\r\n"
+                       "          say), tests the stored settings.\r\n");
+  rig.run("scalecheck EV_float 13.70");
   const std::string settled = rig.run("status");
   CHECK_HAS(settled, "Voltage   stored settings: scale vset = x100/32768, confirmed by 'scalecheck'");
-  CHECK_HAS(settled, "          live readings:   scale vlive = x100/32768, confirmed by 'scalecheck'");
-  CHECK_HASNT(settled, "'scalecheck' tests");
+  CHECK_HAS(settled, "          live readings:   scale vlive = x100/32768, not confirmed on this controller\r\n"
+                     "          'scalecheck <volts>', with a multimeter reading at the battery, tests the live "
+                     "readings.\r\nModes");
+  rig.run("scalecheck 13.68");
+  const std::string metered = rig.run("status");
+  CHECK_HAS(metered, "          live readings:   scale vlive = x100/32768, confirmed by 'scalecheck'");
+  CHECK_HASNT(metered, "'scalecheck <");
 
   Rig fresh;
   const std::string status = fresh.run("status");
@@ -2332,7 +2668,9 @@ static void testConsoleBasics() {
   CHECK_HAS(status, "blocks auto: up to 16 registers in a request");
   CHECK_HAS(status, "Voltage   stored settings: scale vset = x100/32768, not confirmed on this controller");
   CHECK_HAS(status, "          live readings:   scale vlive = x100/32768, not confirmed on this controller");
-  CHECK_HAS(status, "          'scalecheck' tests what is not confirmed.");
+  CHECK_HAS(status, "          'scalecheck <volts>', with a multimeter reading at the battery, tests the live "
+                    "readings.");
+  CHECK_HAS(status, "          'scalecheck <setting> <volts>', with a setting whose value you know");
 
   CHECK_HAS(rig.run("link"), "Link: slave 1, 9600 8N2, read function 4");
   CHECK_HAS(rig.run("link 19200"), "19200 8N2");
@@ -2612,6 +2950,13 @@ static void testConsoleSet() {
     CHECK_HAS(rig.run("set EV_lvd raw 70000"), "A raw value is a whole number from 0 to 65535");
     CHECK_HAS(rig.run("set EV_lvd raw"), "A raw value is a whole number");
     CHECK_HAS(rig.run("set EV_lvd raw 100"), "That is below");  // 0.31 V: the limits apply to raw values too
+    // A one-byte setting takes a byte.
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x0114"),
+              "EV_tempcomp is one byte: its raw value is a whole number from 0 to 255, or 0x00 to 0xFF.");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 256"), "EV_tempcomp is one byte");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x0100"), "EV_tempcomp is one byte");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x00FF"), "That is above");  // 0.3891 V/C
+    CHECK_HAS(rig.run("set EV_lvd raw 0x0114"), "That is below");       // a whole word takes any word
     CHECK_HAS(rig.run("set Et_float 70000"), "That value does not fit the register.");
     const std::string readOnly = rig.run("set Emodbus_id 2");
     CHECK_HAS(readOnly, "Emodbus_id is read-only in this profile.");
@@ -2986,6 +3331,96 @@ static void testConsoleSet() {
     CHECK_HAS(status, kChanged);
     CHECK_HASNT(status, "may have been changed");
   }
+  {  // A one-byte setting. The controller uses only the low byte of EV_tempcomp, and its other
+     // byte may hold anything: the value is read, shown and compared by the low byte alone.
+    Rig rig;
+    rig.sim.regs[0xE01A] = 0x0114;
+    const std::string got = rig.run("get EV_tempcomp");
+    CHECK_HAS(got, "0.0305 V/C");
+    CHECK_HAS(got, "[0x0114]");
+    CHECK_HASNT(got, "0.4211");
+    // The value it holds is not written again, whatever the high byte holds.
+    const std::string same = rig.run("set EV_tempcomp 0.0305");
+    CHECK_HAS(lineWith(same, "  now  "), "0.0305 V/C");
+    CHECK_HAS(lineWith(same, "  new  "), "[0x0014]");
+    CHECK_HAS(same, "It already holds that value. Nothing to write.");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x14"), "It already holds that value.");
+    CHECK(!rig.console.awaitingConfirmation());
+    CHECK_EQ(rig.sent(0x06), 0);
+    // A new value goes in the low byte, with 0 in the high byte. This controller keeps its high
+    // byte, so it reads back 0x011E: that is the value that was written.
+    rig.sim.keepBits = 0xFF00;
+    const std::string ask = rig.run("set EV_tempcomp 0.0458");
+    CHECK_HAS(lineWith(ask, "  new  "), "0.0458 V/C");
+    CHECK_HAS(lineWith(ask, "  new  "), "[0x001E]");
+    const std::string done = rig.run("yes");
+    CHECK_HAS(done, "Written and read back: EV_tempcomp = 0.0458 V/C [0x011E]");
+    CHECK(rig.sim.requests[rig.sim.requests.size() - 2] ==
+          SimSunSaver::frame(bytes({0x01, 0x06, 0xE0, 0x1A, 0x00, 0x1E})));
+    CHECK_EQ(rig.sim.regs[0xE01A], 0x011E);
+    CHECK(rig.device.resetNeeded());
+    CHECK_HAS(rig.run("set EV_tempcomp 0.0305"), "Type yes to write it.");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_tempcomp = 0.0305 V/C [0x0114]");
+  }
+  {  // The byte that is not used may change while the value stays. A write that is refused, or
+     // lost on the way, then leaves the setting as it was, and no restart is due for it.
+    Rig rig;
+    rig.sim.regs[0xE01A] = 0x0114;
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.regs[0xE01A] = 0x0214;
+    rig.sim.refuseWrites = true;
+    const std::string refused = rig.run("yes");
+    CHECK_HAS(refused, "The controller refused the write (exception 4 (device failure)), and EV_tempcomp still "
+                       "reads 0.0305 V/C [0x0214].\r\n");
+    CHECK_HASNT(refused, "restart");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    rig.sim.refuseWrites = false;
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.regs[0xE01A] = 0x0314;
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    const std::string lost = rig.run("yes");
+    CHECK_HAS(lost, "The controller did not acknowledge the write (no reply), and EV_tempcomp still reads "
+                    "0.0305 V/C [0x0314]: it was not written.\r\n");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    // Nothing comes back at all, so the write is in doubt. The next read finds the value as it
+    // was, under another high byte: the write was not taken.
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    CHECK_HAS(rig.run("yes"), "whether it was written is not known.");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.sim.regs[0xE01A] = 0x0414;
+    CHECK_HAS(rig.run("get EV_tempcomp"), "[0x0414]");
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK(!rig.device.resetNeeded());
+    // A change of the low byte is a change.
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    rig.run("yes");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.sim.regs[0xE01A] = 0x0415;
+    rig.run("get EV_tempcomp");
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK(rig.device.resetNeeded());
+  }
+  {  // A whole word counts whole: a new value that differs from the old one only in its high
+     // byte is a change (9000 s is 0x2328, 9256 s is 0x2428).
+    Rig rig;
+    const std::string ask = rig.run("set Et_float 9256");
+    CHECK_HAS(lineWith(ask, "  new  "), "[0x2428]");
+    CHECK_HAS(ask, "Type yes to write it.");
+    // The acknowledgement and the read-back are lost, so the write is in doubt. The next read
+    // finds the new value, and the restart is due.
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_HAS(rig.run("yes"), "whether it was written is not known.");
+    CHECK_EQ(rig.sim.regs[0xE002], 0x2428);
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("get Et_float"), "9256 s");
+    CHECK(rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+  }
   {  // A profile without a reset command has nothing to say about restarts.
     const std::string noReset = replaced(kMiniProfile, ",\"resetCoil\":\"reset\"", "");
     Rig rig(100.0, noReset.c_str());
@@ -3017,7 +3452,7 @@ static void testConsoleCoilsAndReset() {
     CHECK_HAS(rig.run("reset"), "Type yes to restart it.");
     const std::string restarted = rig.run("yes");
     CHECK_HAS(restarted, "Reset acknowledged.");
-    CHECK_HAS(restarted, "The controller answers again after 3.0 s.");
+    CHECK_HAS(restarted, "The controller answers again after 2.1 s.");
     CHECK_HAS(lineWith(restarted, "V_lvd"), "13.10 V");
     CHECK_EQ(rig.sim.resets, 1);
     CHECK(rig.sim.requests.size() > 20);
@@ -3052,6 +3487,53 @@ static void testConsoleCoilsAndReset() {
     rig.sim.coils.erase(0x0002);
     rig.run("coil charge_disconnect on");
     CHECK_HAS(rig.run("yes"), "The controller refused it: exception 2 (illegal data address).");
+  }
+  {  // What each action does, as the console reads it back: each clears what it names and nothing
+     // else, and the stored totals change only when they are stored.
+    Rig rig;
+    const char *const kCounters[] = {" Ahc_r ", " Ahc_t ", " kWhc ", " Ahl_r ", " Ahl_t ", " hourmeter "};
+    const char *const kStored[] = {" EAhc_r ", " EAhc_t ", " EkWhc ", " EAhl_r ", " EAhl_t ", " Ehourmeter "};
+    const char *const kBefore[] = {"123.4 Ah", "7000.0 Ah", "8.5 kWh", "45.6 Ah", "6554.5 Ah", "4321 h"};
+    const char *const kSteps[] = {"clear_kwh", "clear_ah_total", "clear_ah_resettable"};
+    // After each step, the counters that are 0 by then.
+    const bool kCleared[][6] = {{false, false, true, false, false, false},
+                                {false, true, true, false, true, false},
+                                {true, true, true, true, true, false}};
+    std::string counters = rig.run("dump counters");
+    std::string stored = rig.run("dump totals");
+    for (size_t i = 0; i < 6; ++i) {
+      CHECK_HAS(lineWith(counters, kCounters[i]), kBefore[i]);
+      CHECK_HAS(lineWith(stored, kStored[i]), kBefore[i]);
+    }
+    for (size_t step = 0; step < 3; ++step) {
+      CHECK_HAS(rig.run(std::string("coil ") + kSteps[step] + " on"), "?");
+      CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
+      counters = rig.run("dump counters");
+      stored = rig.run("dump totals");
+      for (size_t i = 0; i < 6; ++i) {
+        const std::string now = lineWith(counters, kCounters[i]);
+        if (kCleared[step][i]) {
+          CHECK_MSG(now.find(" 0.0 ") != std::string::npos, "after %s: %s", kSteps[step], now.c_str());
+        } else {
+          CHECK_MSG(now.find(kBefore[i]) != std::string::npos, "after %s: %s", kSteps[step], now.c_str());
+        }
+        CHECK_HAS(lineWith(stored, kStored[i]), kBefore[i]);  // not stored yet
+      }
+    }
+    // Storing them copies the running totals into the EEPROM, each into its own place and low
+    // word first there: the cleared ones, and the others as they have grown.
+    rig.sim.setU32HiLo(0x0015, 1111);    // Ahc_r
+    rig.sim.setU32HiLo(0x0017, 222222);  // Ahc_t, both words
+    rig.sim.regs[0x0019] = 333;          // kWhc
+    rig.sim.setU32HiLo(0x0021, 66666);   // hourmeter
+    rig.run("coil force_eeprom_update on");
+    CHECK_HAS(rig.run("yes"), "Sent and acknowledged.");
+    stored = rig.run("dump totals");
+    const char *const kAfter[] = {"111.1 Ah", "22222.2 Ah", "33.3 kWh", "0.0 Ah", "0.0 Ah", "66666 h"};
+    for (size_t i = 0; i < 6; ++i) {
+      CHECK_HAS(lineWith(stored, kStored[i]), kAfter[i]);
+    }
+    CHECK_EQ(rig.sim.triggered.size(), 4U);
   }
   {  // The acknowledgement is lost, but the controller has switched. That is not a refusal: the
      // coil is read back, and what it reads is what is said.
@@ -3128,8 +3610,8 @@ static void testConsoleCoilsAndReset() {
     const std::string out = rig.run("yes");
     CHECK_EQ(rig.sim.resets, 1);
     CHECK_HAS(out, "Reset acknowledged.");
-    CHECK_HAS(out, "The controller answers again after 3.0 s.");
-    CHECK(rig.sim.elapsedMs() - t0 >= 3000);
+    CHECK_HAS(out, "The controller answers again after 2.1 s.");
+    CHECK(rig.sim.elapsedMs() - t0 >= rig.sim.resetDownMs);  // not before it is back
     CHECK_HAS(lineWith(out, "array_fault"), "none");
     CHECK_HAS(lineWith(out, "V_lvd"), "13.10 V");
     CHECK_HASNT(rig.run("status"), "Settings were changed");
@@ -3212,9 +3694,19 @@ static void testConsoleCoilsAndReset() {
     rig.run("reset");
     const uint64_t t0 = rig.sim.elapsedMs();
     const std::string out = rig.run("yes");
-    CHECK_HAS(out, "The controller has not answered for 20 s.");
+    CHECK_HAS(out, "The controller has not answered for 21 s.");
     CHECK(rig.sim.elapsedMs() - t0 < 23000);
     CHECK_HASNT(out, "Meters");
+  }
+  {  // An exception is an answer: a controller that refuses the reads is there all along, and
+     // it was not seen to restart.
+    Rig rig;
+    rig.sim.resetWorks = false;
+    rig.run("reset");
+    rig.sim.regs.erase(0x0008);  // adc_vb_f, which the wait reads
+    const std::string out = rig.run("yes");
+    CHECK_HAS(out, "The controller answered all the time for 3.0 s, so it was not seen to restart.");
+    CHECK_HASNT(out, "has not answered");
   }
   {  // A key press ends the wait.
     Rig rig;
@@ -3231,15 +3723,50 @@ static void testConsoleCoilsAndReset() {
     const std::string out = rig.run("yes");
     CHECK_HAS(out, "The controller refused the reset command: exception 2 (illegal data address).");
   }
-  {  // The command is acknowledged but nothing restarts: the fault that is still there says so.
+  {  // The command is acknowledged but nothing restarts. The controller answers every request,
+     // so it was not seen to restart and the restart is still due. Meanwhile it is not asked as
+     // fast as it answers.
     Rig rig;
     rig.sim.resetWorks = false;
     rig.run("set EV_lvr 13.25");
     rig.run("yes");
     rig.run("reset");
+    const uint64_t t0 = rig.sim.elapsedMs();
+    const size_t before = rig.sim.requests.size();
     const std::string out = rig.run("yes");
+    CHECK_HAS(out, "Reset acknowledged.");
+    CHECK_HAS(out, "The controller answered all the time for 3.0 s, so it was not seen to restart.\r\n");
+    CHECK_HASNT(out, "answers again");
     CHECK_HAS(lineWith(out, "array_fault"), "EEPROM setting edit (reset required)");
-    CHECK_HAS(out, "If a fault above still asks for a reset, the controller did not restart");
+    CHECK_HAS(out, "If a fault above still asks for a reset, it did not restart: try 'reset' again or\r\n"
+                   "power-cycle it.\r\n");
+    CHECK(rig.device.resetNeeded());
+    CHECK_HAS(rig.run("status"), "Settings were changed in this session. 'reset' makes the controller use them.");
+    size_t polls = 0;
+    for (size_t i = before; i < rig.sim.requests.size() && rig.sim.requestTimes[i] < t0 + 3100; ++i) {
+      const std::vector<uint8_t> &q = rig.sim.requests[i];
+      if (q.size() == 8 && q[1] == 0x04 && q[2] == 0x00 && q[3] == 0x08 && q[4] == 0x00 && q[5] == 0x01) {
+        ++polls;
+      }
+    }
+    CHECK_MSG(polls >= 10 && polls <= 14, "%zu requests while the restart was awaited", polls);
+    // A write of unknown outcome stays an open question too.
+    Rig unsure;
+    unsure.sim.resetWorks = false;
+    unsure.run("set EV_float 13.60");
+    unsure.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    unsure.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_HAS(unsure.run("yes"), "whether it was written is not known.");
+    CHECK(unsure.device.resetMaybeNeeded());
+    unsure.run("reset");
+    CHECK_HAS(unsure.run("yes"), "so it was not seen to restart.");
+    CHECK(unsure.device.resetMaybeNeeded());
+    // Once it does restart, both are over.
+    unsure.sim.resetWorks = true;
+    unsure.run("reset");
+    CHECK_HAS(unsure.run("yes"), "The controller answers again");
+    CHECK(!unsure.device.resetMaybeNeeded());
+    CHECK(!unsure.device.resetNeeded());
   }
   {  // No link: say so instead of asking for a yes.
     Rig rig;
@@ -3330,6 +3857,12 @@ static void testConsoleRawAndExpert() {
     // OptaView does not know which register a raw request was for, so no read settles it.
     lost.run("get EV_lvd");
     CHECK(lost.device.resetMaybeNeeded());
+    // Nor does a reset that the controller acknowledges and does not act on.
+    lost.sim.resetWorks = false;
+    lost.run("reset anyway");
+    CHECK_HAS(lost.run("yes"), "so it was not seen to restart.");
+    CHECK(lost.device.resetMaybeNeeded());
+    lost.sim.resetWorks = true;
     lost.run("reset anyway");
     CHECK_HAS(lost.run("yes"), "The controller answers again");
     CHECK(!lost.device.resetMaybeNeeded());
@@ -3403,33 +3936,108 @@ static void testScaleCheck() {
   {  // A. The specification as written: readings and settings x100, the target x96.667.
     Rig rig(100.0);
     const std::string out = rig.run("scalecheck");
-    CHECK_HAS(out, "Stored settings (scale vset, now x100/32768). Candidates: x100, x96.667.");
-    CHECK_HAS(out, "  1. Setpoints: 13 in use (14 of 14 read)");
+    CHECK_HAS(out, "Stored settings (scale vset, now x100/32768). Candidates: x100, x96.667.\r\n"
+                   "  1. Round setpoints: 13 in use (14 of 14 read). They look round at the scale that wrote them.\r\n"
+                   "     This only points: settings that OptaView or another tool wrote with a wrong scale look\r\n"
+                   "     round at that wrong scale.\r\n");
     CHECK_HAS(out, "at x100, 13 of 13 are multiples of 0.05 V");
-    CHECK_HAS(out, "at x96.667, 1 of 13 is a multiple of 0.05 V");
+    CHECK_HAS(out, "at x96.667, 1 of 13 is a multiple of 0.05 V\r\n     -> x100\r\n");
+    CHECK_HAS(out, "  2. A setting you know: none given.\r\n"
+                   "     -> read one in MSView (Morningstar's own program), then: scalecheck <setting> <volts>\r\n");
     CHECK_HAS(out, "Live readings (scale vlive, now x100/32768). Candidates: x100, x96.667.");
-    CHECK_HAS(out, "the controller is holding the battery at its target (Vb_ref = 13.70 V).");
-    CHECK_HAS(out, "Vb_f reads 13.70 V at x100, 13.24 V at x96.667");
-    CHECK_HAS(out, "  3. Multimeter: no reading given.");
+    CHECK_HAS(out, "  3. Regulation: in FLOAT (7) the controller works to hold the battery at Vb_ref = 13.70 V.\r\n"
+                   "     This only points: the battery is not always at its target in this state (too little sun\r\n"
+                   "     for the load), and one that is below it can read as on it at another scale.\r\n");
+    CHECK_HAS(out, "Vb_f reads 13.70 V at x100, 13.24 V at x96.667\r\n     -> x100\r\n");
+    CHECK_HAS(out, "  4. Multimeter: no reading given.");
+    // Neither the round setpoints nor the regulation test is proof: settings that a tool wrote
+    // with a wrong scale look round at it (case F), and see case E for the regulation test.
     CHECK_HAS(out, "Verdict\r\n"
-                   "  Stored settings: x100, which is what OptaView uses now.\r\n"
-                   "  Live readings:   x100, which is what OptaView uses now.\r\n");
+                   "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.\r\n"
+                   "     A setting whose value you know settles it: scalecheck <setting> <volts>\r\n"
+                   "  Live readings:   cannot tell yet. A multimeter reading settles it: scalecheck <volts>\r\n");
     CHECK_HASNT(out, "The two differ");
     CHECK_HASNT(out, "That holds only if");
-    // Settled: the reminders stop.
-    CHECK_HASNT(rig.run("live"), "Note: voltages are shown");
+    CHECK_HASNT(out, "switches to that");  // only when they point away from the scale in use
+    // Nothing is settled, so both reminders stay.
+    CHECK_HAS(rig.run("set EV_lvd 13.10"), "is not confirmed");
+    rig.run("no");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 0);
+
+    // A setting whose value is known from elsewhere settles the stored settings.
+    const std::string known = rig.run("scalecheck EV_float 13.70");
+    CHECK_HAS(known, "  2. A setting you know: EV_float = 13.70 V, which with the raw value works out to x100.00.\r\n"
+                     "       EV_float reads 13.70 V at x100, 13.24 V at x96.667\r\n"
+                     "     -> x100\r\n");
+    CHECK_HAS(known, "  Stored settings: x100, which is what OptaView uses now.\r\n"
+                     "  Live readings:   cannot tell yet.");
+    CHECK_HASNT(known, "The round setpoints point at");  // they agree
+    // The settings are settled, so their reminder stops. The readings' reminder stays.
     CHECK_HASNT(rig.run("set EV_lvd 13.10"), "is not confirmed");
     rig.run("no");
-    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
+    CHECK_HAS(rig.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 1);
+    // A check without a setting leaves what was found as it is.
+    CHECK_HAS(rig.run("scalecheck"), "  Stored settings: cannot tell yet.");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 1);
 
     const std::string metered = rig.run("scalecheck 13.68");
     CHECK_HAS(metered, "13.68 V measured, which with the register value works out to x99.9");
     CHECK_HAS(metered, "adc_vb_f reads 13.68 V at x100, 13.23 V at x96.667");
     CHECK_HAS(metered, "  Live readings:   x100, which is what OptaView uses now.");
     CHECK_HASNT(metered, "The regulation test disagrees");
+    // Settled: the reminders stop.
+    CHECK_HASNT(rig.run("live"), "Note: voltages are shown");
+    CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
     CHECK_HAS(rig.run("scalecheck twelve"), "Usage: scalecheck");
     CHECK_HAS(rig.run("scalecheck -3"), "Usage: scalecheck");
     CHECK_HAS(rig.run("scalecheck 0"), "Usage: scalecheck");
+    CHECK_HAS(rig.run("scalecheck EV_float"), "Usage: scalecheck");
+    CHECK_HAS(rig.run("scalecheck EV_float 0"), "Usage: scalecheck");
+    CHECK_HAS(rig.run("scalecheck EV_float -13.7"), "Usage: scalecheck");
+    CHECK_HAS(rig.run("scalecheck 13.68 13.70"), "Usage: scalecheck");
+    CHECK_HAS(rig.run("scalecheck EV_float 13.70 EV_lvd 11.50"), "Usage: scalecheck");
+    CHECK_HAS(rig.run("scalecheck 13.68 EV_float 13.70 x"), "Usage: scalecheck");
+    const size_t before = rig.sim.requests.size();
+    CHECK_HAS(rig.run("scalecheck nope 13.70"), "There is no register called nope. 'dump' lists them.");
+    CHECK_HAS(rig.run("scalecheck adc_vb_f 13.68"),
+              "adc_vb_f is not a stored voltage setting on the scale vset, so it cannot test that scale.");
+    CHECK_HAS(rig.run("scalecheck Et_float 9000"), "Et_float is not a stored voltage setting");
+    CHECK_EQ(rig.sim.requests.size(), before);  // refused before anything was read
+    // Both at once, in either order, and names in any case.
+    const std::string both = rig.run("scalecheck 13.68 ev_float 13.70");
+    CHECK_HAS(both, "  Stored settings: x100, which is what OptaView uses now.\r\n"
+                    "  Live readings:   x100, which is what OptaView uses now.");
+    CHECK_HAS(both, "  2. A setting you know: EV_float = 13.70 V,");
+    const std::string turned = rig.run("scalecheck EV_float 13.70 13.68");
+    CHECK_HAS(turned, "  Stored settings: x100, which is what OptaView uses now.\r\n"
+                      "  Live readings:   x100, which is what OptaView uses now.");
+  }
+  {  // The battery voltage that the PC preview's 'sim battery' sets reaches every reading of it.
+     // The regulation test compares the slow-filtered one with the target, and a battery that
+     // has fallen well below its target matches no candidate there.
+    Rig rig(100.0);
+    rig.sim.setBattery(12.40);
+    const std::string out = rig.run("scalecheck 12.40");
+    CHECK_HAS(out, "Vb_f reads 12.40 V at x100, 11.99 V at x96.667\r\n     -> no candidate matches the target\r\n");
+    CHECK_HAS(out, "adc_vb_f reads 12.40 V at x100, 11.99 V at x96.667");
+    CHECK_HAS(out, "  Live readings:   x100, which is what OptaView uses now.");
+    CHECK_HASNT(out, "The regulation test disagrees");
+    // The lowest and highest voltage of the day and since the last reset take it in.
+    std::string daily = rig.run("dump daily");
+    CHECK_HAS(lineWith(daily, " Vb_min_daily "), "12.40 V");  // it was 12.60
+    CHECK_HAS(lineWith(daily, " Vb_max_daily "), "14.10 V");
+    CHECK_HAS(lineWith(daily, " vb_min "), "11.90 V");        // lower already
+    CHECK_HAS(lineWith(daily, " vb_max "), "14.90 V");
+    rig.sim.setBattery(15.10);
+    daily = rig.run("dump daily");
+    CHECK_HAS(lineWith(daily, " Vb_min_daily "), "12.40 V");
+    CHECK_HAS(lineWith(daily, " Vb_max_daily "), "15.10 V");
+    CHECK_HAS(lineWith(daily, " vb_min "), "11.90 V");
+    CHECK_HAS(lineWith(daily, " vb_max "), "15.10 V");
+    rig.sim.setBattery(11.50);
+    CHECK_HAS(lineWith(rig.run("dump daily"), " vb_min "), "11.50 V");
+    CHECK_HAS(rig.run("get Vb_f"), "11.50 V");
   }
   {  // B. Everything x96.667, as the TankAlarm client assumes.
     Rig rig(96.667);
@@ -3441,8 +4049,11 @@ static void testScaleCheck() {
     CHECK_HASNT(rig.run("dump load"), "Note: voltages are shown");
     const std::string out = rig.run("scalecheck");
     CHECK_HAS(out, "at x96.667, 13 of 13 are multiples of 0.05 V");
-    CHECK_HAS(out, "  Stored settings: x96.667, not the x100 that OptaView uses now.\r\n"
-                   "     'scale vset 96.667' switches it until OptaView restarts. Correct the profile file too.");
+    // They point away from the scale in use, which is worth knowing, but they decide nothing.
+    CHECK_HAS(out, "  Stored settings: cannot tell yet. The setpoints point at x96.667, not the x100 that OptaView "
+                   "uses now.\r\n"
+                   "     If they were set at the factory or with MSView, 'scale vset 96.667' switches to that.\r\n"
+                   "     A setting whose value you know settles it: scalecheck <setting> <volts>\r\n");
     // The battery matches the target at x96.667, but that alone cannot overturn the scale in
     // use: case C looks exactly the same from here.
     CHECK_HAS(out, "Vb_f reads 14.17 V at x100, 13.70 V at x96.667\r\n     -> x96.667\r\n");
@@ -3453,12 +4064,18 @@ static void testScaleCheck() {
     CHECK_HAS(warned, "is not confirmed");
     CHECK_HAS(lineWith(warned, "  new  "), "[0x10C5]");  // what x100 makes of 13.10 V: wrong for this controller
     rig.run("no");
+    // Nothing was found, so the reminders, given once already, do not come back.
+    CHECK_HASNT(rig.run("dump load"), "Note: voltages are shown");
+    CHECK_HASNT(rig.run("live"), "Note: voltages are shown");
+
+    const std::string metered = rig.run("scalecheck 13.68 EV_float 13.70");
+    CHECK_HAS(metered, "EV_float reads 14.17 V at x100, 13.70 V at x96.667\r\n     -> x96.667\r\n");
+    CHECK_HAS(metered, "  Stored settings: x96.667, not the x100 that OptaView uses now.\r\n"
+                       "     'scale vset 96.667' switches it until OptaView restarts. Correct the profile file too.");
+    CHECK_HASNT(metered, "The round setpoints point at");  // they agree with the setting
     // The check found the settings' scale in use to be wrong, so the reminder about it is back.
     CHECK_HAS(rig.run("dump load"), "(stored settings x100/32768). 'scalecheck' tests it.");
     CHECK_HASNT(rig.run("dump load"), "Note: voltages are shown");
-    CHECK_HASNT(rig.run("live"), "Note: voltages are shown");  // nothing new was found about the readings
-
-    const std::string metered = rig.run("scalecheck 13.68");
     CHECK_HAS(metered, "works out to x96.67");
     CHECK_HAS(metered, "  Live readings:   x96.667, not the x100 that OptaView uses now.\r\n"
                        "     'scale vlive 96.667' switches it until OptaView restarts. Correct the profile file too.");
@@ -3485,7 +4102,7 @@ static void testScaleCheck() {
     CHECK_HAS(rig.run("scale vlive 96.667"), "vlive is now x96.667/32768 until OptaView restarts.");
     CHECK_HAS(lineWith(rig.run("live"), "adc_vb_f"), "13.68 V");
     // Checking again with both switched agrees with itself.
-    const std::string again = rig.run("scalecheck 13.68");
+    const std::string again = rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_HAS(again, "Stored settings (scale vset, now x96.667/32768). Candidates: x96.667, x100.");
     // Confirmed, but only for this session: the profile file is where it has to be put right.
     CHECK_HAS(again, "  Stored settings: x96.667, which is what OptaView uses now.\r\n"
@@ -3497,26 +4114,44 @@ static void testScaleCheck() {
   {  // C. Everything x100, the target too: the specification's 96.667 for Vb_ref is the mistake.
     Rig rig(100.0, OV_BUILTIN_PROFILE, 100.0, 100.0);
     const std::string out = rig.run("scalecheck");
-    CHECK_HAS(out, "  Stored settings: x100, which is what OptaView uses now.");
-    CHECK_HAS(out, "the controller is holding the battery at its target (Vb_ref = 13.24 V).");
+    CHECK_HAS(out, "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.");
+    CHECK_HAS(out, "the controller works to hold the battery at Vb_ref = 13.24 V.");
     CHECK_HAS(out, "Vb_f reads 13.70 V at x100, 13.24 V at x96.667\r\n     -> x96.667\r\n");
     // The readings are right as they are. The regulation test must not talk OptaView out of it.
     CHECK_HAS(out, "  Live readings:   cannot tell yet.");
     CHECK_HASNT(out, "'scale vlive");
-    const std::string metered = rig.run("scalecheck 13.68");
+    const std::string metered = rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_HAS(metered, "  Live readings:   x100, which is what OptaView uses now.\r\n"
-                       "     The regulation test disagrees. If the multimeter is right, the target's own scale (vref)\r\n"
-                       "     is the one that is off: 'scale vref 100' would put Vb_ref at the battery voltage.");
+                       "     The regulation test disagrees. If the multimeter is right, either the battery is not at its\r\n"
+                       "     target just now, or the target's own scale (vref) is off: 'scale vref 100' would put Vb_ref\r\n"
+                       "     at the battery voltage.\r\n");
     CHECK_HASNT(rig.run("live"), "Note: voltages are shown");  // both settled
     // The battery a little off its target still names the known figure, not 100.4.
     rig.sim.regs[0x0013] = rig.sim.volts(13.76);
-    CHECK_HAS(rig.run("scalecheck 13.68"), "'scale vref 100' would put Vb_ref at the battery voltage.");
+    CHECK_HAS(rig.run("scalecheck 13.68"), "'scale vref 100' would put Vb_ref\r\n     at the battery voltage.");
     rig.sim.regs[0x0013] = rig.sim.volts(13.70);
     CHECK_HAS(rig.run("scale vref 100"), "vref is now x100/32768");
     const std::string fixed = rig.run("scalecheck 13.68");
-    CHECK_HAS(fixed, "(Vb_ref = 13.70 V)");
+    CHECK_HAS(fixed, "at Vb_ref = 13.70 V.");
     CHECK_HASNT(fixed, "The regulation test disagrees");
     CHECK_HASNT(fixed, "That holds only if");
+    // At night the controller holds the battery at no target, so a battery away from Vb_ref is
+    // no disagreement: the same controller in NIGHT gets no such hint.
+    Rig night(100.0, OV_BUILTIN_PROFILE, 100.0, 100.0);
+    night.sim.regs[0x0011] = 3;
+    const std::string dark = night.run("scalecheck 13.68");
+    CHECK_HAS(dark, "the controller is in NIGHT (3), not holding the battery at its target");
+    CHECK_HAS(dark, "  Live readings:   x100, which is what OptaView uses now.\r\n");
+    CHECK_HASNT(dark, "The regulation test disagrees");
+    // Nor is a target register that reads 0 compared with, even with a battery reading so small
+    // (0.15 V, 50 raw) that only x96.667 would put it within 0.15 V of zero.
+    Rig zero(100.0, OV_BUILTIN_PROFILE, 100.0, 100.0);
+    zero.sim.regs[0x0013] = 50;
+    zero.sim.regs[0x0014] = 0;
+    const std::string flat = zero.run("scalecheck 13.68");
+    CHECK_HAS(flat, "  3. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
+    CHECK_HAS(flat, "  Live readings:   x100, which is what OptaView uses now.\r\n");
+    CHECK_HASNT(flat, "The regulation test disagrees");
   }
   {  // D. Readings x96.667 and settings x100: one figure for what the controller measures,
      // another for what it is told. The case a single voltage scale gets wrong.
@@ -3524,9 +4159,9 @@ static void testScaleCheck() {
     CHECK_HAS(lineWith(rig.run("live"), "adc_vb_f"), "14.15 V");
     const std::string out = rig.run("scalecheck");
     CHECK_HAS(out, "at x100, 13 of 13 are multiples of 0.05 V");
-    CHECK_HAS(out, "  Stored settings: x100, which is what OptaView uses now.");
+    CHECK_HAS(out, "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.");
     CHECK_HAS(out, "  Live readings:   cannot tell yet.");
-    const std::string metered = rig.run("scalecheck 13.68");
+    const std::string metered = rig.run("scalecheck 13.68 EV_lvr 12.60");
     CHECK_HAS(metered, "works out to x96.67");
     CHECK_HAS(metered, "  Stored settings: x100, which is what OptaView uses now.\r\n"
                        "  Live readings:   x96.667, not the x100 that OptaView uses now.\r\n"
@@ -3551,17 +4186,64 @@ static void testScaleCheck() {
     rig.run("yes");
     // After the restart the controller acts on 13.10 V, and the reading of it says so.
     CHECK_HAS(lineWith(rig.run("live"), " V_lvd "), "13.10 V");
-    const std::string again = rig.run("scalecheck 13.68");
+    // What OptaView wrote cannot vouch for the scale it was written with.
+    const size_t sent = rig.sim.requests.size();
+    CHECK_HAS(rig.run("scalecheck EV_lvd 13.10"),
+              "OptaView has written EV_lvd since it started, with the scale this would test, so it cannot test it.\r\n"
+              "Give a setting that MSView shows and that OptaView has not written.\r\n");
+    CHECK_HAS(rig.run("scalecheck 13.68 EV_lvr 13.25"), "OptaView has written EV_lvr since it started");
+    CHECK_EQ(rig.sim.requests.size(), sent);  // refused before anything was read
+    const std::string again = rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_HAS(again, "  Stored settings: x100, which is what OptaView uses now.\r\n"
                      "  Live readings:   x96.667, which is what OptaView uses now.\r\n"
                      "     The profile file still has x100: correct it there, or OptaView starts with that again.\r\n"
                      "  The two differ on this controller.");
   }
-  {  // At night the regulation test does not apply. The setpoints still settle the settings;
-     // the readings wait for a multimeter.
+  {  // E. Readings x96.667 again, and a battery below its target: in float until Et_float_exit_cum
+     // runs out, or in absorption without the sun to get there. 3.3 % below, it reads as on its
+     // target at x100, the scale in use. The regulation test points there and must not confirm it.
+    Rig rig(96.667, OV_BUILTIN_PROFILE, 100.0, 96.667);
+    rig.sim.regs[0x0008] = rig.sim.volts(13.24);  // adc_vb_f
+    rig.sim.regs[0x0013] = rig.sim.volts(13.24);  // Vb_f
+    const std::string out = rig.run("scalecheck");
+    CHECK_HAS(out, "the controller works to hold the battery at Vb_ref = 13.70 V.");
+    CHECK_HAS(out, "Vb_f reads 13.70 V at x100, 13.24 V at x96.667\r\n     -> x100\r\n");
+    CHECK_HAS(out, "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.\r\n"
+                   "     A setting whose value you know settles it: scalecheck <setting> <volts>\r\n"
+                   "  Live readings:   cannot tell yet. A multimeter reading settles it: scalecheck <volts>\r\n");
+    CHECK_HAS(rig.run("status"), "live readings:   scale vlive = x100/32768, not confirmed on this controller");
+    CHECK_HAS(rig.run("live"), "      (live readings x100/32768). 'scalecheck' tests it.");
+    // The multimeter tells, and the console names both things that can be behind the disagreement.
+    const std::string metered = rig.run("scalecheck 13.24");
+    CHECK_HAS(metered, "  Live readings:   x96.667, not the x100 that OptaView uses now.\r\n");
+    CHECK_HAS(metered, "     The regulation test disagrees. If the multimeter is right, either the battery is not at its\r\n"
+                       "     target just now, or the target's own scale (vref) is off");
+    CHECK_HAS(rig.run("status"),
+              "live readings:   scale vlive = x100/32768, but 'scalecheck' found x96.667 on this controller");
+  }
+  {  // F. Settings that a tool wrote with the wrong scale. The controller stores x96.667, but every
+     // setpoint went in at x100 (OptaView in an earlier session, say, or the TankAlarm client), so
+     // they are round at x100 and the controller works to 3.3 % less. MSView shows what it uses:
+     // 13.24 V for the float voltage that was meant to be 13.70 V.
+    Rig rig(100.0);
+    CHECK_HAS(rig.run("scalecheck"),
+              "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.");
+    const std::string known = rig.run("scalecheck EV_float 13.24");
+    CHECK_HAS(known, "       EV_float reads 13.70 V at x100, 13.24 V at x96.667\r\n     -> x96.667\r\n");
+    CHECK_HAS(known, "  Stored settings: x96.667, not the x100 that OptaView uses now.\r\n"
+                     "     'scale vset 96.667' switches it until OptaView restarts. Correct the profile file too.\r\n"
+                     "     The round setpoints point at x100 instead. If the value you gave is right, some of them were\r\n"
+                     "     written with a wrong scale: 'dump' shows them.\r\n");
+    CHECK_HAS(rig.run("status"),
+              "stored settings: scale vset = x100/32768, but 'scalecheck' found x96.667 on this controller");
+    CHECK_HAS(rig.run("set EV_lvd 13.10"), "is not confirmed");
+    rig.run("no");
+  }
+  {  // At night the regulation test does not apply. A setting still settles the settings; the
+     // readings wait for a multimeter.
     Rig rig(100.0);
     rig.sim.regs[0x0011] = 3;
-    const std::string out = rig.run("scalecheck");
+    const std::string out = rig.run("scalecheck EV_lvd 11.50");
     CHECK_HAS(out, "the controller is in NIGHT (3), not holding the battery at its target");
     CHECK_HAS(out, "     -> cannot tell now; try again in absorption or float");
     CHECK_HAS(out, "  Stored settings: x100, which is what OptaView uses now.");
@@ -3569,7 +4251,8 @@ static void testScaleCheck() {
     const std::string status = rig.run("status");
     CHECK_HAS(status, "stored settings: scale vset = x100/32768, confirmed by 'scalecheck'");
     CHECK_HAS(status, "live readings:   scale vlive = x100/32768, not confirmed on this controller");
-    CHECK_HAS(status, "'scalecheck' tests what is not confirmed.");
+    CHECK_HAS(status, "'scalecheck <volts>', with a multimeter reading at the battery, tests the live readings.");
+    CHECK_HASNT(status, "tests the stored settings");
     CHECK_HASNT(rig.run("set EV_lvd 13.10"), "is not confirmed");
     rig.run("no");
     // The reminder now names the one scale that is still open.
@@ -3587,13 +4270,26 @@ static void testScaleCheck() {
     }
     const std::string out = rig.run("scalecheck");
     CHECK_HAS(out, "     -> too few round setpoints to tell");
-    CHECK_HAS(out, "  Stored settings: cannot tell from these setpoints.\r\n"
-                   "     If you know what one of them was set to, 'get <name>' shows whether this scale reads it right.");
+    CHECK_HAS(out, "  Stored settings: cannot tell yet, and the setpoints do not point anywhere.\r\n"
+                   "     A setting whose value you know settles it: scalecheck <setting> <volts>\r\n");
     CHECK_HAS(out, "  Live readings:   cannot tell yet.");
     CHECK_HAS(rig.run("dump"), "(live readings x100/32768, stored settings x100/32768). 'scalecheck' tests them.");
+    // A setting still settles the settings, without round setpoints: 11.515 V, read as 11.52.
+    const std::string known = rig.run("scalecheck EV_lvd 11.52");
+    CHECK_HAS(known, "       EV_lvd reads 11.51 V at x100, 11.13 V at x96.667\r\n     -> x100\r\n");
+    CHECK_HAS(known, "  Stored settings: x100, which is what OptaView uses now.");
+    CHECK_HASNT(known, "The round setpoints point at");  // they point nowhere
+    // One that fits no candidate decides nothing, takes back what was found, and says what it
+    // would mean.
+    const std::string misfit = rig.run("scalecheck EV_lvd 12.00");
+    CHECK_HAS(misfit, "     -> no candidate is within 0.5 % of that value");
+    CHECK_HAS(misfit, "  Stored settings: the setting you gave fits none of the candidates, so this stays open.\r\n"
+                      "     That takes back what an earlier check found (x100).\r\n"
+                      "     If the value is right, the scale is x104.22: 'scale vset 104.22' uses that.\r\n");
+    CHECK_HAS(rig.run("status"), "stored settings: scale vset = x100/32768, not confirmed on this controller");
     // A multimeter settles the readings, and only the readings.
     const std::string metered = rig.run("scalecheck 13.70");
-    CHECK_HAS(metered, "  Stored settings: cannot tell from these setpoints.");
+    CHECK_HAS(metered, "  Stored settings: cannot tell yet, and the setpoints do not point anywhere.");
     CHECK_HAS(metered, "  Live readings:   x100, which is what OptaView uses now.");
     CHECK_HAS(rig.run("set EV_lvd 13.10"), "is not confirmed");
     rig.run("no");
@@ -3612,7 +4308,7 @@ static void testScaleCheck() {
     CHECK_HAS(out, "  Live readings:   the multimeter fits none of the candidates, so this stays open.");
     CHECK_HAS(rig.run("status"), "live readings:   scale vlive = x100/32768, not confirmed on this controller");
     // A verdict against the scale in use takes back an earlier confirmation.
-    rig.run("scalecheck 13.68");
+    rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
     rig.run("scalecheck 13.22");
     CHECK_HAS(rig.run("status"),
@@ -3620,11 +4316,11 @@ static void testScaleCheck() {
     // A battery register that reads 0 cannot be compared with anything.
     rig.sim.regs[0x0008] = 0;
     const std::string dead = rig.run("scalecheck 13.68");
-    CHECK_HAS(dead, "  3. Multimeter: adc_vb_f reads 0, so there is nothing to compare the reading with.");
-    CHECK_HAS(dead, "  Live readings:   x100, which is what OptaView uses now.");  // regulation still confirms
+    CHECK_HAS(dead, "  4. Multimeter: adc_vb_f reads 0, so there is nothing to compare the reading with.");
+    CHECK_HAS(dead, "  Live readings:   cannot tell: test 4 could not compare the multimeter reading.");
     rig.sim.regs[0x0013] = 0;
     const std::string flat = rig.run("scalecheck");
-    CHECK_HAS(flat, "  2. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
+    CHECK_HAS(flat, "  3. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
     CHECK_HAS(flat, "  Live readings:   cannot tell yet.");
   }
   {  // Blank or damaged EEPROM cells are not settings that somebody chose. 0xFFFF would look
@@ -3639,30 +4335,78 @@ static void testScaleCheck() {
     rig.sim.regs[0xE031] = 0x0001;
     rig.sim.regs[0xE032] = 0x0010;
     const std::string out = rig.run("scalecheck");
-    CHECK_HAS(out, "  1. Setpoints: 3 in use (14 of 14 read)");
+    CHECK_HAS(out, "  1. Round setpoints: 3 in use (14 of 14 read)");
     CHECK_HAS(out, "     -> too few round setpoints to tell");
-    CHECK_HAS(out, "  Stored settings: cannot tell from these setpoints.");
+    CHECK_HAS(out, "  Stored settings: cannot tell yet, and the setpoints do not point anywhere.");
+    // Nor is such a cell a setting to compare a known value with.
+    const std::string blank = rig.run("scalecheck EV_float 13.70");
+    CHECK_HAS(blank, "  2. A setting you know: EV_float holds 0xFFFF, outside its limits at every candidate:\r\n"
+                     "     no setting to compare the value with.\r\n");
+    CHECK_HAS(blank, "  Stored settings: cannot tell: test 2 could not compare the setting you gave.");
+    CHECK_HASNT(blank, "If the value is right");
     // With one more real setpoint there are enough again, and they say what they said before.
     rig.sim.regs[0xE000] = rig.sim.setVolts(14.00);
     const std::string enough = rig.run("scalecheck");
-    CHECK_HAS(enough, "  1. Setpoints: 4 in use (14 of 14 read)");
+    CHECK_HAS(enough, "  1. Round setpoints: 4 in use (14 of 14 read)");
     CHECK_HAS(enough, "at x96.667, 4 of 4 are multiples of 0.05 V");
-    CHECK_HAS(enough, "  Stored settings: x96.667, not the x100 that OptaView uses now.");
+    CHECK_HAS(enough, "  Stored settings: cannot tell yet. The setpoints point at x96.667, not the x100 that OptaView "
+                      "uses now.");
+  }
+  {  // The same goes for a write that got no answer, and for one sent with 'raw'; the registers
+     // around them still serve.
+    Rig rig(96.667, OV_BUILTIN_PROFILE, 100.0, 96.667);
+    rig.run("set EV_lvd 13.10");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    rig.run("yes");
+    CHECK_HAS(rig.run("scalecheck EV_lvd 11.50"), "OptaView has written EV_lvd since it started");
+    rig.run("expert on");
+    rig.run("raw 1 6 0xE023 0x1000");
+    CHECK_HAS(rig.run("yes"), "Acknowledged.");
+    CHECK_HAS(rig.run("scalecheck ev_lvr 12.50"), "OptaView has written EV_lvr since it started");
+    rig.run("raw 1 5 0x0001 0xFF00");  // a coil is no register
+    rig.run("yes");
+    CHECK_HAS(rig.run("scalecheck EV_soc_r2y 12.40"), "  Stored settings: x100, which is what OptaView uses now.");
+    // Another controller does not make OptaView's own values any more telling.
+    rig.run("slave 2");
+    rig.sim.slaveId = 2;
+    CHECK_HAS(rig.run("scalecheck EV_lvd 11.50"), "OptaView has written EV_lvd since it started");
+  }
+  {  // Past what it can remember, every register counts as written.
+    Rig many;
+    for (uint16_t a = 0; a < OV_WRITTEN_MAX; ++a) {
+      many.device.noteRegisterWritten((uint16_t)(0x9000 + a));
+    }
+    CHECK(!many.device.wroteRegister(0xE001));
+    many.device.noteRegisterWritten(0x9000);  // already listed: nothing changes
+    CHECK(!many.device.wroteRegister(0xE001));
+    many.device.noteRegisterWritten(0x8000);
+    CHECK(many.device.wroteRegister(0xE001));
+    CHECK_HAS(many.run("scalecheck EV_float 13.70"), "OptaView has written EV_float since it started");
   }
   {  // Setpoints that cannot be read are left out, not counted as zero.
     Rig rig(100.0);
     rig.sim.regs.erase(0xE030);
     rig.sim.regs.erase(0xE031);
     const std::string out = rig.run("scalecheck");
-    CHECK_HAS(out, "  1. Setpoints: 11 in use (12 of 14 read)");
-    CHECK_HAS(out, "  Stored settings: x100, which is what OptaView uses now.");
+    CHECK_HAS(out, "  1. Round setpoints: 11 in use (12 of 14 read)");
+    CHECK_HAS(out, "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.");
     // The regulation registers missing: that test says so and the rest goes on.
     rig.sim.regs.erase(0x0014);
     const std::string blind = rig.run("scalecheck 13.68");
-    CHECK_HAS(blind, "  2. Regulation: the registers could not be read.");
+    CHECK_HAS(blind, "  3. Regulation: the registers could not be read.");
     CHECK_HAS(blind, "  Live readings:   x100, which is what OptaView uses now.");
     rig.sim.regs.erase(0x0008);
-    CHECK_HAS(rig.run("scalecheck 13.68"), "  3. Multimeter: the register could not be read.");
+    CHECK_HAS(rig.run("scalecheck 13.68"), "  4. Multimeter: the register could not be read.");
+    // A setting that cannot be read decides nothing either.
+    const std::string unread = rig.run("scalecheck EV_soc_y2g 13.10");
+    CHECK_HAS(unread, "  2. A setting you know: EV_soc_y2g could not be read.\r\n");
+    CHECK_HAS(unread, "  Stored settings: cannot tell: test 2 could not compare the setting you gave.");
+    // And one that reads 0 is switched off, not set.
+    const std::string off = rig.run("scalecheck EV_eq 14.40");
+    CHECK_HAS(off, "  2. A setting you know: EV_eq reads 0, so there is nothing to compare the value with.\r\n");
+    CHECK_HAS(off, "  Stored settings: cannot tell: test 2 could not compare the setting you gave.");
   }
   {  // A profile of one's own may name no alternates and give a setpoint no limits. Then there is
      // one candidate, which any match confirms, and nothing but its value says whether a setpoint
@@ -3677,25 +4421,27 @@ static void testScaleCheck() {
     rig.sim.regs[10] = 30;                           // target: 0.09 V
     const std::string dead = rig.run("scalecheck");
     CHECK_HAS(dead, "Stored settings (scale vs, now x100/32768). Candidates: x100.\r\n");
-    CHECK_HAS(dead, "  1. Setpoints: 1 in use (2 of 2 read)");
+    CHECK_HAS(dead, "  1. Round setpoints: 1 in use (2 of 2 read)");
     CHECK_HAS(dead, "at x100, 1 of 1 is a multiple of 0.05 V");
     CHECK_HAS(dead, "Live readings (scale vl, now x100/32768). Candidates: x100.\r\n");
-    CHECK_HAS(dead, "  2. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
+    CHECK_HAS(dead, "  3. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
     CHECK_HAS(dead, "  Live readings:   cannot tell yet.");
     // The same with a battery reading and no target.
     rig.sim.regs[9] = 30;
     rig.sim.regs[10] = 0;
     const std::string aimless = rig.run("scalecheck");
-    CHECK_HAS(aimless, "  2. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
+    CHECK_HAS(aimless, "  3. Regulation: the battery or the target register reads 0.\r\n     -> cannot tell\r\n");
     CHECK_HAS(aimless, "  Live readings:   cannot tell yet.");
     CHECK_HAS(rig.run("status"), "not confirmed on this controller");
-    // With both there, the one candidate is confirmed by a battery at its target.
+    // With both there, a battery at its target points at the one candidate. Only a multimeter
+    // confirms it, even then.
     rig.sim.regs[9] = rig.sim.volts(13.70);
     rig.sim.regs[10] = rig.sim.refVolts(13.70);
     const std::string held = rig.run("scalecheck");
-    CHECK_HAS(held, "the controller is holding the battery at its target (target = 13.70 V).");
+    CHECK_HAS(held, "the controller works to hold the battery at target = 13.70 V.");
     CHECK_HAS(held, "slow reads 13.70 V at x100\r\n     -> x100\r\n");
-    CHECK_HAS(held, "  Live readings:   x100, which is what OptaView uses now.");
+    CHECK_HAS(held, "  Live readings:   cannot tell yet.");
+    CHECK_HAS(rig.run("scalecheck 13.68"), "  Live readings:   x100, which is what OptaView uses now.");
   }
   {  // No link.
     Rig rig;
@@ -3735,16 +4481,16 @@ static void testScaleCheck() {
     const uint16_t three[] = {4588, 4489, 3768};
     ovJudgeSetpoints(&settings, three, 3, 32768.0, 0.05);
     CHECK_EQ(settings.fits[0], 3);
-    CHECK_EQ(settings.verdict, -1);  // three setpoints are too few to call it
+    CHECK_EQ(settings.roundVerdict, -1);  // three setpoints are too few to call it
     // Truncated instead of rounded by whoever programmed them: still on the grid.
     const uint16_t truncated[] = {4587, 4489, 3768, 4128, 4292};
     ovJudgeSetpoints(&settings, truncated, 5, 32768.0, 0.05);
     CHECK_EQ(settings.fits[0], 5);
-    CHECK_EQ(settings.verdict, 0);
+    CHECK_EQ(settings.roundVerdict, 0);
     // Values on a 0.01 V grid only: no pattern, no verdict.
     const uint16_t odd[] = {4594, 4496, 3775, 4135, 4300, 4391};
     ovJudgeSetpoints(&settings, odd, 6, 32768.0, 0.05);
-    CHECK_EQ(settings.verdict, -1);
+    CHECK_EQ(settings.roundVerdict, -1);
     // Most of the setpoints have to be round under the winner: six of ten are enough, five of
     // ten are not. The others here sit 0.02 V off a round value and are round under neither.
     const uint16_t sixOfTen[] = {4588, 4489, 3768, 4129, 4293, 4719,  // 14.00 13.70 11.50 12.60 13.10 14.40
@@ -3752,13 +4498,13 @@ static void testScaleCheck() {
     ovJudgeSetpoints(&settings, sixOfTen, 10, 32768.0, 0.05);
     CHECK_EQ(settings.fits[0], 6);
     CHECK_EQ(settings.fits[1], 0);
-    CHECK_EQ(settings.verdict, 0);
+    CHECK_EQ(settings.roundVerdict, 0);
     const uint16_t fiveOfTen[] = {4588, 4489, 3768, 4129, 4293, 4037,  // the sixth is 12.32 now
                                   4496, 3775, 4299, 4725};
     ovJudgeSetpoints(&settings, fiveOfTen, 10, 32768.0, 0.05);
     CHECK_EQ(settings.fits[0], 5);
     CHECK_EQ(settings.fits[1], 0);
-    CHECK_EQ(settings.verdict, -1);
+    CHECK_EQ(settings.roundVerdict, -1);
     // And the winner needs twice the fits of any other candidate. 12.00, 13.50 and 15.00 V are
     // round at x96.667 as well (11.60, 13.05 and 14.50 V). With three of six setpoints like that,
     // x100 is ahead by two to one. With a fourth it is six against four: too close to call.
@@ -3766,18 +4512,81 @@ static void testScaleCheck() {
     ovJudgeSetpoints(&settings, twoToOne, 6, 32768.0, 0.05);
     CHECK_EQ(settings.fits[0], 6);
     CHECK_EQ(settings.fits[1], 3);
-    CHECK_EQ(settings.verdict, 0);
+    CHECK_EQ(settings.roundVerdict, 0);
     const uint16_t tooClose[] = {4588, 4489, 3441, 3932, 4424, 4915};  // 10.50 V is 10.15 V at x96.667
     ovJudgeSetpoints(&settings, tooClose, 6, 32768.0, 0.05);
     CHECK_EQ(settings.fits[0], 6);
     CHECK_EQ(settings.fits[1], 4);
-    CHECK_EQ(settings.verdict, -1);
+    CHECK_EQ(settings.roundVerdict, -1);
     // None at all.
     ovJudgeSetpoints(&settings, odd, 0, 32768.0, 0.05);
     CHECK_EQ(settings.setpointsUsed, 0);
-    CHECK_EQ(settings.verdict, -1);
+    CHECK_EQ(settings.roundVerdict, -1);
 
-    // The multimeter decides; the regulation test may only confirm.
+    // Round setpoints alone decide nothing: they look round at whatever scale wrote them.
+    ovJudgeSetpoints(&settings, truncated, 5, 32768.0, 0.05);
+    ovJudgeSettings(&settings);
+    CHECK_EQ(settings.roundVerdict, 0);
+    CHECK_EQ(settings.verdict, -1);
+    CHECK(!settings.conflict);
+
+    // A setting whose value the user knows decides, within 0.5 %.
+    settings.knownGivenVolts = 13.70;
+    settings.knownRaw = 4489;  // 13.70 V at x100, 13.24 V at x96.667
+    ovJudgeKnown(&settings, 32768.0);
+    ovJudgeSettings(&settings);
+    CHECK(settings.knownCompared);
+    CHECK_EQ(settings.knownMatches, 1);
+    CHECK_EQ(settings.knownVerdict, 0);
+    CHECK_EQ(settings.verdict, 0);
+    CHECK(!settings.conflict);
+    CHECK_MSG(settings.knownVolts[1] > 13.23 && settings.knownVolts[1] < 13.25, "%f", settings.knownVolts[1]);
+    CHECK_MSG(settings.impliedNumerator > 100.0 && settings.impliedNumerator < 100.01, "%f",
+              settings.impliedNumerator);
+    settings.knownGivenVolts = 13.76;  // 0.44 % above what x100 makes of the register
+    ovJudgeKnown(&settings, 32768.0);
+    CHECK_EQ(settings.knownVerdict, 0);
+    settings.knownGivenVolts = 13.78;  // 0.59 % above
+    ovJudgeKnown(&settings, 32768.0);
+    CHECK_EQ(settings.knownMatches, 0);
+    CHECK_EQ(settings.knownVerdict, -1);
+    // The other candidate, and against the round setpoints: the setting wins, and says so.
+    settings.knownGivenVolts = 13.24;
+    ovJudgeKnown(&settings, 32768.0);
+    ovJudgeSettings(&settings);
+    CHECK_EQ(settings.knownVerdict, 1);
+    CHECK_EQ(settings.verdict, 1);
+    CHECK(settings.conflict);
+    // A value that fits nothing leaves the scale open, whatever the setpoints say.
+    settings.knownGivenVolts = 12.00;
+    ovJudgeKnown(&settings, 32768.0);
+    ovJudgeSettings(&settings);
+    CHECK(settings.knownCompared);
+    CHECK_EQ(settings.knownMatches, 0);
+    CHECK_EQ(settings.verdict, -1);
+    CHECK(!settings.conflict);
+    CHECK_MSG(settings.impliedNumerator > 87.5 && settings.impliedNumerator < 87.7, "%f", settings.impliedNumerator);
+    // A register that reads 0 holds no setting to compare with.
+    settings.knownRaw = 0;
+    settings.knownGivenVolts = 13.70;
+    ovJudgeKnown(&settings, 32768.0);
+    ovJudgeSettings(&settings);
+    CHECK(!settings.knownCompared);
+    CHECK_EQ(settings.verdict, -1);
+    // Two candidates 0.2 % apart both fit: no verdict.
+    OvSettingsScaleReport close;
+    memset(&close, 0, sizeof(close));
+    ovAddCandidate(&close.candidates, 100.0);
+    ovAddCandidate(&close.candidates, 99.8);
+    close.knownRaw = 4489;
+    close.knownGivenVolts = 13.70;
+    ovJudgeKnown(&close, 32768.0);
+    ovJudgeSettings(&close);
+    CHECK_EQ(close.knownMatches, 2);
+    CHECK_EQ(close.verdict, -1);
+
+    // Only the multimeter decides. The regulation test cannot even confirm the scale in use: a
+    // battery that is below its target can sit right on it at another scale.
     OvLiveScaleReport live;
     memset(&live, 0, sizeof(live));
     ovAddCandidate(&live.candidates, 100.0);
@@ -3785,11 +4594,11 @@ static void testScaleCheck() {
     live.regulationVerdict = 0;
     live.meterVerdict = -1;
     ovJudgeLive(&live);
-    CHECK_EQ(live.verdict, 0);
+    CHECK_EQ(live.verdict, -1);
     CHECK(!live.conflict);
     live.regulationVerdict = 1;
     ovJudgeLive(&live);
-    CHECK_EQ(live.verdict, -1);  // it cannot overturn the scale in use
+    CHECK_EQ(live.verdict, -1);  // nor overturn it
     live.regulationVerdict = -1;
     ovJudgeLive(&live);
     CHECK_EQ(live.verdict, -1);
@@ -3860,7 +4669,7 @@ static void testScaleCheck() {
   {  // The device's report, without the console.
     Rig rig(96.667, OV_BUILTIN_PROFILE, 100.0, 96.667);  // case D
     OvScaleReport report;
-    CHECK(rig.device.scaleCheck(13.68, &report));
+    CHECK(rig.device.scaleCheck(13.68, nullptr, 0.0, &report));
     CHECK(report.settings.tested);
     CHECK_EQ(report.settings.candidates.count, 2);
     CHECK(report.settings.candidates.num[0] == 100.0);
@@ -3868,7 +4677,9 @@ static void testScaleCheck() {
     CHECK_EQ(report.settings.setpointsRead, 14);
     CHECK_EQ(report.settings.setpointsUsed, 13);
     CHECK_EQ(report.settings.fits[0], 13);
-    CHECK_EQ(report.settings.verdict, 0);
+    CHECK_EQ(report.settings.roundVerdict, 0);
+    CHECK(report.settings.known == nullptr);
+    CHECK_EQ(report.settings.verdict, -1);  // the round setpoints only point
     CHECK(report.live.tested);
     CHECK(report.live.regulationRead);
     CHECK(report.live.regulating);
@@ -3878,9 +4689,26 @@ static void testScaleCheck() {
     CHECK_EQ(report.live.meterVerdict, 1);
     CHECK_EQ(report.live.verdict, 1);
     CHECK(!report.live.conflict);
+    // With a setting whose value is known, the stored settings get a verdict.
+    const OvRegister *floatV = rig.profile.findRegister("EV_float");
+    const size_t sent = rig.sim.requests.size();
+    CHECK(rig.device.scaleCheck(0.0, floatV, 13.70, &report));
+    CHECK(report.settings.known == floatV);
+    CHECK(report.settings.knownRead && report.settings.knownCompared);
+    CHECK_EQ(report.settings.knownRaw, rig.sim.regs[0xE001]);
+    CHECK_EQ(report.settings.knownVerdict, 0);
+    CHECK_EQ(report.settings.verdict, 0);
+    CHECK(!report.settings.conflict);
+    CHECK(!report.live.meterGiven);
+    // It was read from the controller, not taken from the round test's reads: one more request.
+    CHECK_EQ(rig.sim.requests.size() - sent, (size_t)(14 + 3 + 1));
+    // A register on another scale is not used (the console refuses it before this).
+    CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("adc_vb_f"), 13.68, &report));
+    CHECK(report.settings.known == nullptr);
+    CHECK_EQ(report.settings.verdict, -1);
     // An override becomes candidate 0; the file's own number stays in the list.
     rig.profile.findScale("vlive")->num = 98.5;
-    CHECK(rig.device.scaleCheck(0.0, &report));
+    CHECK(rig.device.scaleCheck(0.0, nullptr, 0.0, &report));
     CHECK_EQ(report.live.candidates.count, 3);
     CHECK(report.live.candidates.num[0] == 98.5);
     CHECK(report.live.candidates.num[1] == 100.0);
@@ -3919,7 +4747,7 @@ static void testScaleCheck() {
     CHECK_HAS(rig.run("set EV_lvd 13.10"), "is not confirmed");
     rig.run("no");
     // This controller follows the specification, and the check says so against the hand-set scale.
-    const std::string out = rig.run("scalecheck 13.68");
+    const std::string out = rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_HAS(out, "Live readings (scale vlive, now x96.667/32768). Candidates: x96.667, x100.");
     CHECK_HAS(out, "  Stored settings: x100, which is what OptaView uses now.\r\n"
                    "  Live readings:   x100, not the x96.667 that OptaView uses now.\r\n"
@@ -3946,13 +4774,15 @@ static void testScaleCheck() {
   }
   {  // A multimeter reading that fits no candidate contradicts an earlier verdict too: the live
      // scale is open again, while the stored settings keep the verdict they got on their own.
+     // (A check without a setting leaves that verdict as it is.)
     Rig rig;
     CHECK_HAS(rig.run("live"), "Note: voltages are shown");  // the reminder has been given once
-    rig.run("scalecheck 13.68");
+    rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
     CHECK_HASNT(rig.run("live"), "Note: voltages are shown");
     const std::string off = rig.run("scalecheck 12.00");
-    CHECK_HAS(off, "  Stored settings: x100, which is what OptaView uses now.\r\n"
+    CHECK_HAS(off, "  Stored settings: cannot tell yet. The setpoints point at x100, which OptaView uses now.\r\n"
+                   "     A setting whose value you know settles it: scalecheck <setting> <volts>\r\n"
                    "  Live readings:   the multimeter fits none of the candidates, so this stays open.\r\n"
                    "     That takes back what an earlier check found (x100).\r\n"
                    "     If the reading is right, the scale is x87.71: 'scale vlive 87.71' uses that.");
@@ -3975,7 +4805,7 @@ static void testScaleCheck() {
     CHECK_HASNT(fresh.run("live"), "Note: voltages are shown");
     // A check that merely cannot tell leaves an earlier verdict alone.
     Rig night;
-    night.run("scalecheck 13.68");
+    night.run("scalecheck 13.68 EV_float 13.70");
     night.sim.regs[0x0011] = 3;
     CHECK_HAS(night.run("scalecheck"), "  Live readings:   cannot tell yet.");
     CHECK_EQ(countOf(night.run("status"), "confirmed by 'scalecheck'"), 2);
@@ -3983,7 +4813,7 @@ static void testScaleCheck() {
   {  // What 'scalecheck' found belongs to the controller it talked to. Another slave address or
      // other serial settings may reach another controller, so both scales are unconfirmed again.
     Rig rig;
-    rig.run("scalecheck 13.68");
+    rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_EQ(countOf(rig.run("status"), "confirmed by 'scalecheck'"), 2);
     CHECK_HAS(rig.run("slave 2"),
               "Link: slave 2, 9600 8N2, read function 4\r\n"
@@ -3998,7 +4828,7 @@ static void testScaleCheck() {
     rig.run("no");
 
     // The same address again, the read function, the timeout and the block mode change nothing.
-    rig.run("scalecheck 13.68");
+    rig.run("scalecheck 13.68 EV_float 13.70");
     CHECK_HASNT(rig.run("slave 1"), "Note:");
     rig.run("fc 3");
     rig.run("timeout 800");
@@ -4016,7 +4846,7 @@ static void testScaleCheck() {
 
     // 'probe' that ends at other settings.
     Rig probing;
-    probing.run("scalecheck 13.68");
+    probing.run("scalecheck 13.68 EV_float 13.70");
     probing.sim.deviceBaud = 19200;
     const std::string found = probing.run("probe");
     CHECK_HAS(found, "Found it: slave 1, 19200 8N2, read function 4.");
@@ -4025,7 +4855,7 @@ static void testScaleCheck() {
     CHECK_EQ(countOf(probing.run("status"), "confirmed by 'scalecheck'"), 0);
     // 'probe' that finds the same settings, or nothing at all, leaves the verdicts alone.
     Rig same;
-    same.run("scalecheck 13.68");
+    same.run("scalecheck 13.68 EV_float 13.70");
     CHECK_HASNT(same.run("probe"), "unconfirmed");
     same.sim.powered = false;
     CHECK_HASNT(same.run("probe"), "unconfirmed");
@@ -4391,7 +5221,7 @@ static void testTwoConsoles() {
     OtherConsole web(rig);
     CHECK_HAS(web.run("set EV_lvd 12.00"), "Careful: the scale of stored settings");
     web.run("no");
-    CHECK_HAS(rig.run("scalecheck 13.68"), "Verdict");
+    CHECK_HAS(rig.run("scalecheck 13.68 EV_float 13.70"), "Verdict");
     CHECK(rig.device.settingsScaleConfirmed());
     CHECK(rig.device.liveScaleConfirmed());
     const std::string status = web.run("status");

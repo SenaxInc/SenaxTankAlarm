@@ -63,7 +63,7 @@
     "array_fault": ["Overcurrent", "FETs shorted", "Software bug", "Battery HVD", "Array HVD", "EEPROM setting edit (reset required)", "RTS shorted", "RTS was valid, now disconnected", "Local temperature sensor failed"],
     "load_fault": ["External short circuit", "Overcurrent", "FETs shorted", "Software bug", "HVD", "Heatsink over-temperature", "EEPROM setting edit (reset required)"],
     "alarm": ["RTS open", "RTS shorted", "RTS disconnected", "Ths open", "Ths shorted", "SSMPPT hot", "Current limit", "Current offset", null, null, "Uncalibrated", "RTS miswire", null, null, "Miswire", "FET open", "P12", "High Va current limit"],
-    "dip_switch": ["SW1: custom battery settings", "SW2: custom LVD/LVR", "SW3: equalize", "SW4: MODBUS"]
+    "dip_switch": ["SW1: custom battery settings", "SW2: custom LVD/LVR", "SW3: equalize", "SW4: MeterBus/MODBUS selector"]
   },
   "groups": [
     { "name": "live",      "title": "Meters" },
@@ -148,7 +148,7 @@
     { "addr": "0xE016", "name": "Et_eq_above2", "label": "Equalize time limit above the absorption voltage", "units": "s", "group": "charge2", "writable": true },
     { "addr": "0xE017", "name": "Et_eq_reg2", "label": "Equalize time limit at the equalize voltage", "units": "s", "group": "charge2", "writable": true },
 
-    { "addr": "0xE01A", "name": "EV_tempcomp", "label": "Temperature compensation per C (0 = off)", "scale": "tempco", "group": "charge", "writable": true, "min": 0, "max": 0.1, "note": "Only the low byte is used and the sign is implied negative: write a positive value." },
+    { "addr": "0xE01A", "name": "EV_tempcomp", "label": "Temperature compensation per C (0 = off)", "type": "u8", "scale": "tempco", "group": "charge", "writable": true, "min": 0, "max": 0.1, "note": "Only the low byte is used and the sign is implied negative: write a positive value. OptaView reads only the low byte, and writes 0 in the high byte." },
     { "addr": "0xE01B", "name": "EV_hvd", "label": "Battery high voltage disconnect at 25 C (0 = off)", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
     { "addr": "0xE01C", "name": "EV_hvr", "label": "Battery high voltage reconnect", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
     { "addr": "0xE01D", "name": "Evb_ref_lim", "label": "Regulation ceiling, not compensated (0 = none)", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
