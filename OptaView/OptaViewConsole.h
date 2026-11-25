@@ -106,6 +106,7 @@ class OvLineEditor {
     }
     // One character more than a console line can have is kept, and then the echo stops: a line
     // that was too long stays too long, so the console refuses it instead of running its start.
+    // A backspace takes back the last character shown, so what runs is what the terminal shows.
     if (length_ + 1 < sizeof(line_)) {
       line_[length_++] = (char)key;
       echo.printChar((char)key);

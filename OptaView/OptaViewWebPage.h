@@ -12,7 +12,7 @@
 
 namespace optaview {
 
-// The page: 54685 bytes, its lines ending in LF.
+// The page: 54641 bytes, its lines ending in LF.
 static const char OV_WEB_PAGE[] =
     R"OVWEB(<!DOCTYPE html>)OVWEB" "\n"
     R"OVWEB(<html lang="en">)OVWEB" "\n"
@@ -173,9 +173,9 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(<p id="loginIntro" class="muted"></p>)OVWEB" "\n"
     R"OVWEB(<form id="loginForm" autocomplete="off">)OVWEB" "\n"
     R"OVWEB(<div class="field"><label for="pin">PIN</label>)OVWEB" "\n"
-    R"OVWEB(<input id="pin" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></div>)OVWEB" "\n"
+    R"OVWEB(<input id="pin" type="password" inputmode="numeric" autocomplete="off"></div>)OVWEB" "\n"
     R"OVWEB(<div class="field hidden" id="pin2Field"><label for="pin2">The same PIN again</label>)OVWEB" "\n"
-    R"OVWEB(<input id="pin2" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></div>)OVWEB" "\n"
+    R"OVWEB(<input id="pin2" type="password" inputmode="numeric" autocomplete="off"></div>)OVWEB" "\n"
     R"OVWEB(<p id="loginMessage" class="error-text" role="alert"></p>)OVWEB" "\n"
     R"OVWEB(<button id="loginBtn" class="btn" type="submit">Log in</button>)OVWEB" "\n"
     R"OVWEB(</form>)OVWEB" "\n"
@@ -272,8 +272,7 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(<p class="muted small">The same commands as on the USB port; 'help' lists them. Everything this page sends to )OVWEB"
     R"OVWEB(the controller is logged here.</p>)OVWEB" "\n"
     R"OVWEB(<form id="consoleForm" class="row">)OVWEB" "\n"
-    R"OVWEB(<input id="consoleLine" maxlength="159" autocomplete="off" spellcheck="false" placeholder="help" aria-label="C)OVWEB"
-    R"OVWEB(ommand">)OVWEB" "\n"
+    R"OVWEB(<input id="consoleLine" autocomplete="off" spellcheck="false" placeholder="help" aria-label="Command">)OVWEB" "\n"
     R"OVWEB(<button class="btn" type="submit">Run</button>)OVWEB" "\n"
     R"OVWEB(</form>)OVWEB" "\n"
     R"OVWEB(<pre id="consoleLog" class="out" aria-label="Console log"></pre>)OVWEB" "\n"

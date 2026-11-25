@@ -3092,6 +3092,37 @@ static void testPreviewTerminal() {
     put(std::string(OV_LINE_MAX, 'z') + "\r\n");      // one more: its CR is not kept, and it is too long
     CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX, 'z'));
   }
+  {  // A CR that is the last character kept of a line too long is a part of that line, not its
+     // end, so the line stays too long. As the answer to a question it cancels it: taking off
+     // that CR left 159 characters, and "yes" and 156 spaces wrote the setting (review 20).
+    PreviewTerminal terminal(fds[0]);
+    const std::string yes = "yes" + std::string(OV_LINE_MAX - 4, ' ');  // as long as a line can be
+    put(yes + "\rno\n");
+    CHECK(terminal.takeLine(&line) && line == yes + "\r");
+    put(yes + "\r\r\n");  // the second CR is not kept, so the first one stays
+    CHECK(terminal.takeLine(&line) && line == yes + "\r");
+    put(yes + "\r\n");    // nothing was left out: this CR is the line's end
+    CHECK(terminal.takeLine(&line) && line == yes);
+    put(std::string(OV_LINE_MAX + 40, 'x') + "\nyes\r\n");  // the next line starts afresh
+    CHECK(terminal.takeLine(&line) && line == std::string(OV_LINE_MAX, 'x'));
+    CHECK(terminal.takeLine(&line) && line == "yes");
+    put(yes + "\rno");    // a key press, which the command it stops takes along, to its end
+    CHECK(terminal.inputPending());
+    terminal.discardInput();
+    put("\nyes\r\n");
+    CHECK(terminal.takeLine(&line) && line == "yes");
+
+    Rig rig;
+    CHECK_HAS(rig.run("set EV_lvd 13.10"), "Type yes to write it.");
+    const uint16_t before = rig.sim.regs[0xE022];
+    put(yes + "\rno\n");
+    CHECK(terminal.takeLine(&line));
+    const std::string answered = rig.run(line);
+    CHECK_MSG(answered == "Cancelled. Nothing was sent.\r\n", "the answer was: %s", answered.c_str());
+    CHECK_EQ(rig.sent(0x06), 0);
+    CHECK_EQ(rig.sim.regs[0xE022], before);
+    CHECK(!rig.console.awaitingConfirmation());
+  }
   {  // A NUL is kept: the preview gives that line to the console, which refuses it whole.
     PreviewTerminal terminal(fds[0]);
     put(std::string("sim\0delay 100\n", 14));
@@ -3111,6 +3142,25 @@ static void testPreviewTerminal() {
       ++lines;
     }
     CHECK_EQ(lines, 2 * chunk);
+  }
+  {  // A line that was still arriving when the key press reached its limit goes with it: what is
+     // left of it is not run as a line of its own, however many reads it takes to arrive.
+    PreviewTerminal terminal(fds[0]);
+    const size_t limit = chunk * PreviewTerminal::DISCARD_CHUNKS;
+    put(std::string(limit + 10, 'x') + "\nlive\n");
+    terminal.discardInput();
+    CHECK_EQ(unread(), 16);
+    CHECK(terminal.takeLine(&line) && line == "live");
+    CHECK(!terminal.takeLine(&line));
+    put(std::string(limit + chunk + 50, 'y') + "\nprobe\n");
+    terminal.discardInput();
+    CHECK(!terminal.inputPending());  // what it read was the rest of that line
+    CHECK(terminal.takeLine(&line) && line == "probe");
+    put("part");
+    CHECK(terminal.inputPending());
+    terminal.discardInput();          // a key press whose line had not ended: its end is its own
+    put("\nstatus\n");
+    CHECK(terminal.takeLine(&line) && line == "status");
   }
   {  // When the other end closes, the terminal is gone; the preview still serves the page.
     PreviewTerminal terminal(fds[0]);

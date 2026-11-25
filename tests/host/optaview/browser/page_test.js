@@ -291,12 +291,23 @@ async function firstVisit(win) {
   await page.fill('#pin', '12');
   await page.click('#loginBtn');
   checkEq(await win.text('#loginMessage'), 'A PIN is 4 to 8 digits.', 'a PIN that is too short');
+  // A PIN that is too long is refused too, not cut to its first 8 digits as it is pasted.
+  await page.evaluate(() => { document.querySelector('#loginMessage').textContent = ''; });
+  await page.fill('#pin', '246813579');
+  await page.click('#loginBtn');
+  checkEq(await win.text('#loginMessage'), 'A PIN is 4 to 8 digits.', 'a PIN that is too long');
   await page.fill('#pin', PIN);
   await page.fill('#pin2', '2469');
   await page.click('#loginBtn');
   checkEq(await win.text('#loginMessage'), 'The two PINs are not the same.', 'two different PINs');
-  checkEq(win.requests.length, sent, 'neither was sent to the Opta');
+  await page.evaluate(() => { document.querySelector('#loginMessage').textContent = ''; });
+  await page.fill('#pin', '24681357');
+  await page.fill('#pin2', '246813579');
+  await page.click('#loginBtn');
+  checkEq(await win.text('#loginMessage'), 'The two PINs are not the same.', 'a second PIN one digit longer');
+  checkEq(win.requests.length, sent, 'none was sent to the Opta');
 
+  await page.fill('#pin', PIN);
   await page.fill('#pin2', PIN);
   await page.click('#loginBtn');
   await page.waitForSelector('#liveTiles .data-card');
@@ -763,6 +774,16 @@ async function toolsView(win, profile) {
   checkEq(await page.inputValue('#consoleLine'), '', 'the line is empty after a command');
   await page.press('#consoleLine', 'ArrowUp');
   checkEq(await page.inputValue('#consoleLine'), 'help', 'the arrow keys bring back earlier commands');
+  await page.fill('#consoleLine', '');
+
+  // A line too long is refused whole, pasted as well: the field does not cut it to fit, which
+  // would have run its start, as the USB console never does.
+  const commands = win.requests.length;
+  await page.fill('#consoleLine', 'get adc_vb_f' + ' '.repeat(150) + '1');
+  await page.press('#consoleLine', 'Enter');
+  await page.waitForFunction(() => document.querySelector('#toast').classList.contains('show'));
+  checkEq(await toast(win), 'A command is one line of plain text, at most 159 characters.', 'a line too long is refused');
+  checkEq(win.requests.length, commands, 'and not sent in part');
   await page.fill('#consoleLine', '');
 
   // A change typed as a command is asked about in the same way.
