@@ -644,9 +644,16 @@ async function controllerView(win, profile) {
   await page.waitForFunction((selector) => document.querySelector(selector).textContent === 'off', `${row} td:nth-child(2)`);
   checkEq(await win.preview.writes(), before + 2, 'on and off reached the controller');
 
-  // An action, cancelled.
+  // An action, cancelled. What it does besides clearing the counter is said in its row and in
+  // the question.
+  checkHas(await win.text('#coilsBox tr[data-coil="clear_kwh"] td:nth-child(1)'), 'It also sets vb_min and vb_max',
+           'the row of a counter reset says what else it resets');
+  checkEq(await page.locator('#coilsBox tr[data-coil="load_disconnect"] .reg-note').count(), 0,
+          'a switch without a note has none');
   await page.click('#coilsBox tr[data-coil="clear_kwh"] button:has-text("Do it")');
-  checkHas(await question(win), 'clear_kwh', 'the console\'s question for an action');
+  const action = await question(win);
+  checkHas(action, 'clear_kwh', 'the console\'s question for an action');
+  checkHas(action, 'It also sets vb_min and vb_max', 'the question says what else the action resets');
   await page.click('#dialogNo');
   await dialogHidden(win);
   checkEq(await win.preview.writes(), before + 2, 'a cancelled action sent nothing');

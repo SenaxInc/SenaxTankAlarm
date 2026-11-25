@@ -12,7 +12,7 @@
 
 namespace optaview {
 
-// The page: 54532 bytes, its lines ending in LF.
+// The page: 54617 bytes, its lines ending in LF.
 static const char OV_WEB_PAGE[] =
     R"OVWEB(<!DOCTYPE html>)OVWEB" "\n"
     R"OVWEB(<html lang="en">)OVWEB" "\n"
@@ -946,8 +946,9 @@ static const char OV_WEB_PAGE[] =
     R"OVWEB(        off.disabled = coil.on === false;)OVWEB" "\n"
     R"OVWEB(        add(actions, on, document.createTextNode(' '), off);)OVWEB" "\n"
     R"OVWEB(      })OVWEB" "\n"
-    R"OVWEB(      add(row, add(el('td'), el('div', '', known.label), el('div', 'reg-name', known.name)),)OVWEB" "\n"
-    R"OVWEB(          el('td', coil.error ? 'bad' : 'num', shown), actions);)OVWEB" "\n"
+    R"OVWEB(      var what = add(el('td'), el('div', '', known.label), el('div', 'reg-name', known.name));)OVWEB" "\n"
+    R"OVWEB(      if (known.note) { add(what, el('div', 'reg-note', known.note)); })OVWEB" "\n"
+    R"OVWEB(      add(row, what, el('td', coil.error ? 'bad' : 'num', shown), actions);)OVWEB" "\n"
     R"OVWEB(      add(body, row);)OVWEB" "\n"
     R"OVWEB(    });)OVWEB" "\n"
     R"OVWEB(    add(box, add(el('table'), add(el('thead'), add(el('tr'), el('th', '', 'Switch'), el('th', '', 'Now'),)OVWEB" "\n"
@@ -1393,7 +1394,7 @@ static const size_t OV_WEB_PAGE_LENGTH = sizeof(OV_WEB_PAGE) - 1;
 static const char OV_WEB_PAGE_HEADERS[] =
     "Content-Security-Policy: "
     "default-src 'none'; "
-    "script-src 'sha256-fXizNPfKR4xyGmz6NyN0vMc3A/+fOK+ZxTFa+QI9kYU='; "
+    "script-src 'sha256-rtEQuki3yDwzb0ksU8ystN9pAT+b72Qzv1U0Lk0Y8Y0='; "
     "style-src 'sha256-Ww9KXXDgOmF/WhmUHbakfApV1Aazm40Ei8oarUHhAcw='; "
     "connect-src 'self'; "
     "img-src data:; "

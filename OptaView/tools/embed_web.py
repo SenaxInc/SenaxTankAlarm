@@ -15,14 +15,18 @@ that style sheet and that script and nothing else, whatever ends up in the page.
 therefore refuses a page that needs more than the policy allows (an inline event handler, a
 style attribute, a style sheet it imports, a font, a script file, any file but a data: image),
 because such a page would work when opened from disk and fail when the Opta serves it. It reads
-each tag of the markup as a browser does, attribute by attribute; the style sheet and the script
-it reads as text, so what the script puts together while it runs is left to the browser test,
-which runs the page under the policy. The self-test adds one forbidden thing at a time to the
-page and checks that it is refused, and that the page as it is passes.
+the page the way a browser does where the two could differ: each tag attribute by attribute, with
+character references decoded (&#32; is a space), tag names in any case, a block ending at the
+first "</script" or "</style", and the escapes of the style sheet (@\\69mport is @import) and of
+the script's names (\\u0065val is eval). Past that it reads the style sheet and the script as
+text, so what the script puts together while it runs is left to the browser test, which runs the
+page under the policy. The self-test adds one forbidden thing at a time to the page and checks
+that it is refused, and that the page as it is passes.
 """
 
 import base64
 import hashlib
+import html
 import os
 import re
 import sys
@@ -81,6 +85,14 @@ ATTRIBUTE_NAME = re.compile(r"[^\s/>][^\s/>=]*")
 EQUALS = re.compile(r"\s*=\s*")
 UNQUOTED_VALUE = re.compile(r"[^\s>]*")
 COMMENT_END = re.compile(r"--!?>")
+# What a browser takes for a space between the parts of an attribute (srcset, rel), and what an
+# address loses at both ends (the controls and the space) and inside (tabs and newlines).
+HTML_SPACE = " \t\n\f\r"
+URL_ENDS = "".join(chr(code) for code in range(0x21))
+URL_DROPPED = re.compile(r"[\t\n\r]")
+# The escapes the browser reads before the rules could see the words they spell.
+CSS_ESCAPE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\f\r]?|(\n)|(.))", re.DOTALL)
+JS_ESCAPE = re.compile(r"\\u(?:([0-9a-fA-F]{4})|\{([0-9a-fA-F]{1,6})\})")
 
 
 def fail(message):
@@ -88,21 +100,54 @@ def fail(message):
 
 
 def only_block(page, tag):
-    """The text between <tag> and </tag>. There must be exactly one, and without attributes."""
-    opened = re.findall(r"<%s\b[^>]*>" % tag, page)
+    """The text between <tag> and </tag>. There must be exactly one of each in the page, in any
+    case and anywhere, the start tag without attributes: a second <SCRIPT> would run without a
+    hash in the policy, and the browser would block it. A browser ends the block at the first
+    "</tag" followed by a space, "/" or ">", in any case, and so does this."""
+    opened = re.findall(r"<%s\b[^>]*>?" % tag, page, re.IGNORECASE)
     if opened != ["<%s>" % tag]:
-        fail("there must be exactly one <%s>, without attributes; found %r" % (tag, opened))
+        fail("there must be exactly one <%s>, in lower case and without attributes; found %r"
+             % (tag, opened))
+    closed = re.findall(r"</%s[\s/>]" % tag, page, re.IGNORECASE)
+    if closed != ["</%s>" % tag]:
+        fail("there must be exactly one </%s>, in lower case and with nothing before its >; found %r"
+             % (tag, closed))
     start = page.index("<%s>" % tag) + len(tag) + 2
     end = page.find("</%s>" % tag, start)
-    if end < 0 or page.count("</%s>" % tag) != 1:
-        fail("there must be exactly one </%s>" % tag)
+    if end < 0:
+        fail("the </%s> must come after the <%s>" % (tag, tag))
     return page[start:end], start, end
+
+
+def css_unescaped(text):
+    """The style sheet with each escape replaced by what it stands for, as a browser reads it."""
+    def one(match):
+        if match.group(1):
+            code = int(match.group(1), 16)
+            return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "\ufffd"
+        return "" if match.group(2) else match.group(3)  # an escaped newline continues a string
+    return CSS_ESCAPE.sub(one, text)
+
+
+def js_unescaped(text):
+    """The script with each \\u escape replaced by its character, as in a name it stands for it."""
+    def one(match):
+        code = int(match.group(1) or match.group(2), 16)
+        return chr(code) if code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "\ufffd"
+    return JS_ESCAPE.sub(one, text)
+
+
+def url_of(value):
+    """An attribute's address as a browser parses it: without the controls and spaces at its
+    ends, and without the tabs and newlines inside it."""
+    return URL_DROPPED.sub("", value).strip(URL_ENDS)
 
 
 def start_tags(markup):
     """Each start tag in the markup as a browser reads it: its name and its attributes in lower
-    case, each value without its quotes, and the tag's text. A quoted value may hold ">" and "<".
-    Comments are skipped; a comment ends at the first "-->" or "--!>", "<!-->" included."""
+    case, each value without its quotes and with its character references decoded, and the tag's
+    text. A quoted value may hold ">" and "<". Comments are skipped; a comment ends at the first
+    "-->" or "--!>", "<!-->" included."""
     at = 0
     while True:
         at = markup.find("<", at)
@@ -139,21 +184,22 @@ def start_tags(markup):
                     unquoted = UNQUOTED_VALUE.match(markup, at)
                     value = unquoted.group(0)
                     at = unquoted.end()
-            attributes.append((attribute.group(0).lower(), value))
+            attributes.append((attribute.group(0).lower(), html.unescape(value)))
         yield name.group(0).lower(), attributes, markup[start:at + 1]
         at += 1
 
 
 def srcset_addresses(value):
-    """The addresses in a srcset, by the HTML rules: an address runs to the next space, and a
-    comma at its end or after its sizes ends that candidate."""
+    """The addresses in a srcset, by the HTML rules: an address runs to the next space (a tab, a
+    newline, a form feed or a carriage return too), and a comma at its end or after its sizes
+    ends that candidate."""
     addresses = []
     rest = value
     while True:
-        rest = rest.lstrip(" \n,")
+        rest = rest.lstrip(HTML_SPACE + ",")
         if not rest:
             return addresses
-        address = re.match(r"[^ \n]*", rest).group(0)
+        address = re.match(r"[^ \t\n\f\r]*", rest).group(0)
         rest = rest[len(address):]
         if address.endswith(","):
             addresses.append(address.rstrip(","))
@@ -167,7 +213,8 @@ def markup_problem(markup):
     for name, attributes, text in start_tags(markup):
         if name in ELEMENTS_REFUSED:
             return "an element the policy does not allow", text
-        rel = next((" ".join(value.lower().split()) for key, value in attributes if key == "rel"), "")
+        rel = next((" ".join(re.findall(r"[^ \t\n\f\r]+", value.lower())) for key, value in attributes
+                    if key == "rel"), "")
         for key, value in attributes:
             if re.match(r"on[a-z]+$", key):
                 return "an inline event handler (the policy blocks it; use addEventListener)", text
@@ -175,9 +222,13 @@ def markup_problem(markup):
                 return "a style attribute (the policy blocks it; use a class)", text
             if key in ("action", "formaction"):
                 return "a form action (the policy sends no form; the script sends it)", text
+            if key == "ping":
+                return "a ping (the policy lets the page send only what its script sends)", text
+            address = url_of(value)
+            if "javascript:" in address.lower():
+                return "a javascript: address", text
             if key not in FILE_ATTRIBUTES:
                 continue
-            address = value.strip()
             if re.match(r"(?:https?:)?//", address, re.IGNORECASE):
                 return "a file from another server", text
             # A link to another page, or to a part of this one, loads nothing.
@@ -186,7 +237,11 @@ def markup_problem(markup):
                     continue
             image = ((name, key) in IMAGE_ATTRIBUTES or key == "background"
                      or (name == "link" and rel in ICON_LINKS))
-            for each in (srcset_addresses(value) if key.endswith("srcset") else [address]):
+            if key.endswith("srcset"):
+                addresses = [url_of(one) for one in srcset_addresses(value)]
+            else:
+                addresses = [address]
+            for each in addresses:
                 if not (image and each[:5].lower() == "data:"):
                     return "a file the policy blocks (it allows only data: images)", text
     return None
@@ -244,13 +299,15 @@ def render(page_path):
     if problem:
         fail("the markup has %s: %r" % (problem[0], problem[1][:80]))
     for pattern, what in STYLE_RULES:
-        found = re.search(pattern, style, re.IGNORECASE)
-        if found:
-            fail("the style sheet has %s: %r" % (what, found.group(0)[:80]))
+        for text in (style, css_unescaped(style)):
+            found = re.search(pattern, text, re.IGNORECASE)
+            if found:
+                fail("the style sheet has %s: %r" % (what, found.group(0)[:80]))
     for pattern, what in SCRIPT_RULES:
-        found = re.search(pattern, script)
-        if found:
-            fail("the script has %s: %r" % (what, found.group(0)[:80]))
+        for text in (script, js_unescaped(script)):
+            found = re.search(pattern, text)
+            if found:
+                fail("the script has %s: %r" % (what, found.group(0)[:80]))
 
     policy = "; ".join([
         "default-src 'none'",
@@ -313,7 +370,9 @@ def render(page_path):
 
 
 # The self-test: each entry is added to the page in one place (after <style>, before </body> or
-# after <script>) and must be refused with the words given, or, in the second list, accepted.
+# after <script>) and must be refused with the words given, or, in the second list, accepted. In
+# the third list each entry changes the page's own tags, one replacement after the other, and
+# must be refused.
 SELFTEST_REFUSED = [
     ("style", '@import url("/theme.css");', "an @import"),
     ("style", "@IMPORT 'theme.css';", "an @import"),
@@ -321,6 +380,14 @@ SELFTEST_REFUSED = [
     ("style", ".x { background: url( 'logo.png' ); }", "named by url()"),
     ("style", ".x { background: URL(//elsewhere.example/a.png); }", "named by url()"),
     ("style", '.x { background-image: -webkit-image-set("logo.png" 1x); }', "an image-set()"),
+    # The browser reads a CSS escape as the letter it stands for.
+    ("style", '@\\69mport "theme.css";', "an @import"),
+    ("style", '@\\69 mport "theme.css";', "an @import"),
+    ("style", '@\\000069mport "theme.css";', "an @import"),
+    ("style", ".x { background: \\75rl(logo.png); }", "named by url()"),
+    ("style", "@\\66ont-face { font-family: f; src: url(data:font/woff2;base64,AAAA); }", "a web font"),
+    ("style", '@\\import "theme.css";', "an @import"),
+    ("style", ".x { background: u\\rl(logo.png); }", "named by url()"),
     ("markup", '<link rel="stylesheet" href="theme.css">', "a file the policy blocks"),
     ("markup", '<img src="logo.png" alt="">', "a file the policy blocks"),
     ("markup", '<img alt="" srcset="logo.png 2x">', "a file the policy blocks"),
@@ -331,6 +398,31 @@ SELFTEST_REFUSED = [
     ("markup", '<p style="color: red">x</p>', "a style attribute"),
     ("markup", '<a href="javascript:go()">x</a>', "a javascript: address"),
     ("markup", '<a href="https://elsewhere.example/">x</a>', "a file from another server"),
+    ("markup", '<a href="#live" ping="/count">x</a>', "a ping"),
+    # A second block, in any case, would run without a hash in the policy.
+    ("markup", "<SCRIPT>go()</SCRIPT>", "there must be exactly one <script>"),
+    ("markup", "<Script>go()</Script>", "there must be exactly one <script>"),
+    ("markup", '<script src="more.js"></script>', "there must be exactly one <script>"),
+    ("markup", "<STYLE>p { color: red; }</STYLE>", "there must be exactly one <style>"),
+    # A value is read with its character references decoded, and an address without the tabs and
+    # newlines inside it.
+    ("markup", '<a href="java&#115;cript:go()">x</a>', "a javascript: address"),
+    ("markup", '<a href="java&#9;script:go()">x</a>', "a javascript: address"),
+    ("markup", '<a href="java\nscript:go()">x</a>', "a javascript: address"),
+    ("markup", '<a href="java&#13;script:go()">x</a>', "a javascript: address"),
+    ("markup", '<a href="Java&#83;cript:go()">x</a>', "a javascript: address"),
+    ("markup", '<svg><a><set attributeName="href" to="java&#115;cript:go()"/></a></svg>',
+     "a javascript: address"),
+    ("markup", '<img alt="" srcset="data:image/png;base64,AAAA&#32;1x,&#32;logo.png&#32;2x">',
+     "a file the policy blocks"),
+    ("markup", '<img alt="" srcset="data:image/png;base64,AAAA&#9;1x,&#9;logo.png&#9;2x">',
+     "a file the policy blocks"),
+    ("markup", '<img alt="" srcset="data:image/png;base64,AAAA&#12;1x,&#13;logo.png&#10;2x">',
+     "a file the policy blocks"),
+    ("markup", '<img src="&#32;logo.png" alt="">', "a file the policy blocks"),
+    ("markup", '<img src="&#32;//elsewhere.example/a.png" alt="">', "a file from another server"),
+    # A no-break space is not one of the spaces an address loses at its ends.
+    ("markup", '<img src="&nbsp;data:image/png;base64,AAAA" alt="">', "a file the policy blocks"),
     ("markup", "<iframe></iframe>", "an element the policy does not allow"),
     ("markup", "<IFRAME></IFRAME>", "an element the policy does not allow"),
     ("markup", "<p class=x><iframe></iframe>", "an element the policy does not allow"),
@@ -366,6 +458,12 @@ SELFTEST_REFUSED = [
     ("markup", '<!--> <img src="logo.png" alt=""> -->', "a file the policy blocks"),
     ("markup", '<!-- a --!> <img src="logo.png" alt="">', "a file the policy blocks"),
     ("script", "x.innerHTML = y;", "innerHTML"),
+    ("script", "x.inner\\u0048TML = y;", "innerHTML"),
+    ("script", "\\u0065val(y);", "eval"),
+    ("script", "\\u{65}val(y);", "eval"),
+    ("script", "var end = '</script>';", "there must be exactly one </script>"),
+    ("script", "var end = '</SCRIPT ';", "there must be exactly one </script>"),
+    ("script", "var end = '</script/';", "there must be exactly one </script>"),
     ("script", "x.insertAdjacentHTML('beforeend', y);", "insertAdjacentHTML"),
     ("script", "document.write(y);", "document.write"),
     ("script", "eval(y);", "eval"),
@@ -412,9 +510,24 @@ SELFTEST_ALLOWED = [
     ("markup", '<svg><use href="#f"/><a xlink:href="/snapshot">x</a></svg>'),
     ("markup", '<p data-src="logo.png" title="a > b">x</p>'),
     ("markup", '<!-- <img src="logo.png"> -->'),
+    ("markup", '<img src="data&#58;image/png,x" alt="">'),
+    ("markup", '<img src="&#32;data:image/png,x&#10;" alt="">'),
+    ("markup", '<img alt="" srcset="data:image/png;base64,AAAA&#9;1x,&#9;data:,b&#9;2x">'),
+    ("markup", '<link rel="shortcut&#9;icon" href="data:,">'),
+    ("markup", '<img alt="" srcset="data:,a 1x,&#12;data:,b 2x">'),
     ("script", "image.src = 'data:image/png;base64,AAAA';"),
     ("script", "image.setAttribute('src', 'data:image/png;base64,AAAA');"),
     ("script", "if (image.src == other) { setTimeout(go, 10); } // see //notes"),
+]
+SELFTEST_REPLACED = [
+    ([("<script>", "<SCRIPT>")], "there must be exactly one <script>"),
+    ([("<script>", '<script type="module">')], "there must be exactly one <script>"),
+    ([("</script>", "</SCRIPT>")], "there must be exactly one </script>"),
+    ([("</script>", "</script >")], "there must be exactly one </script>"),
+    ([("</script>", "</script/>")], "there must be exactly one </script>"),
+    ([("<style>", "<Style>")], "there must be exactly one <style>"),
+    ([("</style>", "</style >")], "there must be exactly one </style>"),
+    ([("</script>", ""), ("<script>", "</script><script>")], "the </script> must come after the <script>"),
 ]
 
 
@@ -450,9 +563,20 @@ def selftest():
         got = outcome(variant(where, text))
         if got is not None:
             problems.append("%s %r: %s" % (where, text, got))
+    for changes, words in SELFTEST_REPLACED:
+        changed = page
+        for old, new in changes:
+            if changed.count(old) != 1:
+                problems.append("%r is not in the page once" % old)
+                break
+            changed = changed.replace(old, new)
+        else:
+            got = outcome(changed)
+            if got is None or words not in got:
+                problems.append("%r: %s" % (changes, got or "accepted"))
     for problem in problems:
         print("self-test: " + problem)
-    total = 1 + len(SELFTEST_REFUSED) + len(SELFTEST_ALLOWED)
+    total = 1 + len(SELFTEST_REFUSED) + len(SELFTEST_ALLOWED) + len(SELFTEST_REPLACED)
     if problems:
         print("embed_web.py self-test: %d of %d pages not as expected" % (len(problems), total))
         return 1
