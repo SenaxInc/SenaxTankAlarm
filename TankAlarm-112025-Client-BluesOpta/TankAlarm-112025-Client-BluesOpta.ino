@@ -1346,6 +1346,8 @@ static float readCurrentLoopSensor(const MonitorConfig &cfg, uint8_t idx);
 static void assessLoopClipping(const MonitorConfig &cfg, uint8_t idx, float milliamps, bool pwmMode);
 static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx);
 static float readMonitorSensor(uint8_t idx);
+static void resetPulseMonitor(uint8_t idx);
+static bool pulseMonitorChanged(const MonitorConfig &was, const MonitorConfig &now);
 
 // ============================================================================
 // Non-blocking Pulse Sampler State Machine
@@ -1619,6 +1621,38 @@ static float readPulseSensorResult(uint8_t idx) {
     return rpm;
   }
   return gRpmLastReading[idx];
+}
+
+// A monitor's pulse count as at boot: no count under way, no last reading, no accumulated pulses
+// and no mark of a charger programming run. For a slot that a config empties, fills, or gives
+// another sensor or other pulse settings (applyConfigUpdate(), pulseMonitorChanged()): what the
+// slot keeps is the old monitor's. A count under way would go on with the old pin and settings,
+// a count of the time between two pulses that sees no second one gives the last reading again,
+// and the mark of a run that cut into the old monitor's count would keep every reading of the
+// new one marked reused until a count of it measures something. A sensor that gives no pulses
+// would never get there: with stuck detection off, its alarms would never be judged.
+static void resetPulseMonitor(uint8_t idx) {
+  if (idx >= MAX_MONITORS) {
+    return;
+  }
+  memset(&gPulseSampler[idx], 0, sizeof(gPulseSampler[idx]));  // PULSE_STATE_IDLE: the next sample starts a count
+  gRpmLastReading[idx] = 0.0f;
+  atomicResetPulses(idx);
+  gRpmAccumulatedStartMillis[idx] = millis();
+  gRpmAccumulatedInitialized[idx] = false;
+  gRpmAccumulatedCutByRun[idx] = false;
+  gRpmReadingBeforeRun[idx] = false;
+  gRpmTimedOutAfterRun[idx] = false;
+}
+
+// Whether the monitor a config puts in a slot is another sensor than the one it held (another
+// interface or number), or one counted another way (startPulseSample() takes all of these).
+static bool pulseMonitorChanged(const MonitorConfig &was, const MonitorConfig &now) {
+  return was.sensorInterface != now.sensorInterface || was.sensorIndex != now.sensorIndex ||
+         was.pulsePin != now.pulsePin || was.primaryPin != now.primaryPin || was.pulsesPerUnit != now.pulsesPerUnit ||
+         was.hallEffectType != now.hallEffectType || was.hallEffectDetection != now.hallEffectDetection ||
+         was.pulseSampleDurationMs != now.pulseSampleDurationMs || was.pulseAccumulatedMode != now.pulseAccumulatedMode ||
+         was.expectedPulseRate != now.expectedPulseRate;
 }
 static void evaluateAlarms(uint8_t idx);
 static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow);
@@ -5689,11 +5723,14 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       }
       // Zero out stale runtime state so it's clean if monitor is re-added later
       memset(&gMonitorState[i], 0, sizeof(MonitorRuntime));
+      resetPulseMonitor(i);  // and its pulse count
     }
 
+    const uint8_t oldCount = gConfig.monitorCount;
     gConfig.monitorCount = newCount;
     for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
       // Capture previous state before config update
+      const MonitorConfig was = gConfig.monitors[i];
       bool wasAlarmsEnabled = gConfig.monitors[i].alarmsEnabled;
       bool wasStuckEnabled = gConfig.monitors[i].stuckDetectionEnabled;
       char wasRelayTarget[48];
@@ -5702,6 +5739,11 @@ static void applyConfigUpdate(const JsonDocument &doc) {
 
       JsonObjectConst t = sensors[i];
       parseMonitorFromJson(gConfig.monitors[i], t, i);
+      // A monitor in a slot that held none, or another sensor than before, or one counted another
+      // way: its pulse count starts as at boot (resetPulseMonitor()).
+      if (i >= oldCount || pulseMonitorChanged(was, gConfig.monitors[i])) {
+        resetPulseMonitor(i);
+      }
 
       // BugFix 04022026: When alarmsEnabled transitions from true to false,
       // clear any latched alarm state and send a "clear" note to the server.
