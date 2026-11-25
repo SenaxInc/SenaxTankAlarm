@@ -585,10 +585,11 @@ enum Refusal : uint32_t {
   REFUSE_NO_CHARGER = 1ul << 11,     // the charger is not enabled, or did not answer in time
   REFUSE_JOURNAL = 1ul << 12,        // the client could not record the run in its flash
   REFUSE_WITHDRAWN = 1ul << 13,      // a newer config no longer asked for it while it waited
-  REFUSE_CONFIG_UNSAVED = 1ul << 14  // the client could not save the config that carried it in its flash
+  REFUSE_CONFIG_UNSAVED = 1ul << 14,  // the client could not save the config that carried it in its flash
+  REFUSE_HISTORY_LOST = 1ul << 15     // asked for before a start that lost the record of the requests answered (cautiousJournal())
 };
 
-static const uint8_t REFUSAL_BITS = 15;
+static const uint8_t REFUSAL_BITS = 16;
 
 inline const char *refusalText(uint32_t refusal) {
   switch (refusal) {
@@ -622,6 +623,11 @@ inline const char *refusalText(uint32_t refusal) {
     case REFUSE_CONFIG_UNSAVED:
       return "The client could not save the config that asked for these values in its flash memory, so they "
              "were not written: after a restart it would go by the config it had before.";
+    case REFUSE_HISTORY_LOST:
+      return "The client could not read its record of the requests it had carried out when it last started, "
+             "and this request was asked for before that start, or too soon after it to tell, so it may have "
+             "been carried out already. Check the charger's settings, and ask again if they still need to "
+             "change.";
     default: return "A reason this firmware has no text for.";
   }
 }
@@ -1728,6 +1734,10 @@ enum JournalPhase : uint8_t { JOURNAL_IDLE = 0, JOURNAL_RESTARTING, JOURNAL_WRIT
 
 static const uint8_t JOURNAL_PHASE_LAST = JOURNAL_WRITING;
 
+// Journal::historyFrom of a record of the requests answered that a start lost, while the client
+// has yet to learn the time of that start.
+static const uint32_t HISTORY_FROM_UNKNOWN = 1;
+
 struct Journal {
   uint32_t requestId;    // the request of the last run that reached a commit point
   uint8_t phase;         // JournalPhase: how far that run came
@@ -1747,6 +1757,9 @@ struct Journal {
   uint32_t sentEpoch;    // the time that result went out with, 0 for none
   uint32_t lookSentEpoch;  // the time the last look went out with, 0 for none
   uint32_t keptTaken;    // the check value of a journal kept aside that this one took in, 0 for none
+  uint32_t historyFrom;  // the record of the requests answered holds only those asked for from this
+                         // time on, less HISTORY_MARGIN_SECONDS: 0 when it holds them all,
+                         // HISTORY_FROM_UNKNOWN while the time is not known (see cautiousJournal())
 };
 
 // The journal of a client that owes nothing and has answered nothing.
@@ -1756,10 +1769,19 @@ inline Journal emptyJournal() {
   return journal;
 }
 
-// The journal of a client whose journal cannot be read: it may owe the controller a restart.
+// The journal of a client whose journal cannot be read: it may owe the controller a restart, and
+// it has lost its record of the requests it answered. A request asked for before this start (or
+// within HISTORY_MARGIN_SECONDS after it, for the difference between the server's clock and the
+// client's) may have been answered already, and is refused with REFUSE_HISTORY_LOST; one asked
+// for later, and every duty, go on as before. The journal keeps the start (Journal::historyFrom),
+// as a time once the clock has one (Supervisor::service()), so that later starts refuse the same
+// requests: the record they read holds none of those either. A start that reads
+// HISTORY_FROM_UNKNOWN stands for the start that lost the record, and is later. A request is fresh
+// for a day (requestIsFresh()), so the time holds back no request asked for after it.
 inline Journal cautiousJournal() {
   Journal journal = emptyJournal();
   journal.phase = JOURNAL_WRITING;
+  journal.historyFrom = HISTORY_FROM_UNKNOWN;
   return journal;
 }
 
@@ -1768,14 +1790,18 @@ inline Journal cautiousJournal() {
 // `journal` does not comes in:
 //   - the duty to the controller its run talked to, where `journal` owes none, or owes the
 //     cautious look, which went to the controller the config names. A duty that `journal` owes a
-//     known controller stays: it is newer, and a journal holds one;
+//     known controller stays: it is newer, and a journal holds one. When that is another
+//     controller, the kept duty is left out (keptDutyLeftOut()): the client keeps the kept file,
+//     and takes its duty up once the one owed now is settled (Supervisor::takeKeptDuty());
 //   - the requests it answered or took on, so that none of them is acted on again;
 //   - a request that waited, newer than any that `journal` answered: begin() answers it as
 //     interrupted, unless `journal` has one that waits;
 //   - its result that had yet to go out, unless `journal` holds one of the same request or a
 //     newer one, or sent one; and its look, while `journal` has none and sent none;
 //   - the times its last result and its last look went out with, where they are later: a later
-//     result of the same request, and a later look, go out later still (Supervisor::sendEpoch()).
+//     result of the same request, and a later look, go out later still (Supervisor::sendEpoch());
+//   - the time from which its record of the requests answered is whole, where it is later: the
+//     record is whole only from the later of the two (Journal::historyFrom).
 // `keptTaken` stays as `journal` has it: the caller sets it to the check value of the kept file.
 inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
   uint32_t answered = journal.answeredId;
@@ -1813,6 +1839,10 @@ inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
   if (kept.lookSentEpoch > journal.lookSentEpoch) {
     journal.lookSentEpoch = kept.lookSentEpoch;
   }
+  if (journal.historyFrom != HISTORY_FROM_UNKNOWN &&
+      (kept.historyFrom == HISTORY_FROM_UNKNOWN || kept.historyFrom > journal.historyFrom)) {
+    journal.historyFrom = kept.historyFrom;
+  }
   const uint32_t keptIds[] = {answered, kept.answeredId, kept.requestId, kept.waitingId, kept.reportId};
   for (uint8_t i = 0; i < sizeof(keptIds) / sizeof(keptIds[0]); ++i) {
     if (journal.answeredId < keptIds[i]) {
@@ -1820,6 +1850,14 @@ inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
     }
   }
   return journal;
+}
+
+// Whether mergeKeptJournal() leaves the duty of `kept` out: `journal` owes a duty to another
+// controller, and both know which one. A duty owed to the same controller covers it: the look
+// goes to that controller, and asks it what it holds.
+inline bool keptDutyLeftOut(const Journal &journal, const Journal &kept) {
+  return kept.phase != JOURNAL_IDLE && kept.controller != 0 && journal.phase != JOURNAL_IDLE &&
+         journal.controller != 0 && journal.controller != kept.controller;
 }
 
 // Where the client keeps the journal.
@@ -1938,6 +1976,7 @@ static const uint32_t REQUEST_WAIT_MS = 3600000ul;        // a request waits thi
 static const double REQUEST_MAX_AGE_SECONDS = 86400.0;    // and may be this old when it runs
 static const double REQUEST_MAX_AHEAD_SECONDS = 3600.0;   // or this far ahead of the client's clock
 static const double CLOCK_SET_EPOCH = 1600000000.0;       // 2020-09-13: a clock that reads less was never set
+static const double HISTORY_MARGIN_SECONDS = 600.0;       // see cautiousJournal()
 static const uint32_t DUTY_RETRY_MS = 600000ul;           // between two tries of a duty
 static const uint32_t DUTY_SLOW_RETRY_MS = 86400000ul;    // and after DUTY_FAST_TRIES of them
 static const uint8_t DUTY_FAST_TRIES = 3;
@@ -1990,6 +2029,7 @@ class Supervisor {
     dutyTryMs_ = nowMs;
     reportMs_ = nowMs;
     lookMs_ = nowMs;
+    startMs_ = nowMs;
     if (journal_.waitingId != 0) {
       // The client restarted while the request waited, or before its run reached the controller.
       const uint32_t requestId = journal_.waitingId;
@@ -1999,6 +2039,32 @@ class Supervisor {
       post(requestId, result, 0.0, nowMs);
       saveJournal(nowMs);
     }
+  }
+
+  // The duty of a journal kept aside, which the client's start did not take in because the
+  // journal owed a duty to another controller then (keptDutyLeftOut()). Taken once no duty is
+  // owed: a look at the controller the kept journal's run talked to, at the next chance, which
+  // asks that controller what it holds. `check` is the check value of the kept file
+  // (Journal::keptTaken), which the journal holds from then on. Returns false, and does nothing,
+  // while a duty is owed, or when `kept` owes none.
+  bool takeKeptDuty(const Journal &kept, uint32_t check, uint32_t nowMs) {
+    if (dutyOwed() || kept.phase == JOURNAL_IDLE) {
+      return false;
+    }
+    journal_.requestId = kept.requestId;
+    journal_.phase = kept.phase > JOURNAL_PHASE_LAST ? (uint8_t)JOURNAL_WRITING : kept.phase;
+    journal_.controller = kept.controller;
+    journal_.readFunction = kept.readFunction;
+    if (journal_.answeredId < kept.requestId) {
+      journal_.answeredId = kept.requestId;
+    }
+    journal_.keptTaken = check;
+    programmer_ = Programmer();  // no run of this start is taken up for it
+    dutyForced_ = true;
+    dutyTries_ = 0;
+    dutyTryMs_ = nowMs;
+    saveJournal(nowMs);
+    return true;
   }
 
   // A config carried a request. `profileErrors` is what readProfile() found, `clientRefusals`
@@ -2049,6 +2115,13 @@ class Supervisor {
   bool service(Port &port, double epochNow, bool ready) {
     const uint32_t nowMs = port.millisNow();
     maintain(nowMs);
+    if (journal_.historyFrom != 0 && epochNow >= CLOCK_SET_EPOCH) {
+      const uint32_t from = (uint32_t)historyStart(epochNow, nowMs);
+      if (from != journal_.historyFrom) {
+        journal_.historyFrom = from;  // the start as a time, taken once: millis() may come round later
+        saveJournal(nowMs);
+      }
+    }
     if (dutyOwed()) {
       if (ready && dutyTurn(nowMs)) {
         // The run the duty is about is taken up again, if this client still holds it. After a
@@ -2073,6 +2146,10 @@ class Supervisor {
     const bool clockSet = epochNow >= CLOCK_SET_EPOCH;
     if (clockSet && !requestIsFresh(waitingAskedAt_, epochNow)) {
       refuseWaiting(REFUSE_STALE, epochNow, nowMs);
+      return false;
+    }
+    if (clockSet && askedBeforeHistory(waitingAskedAt_, epochNow, nowMs)) {
+      refuseWaiting(REFUSE_HISTORY_LOST, epochNow, nowMs);
       return false;
     }
     if (waitOver(nowMs)) {
@@ -2215,7 +2292,8 @@ class Supervisor {
     if (dutyOwed()) {
       return dutyTurn(nowMs);
     }
-    return journal_.waitingId != 0 && requestIsFresh(waitingAskedAt_, epochNow) && !waitOver(nowMs);
+    return journal_.waitingId != 0 && requestIsFresh(waitingAskedAt_, epochNow) &&
+           !askedBeforeHistory(waitingAskedAt_, epochNow, nowMs) && !waitOver(nowMs);
   }
   // The controller may wait for a restart, and the client has yet to settle that.
   bool dutyOwed() const { return journal_.phase == JOURNAL_RESTARTING || journal_.phase == JOURNAL_WRITING; }
@@ -2226,14 +2304,26 @@ class Supervisor {
   // while no poll runs (the charger is off in the config), does without: the poll says nothing of
   // its controller, and a controller that waits for its restart may not charge. Its first request
   // asks the controller, and a miss leaves the duty owed until its next turn (dutyTurn()).
-  bool mayTalk(const Port &port, const Line &line) const {
+  bool mayTalk(const Port &port, const Line &line) const { return mayTalkTo(port.controller(), line); }
+  // The same for a port that talks to the controller `controller`.
+  bool mayTalkTo(uint8_t controller, const Line &line) const {
     if (!line.free) {
       return false;
     }
     if (line.polling && line.pollAnswered) {
       return true;
     }
-    return dutyOwed() && (!line.polling || port.controller() != line.configured);
+    return dutyOwed() && (!line.polling || controller != line.configured);
+  }
+  // Whether the client is to give programming a pass that a poll would take: wantsLine(), in a
+  // pass in which service() may talk with `line` as it stands (mayTalk(), for the controller
+  // controllerToUse() names). A request, and a duty owed to the controller the config names, wait
+  // for a poll that answered: a pass given to them before that goes unused, and holds back the
+  // poll that may bring that answer, such as the one that tells that the battery recovered in
+  // hibernation. Whether the line is free in this pass is not asked: that is for LineTurns.
+  bool wantsPass(double epochNow, uint32_t nowMs, Line line) const {
+    line.free = true;
+    return wantsLine(epochNow, nowMs) && mayTalkTo(controllerToUse(line.configured), line);
   }
   // The Modbus id to talk to: the controller a duty is owed to, when the journal knows which
   // one that is, and otherwise `configured`, the one the client's config names.
@@ -2268,9 +2358,28 @@ class Supervisor {
   uint32_t dutyTryMs_;
   uint32_t reportMs_;
   uint32_t lookMs_;
+  uint32_t startMs_;  // the client's millis() at this start (historyStart())
   uint16_t stepLimit_;
 
   bool waitOver(uint32_t nowMs) const { return (uint32_t)(nowMs - waitingSinceMs_) >= REQUEST_WAIT_MS; }
+
+  // The time from which the record of the requests answered holds them all (Journal::historyFrom),
+  // in whole seconds, from the clock now: this start for HISTORY_FROM_UNKNOWN, and for a time that
+  // no clock gives or that is later than the clock now, which is no start's.
+  double historyStart(double epochNow, uint32_t nowMs) const {
+    const double kept = (double)journal_.historyFrom;  // HISTORY_FROM_UNKNOWN is a time no clock gives
+    if (kept >= CLOCK_SET_EPOCH && kept <= epochNow) {
+      return kept;
+    }
+    double at = epochNow - (double)(uint32_t)(nowMs - startMs_) / 1000.0;
+    at = at < CLOCK_SET_EPOCH ? CLOCK_SET_EPOCH : at > 4294967295.0 ? 4294967295.0 : at;
+    return (double)(uint32_t)at;
+  }
+  // A request asked for at `askedAt` (the server's time) that a record of the requests answered
+  // that a start lost may have answered (cautiousJournal()).
+  bool askedBeforeHistory(uint32_t askedAt, double epochNow, uint32_t nowMs) const {
+    return journal_.historyFrom != 0 && (double)askedAt < historyStart(epochNow, nowMs) + HISTORY_MARGIN_SECONDS;
+  }
 
   // The duty that is owed may be tried now: at once after a request or a client's start, and then
   // DUTY_RETRY_MS apart, DUTY_SLOW_RETRY_MS after DUTY_FAST_TRIES tries.

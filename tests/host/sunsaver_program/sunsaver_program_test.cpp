@@ -3527,6 +3527,7 @@ static void testRequestJson() {
         }
         out.lookSentEpoch = phase == 1 ? 0u : (uint32_t)kClientNow - 30 - phase;
         out.keptTaken = due == 1 ? 0u : 0x9E3779B9u + phase;
+        out.historyFrom = phase == 0 ? 0u : phase == 1 ? ss::HISTORY_FROM_UNKNOWN : (uint32_t)kClientNow - 3600u + due;
         JsonDocument file;
         ss::encodeJournal(out, file.to<JsonObject>());
         std::string text;
@@ -3537,6 +3538,7 @@ static void testRequestJson() {
         CHECK_EQ(text.find("sep") != std::string::npos, out.sentEpoch != 0);
         CHECK_EQ(text.find("lep") != std::string::npos, out.lookSentEpoch != 0);
         CHECK_EQ(text.find("\"kt\"") != std::string::npos, out.keptTaken != 0);
+        CHECK_EQ(text.find("\"hf\"") != std::string::npos, out.historyFrom != 0);
         JsonDocument back = parsed(text);
         const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
         CHECK_MSG(in.requestId == out.requestId && in.phase == out.phase && in.controller == out.controller &&
@@ -3557,6 +3559,7 @@ static void testRequestJson() {
         CHECK_EQ(in.sentEpoch, out.sentEpoch);
         CHECK_EQ(in.lookSentEpoch, out.lookSentEpoch);
         CHECK_EQ(in.keptTaken, out.keptTaken);
+        CHECK_EQ(in.historyFrom, out.historyFrom);
       }
     }
     // A look whose result this code cannot read is left out, and the rest still holds; times that
@@ -3571,6 +3574,14 @@ static void testRequestJson() {
       for (const char *kt : {"1.5", "\"7\"", "4294967296", "true"}) {
         JsonDocument other = parsed((std::string("{\"req\":5,\"ph\":0,\"kt\":") + kt + "}").c_str());
         CHECK_MSG(ss::decodeJournal(other.as<JsonObjectConst>()).keptTaken == 0u, "kt %s", kt);
+      }
+      // A time from which the record is whole that does not read: the record is lost, as of the
+      // start that reads it.
+      for (const char *hf : {"1.5", "\"7\"", "4294967296", "-1", "true", "null"}) {
+        JsonDocument other = parsed((std::string("{\"req\":5,\"ph\":0,\"ans\":9,\"hf\":") + hf + "}").c_str());
+        CHECK_MSG(ss::decodeJournal(other.as<JsonObjectConst>()).historyFrom ==
+                      (strcmp(hf, "null") == 0 ? 0u : ss::HISTORY_FROM_UNKNOWN),
+                  "hf %s", hf);
       }
     }
 
@@ -3618,6 +3629,7 @@ static void testRequestJson() {
       longest.sentEpoch = 0xFFFFFFFFu;
       longest.lookSentEpoch = 0xFFFFFFFFu;
       longest.keptTaken = 0xFFFFFFFFu;
+      longest.historyFrom = 0xFFFFFFFFu;
       JsonDocument file;
       ss::encodeJournal(longest, file.to<JsonObject>());
       CHECK(!file.overflowed());
@@ -4518,9 +4530,16 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
     // The port of this pass, as SolarManager::serviceChargerProgramming() makes it.
     choice = ss::FunctionChoice(supervisor.readFunctionToUse(now.configured, now.pollAnswered ? pollFunction : 0));
     const bool mayTalk = supervisor.mayTalk(*this, now);
+    const bool passWanted = supervisor.wantsPass(clock(), millisNow(), now);
     const bool ran = supervisor.service(*this, clock(), now);
     CHECK_MSG(ran == (wanted && mayTalk), "wantsLine() said %s, mayTalk() said %s, and service() %s",
               wanted ? "yes" : "no", mayTalk ? "yes" : "no", ran ? "ran" : "did not run");
+    // And the pass it asks a poll to leave it (wantsPass()) is one it talks in, when the line is
+    // free then.
+    if (now.free) {
+      CHECK_MSG(ran == passWanted, "wantsPass() said %s, and service() %s", passWanted ? "yes" : "no",
+                ran ? "ran" : "did not run");
+    }
     collect(supervisor);
     return ran;
   }
@@ -5179,7 +5198,9 @@ static void testSupervisor() {
     CHECK_EQ(desk.bus.count('c'), which == 1 ? 1 : 0);
     CHECK(!editPending(desk.sim));
     CHECK(!supervisor.dutyOwed());
-    CHECK_EQ(desk.saves.size(), 2);  // the result, and that it went out
+    // The result, and that it went out; and for the cautious journal, the start as a time once the
+    // clock had one (see testHistoryLost()).
+    CHECK_EQ(desk.saves.size(), which == 3 ? 3u : 2u);
     CHECK(sameJournal(desk.flash, journal.requestId, ss::JOURNAL_IDLE));
     CHECK(settledOn(desk.flash, journal.requestId));
     CHECK_EQ(desk.loopFor(supervisor, 2 * 86400000ull, 600000), 0);
@@ -5761,6 +5782,345 @@ static void testReplayKeepsItsTime() {
   }
 }
 
+// The nineteenth review of PR 335.
+//   - A start that lost the record of the requests answered (cautiousJournal(), and a journal
+//     whose record does not read) refuses a request asked for before it, or within
+//     HISTORY_MARGIN_SECONDS after it, with REFUSE_HISTORY_LOST once the clock is set, and goes on
+//     with a later one and with every duty. The journal keeps the start (Journal::historyFrom), as
+//     a time once the clock has one, so later starts refuse the same requests and a turn of
+//     millis() does not move it.
+//   - The duty of a journal kept aside that a start left out (keptDutyLeftOut()) is taken up once
+//     none is owed (takeKeptDuty()).
+//   - A request, and a duty owed to the controller the config names, ask no poll to leave them a
+//     pass while the last poll got no answer (wantsPass()). Desk::pass() checks wantsPass()
+//     against service() in every pass of every test.
+
+// A journal that owes nothing and whose record of the requests answered was lost at the start
+// that reads it, at a time not known yet: what the cautious journal says once its look is done.
+static ss::Journal lostRecord() {
+  ss::Journal journal = ss::emptyJournal();
+  journal.historyFrom = ss::HISTORY_FROM_UNKNOWN;
+  return journal;
+}
+
+static void testHistoryLost() {
+  CHECK_EQ(ss::cautiousJournal().historyFrom, ss::HISTORY_FROM_UNKNOWN);
+  CHECK_EQ(ss::emptyJournal().historyFrom, 0u);
+  // When the request was asked for, from the start; and whether it is refused when the record
+  // was lost.
+  const double margin = ss::HISTORY_MARGIN_SECONDS;
+  const struct {
+    double fromStart;
+    bool refused;
+  } cases[] = {{-3600.0, true}, {-1.0, true}, {0.0, true}, {margin - 1.0, true}, {margin, false}, {7200.0, false}};
+  for (const auto &c : cases) {
+    for (int lost = 0; lost < 2; ++lost) {
+      for (int wrap = 0; wrap < 2; ++wrap) {
+        Desk desk;
+        desk.millisAtBoot = wrap == 1 ? 0xFFFFF000u : 0u;  // millis() comes round 4 s after the start
+        desk.clockSet = false;
+        if (lost == 1) {
+          desk.flash = lostRecord();
+        }
+        // A start half way through a second: it counts from the whole second, as the journal
+        // keeps it, also in the pass that first has the clock and before the journal has it.
+        desk.advance(3500);
+        ss::Supervisor supervisor;
+        desk.boot(supervisor);
+        const double start = desk.epochBase + (double)desk.bootedAt / 1000.0;
+        desk.advance(3 * 3600000ull);  // the clock comes three hours later
+        desk.clockSet = true;
+        const uint32_t asked = (uint32_t)(start + c.fromStart);
+        CHECK(supervisor.request(asked, ss::lifepo4Profile(), 0, 0, true, desk.clock(), desk.millisNow()));
+        desk.collect(supervisor);
+        const bool refused = lost == 1 && c.refused;
+        CHECK_EQ(supervisor.wantsLine(desk.clock(), desk.millisNow()), !refused);
+        CHECK_EQ(desk.pass(supervisor), !refused);
+        CHECK_EQ(desk.reports.size(), 1);
+        CHECK_MSG(desk.reports.back().result.outcome == (refused ? ss::OUTCOME_REFUSED : ss::OUTCOME_PROGRAMMED),
+                  "asked %.0f s from the start, lost %d, wrap %d", c.fromStart, lost, wrap);
+        CHECK_EQ(desk.reports.back().result.refusals, refused ? (uint32_t)ss::REFUSE_HISTORY_LOST : 0u);
+        CHECK_EQ(desk.bus.log.empty(), refused);
+        CHECK(!supervisor.requestWaiting());
+        CHECK_EQ(desk.flash.historyFrom, lost == 1 ? (uint32_t)start : 0u);  // the start as a time
+      }
+    }
+  }
+  // The start is taken as a time when the clock is first set: 49.7 days and 7 hours on, after a
+  // turn of millis(), a request asked for 8 hours before goes on. Worked out from millis() then,
+  // the start would be 7 hours back, and the request older than that.
+  for (int clockEarly = 0; clockEarly < 2; ++clockEarly) {
+    Desk desk;
+    desk.clockSet = clockEarly == 1;
+    desk.flash = lostRecord();
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.advance(60000);
+    desk.clockSet = true;
+    if (clockEarly == 1) {
+      desk.pass(supervisor);  // a pass with the clock set: the start is taken as a time
+    }
+    desk.advance(4294967296ull + 7ull * 3600000ull);
+    const uint32_t asked = (uint32_t)(desk.clock() - 8.0 * 3600.0);
+    CHECK(supervisor.request(asked, ss::lifepo4Profile(), 0, 0, true, desk.clock(), desk.millisNow()));
+    // Without a pass that had the clock, the start comes from the turn of millis(): refused, which
+    // errs on the safe side.
+    CHECK_EQ(desk.pass(supervisor), clockEarly == 1);
+    CHECK_EQ(desk.reports.back().result.refusals, clockEarly == 1 ? 0u : (uint32_t)ss::REFUSE_HISTORY_LOST);
+  }
+  // The cautious journal: its look is made all the same, and a request that was asked for later
+  // than the start goes on after it; one asked for before it is refused, after the look too.
+  for (int before = 0; before < 2; ++before) {
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    const double start = desk.epochBase + (double)desk.bootedAt / 1000.0;
+    CHECK(desk.pass(supervisor));
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.flash.historyFrom, (uint32_t)start);  // and the look keeps it
+    desk.advance(1200000);
+    CHECK(desk.ask(supervisor, before == 1 ? (uint32_t)start - 60u : (uint32_t)desk.clock() - 60u));
+    CHECK_EQ(desk.pass(supervisor), before == 0);
+    CHECK_EQ(desk.reports.back().result.outcome, before == 1 ? ss::OUTCOME_REFUSED : ss::OUTCOME_PROGRAMMED);
+  }
+  // Later starts, whose record holds none of the requests that the lost one answered either,
+  // refuse the same ones: those asked for before it, or within the margin after it. Where the time
+  // of the start that lost it never came, the later start stands for it.
+  for (int clockAtFirst = 0; clockAtFirst < 2; ++clockAtFirst) {
+    for (int wrap = 0; wrap < 2; ++wrap) {
+      Desk desk;
+      desk.millisAtBoot = wrap == 1 ? 0xFFFFF000u : 0u;
+      desk.clockSet = clockAtFirst == 1;
+      desk.flash = lostRecord();
+      desk.advance(5000);
+      ss::Supervisor supervisor;
+      desk.boot(supervisor);
+      const double first = desk.epochBase + (double)desk.bootedAt / 1000.0;
+      const size_t saves = desk.saves.size();
+      desk.advance(60000);
+      CHECK(!desk.pass(supervisor));
+      const size_t taken = saves + (clockAtFirst == 1 ? 1u : 0u);
+      CHECK_EQ(desk.saves.size(), taken);
+      CHECK_EQ(desk.flash.historyFrom, clockAtFirst == 1 ? (uint32_t)first : ss::HISTORY_FROM_UNKNOWN);
+      desk.advance(60000);
+      CHECK(!desk.pass(supervisor));
+      CHECK_EQ(desk.saves.size(), taken);  // taken as a time once
+      desk.advance(3600000);
+      ss::Supervisor later;
+      desk.boot(later);
+      const double second = desk.epochBase + (double)desk.bootedAt / 1000.0;
+      desk.clockSet = true;
+      desk.advance(60000);
+      const double from = clockAtFirst == 1 ? first : second;
+      const struct {
+        double at;
+        bool refused;
+      } asks[] = {{first - 600.0, true}, {from + margin - 1.0, true}, {from + margin, false}};
+      for (const auto &a : asks) {
+        CHECK(later.request((uint32_t)a.at, ss::lifepo4Profile(), 0, 0, true, desk.clock(), desk.millisNow()));
+        desk.collect(later);
+        CHECK_EQ(desk.pass(later), !a.refused);
+        CHECK_MSG(desk.reports.back().result.refusals == (a.refused ? (uint32_t)ss::REFUSE_HISTORY_LOST : 0u),
+                  "asked %.0f s after the first start, clock at it %d, wrap %d", a.at - first, clockAtFirst, wrap);
+        CHECK_EQ(desk.flash.historyFrom, (uint32_t)from);
+      }
+      CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
+    }
+  }
+  // A time in the journal that no clock gives, or that is later than the clock now, is no
+  // start's: the start that reads it stands for it. One before the clock now holds.
+  {
+    const uint32_t sound = (uint32_t)kClientNow - 7200u;
+    for (const uint32_t kept : {2u, 1599999999u, (uint32_t)kClientNow + 86400u, 0xFFFFFFFFu, sound}) {
+      Desk desk;
+      desk.flash.historyFrom = kept;
+      desk.advance(5000);
+      ss::Supervisor supervisor;
+      desk.boot(supervisor);
+      const double start = desk.epochBase + (double)desk.bootedAt / 1000.0;
+      desk.advance(60000);
+      const size_t saves = desk.saves.size();
+      CHECK(desk.ask(supervisor, (uint32_t)start - 1u));
+      CHECK_EQ(supervisor.wantsLine(desk.clock(), desk.millisNow()), kept == sound);
+      CHECK_EQ(desk.pass(supervisor), kept == sound);
+      CHECK_MSG(desk.reports.back().result.refusals == (kept == sound ? 0u : (uint32_t)ss::REFUSE_HISTORY_LOST),
+                "kept %u", kept);
+      CHECK_EQ(desk.flash.historyFrom, kept == sound ? sound : (uint32_t)start);
+      const size_t after = desk.saves.size();
+      CHECK(after > saves);
+      desk.advance(60000);
+      CHECK(!desk.pass(supervisor));
+      CHECK_EQ(desk.saves.size(), after);
+    }
+  }
+  // A start that cannot save the time keeps it all the same, and saves it at the next try.
+  {
+    Desk desk;
+    desk.flash = lostRecord();
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.failSaves = 1;
+    CHECK(!desk.pass(supervisor));
+    CHECK(supervisor.journalUnsaved());
+    CHECK_EQ(desk.flash.historyFrom, ss::HISTORY_FROM_UNKNOWN);
+    CHECK_EQ(supervisor.journal().historyFrom, (uint32_t)desk.epochBase);
+    desk.advance(ss::JOURNAL_RETRY_MS);
+    CHECK(!desk.pass(supervisor));
+    CHECK(!supervisor.journalUnsaved());
+    CHECK_EQ(desk.flash.historyFrom, (uint32_t)desk.epochBase);
+  }
+  // A record of the requests answered that does not read: lost as the cautious journal's is.
+  {
+    const char *const files[] = {"{\"req\":5,\"ph\":0}", "{\"req\":5,\"ph\":0,\"ans\":\"9\"}",
+                                 "{\"req\":5,\"ph\":0,\"ans\":4294967296}", "{\"req\":5,\"ph\":0,\"ans\":9,\"hf\":-1}",
+                                 "{\"req\":5,\"ph\":0,\"ans\":9,\"hf\":1.5}", "{\"ph\":0,\"ans\":9}"};
+    for (const char *file : files) {
+      JsonDocument doc = parsed(file);
+      CHECK_MSG(ss::decodeJournal(doc.as<JsonObjectConst>()).historyFrom == ss::HISTORY_FROM_UNKNOWN, "%s", file);
+    }
+    JsonDocument whole = parsed("{\"req\":5,\"ph\":0,\"ans\":9}");
+    CHECK_EQ(ss::decodeJournal(whole.as<JsonObjectConst>()).historyFrom, 0u);
+    JsonDocument known = parsed("{\"req\":5,\"ph\":0,\"ans\":9,\"hf\":1795000000}");
+    CHECK_EQ(ss::decodeJournal(known.as<JsonObjectConst>()).historyFrom, 1795000000u);
+  }
+  // Its text.
+  const std::string text = ss::refusalText(ss::REFUSE_HISTORY_LOST);
+  CHECK(text.find("may have been carried out already") != std::string::npos);
+  CHECK(text.size() < 300);
+}
+
+static void testKeptDuty() {
+  // keptDutyLeftOut(): both owe a duty to a known controller, and not the same one.
+  const uint8_t phases[] = {ss::JOURNAL_IDLE, ss::JOURNAL_RESTARTING, ss::JOURNAL_WRITING};
+  const uint8_t controllers[] = {0, 1, 7};
+  for (uint8_t jp : phases) {
+    for (uint8_t jc : controllers) {
+      for (uint8_t kp : phases) {
+        for (uint8_t kc : controllers) {
+          ss::Journal journal = journalOf(kRequestId + 1, jp);
+          journal.controller = jc;
+          ss::Journal kept = journalOf(kRequestId, kp);
+          kept.controller = kc;
+          const bool leftOut = ss::keptDutyLeftOut(journal, kept);
+          CHECK_EQ(leftOut, jp != ss::JOURNAL_IDLE && kp != ss::JOURNAL_IDLE && jc != 0 && kc != 0 && jc != kc);
+          // Where it is not left out, the merge keeps a duty owed to that controller. A kept duty to
+          // a controller it does not know (0) stays out: it was owed to the controller the config
+          // names, which the start that kept the file aside owed the cautious look.
+          const ss::Journal merged = ss::mergeKeptJournal(journal, kept);
+          if (!leftOut && kp != ss::JOURNAL_IDLE && kc != 0) {
+            CHECK(merged.phase != ss::JOURNAL_IDLE);
+            CHECK_EQ(merged.controller, kc);
+          }
+          if (leftOut || kp == ss::JOURNAL_IDLE || kc == 0) {
+            CHECK_EQ(merged.controller, jc);
+            CHECK_EQ(merged.phase, jp);
+          }
+        }
+      }
+    }
+  }
+  // takeKeptDuty(): not while a duty is owed, and then the kept one, at once.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId + 5, ss::JOURNAL_WRITING);
+    desk.flash.answeredId = kRequestId + 5;
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    ss::Journal kept = journalOf(kRequestId + 9, ss::JOURNAL_RESTARTING);
+    kept.controller = 7;
+    kept.readFunction = MB_FC_READ_HOLDING;
+    const size_t saves = desk.saves.size();
+    CHECK(!supervisor.takeKeptDuty(kept, 0xABCDu, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves);
+    CHECK_EQ(supervisor.journal().controller, 1);
+    CHECK(desk.pass(supervisor));  // the duty owed now is settled
+    CHECK(!supervisor.dutyOwed());
+    ss::Journal idle = kept;
+    idle.phase = ss::JOURNAL_IDLE;
+    CHECK(!supervisor.takeKeptDuty(idle, 0xABCDu, desk.millisNow()));
+    desk.advance(5000);
+    CHECK(supervisor.takeKeptDuty(kept, 0xABCDu, desk.millisNow()));
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(supervisor.journal().phase, ss::JOURNAL_RESTARTING);
+    CHECK_EQ(supervisor.journal().controller, 7);
+    CHECK_EQ(supervisor.journal().readFunction, MB_FC_READ_HOLDING);
+    CHECK_EQ(supervisor.journal().requestId, kRequestId + 9);
+    CHECK_EQ(supervisor.journal().answeredId, kRequestId + 9);
+    CHECK_EQ(supervisor.journal().keptTaken, 0xABCDu);
+    CHECK_EQ(desk.flash.keptTaken, 0xABCDu);  // in flash
+    CHECK_EQ(desk.flash.controller, 7);
+    CHECK_EQ(supervisor.controllerToUse(1), 7);
+    CHECK_EQ(supervisor.readFunctionToUse(1, MB_FC_READ_INPUT), MB_FC_READ_HOLDING);
+    CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));  // at once, not at the duty's next turn
+    // A request that comes now waits for it, and the look goes first.
+    desk.bus.slave = 7;
+    desk.sim.slaveId = 7;
+    desk.choice = ss::FunctionChoice(MB_FC_READ_HOLDING);
+    desk.pollFunction = MB_FC_READ_HOLDING;
+    desk.configured = 1;
+    desk.ready = false;
+    CHECK(desk.ask(supervisor, kRequestId + 10));
+    CHECK(desk.pass(supervisor));
+    CHECK(!supervisor.dutyOwed());
+    CHECK(supervisor.requestWaiting());
+    CHECK_EQ(desk.reports.back().requestId, kRequestId + 9);
+    // A kept journal from a newer firmware, whose phase this one does not know: the cautious one.
+    ss::Journal newer = kept;
+    newer.phase = ss::JOURNAL_PHASE_LAST + 3;
+    newer.requestId = kRequestId + 2;
+    CHECK(supervisor.takeKeptDuty(newer, 0x1234u, desk.millisNow()));
+    CHECK_EQ(supervisor.journal().phase, ss::JOURNAL_WRITING);
+    CHECK_EQ(supervisor.journal().answeredId, kRequestId + 10);  // not lowered
+  }
+}
+
+static void testWantsPass() {
+  // A request waits for a poll that answered; so does a duty owed to the controller the config
+  // names. A duty owed to another one does not, and neither does one while no poll runs.
+  for (int answered = 0; answered < 2; ++answered) {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.ready = answered == 1;
+    desk.ask(supervisor, kRequestId);
+    CHECK_EQ(supervisor.wantsPass(desk.clock(), desk.millisNow(), desk.line()), answered == 1);
+    desk.held = true;  // not free in this pass: asked all the same
+    CHECK_EQ(supervisor.wantsPass(desk.clock(), desk.millisNow(), desk.line()), answered == 1);
+    desk.held = false;
+    CHECK_EQ(desk.pass(supervisor), answered == 1);
+  }
+  for (int other = 0; other < 2; ++other) {
+    for (int polling = 0; polling < 2; ++polling) {
+      Desk desk;
+      desk.bus.slave = 7;
+      desk.sim.slaveId = 7;
+      desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+      desk.flash.controller = 7;
+      ss::Supervisor supervisor;
+      desk.boot(supervisor);
+      desk.configured = other == 1 ? 1 : 7;
+      desk.polling = polling == 1;
+      desk.ready = false;
+      const bool talks = other == 1 || polling == 0;
+      CHECK_EQ(supervisor.wantsPass(desk.clock(), desk.millisNow(), desk.line()), talks);
+      CHECK_EQ(desk.pass(supervisor), talks);
+    }
+  }
+  // Nothing due: no pass, whatever the poll said.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(!supervisor.wantsPass(desk.clock(), desk.millisNow(), desk.line()));
+  }
+}
+
 // Supervisor::wantsLine() in the plain cases. Desk::pass() checks it against service() in every
 // pass of every other test.
 static void testWantsLine() {
@@ -5891,16 +6251,20 @@ static void testWantsLine() {
     CHECK(desk.pass(supervisor));  // the second try: no answer again
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
     // A request makes the duty due at once, and runs after it. (The line rests first after the
-    // request that got no reply.)
+    // request that got no reply.) It was asked for after the start, by a server whose clock is two
+    // minutes ahead: the cautious journal says that one asked for before it, or within ten minutes
+    // after it, may have been answered (testHistoryLost()).
     desk.sim.powered = true;
     desk.advance(desk.master.responseTimeoutMs);
-    desk.ask(supervisor, kRequestId);
+    const uint32_t asked = (uint32_t)desk.clock() + 120u;
+    CHECK(asked > (uint32_t)desk.epochBase + (uint32_t)ss::HISTORY_MARGIN_SECONDS);
+    desk.ask(supervisor, asked);
     CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
     CHECK(desk.pass(supervisor));  // the duty
     CHECK(!supervisor.dutyOwed());
     CHECK(supervisor.wantsLine(desk.clock(), desk.millisNow()));
     CHECK(desk.pass(supervisor));  // the request
-    CHECK_EQ(desk.reports.back().requestId, kRequestId);
+    CHECK_EQ(desk.reports.back().requestId, asked);
     CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
     CHECK(!supervisor.wantsLine(desk.clock(), desk.millisNow()));
   }
@@ -8102,6 +8466,24 @@ static void testKeptJournal() {
       CHECK_EQ(ss::mergeKeptJournal(own, other).keptTaken, 0x12345678u);
       CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), other).keptTaken, 0u);
     }
+    // The record of the requests answered is whole only from the later of the two times; one
+    // whose time is not known stays so.
+    {
+      const uint32_t unknown = ss::HISTORY_FROM_UNKNOWN;
+      const uint32_t t1 = (uint32_t)kClientNow - 7200u, t2 = (uint32_t)kClientNow - 60u;
+      const uint32_t cases[][3] = {{0, 0, 0},           {0, t1, t1},          {t1, 0, t1},
+                                   {t1, t2, t2},        {t2, t1, t2},         {0, unknown, unknown},
+                                   {unknown, 0, unknown}, {unknown, t2, unknown}, {t2, unknown, unknown}};
+      for (const auto &c : cases) {
+        ss::Journal own = ss::emptyJournal();
+        own.historyFrom = c[0];
+        ss::Journal other = cut;
+        other.historyFrom = c[1];
+        CHECK_MSG(ss::mergeKeptJournal(own, other).historyFrom == c[2], "%u and kept %u", c[0], c[1]);
+        other.phase = ss::JOURNAL_IDLE;
+        CHECK_EQ(ss::mergeKeptJournal(own, other).historyFrom, c[2]);
+      }
+    }
     const ss::Journal idle = ss::mergeKeptJournal(ss::emptyJournal(), cut);
     CHECK_EQ(idle.phase, ss::JOURNAL_WRITING);
     CHECK_EQ(idle.controller, 7);
@@ -8467,6 +8849,9 @@ int main() {
   testResultJson();
   testSupervisor();
   testWantsLine();
+  testHistoryLost();
+  testKeptDuty();
+  testWantsPass();
   testSendTimeFirst();
   testReplayKeepsItsTime();
   testWithdraw();

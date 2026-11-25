@@ -13639,11 +13639,15 @@ static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc,
   const double madeAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
   const uint32_t sent = doc["epoch"].is<uint32_t>() ? doc["epoch"].as<uint32_t>() : 0;
   const bool look = requestId == 0;
-  if (look ? meta->chargerLookValid &&
-                 !sunsaver::resultFollows(meta->chargerLookEpoch, meta->chargerLookSent, madeAt, sent)
-           : !sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId,
-                                              meta->chargerProgramEpoch, meta->chargerProgramSent, requestId, madeAt,
-                                              sent)) {
+  // The time of the one held is judged again, by this server's clock now, as a charger report's
+  // is: one that came while the clock was not set can be more than a day ahead of it, and would
+  // hold back every later result of its request, or every later look, that a client sends with a
+  // time it has to start again (a journal it could not read).
+  const double heldAt =
+      sunsaver::reportCheckTime(look ? meta->chargerLookEpoch : meta->chargerProgramEpoch, currentEpoch());
+  if (look ? meta->chargerLookValid && !sunsaver::resultFollows(heldAt, meta->chargerLookSent, madeAt, sent)
+           : !sunsaver::programResultReplaces(meta->chargerProgramValid, meta->chargerProgramRequestId, heldAt,
+                                              meta->chargerProgramSent, requestId, madeAt, sent)) {
     Serial.print(F("Charger programming result from "));
     Serial.print(clientUid);
     Serial.println(F(" is older than the one this server holds: not kept"));
@@ -13838,6 +13842,7 @@ static void loadChargerPrograms() {
     return;
   }
   uint8_t loaded = 0;
+  const double now = currentEpoch();
   for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
     ClientMetadata *meta = findClientMetadata(obj["c"] | "");
     if (!meta || !meta->chargerProgramUnread) {
@@ -13867,14 +13872,18 @@ static void loadChargerPrograms() {
         any = true;
       }
     }
+    // Their times are judged as at their arrival, and so are those of the ones that came in since
+    // (see loadChargerReports()): the file can hold any time, written by an older firmware or by
+    // hand, or one taken while the clock was not set.
     sunsaver::ProgramResult result;
     if (!obj["play"].isNull() && sunsaver::decodeProgramResult(obj, &result)) {
       const uint32_t requestId = obj["r"].is<uint32_t>() ? obj["r"].as<uint32_t>() : 0;
-      const double madeAt = obj["e"] | 0.0;
+      const double madeAt = sunsaver::reportCheckTime(obj["e"] | 0.0, now);
       const uint32_t sent = obj["s"].is<uint32_t>() ? obj["s"].as<uint32_t>() : 0;
       if (!meta->chargerProgramValid ||
           !sunsaver::programResultReplaces(true, requestId, madeAt, sent, meta->chargerProgramRequestId,
-                                           meta->chargerProgramEpoch, meta->chargerProgramSent)) {
+                                           sunsaver::reportCheckTime(meta->chargerProgramEpoch, now),
+                                           meta->chargerProgramSent)) {
         meta->chargerProgramValid = true;
         meta->chargerProgramRequestId = requestId;
         meta->chargerProgramEpoch = madeAt;
@@ -13885,10 +13894,11 @@ static void loadChargerPrograms() {
     }
     JsonObjectConst look = obj["l"].as<JsonObjectConst>();
     if (!look.isNull() && sunsaver::decodeProgramResult(look, &result)) {
-      const double madeAt = look["e"] | 0.0;
+      const double madeAt = sunsaver::reportCheckTime(look["e"] | 0.0, now);
       const uint32_t sent = look["s"].is<uint32_t>() ? look["s"].as<uint32_t>() : 0;
       if (!meta->chargerLookValid ||
-          !sunsaver::resultFollows(madeAt, sent, meta->chargerLookEpoch, meta->chargerLookSent)) {
+          !sunsaver::resultFollows(madeAt, sent, sunsaver::reportCheckTime(meta->chargerLookEpoch, now),
+                                   meta->chargerLookSent)) {
         meta->chargerLookValid = true;
         meta->chargerLookEpoch = madeAt;
         meta->chargerLookSent = sent;

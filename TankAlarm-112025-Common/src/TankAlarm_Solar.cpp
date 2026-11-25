@@ -1251,6 +1251,22 @@ void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, Cha
   _programming.begin(journal, &_journalFile, (uint32_t)millis());
 }
 
+bool SolarManager::takeKeptChargerDuty(const sunsaver::Journal &kept, uint32_t check) {
+  return _programming.takeKeptDuty(kept, check, (uint32_t)millis());
+}
+
+sunsaver::Line SolarManager::chargerProgramLine(bool allowed) const {
+  // The poll comes first here too: it finds the function code and shows that the link works, for
+  // the controller the config names.
+  const bool linkKnown = _cachedHoldingFC == 3 || _cachedHoldingFC == 4;
+  sunsaver::Line line;
+  line.free = allowed && !lineResting();
+  line.polling = _config.enabled && _initialized;
+  line.pollAnswered = line.polling && _data.lastPollOk && linkKnown;
+  line.configured = _config.modbusSlaveId;
+  return line;
+}
+
 bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
                                          uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow,
                                          uint32_t askedAt) {
@@ -1276,14 +1292,7 @@ bool SolarManager::chargerProgramReportSending(uint32_t sentEpoch) {
 
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
 #if TANKALARM_SUNSAVER_PROGRAMMING
-  // The poll comes first here too: it finds the function code and shows that the link works, for
-  // the controller the config names.
-  const bool linkKnown = _cachedHoldingFC == 3 || _cachedHoldingFC == 4;
-  sunsaver::Line line;
-  line.free = allowed && !lineResting();
-  line.polling = _config.enabled && _initialized;
-  line.pollAnswered = line.polling && _data.lastPollOk && linkKnown;
-  line.configured = _config.modbusSlaveId;
+  sunsaver::Line line = chargerProgramLine(allowed);
   // A duty goes to the controller its run talked to, should the config name another one now, and
   // reads it with the function that run read it with. A port that is told no function finds one.
   ChargerProgramPort port(_programming.controllerToUse(_config.modbusSlaveId),
@@ -1321,7 +1330,10 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
 
 bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
 #if TANKALARM_SUNSAVER_PROGRAMMING
-  return _config.enabled && _initialized && _programming.wantsLine(epochNow, (uint32_t)millis());
+  // Only while a poll runs: without one there is no pass to give up. And only for a pass in which
+  // programming may talk: after a poll that got no answer, a request waits for one that does.
+  return _config.enabled && _initialized &&
+         _programming.wantsPass(epochNow, (uint32_t)millis(), chargerProgramLine(true));
 #else
   (void)epochNow;
   return false;
@@ -1381,6 +1393,9 @@ void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, Cha
   // Nothing here talks to a controller, but what the journal says is owed stays in it, for a
   // build that can settle it.
   _programming.begin(journal, &_journalFile, (uint32_t)millis());
+}
+bool SolarManager::takeKeptChargerDuty(const sunsaver::Journal &kept, uint32_t check) {
+  return _programming.takeKeptDuty(kept, check, (uint32_t)millis());
 }
 bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
                                          uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow,

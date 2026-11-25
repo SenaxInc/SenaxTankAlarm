@@ -942,6 +942,10 @@ static bool gChargerJournalHeld = false;
 // The journal kept aside was taken in (takeKeptChargerJournal()) and its file is still there:
 // saveChargerJournal() removes it once flash holds a journal that says so.
 static bool gChargerKeptToRemove = false;
+// The journal kept aside was taken in without the duty it owes a controller, because the journal
+// owed one to another controller (sunsaver::keptDutyLeftOut()): its file stays, and the duty is
+// taken up once none is owed (takeKeptChargerDuty()).
+static bool gChargerKeptDutyWaits = false;
 // What readChargerJournalFile() found.
 static const uint8_t CHARGER_JOURNAL_READ = 0;    // the file's text
 static const uint8_t CHARGER_JOURNAL_ABSENT = 1;  // no such file
@@ -956,6 +960,10 @@ static bool gChargerProgramReportSeen = false;          // it has been shown on 
 static uint32_t gChargerProgramReportId = 0;            // the request it answers
 static uint32_t gChargerProgramReportAt = 0;            // the millis() it came about
 static uint32_t gChargerProgramReportEpoch = 0;         // that moment as a time, once the clock has one
+// While it has no time, its age is counted in every pass, as a charger report's is (see
+// ageChargerReport()): whole seconds, and the millis() they run to.
+static uint32_t gChargerProgramReportAgeSeconds = 0;
+static uint32_t gChargerProgramReportAgedMillis = 0;
 static bool gChargerProgramReportTried = false;         // the Notecard did not take it at the last try
 static unsigned long gChargerProgramReportTryMillis = 0;
 
@@ -1608,6 +1616,7 @@ static void keepUnreadChargerJournal(const char *path);
 static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent);
 static uint32_t keptChargerJournalCheck(const char *text);
 static void removeKeptChargerJournal();
+static void takeKeptChargerDuty();
 #endif
 static void keepChargerLookAfterLostFiles();
 static void handleChargerProgramRequest(JsonObjectConst program);
@@ -2690,8 +2699,13 @@ void loop() {
   // Higher states = longer sleep = lower power draw.
   // For sleep durations longer than the watchdog timeout, we sleep in chunks
   // and kick the watchdog between each chunk to prevent a hardware reset.
-  unsigned long sleepMs = getPowerStateSleepMs(gPowerState);
-  safeSleep(sleepMs);
+  // Not after a pass in which charger programming talked to the charger: that held the pass for
+  // up to a minute, and the next one takes a sample that came due meanwhile, and then sends the
+  // run's result (serviceChargerProgramming()).
+  if (!programmed) {
+    unsigned long sleepMs = getPowerStateSleepMs(gPowerState);
+    safeSleep(sleepMs);
+  }
 }
 
 // Helper: Get recommended pulse sampling parameters based on expected rate
@@ -7959,15 +7973,19 @@ static void keepChargerLookAfterLostFiles() {
 // kept aside (keepUnreadChargerJournal()), and the charger gets a look. So it does for a file that
 // holds no journal (which is not kept: it never reads as more than that), when there is no flash
 // to read it from, and when the flash lost its files at this start (keepChargerLookAfterLostFiles()
-// writes the cautious journal for it). A journal kept aside at an earlier start gives what it says
-// is owed once it reads (takeKeptChargerJournal()). Firmware without programming keeps what is
-// owed for firmware that has it (see beginChargerProgramming()), and says nothing of a look.
+// writes the cautious journal for it). The cautious journal also says that the record of the
+// requests answered was lost at this start, so that a request asked for before it is refused,
+// now and at later starts (sunsaver::cautiousJournal()). A journal kept aside at an earlier start
+// gives what it says is owed once it reads (takeKeptChargerJournal()). Firmware without
+// programming keeps what is owed for firmware that has it (see beginChargerProgramming()), and
+// says nothing of a look.
 static sunsaver::Journal loadChargerJournal() {
   const sunsaver::Journal none = sunsaver::emptyJournal();
 #if defined(POSIX_FILE_IO_AVAILABLE)
   gChargerJournalInTmp = false;
   gChargerJournalHeld = false;
   gChargerKeptToRemove = false;
+  gChargerKeptDutyWaits = false;
   if (!isStorageAvailable()) {
     // The journal may say that a run was cut short, and nothing can show otherwise. Without flash
     // nothing can be kept either, so saveChargerJournal() fails and no request is taken on: the
@@ -8142,18 +8160,70 @@ static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool 
   }
   if (read == CHARGER_JOURNAL_UNREAD || parsed == DeserializationError::NoMemory) {
     Serial.println(F("Charger programming: a journal kept aside at an earlier start still cannot be read"));
+    // The journal says from when its record of the requests answered is whole: from the start that
+    // kept this one aside (sunsaver::cautiousJournal()).
     return absent ? sunsaver::cautiousJournal() : journal;
   }
   // One that holds no journal says no more than the cautious journal.
   const sunsaver::Journal kept =
       parsed == DeserializationError::Ok ? sunsaver::decodeJournal(doc.as<JsonObjectConst>()) : sunsaver::cautiousJournal();
+  // A duty it owes a controller that the journal does not owe one to, while the journal owes one
+  // to another controller, does not fit in: the file stays until that one is settled, and
+  // everything else comes in now.
+  const bool dutyLeftOut = !absent && sunsaver::keptDutyLeftOut(journal, kept);
   journal = absent ? kept : sunsaver::mergeKeptJournal(journal, kept);
+  if (dutyLeftOut) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "Charger programming: a journal kept aside owes charger %u a look, which follows the one owed to charger %u",
+             (unsigned)kept.controller, (unsigned)journal.controller);
+    Serial.println(line);
+    addSerialLog(line);
+    gChargerKeptDutyWaits = true;
+    saveChargerJournal(journal);  // the kept file stays
+    return journal;
+  }
   journal.keptTaken = check;
   Serial.println(F("Charger programming: a journal kept aside at an earlier start reads now, and what it says is owed is taken up"));
   addSerialLog("Charger programming: a journal kept aside at an earlier start reads now");
   gChargerKeptToRemove = true;
   saveChargerJournal(journal);  // which removes the kept file once flash has the journal
   return journal;
+}
+
+// The duty of the journal kept aside that this start left out, because the journal owed a duty
+// to another controller (gChargerKeptDutyWaits): taken up in the first pass in which none is owed
+// any more, from the kept file read again, and the file removed once flash holds a journal that
+// says so. A file that does not read then is taken in at the next start.
+static void takeKeptChargerDuty() {
+  if (!gChargerKeptDutyWaits || gSolarManager.chargerProgramming().dutyOwed()) {
+    return;
+  }
+  gChargerKeptDutyWaits = false;
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
+  if (readChargerJournalFile(CHARGER_JOURNAL_KEPT_FILE, buf, sizeof(buf)) != CHARGER_JOURNAL_READ) {
+    return;
+  }
+  sunsaver::Journal kept;
+  {
+    JsonDocument doc;
+    if (deserializeJson(doc, buf) != DeserializationError::Ok) {
+      return;
+    }
+    kept = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
+  }
+  if (!gSolarManager.takeKeptChargerDuty(kept, keptChargerJournalCheck(buf))) {
+    return;
+  }
+  char line[96];
+  snprintf(line, sizeof(line), "Charger programming: the look a journal kept aside owes charger %u is taken up now",
+           (unsigned)kept.controller);
+  Serial.println(line);
+  addSerialLog(line);
+  gChargerKeptToRemove = true;
+  if (!gSolarManager.chargerProgramming().journalUnsaved()) {
+    removeKeptChargerJournal();
+  }
 }
 
 // The check value of a kept journal's text (32-bit FNV-1a), never 0: 0 stands for none.
@@ -8348,6 +8418,9 @@ static bool chargerRunWouldHoldSample() {
 // flash does not take is refused (REFUSE_CONFIG_UNSAVED). A look that a run cut short left owed
 // does not wait for the config: it writes nothing, and goes first anyway.
 static bool serviceChargerProgramming(unsigned long now, bool allowed) {
+#if defined(POSIX_FILE_IO_AVAILABLE)
+  takeKeptChargerDuty();
+#endif
   const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
   if (gConfigDirty && programming.requestWaiting()) {
     persistConfigIfDirty();
@@ -8376,6 +8449,10 @@ static bool serviceChargerProgramming(unsigned long now, bool allowed) {
     }
     // The charger may hold other settings now: check them again, and send that report at once.
     requestChargerCheck();
+    // Its result goes out in the next pass, which loop() begins without a sleep: a sample that
+    // came due during the run is taken first. Sent now, the result and the buffered notes its
+    // send flushes could hold that sample up for as long as the Notecard takes.
+    return true;
   }
   sendDueChargerProgramReport(now);
   return talked;
@@ -8452,11 +8529,22 @@ static void sendDueChargerProgramReport(unsigned long now) {
     gChargerProgramReportId = requestId;
     gChargerProgramReportAt = resultAt;
     gChargerProgramReportEpoch = 0;
+    gChargerProgramReportAgeSeconds = 0;
+    gChargerProgramReportAgedMillis = resultAt;
     gChargerProgramReportTried = false;
     printChargerProgramResult(requestId, programming.report());
     if (!deviceUidKnown()) {
       Serial.println(F("Charger programming: the result goes out once the Notecard has given this client its device UID"));
     }
+  }
+  // Its age, while it has no time: in every pass, before anything that makes it wait, so that the
+  // millis() difference never comes near a turn of millis() (49.7 days). Taken once, after the
+  // device UID or the clock took that long, it would date the result as hours old, and the server
+  // could keep an older result of the same request over it.
+  if (gChargerProgramReportEpoch == 0) {
+    const uint32_t seconds = ((uint32_t)millis() - gChargerProgramReportAgedMillis) / 1000u;
+    gChargerProgramReportAgeSeconds += seconds;
+    gChargerProgramReportAgedMillis += seconds * 1000u;
   }
   // Under the device label the server takes no note, and the result would count as taken (see
   // sendDueChargerReport()): it waits in the journal for the client's id.
@@ -8478,7 +8566,8 @@ static void sendDueChargerProgramReport(unsigned long now) {
       if (nowEpoch <= 0.0) {
         return;
       }
-      const double at = nowEpoch - (double)(uint32_t)((uint32_t)millis() - resultAt) / 1000.0;
+      const double at = nowEpoch - (double)gChargerProgramReportAgeSeconds -
+                        (double)(uint32_t)((uint32_t)millis() - gChargerProgramReportAgedMillis) / 1000.0;
       epoch = at >= 1.0 ? (uint32_t)at : 1u;
     }
     gChargerProgramReportEpoch = programming.sendEpoch(epoch);

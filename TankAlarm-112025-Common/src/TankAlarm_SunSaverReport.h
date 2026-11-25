@@ -575,6 +575,9 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
 //   lep            the time the last look went out with (left out while none has)
 //   kt             the check value of a journal kept aside that this one took in (left out for
 //                  none: see the client's takeKeptChargerJournal())
+//   hf             the time from which its record of the requests answered holds them all, or 1
+//                  while that time is not known (left out when it holds them all: see
+//                  cautiousJournal())
 // It is written whole, as a new file that takes the place of the old one, and is no longer than
 // JOURNAL_JSON_MAX.
 
@@ -610,11 +613,15 @@ inline void encodeJournal(const Journal &journal, JsonObject out) {
   if (journal.keptTaken != 0) {
     out["kt"] = journal.keptTaken;
   }
+  if (journal.historyFrom != 0) {
+    out["hf"] = journal.historyFrom;
+  }
 }
 
 // A file that is no journal reads as cautiousJournal(): the client may owe the controller a
 // restart, and finds out by asking it. A result in it that this code cannot read is left out:
-// the rest of the journal still holds.
+// the rest of the journal still holds. A record of the requests answered ("ans", "hf") that does
+// not read is lost as the cautious journal's is: the start that reads it stands for the time.
 inline Journal decodeJournal(JsonObjectConst in) {
   if (in.isNull() || !in["req"].is<uint32_t>() || !in["ph"].is<uint32_t>() ||
       in["ph"].as<uint32_t>() > JOURNAL_PHASE_LAST) {
@@ -627,6 +634,11 @@ inline Journal decodeJournal(JsonObjectConst in) {
   const uint8_t function = reportByte(in, "fc", 4, 0);
   journal.readFunction = function == 3 || function == 4 ? function : (uint8_t)0;
   journal.answeredId = in["ans"].is<uint32_t>() ? in["ans"].as<uint32_t>() : 0;
+  if (!in["ans"].is<uint32_t>() || (!in["hf"].isNull() && !in["hf"].is<uint32_t>())) {
+    journal.historyFrom = HISTORY_FROM_UNKNOWN;
+  } else {
+    journal.historyFrom = in["hf"].is<uint32_t>() ? in["hf"].as<uint32_t>() : 0;
+  }
   journal.waitingId = in["wait"].is<uint32_t>() ? in["wait"].as<uint32_t>() : 0;
   JsonObjectConst report = in["rep"].as<JsonObjectConst>();
   if (!report.isNull() && report["rq"].is<uint32_t>() && decodeProgramResult(report, &journal.report)) {

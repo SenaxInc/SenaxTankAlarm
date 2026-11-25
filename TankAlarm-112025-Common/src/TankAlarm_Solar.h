@@ -450,6 +450,11 @@ public:
   // writes it.
   void beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer);
 
+  // The duty of a journal kept aside that the start did not take in, because the journal owed a
+  // duty to another controller then (sunsaver::keptDutyLeftOut()): taken once none is owed. See
+  // sunsaver::Supervisor::takeKeptDuty(). False while a duty is owed.
+  bool takeKeptChargerDuty(const sunsaver::Journal &kept, uint32_t check);
+
   // A run holds loop() for as long as it takes (see serviceChargerProgramming()), and calls
   // `hook` wherever it feeds the watchdog: before every request and while it rests between them,
   // at least every 100 ms of a rest. The client does there what cannot wait for the run's end. A
@@ -480,8 +485,10 @@ public:
   bool serviceChargerProgramming(double epochNow, bool allowed);
 
   // Whether programming would talk to the controller now if the line were free: a run or a look
-  // at the controller is due (see sunsaver::Supervisor::wantsLine()). The client's loop then lets
-  // it have the pass after a poll, when every pass is due to poll. False without programming.
+  // at the controller is due (see sunsaver::Supervisor::wantsLine()), and a poll that answered
+  // lets it talk, where it needs one (sunsaver::Supervisor::wantsPass()). The client's loop then
+  // lets it have the pass after a poll, when every pass is due to poll. False without
+  // programming.
   bool chargerProgrammingWantsLine(double epochNow) const;
 
   // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis(),
@@ -521,6 +528,9 @@ private:
   sunsaver::Supervisor _programming;
   JournalFile _journalFile;
   ChargerRunHook _runHook;
+  // The line as programming finds it in a pass (sunsaver::Line), `allowed` as for
+  // serviceChargerProgramming().
+  sunsaver::Line chargerProgramLine(bool allowed) const;
   
   // Modbus communication
   bool startModbusLink();  // ModbusRTUClient on the RS-485 port, as _config says: false when it does not start
