@@ -63,7 +63,7 @@
     "array_fault": ["Overcurrent", "FETs shorted", "Software bug", "Battery HVD", "Array HVD", "EEPROM setting edit (reset required)", "RTS shorted", "RTS was valid, now disconnected", "Local temperature sensor failed"],
     "load_fault": ["External short circuit", "Overcurrent", "FETs shorted", "Software bug", "HVD", "Heatsink over-temperature", "EEPROM setting edit (reset required)"],
     "alarm": ["RTS open", "RTS shorted", "RTS disconnected", "Ths open", "Ths shorted", "SSMPPT hot", "Current limit", "Current offset", null, null, "Uncalibrated", "RTS miswire", null, null, "Miswire", "FET open", "P12", "High Va current limit"],
-    "dip_switch": ["SW1: custom battery settings", "SW2: custom LVD/LVR", "SW3: equalize", "SW4: MODBUS"]
+    "dip_switch": ["SW1: custom battery settings", "SW2: custom LVD/LVR", "SW3: equalize", "SW4: MeterBus/MODBUS selector"]
   },
   "groups": [
     { "name": "live",      "title": "Meters" },

@@ -113,7 +113,7 @@ What to know before you rely on it:
   that takes longer than a minute is stopped, and so is one whose browser has gone.
 - **No connection can hold the Opta up.** A request has 6 seconds to arrive. A browser that
   takes nothing of an answer for 5 seconds is taken to be gone, and an answer that is still
-  not delivered after 30 seconds of sending is given up. The page is 53 KB and the Opta's
+  not delivered after 30 seconds of sending is given up. The page is 55 KB and the Opta's
   network stack sends about 1 KB per round trip, so the page needs a link whose round trip is
   well under half a second.
 - **Open it by its address.** A request that names the Opta in any other way than by its IP
@@ -183,7 +183,10 @@ Controller view (7).
    record of how the controller was set before you changed anything. Download a snapshot on the
    page saves the same JSON as a file. It saves nothing that broke off on the way, and asks
    first when some registers could not be read.
-5. `scalecheck 13.42` (with your own multimeter reading) settles the voltage scales. See
+5. `scalecheck 13.42 EV_float 13.70` settles the voltage scales. The first figure is your own
+   multimeter reading at the battery terminals. `EV_float 13.70` is a setting with the value
+   that MSView (Morningstar's own program) shows for it on this controller. Read one before
+   you start: any voltage that `set` can write will do. See
    [The voltage scales](#the-voltage-scales). Do this before writing any voltage.
 6. `set EV_lvr 13.25`, then `set EV_lvd 13.10`: each shows the old and the new value and waits
    for `yes`. Raising the reconnect voltage first keeps it above the disconnect voltage at
@@ -242,7 +245,7 @@ The controller uses it after a restart: 'reset' when all your changes are in.
 | `get <address> [count]` | Raw registers from an address |
 | `coils` | Coil states |
 | `snapshot` | Every raw value as JSON |
-| `scalecheck [volts]` | Test the voltage scales. The live readings need a multimeter reading |
+| `scalecheck [volts] [setting volts]` | Test the voltage scales. The live readings need a multimeter reading, the stored settings a setting whose value you know |
 | `set <name> <value>` | Write a setting, for example `set EV_lvd 13.10` |
 | `set <name> raw <n>` | The same with a raw register value |
 | `coil <name> on\|off` | Switch a coil |
@@ -294,6 +297,7 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   `expert on` first and still asks for `yes`, because OptaView cannot tell what it would change.
 - Stored settings and live readings have a voltage scale each. `set` warns until the scale of
   the settings is confirmed, and a multimeter reading never changes how a setting is written.
+  A setting that OptaView wrote since it started cannot confirm the scale it was written with.
   What `scalecheck` found holds for the controller it talked to: another slave address or other
   serial settings make both scales unconfirmed again. A different controller on the same cable
   and settings looks the same to OptaView, so run `scalecheck` again after swapping one.
@@ -335,8 +339,14 @@ voltage scales, and each can be corrected on its own:
 OptaView starts with the specification's figures and says so until `scalecheck` has settled
 them. It tests the first two separately, each on its own evidence:
 
-- **Stored settings.** The setpoints in the controller are round numbers (14.40 V, 11.50 V)
-  only at the right scale. This needs no multimeter.
+- **Stored settings.** A setting whose value you know, given as `scalecheck EV_float 13.70`,
+  decides. Read it in MSView, which does not depend on OptaView's figures. It has to match
+  within 0.5 %, and the two candidates are 3.3 % apart. A setting that OptaView has written
+  since it started is refused: it went in at the scale under test, so it would read back as
+  right at that scale. The check also counts the setpoints that are round numbers (14.40 V,
+  11.50 V) at each scale, but that only points, because a setting looks round at whatever
+  scale wrote it, a wrong one included. When the two disagree, `scalecheck` goes by the
+  setting you gave and says that some setpoints were written with a wrong scale.
 - **Live readings.** A multimeter reading at the controller's battery terminals, given as
   `scalecheck 13.42`, decides, and nothing else does. In absorption and float the check also
   compares the battery with `Vb_ref`, the target the controller works towards, but that only
@@ -344,30 +354,39 @@ them. It tests the first two separately, each on its own evidence:
   out, and the sun may be too weak to get there), and a battery 3.3 % below its target reads
   as right on it at the other scale.
 
-A multimeter says nothing about how settings are stored, and round setpoints say nothing about
+A multimeter says nothing about how settings are stored, and a stored setting says nothing about
 the readings, so neither verdict is taken from the other's evidence. This is the simulator
 again, behaving as the specification says:
 
 ```text
-optaview> scalecheck 13.68
+optaview> scalecheck 13.68 EV_float 13.70
 Stored settings (scale vset, now x100/32768). Candidates: x100, x96.667.
-  1. Setpoints: 13 in use (14 of 14 read). Round settings only look round at the right scale.
+  1. Round setpoints: 13 in use (14 of 14 read). They look round at the scale that wrote them.
+     This only points: settings that OptaView or another tool wrote with a wrong scale look
+     round at that wrong scale.
        at x100, 13 of 13 are multiples of 0.05 V
        at x96.667, 1 of 13 is a multiple of 0.05 V
      -> x100
+  2. A setting you know: EV_float = 13.70 V, which with the raw value works out to x100.00.
+       EV_float reads 13.70 V at x100, 13.24 V at x96.667
+     -> x100
 Live readings (scale vlive, now x100/32768). Candidates: x100, x96.667.
-  2. Regulation: in FLOAT (7) the controller works to hold the battery at Vb_ref = 13.70 V.
+  3. Regulation: in FLOAT (7) the controller works to hold the battery at Vb_ref = 13.70 V.
      This only points: the battery is not always at its target in this state (too little sun
      for the load), and one that is below it can read as on it at another scale.
        Vb_f reads 13.70 V at x100, 13.24 V at x96.667
      -> x100
-  3. Multimeter: 13.68 V measured, which with the register value works out to x99.99.
+  4. Multimeter: 13.68 V measured, which with the register value works out to x99.99.
        adc_vb_f reads 13.68 V at x100, 13.23 V at x96.667
      -> x100
 Verdict
   Stored settings: x100, which is what OptaView uses now.
   Live readings:   x100, which is what OptaView uses now.
 ```
+
+Without `EV_float 13.70` the verdict for stored settings is "cannot tell yet", followed by where
+the setpoints point. Either part can be run on its own: `scalecheck 13.68` or
+`scalecheck EV_float 13.70`.
 
 When a verdict differs from the scale in use, `scalecheck` prints the command that switches it
 for the session, such as `scale vlive 96.667`, and the fix belongs in
@@ -397,7 +416,9 @@ Not confirmed yet, and so the first things to try:
   specification, so OptaView does not use it.
 - Which scales the voltages use (see above).
 - Which position of DIP switch 4 is MODBUS. The repository's notes disagree, so the texts only
-  say that it selects it.
+  say that it selects between MeterBus and MODBUS. A controller that answers OptaView is in
+  MODBUS mode, so the position of switch 4 on the bench settles it, and whether `live` then
+  lists SW4 shows whether a set bit in `dip_switch` means ON.
 
 ## The profile
 

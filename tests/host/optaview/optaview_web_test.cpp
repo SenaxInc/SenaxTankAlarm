@@ -2923,6 +2923,8 @@ static void testWebReading() {
 
     // It follows what happens on the USB console: the link, the scales, a restart that is due.
     w.rig.run("scalecheck 13.68");
+    CHECK(w.get("/api/state").json["scales"]["settings"]["confirmed"] == false);  // round setpoints only point
+    w.rig.run("scalecheck EV_float 13.70");
     w.rig.run("timeout 800");
     w.rig.run("blocks off");
     const Reply checked = w.get("/api/state");

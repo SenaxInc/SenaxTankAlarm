@@ -179,7 +179,8 @@ inline bool ovIsSentinel(const OvRegister &reg, const uint16_t *words) {
 
 inline bool ovIsNumeric(const OvRegister &reg) { return reg.type != OV_ENUM && reg.type != OV_BITS; }
 
-// The value as text: "13.68 V", "FLOAT (7)", "SW2 ON: custom LVD/LVR, SW4 ON: MODBUS", "none".
+// The value as text: "13.68 V", "FLOAT (7)", "SW1: custom battery settings, SW2: custom LVD/LVR"
+// (the bits that are set), "none".
 inline void ovFormatValue(const OvRegister &reg, const uint16_t *words, char *out, size_t cap) {
   OvText text(out, cap);
   if (ovIsSentinel(reg, words)) {

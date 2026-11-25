@@ -673,14 +673,32 @@ async function toolsView(win, profile) {
   checkEq((await win.text('#scaleText')).split('not confirmed').length - 1, 2, 'both scales start unconfirmed');
   checkHas(await win.text('#wiringText'), 'MRC-1 terminal B', 'the wiring checklist');
 
-  // The scale check with a multimeter reading.
+  // The scale check with a multimeter reading and a setting whose value is known.
   await page.fill('#meterVolts', '13,68');
   await page.click('#scaleForm button');
   checkHas(await toast(win), 'Give the multimeter reading as a number', 'a reading that is not a number');
+  const names = await page.$$eval('#knownName option', (options) => options.map((option) => option.value));
+  checkEq(names[0], '', 'the list of settings starts with none');
+  check(names.includes('EV_float') && names.includes('EV_lvd') && names.includes('EV_soc_r2y'),
+        'it lists the stored voltage settings');
+  check(!names.includes('adc_vb_f') && !names.includes('Et_float') && !names.includes('EV_tempcomp'),
+        'and nothing on another scale');
+  checkEq(names.length, 1 + profile.registers.filter((reg) => reg.scale === 'vset').length,
+          'every register on the scale of stored settings is offered');
   await page.fill('#meterVolts', '13.68');
+  await page.selectOption('#knownName', 'EV_float');
+  await page.fill('#knownVolts', '13.7 V');
+  await page.click('#scaleForm button');
+  checkHas(await toast(win), 'Give the value of EV_float as a number', 'a value that is not a number');
+  await page.selectOption('#knownName', '');
+  await page.fill('#knownVolts', '13.70');
+  await page.click('#scaleForm button');
+  checkHas(await toast(win), 'Pick the setting whose value you know', 'a value without a setting');
+  await page.selectOption('#knownName', 'EV_float');
   await page.click('#scaleForm button');
   const verdict = await result(win);
   checkHas(verdict, 'Multimeter: 13.68 V measured', 'the reading reached the console');
+  checkHas(verdict, 'A setting you know: EV_float = 13.70 V', 'and so did the setting');
   checkHas(verdict, 'Stored settings: x100, which is what OptaView uses now.', 'the verdict');
   await close(win);
   await page.waitForFunction(() => !document.querySelector('#scaleText').textContent.includes('not confirmed'));

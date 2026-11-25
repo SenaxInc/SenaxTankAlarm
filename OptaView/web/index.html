@@ -200,11 +200,19 @@ table.settings td:nth-child(5){grid-column:2;grid-row:3;text-align:right}
 </div>
 <div class="card">
 <h2>Voltage scale check</h2>
-<p>Tests whether the controller uses the voltage scales that this register map assumes. The stored settings need nothing more. The live readings need a multimeter reading taken at the battery terminals.</p>
+<p>Tests whether the controller uses the voltage scales that this register map assumes. The live readings need a multimeter reading taken at the battery terminals. The stored settings need one setting whose value you know from elsewhere, from MSView for example: round setpoints only show the scale they were written with, and that can be a wrong one.</p>
 <p id="scaleText" class="muted small"></p>
-<form id="scaleForm" class="row">
+<form id="scaleForm">
+<div class="row">
 <label for="meterVolts">Multimeter reading, in volts (optional)</label>
 <input id="meterVolts" inputmode="decimal" size="8" placeholder="13.68" autocomplete="off">
+</div>
+<div class="row">
+<label for="knownName">A setting you know (optional)</label>
+<select id="knownName"><option value="">none</option></select>
+<input id="knownVolts" inputmode="decimal" size="8" placeholder="13.70" autocomplete="off" aria-label="Its value, in volts">
+<span class="small muted">V</span>
+</div>
 <button class="btn secondary" type="submit">Run the check</button>
 </form>
 </div>
@@ -916,6 +924,7 @@ function readGroupTable() {
 
 function drawLink() {
   if (!state) { return; }
+  buildKnownPick();
   var link = state.link;
   var counters = state.counters;
   $('linkText').textContent = 'Slave address ' + link.slave + ', ' + link.baud + ' baud ' + link.format +
@@ -934,14 +943,45 @@ function drawLink() {
   $('scaleText').textContent = lines.join(' ');
 }
 
+// The stored settings that can be checked against a value the user knows: one-word registers
+// on the scale of stored settings. Built once the register map and that scale's name are known.
+function buildKnownPick() {
+  var pick = $('knownName');
+  var scale = state && state.scales && state.scales.settings;
+  if (!profile || !scale || pick.getAttribute('data-scale') === scale.name) { return; }
+  pick.setAttribute('data-scale', scale.name);
+  clear(pick);
+  var none = el('option', '', 'none');
+  none.value = '';
+  add(pick, none);
+  profile.registers.forEach(function (reg) {
+    if (reg.scale !== scale.name || reg.type === 'u32') { return; }
+    var option = el('option', '', reg.name + ': ' + reg.label);
+    option.value = reg.name;
+    add(pick, option);
+  });
+}
+
 function submitScale(event) {
   event.preventDefault();
   var volts = $('meterVolts').value.trim();
-  if (volts && !/^[0-9]+(\.[0-9]+)?$/.test(volts)) {
+  var name = $('knownName').value;
+  var known = $('knownVolts').value.trim();
+  var number = /^[0-9]+(\.[0-9]+)?$/;
+  if (volts && !number.test(volts)) {
     toast('Give the multimeter reading as a number, for example 13.68.');
     return;
   }
-  command('scalecheck' + (volts ? ' ' + volts : ''), 'Voltage scale check').then(refreshView).catch(fail);
+  if (name && !number.test(known)) {
+    toast('Give the value of ' + name + ' as a number, for example 13.70.');
+    return;
+  }
+  if (!name && known) {
+    toast('Pick the setting whose value you know.');
+    return;
+  }
+  command('scalecheck' + (volts ? ' ' + volts : '') + (name ? ' ' + name + ' ' + known : ''),
+          'Voltage scale check').then(refreshView).catch(fail);
 }
 
 function downloadSnapshot() {

@@ -233,6 +233,7 @@ class SimSunSaver : public optaview::MbTransport {
   }
 
   uint64_t elapsedMs() const { return now_; }
+  size_t incomingCount() const { return incoming_.size(); }  // bytes not read yet, due or on their way
   void advance(uint32_t ms) { now_ += ms; }
 
   static std::vector<uint8_t> frame(std::vector<uint8_t> body) {
@@ -257,7 +258,7 @@ class SimSunSaver : public optaview::MbTransport {
   void send(const uint8_t *data, size_t len) override {
     requests.push_back(std::vector<uint8_t>(data, data + len));
     requestTimes.push_back(now_);
-    now_ += len;  // about a millisecond per byte at 9600 baud
+    now_ += wireMs(len);  // the request goes out at the port's baud rate
     if (!powered || now_ < downUntil_) return;
     if (linkBaud_ != deviceBaud) return;
     if (!anyFormat && linkFormat_ != deviceFormat) return;
@@ -323,10 +324,21 @@ class SimSunSaver : public optaview::MbTransport {
         break;
     }
 
+    // The reply starts responseDelayMs after the request, and each byte can be read once its
+    // last bit is in: one character time after the one before, at the baud rate and format of
+    // the link (1.15 ms at 9600 baud 8N2, 36.7 ms at 300).
     uint64_t at = now_ + responseDelayMs;
     if (!incoming_.empty() && incoming_.back().first >= at) at = incoming_.back().first + 1;
-    for (uint8_t i = 0; i < leadingNoiseBytes; ++i) incoming_.push_back(std::make_pair(at++, (uint8_t)0x00));
-    for (size_t i = 0; i < reply.size(); ++i) incoming_.push_back(std::make_pair(at++, reply[i]));
+    std::vector<uint8_t> wire((size_t)leadingNoiseBytes, (uint8_t)0x00);
+    wire.insert(wire.end(), reply.begin(), reply.end());
+    for (size_t i = 0; i < wire.size(); ++i) incoming_.push_back(std::make_pair(at + wireMs(i + 1), wire[i]));
+  }
+
+  // How long `bytes` characters take on the wire at the link's baud rate and format, rounded up
+  // to the millisecond clock.
+  uint64_t wireMs(size_t bytes) const {
+    const uint64_t charUs = optaview::mbCharMicros(linkBaud_ == 0 ? 9600 : linkBaud_, linkFormat_);
+    return ((uint64_t)bytes * charUs + 999) / 1000;
   }
 
   int read() override {
