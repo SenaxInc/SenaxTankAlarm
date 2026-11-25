@@ -681,12 +681,19 @@ bool SolarManager::readRegisters() {
     // threshold says it sits lower than lead-acid. It is never scaled up: a LiFePO4 battery
     // has a low threshold of 13 V and more, and scaling by that put the float target near
     // 15 V, where a full battery in daylight looked like one that was not being charged.
-    float packs = (nextData.systemNominalV == 24) ? 2.0f : 1.0f;
-    float scale = _config.batteryLowVoltage / BATTERY_VOLTAGE_LOW;
-    if (!(scale > 0.0f) || scale > packs) {
-      scale = packs;
+    // The low threshold can be a figure per 12 V whatever the pack (the default, 11.8 V, is
+    // one, and a config without batteryLowV keeps it on a 24 V pack too) or one for a 24 V
+    // pack: a threshold above SOLAR_24V_SYSTEM_MIN_V is taken as the latter.
+    const float packs = (nextData.systemNominalV == 24) ? 2.0f : 1.0f;
+    float lowPer12V = _config.batteryLowVoltage;
+    if (lowPer12V > SOLAR_24V_SYSTEM_MIN_V) {
+      lowPer12V /= 2.0f;
     }
-    float floatThreshold = BATTERY_VOLTAGE_FLOAT * scale;
+    float scale = lowPer12V / BATTERY_VOLTAGE_LOW;
+    if (!(scale > 0.0f) || scale > 1.0f) {
+      scale = 1.0f;
+    }
+    float floatThreshold = BATTERY_VOLTAGE_FLOAT * scale * packs;
     if (_floatReferenceV > 8.0f) {
       floatThreshold = _floatReferenceV;
     }

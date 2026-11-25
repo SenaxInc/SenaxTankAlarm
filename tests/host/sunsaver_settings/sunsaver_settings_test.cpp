@@ -422,6 +422,12 @@ static void testValuesAgainstOptaView() {
   CHECK(textOf(ss::I_EV_EQ, 0) == "0 (off)");
   CHECK(textOf(ss::I_EV_EQ, 0, ss::SCALE_UNKNOWN) == "0 (off)");
   CHECK(textOf(ss::I_EV_LVD, 0) == "0.00 V");  // the LVD has no "off"
+  // Nor have the high voltage reconnects: the battery never falls to 0 V, so 0 there would keep
+  // charging, or the load, off after a high voltage disconnect. 0 in the disconnect is "off".
+  CHECK(textOf(ss::I_EV_HVR, 0) == "0.00 V");
+  CHECK(textOf(ss::I_EV_LHVR, 0) == "0.00 V");
+  CHECK(textOf(ss::I_EV_HVD, 0) == "0 (off)");
+  CHECK(textOf(ss::I_EV_LHVD, 0) == "0 (off)");
   CHECK(textOf(ss::I_ET_FLOAT, 900) == "900 s (15 min)");
   CHECK(textOf(ss::I_ET_FLOAT, 90) == "90 s (1.5 min)");
   CHECK(textOf(ss::I_ET_FLOAT, 59) == "59 s");
@@ -599,19 +605,34 @@ static void testText() {
   }
   {
     ss::Text text(line, sizeof(line));
-    ss::describeLiveScale(ss::SCALE_UNKNOWN, ss::LIVE_SOURCE_NONE, &text);
+    ss::describeLiveScale(ss::SCALE_UNKNOWN, ss::LIVE_SOURCE_NONE, 12, &text);
     CHECK(strcmp(line, "not proven") == 0);
   }
   {
     ss::Text text(line, sizeof(line));
-    ss::describeLiveScale(ss::SCALE_100, ss::LIVE_SOURCE_PRESET_LVD, &text);
+    ss::describeLiveScale(ss::SCALE_100, ss::LIVE_SOURCE_PRESET_LVD, 12, &text);
     CHECK(strcmp(line, "x100 (the built-in 11.50 V LVD reads right with it)") == 0);
   }
   {
+    // The built-in LVD of a 24 V system is twice that.
     ss::Text text(line, sizeof(line));
-    ss::describeLiveScale(ss::SCALE_96667, ss::LIVE_SOURCE_STORED_LVD, &text);
+    ss::describeLiveScale(ss::SCALE_100, ss::LIVE_SOURCE_PRESET_LVD, 24, &text);
+    CHECK_MSG(strcmp(line, "x100 (the built-in 23.00 V LVD reads right with it)") == 0, "got '%s'", line);
+  }
+  {
+    // A report from a client that did not send the system names both.
+    ss::Text text(line, sizeof(line));
+    ss::describeLiveScale(ss::SCALE_96667, ss::LIVE_SOURCE_PRESET_LVD, 0, &text);
+    CHECK_MSG(strcmp(line, "x96.667 (the built-in LVD, 11.50 V or 23.00 V on a 24 V system, reads right with it)") == 0,
+              "got '%s'", line);
+  }
+  for (uint8_t system : {0, 12, 24}) {
+    ss::Text text(line, sizeof(line));
+    ss::describeLiveScale(ss::SCALE_96667, ss::LIVE_SOURCE_STORED_LVD, system, &text);
     CHECK(strcmp(line, "x96.667 (the stored LVD reads right with it)") == 0);
   }
+  // The finding names the built-in LVD of both systems: it has no system to go by.
+  CHECK(strstr(ss::findingText(ss::FINDING_PRESET_LVD), "11.50 V (23.00 V on a 24 V system)") != nullptr);
 }
 
 // ============================================================================
@@ -2413,6 +2434,34 @@ static void testReport() {
     CHECK_EQ(page["findings"].as<JsonArrayConst>().size(), 0);
     CHECK_HAS(shown, "\"13.68 V if x100, 13.23 V if x96.667\"");
     CHECK_MSG(shown.size() < 6000, "the readable report is %zu bytes", shown.size());
+  }
+
+  {
+    // A 24 V system with DIP switch 2 OFF: its built-in LVD is 23.00 V, and the page says so.
+    SimSunSaver sim;
+    const ss::Snapshot snapshot = snapshotOf(sim);
+    ss::Evaluation evaluation;
+    memset(&evaluation, 0, sizeof(evaluation));
+    evaluation.liveScale = ss::SCALE_100;
+    evaluation.liveSource = ss::LIVE_SOURCE_PRESET_LVD;
+    evaluation.systemVolts = 24;
+    evaluation.findings = ss::FINDING_PRESET_LVD;
+    JsonDocument note;
+    ss::encodeReport(snapshot, evaluation, note.to<JsonObject>());
+    ss::Snapshot back;
+    ss::Evaluation decoded;
+    CHECK(ss::decodeReport(note.as<JsonObjectConst>(), &back, &decoded));
+    JsonDocument page;
+    ss::describeReport(back, decoded, page.to<JsonObject>());
+    CHECK(page["liveScale"] == "x100 (the built-in 23.00 V LVD reads right with it)");
+    CHECK_EQ(page["findings"].as<JsonArrayConst>().size(), 1);
+    CHECK(has(page["findings"][0]["t"].as<const char *>(), "11.50 V (23.00 V on a 24 V system)"));
+    // A report without the system names both.
+    note.remove("sv");
+    CHECK(ss::decodeReport(note.as<JsonObjectConst>(), &back, &decoded));
+    JsonDocument without;
+    ss::describeReport(back, decoded, without.to<JsonObject>());
+    CHECK(without["liveScale"] == "x100 (the built-in LVD, 11.50 V or 23.00 V on a 24 V system, reads right with it)");
   }
 
   {

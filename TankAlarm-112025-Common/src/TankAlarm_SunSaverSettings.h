@@ -161,7 +161,7 @@ inline const char *groupTitle(uint8_t group) {
 }
 
 enum ItemFlag : uint8_t {
-  ITEM_ZERO_IS_OFF = 0x01,  // 0 switches the feature off
+  ITEM_ZERO_IS_OFF = 0x01,  // 0 switches the feature off (not a reconnect: the battery never falls to 0 V)
   ITEM_WITNESS = 0x02       // a setpoint the scale test looks at
 };
 
@@ -274,7 +274,7 @@ inline const Item &item(uint8_t index) {
        "Temperature compensation per C"},
       {0xE01B, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_WITNESS | ITEM_ZERO_IS_OFF, "EV_hvd",
        "Battery high voltage disconnect at 25 C"},
-      {0xE01C, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_WITNESS | ITEM_ZERO_IS_OFF, "EV_hvr",
+      {0xE01C, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_WITNESS, "EV_hvr",
        "Battery high voltage reconnect"},
       {0xE01D, KIND_VOLT_SETTING, GROUP_CHARGE, 10, 18, ITEM_ZERO_IS_OFF, "Evb_ref_lim",
        "Regulation ceiling, not compensated"},
@@ -284,7 +284,7 @@ inline const Item &item(uint8_t index) {
       {0xE022, KIND_VOLT_SETTING, GROUP_LOAD, 9, 15, ITEM_WITNESS, "EV_lvd", "Low voltage disconnect"},
       {0xE023, KIND_VOLT_SETTING, GROUP_LOAD, 9, 15, ITEM_WITNESS, "EV_lvr", "Low voltage reconnect"},
       {0xE024, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, ITEM_ZERO_IS_OFF, "EV_lhvd", "Load high voltage disconnect"},
-      {0xE025, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, ITEM_ZERO_IS_OFF, "EV_lhvr", "Load high voltage reconnect"},
+      {0xE025, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, 0, "EV_lhvr", "Load high voltage reconnect"},
       {0xE026, KIND_OHMS, GROUP_LOAD, 0, 0, ITEM_ZERO_IS_OFF, "ER_icomp", "LVD load current compensation"},
       {0xE027, KIND_TENTHS, GROUP_LOAD, 0, 0, 0, "Et_lvd_warn", "LVD warning time"},
 
@@ -677,7 +677,7 @@ enum Finding : uint32_t {
   FINDING_RESET_PENDING = 1ul << 8,     // settings were written, the controller has not restarted
   FINDING_CHARGER_FAULT = 1ul << 9,     // the controller reports another fault
   FINDING_PACK_VOLTAGE = 1ul << 10,     // the battery is not the 12 V or 24 V pack that was configured
-  FINDING_PRESET_LVD = 1ul << 11,       // SW2 OFF: the load disconnects at the built-in 11.50 V
+  FINDING_PRESET_LVD = 1ul << 11,       // SW2 OFF: the load disconnects at the built-in 11.50 V (23.00 V at 24 V)
   FINDING_LIVE_SCALE = 1ul << 12,       // the charger's own LVD reads wrong with this firmware's scale
   FINDING_SYSTEM_24V = 1ul << 13,       // a 24 V system: the stored voltages were not judged
   FINDING_SYSTEM_UNKNOWN = 1ul << 14    // the battery voltage tells no system: not judged either
@@ -713,7 +713,8 @@ inline const char *findingText(uint32_t finding) {
     case FINDING_PACK_VOLTAGE:
       return "The battery voltage does not match the pack voltage that was configured.";
     case FINDING_PRESET_LVD:
-      return "DIP switch 2 is OFF: the load is disconnected at the built-in 11.50 V, not at the stored LVD.";
+      return "DIP switch 2 is OFF: the load is disconnected at the built-in 11.50 V (23.00 V on a 24 V "
+             "system), not at the stored LVD.";
     case FINDING_LIVE_SCALE:
       return "The charger's own LVD reads wrong with the scale this firmware uses for voltages, so the "
              "battery voltage it reports is off by 3.3 %.";
@@ -1279,14 +1280,23 @@ inline void describeSettingsScale(const ScaleVerdict &verdict, Text *out) {
   out->add(scaleName(candidateScale(other))).add(")");
 }
 
-inline void describeLiveScale(uint8_t scale, uint8_t source, Text *out) {
+// systemVolts is Evaluation::systemVolts: the built-in LVD is 11.50 V on a 12 V system and twice
+// that on a 24 V one.
+inline void describeLiveScale(uint8_t scale, uint8_t source, uint8_t systemVolts, Text *out) {
   if (scale == SCALE_UNKNOWN) {
     out->add("not proven");
     return;
   }
   out->add(scaleName(scale));
-  out->add(source == LIVE_SOURCE_PRESET_LVD ? " (the built-in 11.50 V LVD reads right with it)"
-                                             : " (the stored LVD reads right with it)");
+  if (source != LIVE_SOURCE_PRESET_LVD) {
+    out->add(" (the stored LVD reads right with it)");
+  } else if (systemVolts == 24) {
+    out->add(" (the built-in 23.00 V LVD reads right with it)");
+  } else if (systemVolts == 12) {
+    out->add(" (the built-in 11.50 V LVD reads right with it)");
+  } else {
+    out->add(" (the built-in LVD, 11.50 V or 23.00 V on a 24 V system, reads right with it)");
+  }
 }
 
 }  // namespace sunsaver

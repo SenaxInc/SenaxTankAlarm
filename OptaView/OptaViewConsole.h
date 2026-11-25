@@ -1929,7 +1929,8 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       }
       double below = 0.0;
       double above = 0.0;
-      if (device_.runCheck(check, &reg, raw, &below, &above) != OV_CHECK_FAIL) {
+      const OvCheckResult result = device_.runCheck(check, &reg, raw, &below, &above);
+      if (result != OV_CHECK_FAIL && result != OV_CHECK_ZERO) {
         continue;
       }
       printWrapped("  Careful: ", "    ", check.message);
@@ -1942,6 +1943,22 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(" = ");
       printQuantity(*check.above, above);
       out_.println(". Put the other one right before you 'reset'.");
+      if (result == OV_CHECK_ZERO) {
+        printZeroInPair(check, below, above);
+      }
+    }
+  }
+
+  // After a pair check that a 0 failed: names the register whose 0 switches nothing off.
+  void printZeroInPair(const OvCheck &check, double below, double above) {
+    const OvRegister *const registers[2] = {check.below, check.above};
+    const double values[2] = {below, above};
+    for (size_t i = 0; i < 2; ++i) {
+      if (values[i] == 0.0 && !registers[i]->zeroOk) {
+        out_.print("    ");
+        out_.print(registers[i]->name);
+        out_.println(" cannot be 0: 0 does not switch it off.");
+      }
     }
   }
 
@@ -2207,7 +2224,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       double below = 0.0;
       double above = 0.0;
       const OvCheckResult result = device_.runCheck(check, nullptr, 0, &below, &above);
-      if (result == OV_CHECK_FAIL) {
+      if (result == OV_CHECK_FAIL || result == OV_CHECK_ZERO) {
         problems = true;
         printWrapped("  Problem: ", "    ", check.message);
         out_.print("    Now ");
@@ -2219,6 +2236,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         out_.print(" = ");
         printQuantity(*check.above, above);
         out_.println(".");
+        if (result == OV_CHECK_ZERO) {
+          printZeroInPair(check, below, above);
+        }
       } else if (result == OV_CHECK_NOT_READ) {
         problems = true;
         out_.print("  Could not check ");

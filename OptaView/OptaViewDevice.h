@@ -158,7 +158,8 @@ struct OvResetOutcome {
 enum OvCheckResult : uint8_t {
   OV_CHECK_PASS = 0,
   OV_CHECK_FAIL,
-  OV_CHECK_OFF,      // one of the two is 0, which switches that feature off
+  OV_CHECK_OFF,      // one of the two is 0 where 0 switches that feature off (zeroOk)
+  OV_CHECK_ZERO,     // one of the two is 0 where 0 switches nothing off: that fails as well
   OV_CHECK_NOT_READ
 };
 
@@ -1011,8 +1012,17 @@ class OvDevice {
     }
     *below = ovValue(*check.below, belowWords);
     *above = ovValue(*check.above, aboveWords);
-    if (ovRawValue(*check.below, belowWords) == 0 || ovRawValue(*check.above, aboveWords) == 0) {
+    const bool belowZero = ovRawValue(*check.below, belowWords) == 0;
+    const bool aboveZero = ovRawValue(*check.above, aboveWords) == 0;
+    // A 0 switches the check off only in a register whose 0 switches the setting off: with the
+    // high voltage disconnect at 0 there is nothing for its reconnect to stay below. Anywhere
+    // else a 0 is a voltage the battery never reaches: a reconnect at 0 V never reconnects, and
+    // a disconnect at 0 V never disconnects.
+    if ((belowZero && check.below->zeroOk) || (aboveZero && check.above->zeroOk)) {
       return OV_CHECK_OFF;
+    }
+    if (belowZero || aboveZero) {
+      return OV_CHECK_ZERO;
     }
     return *below < *above ? OV_CHECK_PASS : OV_CHECK_FAIL;
   }
