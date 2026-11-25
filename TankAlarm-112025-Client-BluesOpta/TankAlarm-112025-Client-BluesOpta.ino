@@ -1215,6 +1215,10 @@ static unsigned long gRpmPulsePeriodMs[MAX_MONITORS] = {0};
 static volatile uint32_t gRpmAccumulatedPulses[MAX_MONITORS] = {0};
 static unsigned long gRpmAccumulatedStartMillis[MAX_MONITORS] = {0};
 static bool gRpmAccumulatedInitialized[MAX_MONITORS] = {false};
+// An accumulated count gives no result once a charger programming run has held up one of its
+// samples: the time it divides by then takes in the run, and its pulses do not
+// (restartPulseCountsAfterChargerRun()).
+static bool gRpmAccumulatedCutByRun[MAX_MONITORS] = {false};
 
 // Atomic access helpers for volatile pulse counter (protects against future interrupt use)
 // On 32-bit ARM (Cortex-M7 in STM32H747XI), 32-bit aligned reads/writes are atomic,
@@ -1472,7 +1476,12 @@ static bool pollPulseSampler(uint8_t idx) {
     unsigned long accumElapsed = now - gRpmAccumulatedStartMillis[idx];
     if (accumElapsed >= ctx.sampleDurationMs || (accumElapsed > 1000 && elapsed >= ctx.sampleDurationMs)) {
       uint32_t pulseCount = atomicReadAndResetPulses(idx);
-      if (accumElapsed > 1000 && pulseCount > 0) {
+      if (gRpmAccumulatedCutByRun[idx]) {
+        // A charger programming run held up a sample of this count: the last reading stands, and
+        // the next count starts now, as after any result.
+        ctx.resultRpm = gRpmLastReading[idx];
+        gRpmAccumulatedCutByRun[idx] = false;
+      } else if (accumElapsed > 1000 && pulseCount > 0) {
         ctx.resultRpm = ((float)pulseCount * MS_PER_MINUTE) /
                         ((float)accumElapsed * (float)ctx.pulsesPerRev);
       } else {
@@ -1663,6 +1672,7 @@ static void withdrawUnsuitedChargerProgram();
 static void withdrawChargerProgramForOtherCharger(uint8_t before);
 static unsigned long sampleIntervalMs();
 static bool chargerRunWouldHoldSample();
+static void restartPulseCountsAfterChargerRun();
 static void takeSampleDueAfterChargerRun();
 static bool serviceChargerProgramming(unsigned long now, bool allowed);
 static void sendDueChargerProgramReport(unsigned long now);
@@ -5695,6 +5705,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
         atomicResetPulses(i);
         gRpmAccumulatedStartMillis[i] = millis();
         gRpmAccumulatedInitialized[i] = false;
+        gRpmAccumulatedCutByRun[i] = false;  // the count starts again, without the run's time
       }
       // BugFix 04022026: Reset unload tracking unconditionally when the field
       // is present, not only when enabled. Previously, disabling trackUnloads
@@ -8558,16 +8569,42 @@ static bool chargerRunWouldHoldSample() {
   return since >= interval || interval - since <= sunsaver::RUN_LIMIT_MS;
 }
 
+// A pulse monitor counts pulses only while a sample is taken: each sample polls its count for a
+// moment (pollPulseSampler()). A charger programming run that held up a sample took such moments
+// from a count under way. A count of pulses then has fewer of them than its time asks for, a
+// count of the time between two pulses can measure it across the run, and an accumulated count,
+// whose time runs from one result to the next, has the run's time without its pulses. Each would
+// read low, which could raise a low alarm. So a count of pulses or of the time between them that
+// is under way is started again by the sample that follows, and an accumulated count gives no
+// result this once: the last reading stands, and the next count starts as after any result.
+// takeSampleDueAfterChargerRun() calls this only after a run that held up a sample: one that held
+// up none took no such moment.
+static void restartPulseCountsAfterChargerRun() {
+  for (uint8_t i = 0; i < gConfig.monitorCount; ++i) {
+    if (gConfig.monitors[i].sensorInterface != SENSOR_PULSE) {
+      continue;
+    }
+    PulseSamplerContext &ctx = gPulseSampler[i];
+    if (ctx.useAccumulatedMode) {
+      gRpmAccumulatedCutByRun[i] = true;
+    } else if (ctx.state == PULSE_STATE_SAMPLING) {
+      ctx.state = PULSE_STATE_IDLE;  // readPulseSensor() starts it again
+    }
+  }
+}
+
 // A sample of the monitors that came due while a charger programming run held loop(), taken as
 // soon as the run returns, with the time it returned: so a run holds a sample up by its own time
 // alone (a minute at most), and not by what the rest of that pass does as well. Not in
-// hibernation, and not without monitors, as at the top of loop().
+// hibernation, and not without monitors, as at the top of loop(). The pulse counts that the run
+// cut into start again first (restartPulseCountsAfterChargerRun()).
 static void takeSampleDueAfterChargerRun() {
   if (gPowerState == POWER_STATE_CRITICAL_HIBERNATE || gConfig.monitorCount == 0) {
     return;
   }
   const unsigned long at = millis();
   if (at - gLastTelemetryMillis >= sampleIntervalMs()) {
+    restartPulseCountsAfterChargerRun();
     gLastTelemetryMillis = at;
     sampleMonitors();
   }
@@ -11286,17 +11323,25 @@ static void switchOffRelaysTimeUp() {
 // writes as it ends.
 #define CHARGER_RUN_HOLD_MS (sunsaver::RUN_LIMIT_MS + 5000UL)
 
-// Whether the time of a relay that is on runs out before a charger programming run that starts
-// now would end (relayTimeUp()). The run then waits until checkRelayMomentaryTimeout() has
-// switched that relay off, a minute or so at most: within a run, the hook
-// (switchOffRelaysTimeUp()) runs between requests only, and one request can hold loop() for twice
-// the Modbus timeout and more (sunsaver::modbusRequestLimitMs()), about 9 seconds at the longest
-// timeout. Relays go on in loop() alone, never while a run holds it, so no other time runs out
-// during the run.
+// Whether the time of a relay runs out before a charger programming run that starts now would
+// end (relayTimeUp()). The run then waits until checkRelayMomentaryTimeout() has switched that
+// relay off, a minute or so at most: within a run, the hook (switchOffRelaysTimeUp()) runs
+// between requests only, and one request can hold loop() for twice the Modbus timeout and more
+// (sunsaver::modbusRequestLimitMs()), about 9 seconds at the longest timeout. Relays go on in
+// loop() alone, never while a run holds it, so no other time runs out during the run.
+//
+// That counts a relay whose output is off while its time still runs, too: hibernation switches
+// the outputs off and leaves the rest to checkRelayMomentaryTimeout(), which sends the command
+// that switches a remote relay off when the time is up. After hibernation, that command would
+// otherwise wait for the run. In hibernation itself, where loop() does not call
+// checkRelayMomentaryTimeout() and the outputs are off, only an output that is on holds the run,
+// as a charger that waits for its restart should not wait any longer
+// (serviceChargerProgramming()).
 static bool relayTimeRunsOutDuringChargerRun() {
   const unsigned long now = millis();
+  const bool hibernating = gPowerState == POWER_STATE_CRITICAL_HIBERNATE;
   for (uint8_t r = 0; r < MAX_RELAYS; r++) {
-    if (gRelayState[r] && relayTimeUp(r, now + CHARGER_RUN_HOLD_MS) != nullptr) {
+    if ((gRelayState[r] || !hibernating) && relayTimeUp(r, now + CHARGER_RUN_HOLD_MS) != nullptr) {
       return true;
     }
   }
