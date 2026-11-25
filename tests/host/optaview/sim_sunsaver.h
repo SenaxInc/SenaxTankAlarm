@@ -457,6 +457,12 @@ class SimSunSaver : public optaview::MbTransport {
   // change only when the running totals are stored (force_eeprom_update): when a real
   // controller stores them by itself is not known, and this one never does.
   void act(uint16_t coil) {
+    if (coil >= 0x0010 && coil <= 0x0012) {
+      // "set equal to the present battery voltage when a Ah / kWh reset is requested"
+      // (specification, vb_min and vb_max)
+      regs[0x0033] = regs[0x0008];  // vb_min
+      regs[0x0034] = regs[0x0008];  // vb_max
+    }
     if (coil == 0x0010) {         // clear_ah_resettable
       setU32HiLo(0x0015, 0);      // Ahc_r
       setU32HiLo(0x001D, 0);      // Ahl_r

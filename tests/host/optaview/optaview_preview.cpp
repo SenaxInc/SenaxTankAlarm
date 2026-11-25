@@ -56,6 +56,14 @@
 #include "OptaViewWebPage.h"
 #include "sim_sunsaver.h"
 
+// A send to a browser that has gone raises SIGPIPE, which main() ignores, so the flag that keeps
+// one send from raising it is only a second guard. macOS has no MSG_NOSIGNAL.
+#ifdef MSG_NOSIGNAL
+#define OV_SEND_NO_SIGNAL MSG_NOSIGNAL
+#else
+#define OV_SEND_NO_SIGNAL 0
+#endif
+
 using namespace optaview;
 
 static uint64_t realMs() {
@@ -162,7 +170,7 @@ class PcConn : public OvConn {
     if (fd_ < 0) {
       return -1;
     }
-    const ssize_t sent = ::send(fd_, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    const ssize_t sent = ::send(fd_, data, len, MSG_DONTWAIT | OV_SEND_NO_SIGNAL);
     if (sent >= 0) {
       return (int)sent;
     }

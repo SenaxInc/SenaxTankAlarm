@@ -189,9 +189,9 @@
     { "addr": "0x0000", "name": "equalize", "label": "Equalize triggered" },
     { "addr": "0x0001", "name": "load_disconnect", "label": "Load disconnect (on = load forced off)" },
     { "addr": "0x0002", "name": "charge_disconnect", "label": "Charge disconnect (on = charging stopped)" },
-    { "addr": "0x0010", "name": "clear_ah_resettable", "label": "Clear the resettable Ah counters", "trigger": true },
-    { "addr": "0x0011", "name": "clear_ah_total", "label": "Clear the total Ah counters", "trigger": true },
-    { "addr": "0x0012", "name": "clear_kwh", "label": "Clear the kWh counter", "trigger": true },
+    { "addr": "0x0010", "name": "clear_ah_resettable", "label": "Clear the resettable Ah counters", "trigger": true, "note": "It also sets vb_min and vb_max, the lowest and highest battery voltage since the last reset, to the battery voltage now." },
+    { "addr": "0x0011", "name": "clear_ah_total", "label": "Clear the total Ah counters", "trigger": true, "note": "It also sets vb_min and vb_max, the lowest and highest battery voltage since the last reset, to the battery voltage now." },
+    { "addr": "0x0012", "name": "clear_kwh", "label": "Clear the kWh counter", "trigger": true, "note": "It also sets vb_min and vb_max, the lowest and highest battery voltage since the last reset, to the battery voltage now." },
     { "addr": "0x0016", "name": "force_eeprom_update", "label": "Store the running totals in EEPROM now", "trigger": true },
     { "addr": "0x00FF", "name": "reset", "label": "Restart the controller", "trigger": true }
   ],

@@ -907,6 +907,7 @@ class OvWeb : public OvConsoleExtra {
       json.str("name", coil.name);
       json.u("addr", coil.addr);
       json.str("label", coil.label);
+      json.str("note", coil.note);
       json.flag("trigger", coil.trigger);
       json.flag("reset", &coil == modbus.resetCoil);
       json.endObject();

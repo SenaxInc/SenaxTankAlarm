@@ -1392,6 +1392,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         out_.printPadded(on ? "on" : "off", 10);
       }
       out_.println(coil.label);
+      if (coil.note[0] != '\0') {
+        printWrapped("        ", "        ", coil.note);
+      }
     }
     if (stopped_) {
       out_.println("Stopped.");
@@ -2154,6 +2157,9 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.print(coil->name);
     out_.print(": ");
     out_.println(coil->label);
+    if (coil->note[0] != '\0') {
+      printWrapped("  ", "  ", coil->note);
+    }
     out_.print("  Switch it ");
     out_.print(on ? "on" : "off");
     out_.print(" (coil 0x");
