@@ -1693,7 +1693,12 @@ class Programmer {
 //       JOURNAL_IDLE         nothing is owed to the controller
 //       JOURNAL_RESTARTING   the first restart command may have gone out; nothing has been written
 //       JOURNAL_WRITING      registers may have been written: the controller may wait for a restart
-//   - the result that has yet to go to the server.
+//   - the result that has yet to go to the server, and apart from it the look that answers no
+//     request (request 0, after a start that could not tell from its flash what was owed): the
+//     server keeps the two apart as well (programResultReplaces());
+//   - the time the last result of a request went out with, and the last look: a later result of
+//     the same request, or a later look, goes out with a later time, whatever the client's clock
+//     did in between (sendEpoch()).
 //
 // Each of these is in flash before the client goes on: a request before the config that carries
 // it is acknowledged, a commit point before the run passes it, a result before the journal
@@ -1725,6 +1730,12 @@ struct Journal {
   uint32_t reportId;     // the request it answers
   uint32_t reportEpoch;  // when it came about, in whole seconds; 0 when the client's clock was not set
   ProgramResult report;
+  bool lookDue;          // `look` has yet to go to the server: the result of a look for request 0
+  uint32_t lookEpoch;    // when it came about, as reportEpoch
+  ProgramResult look;
+  uint32_t sentId;       // the request of the last result that went out (not a look), 0 for none
+  uint32_t sentEpoch;    // the time that result went out with, 0 for none
+  uint32_t lookSentEpoch;  // the time the last look went out with, 0 for none
 };
 
 // The journal of a client that owes nothing and has answered nothing.
@@ -1738,6 +1749,64 @@ inline Journal emptyJournal() {
 inline Journal cautiousJournal() {
   Journal journal = emptyJournal();
   journal.phase = JOURNAL_WRITING;
+  return journal;
+}
+
+// A journal that a start could not read and kept aside (the client's keepUnreadChargerJournal()),
+// which reads at a later start, taken into `journal`, the one written since. What it holds that
+// `journal` does not comes in:
+//   - the duty to the controller its run talked to, where `journal` owes none, or owes the
+//     cautious look, which went to the controller the config names. A duty that `journal` owes a
+//     known controller stays: it is newer, and a journal holds one;
+//   - the requests it answered or took on, so that none of them is acted on again;
+//   - a request that waited, newer than any that `journal` answered: begin() answers it as
+//     interrupted, unless `journal` has one that waits;
+//   - its result that had yet to go out, unless `journal` holds one of the same request or a
+//     newer one, or sent one; and its look, while `journal` has none and sent none;
+//   - the times its last result and its last look went out with, where they are later: a later
+//     result of the same request, and a later look, go out later still (Supervisor::sendEpoch()).
+inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
+  uint32_t answered = journal.answeredId;
+  if (answered < journal.requestId) {
+    answered = journal.requestId;
+  }
+  if (answered < journal.waitingId) {
+    answered = journal.waitingId;
+  }
+  if (kept.phase != JOURNAL_IDLE && kept.controller != 0 &&
+      (journal.phase == JOURNAL_IDLE || journal.controller == 0)) {
+    journal.requestId = kept.requestId;
+    journal.phase = kept.phase;
+    journal.controller = kept.controller;
+    journal.readFunction = kept.readFunction;
+  }
+  if (kept.waitingId > answered && journal.waitingId == 0) {
+    journal.waitingId = kept.waitingId;
+  }
+  if (kept.reportDue && kept.reportId > journal.sentId && !(journal.reportDue && journal.reportId >= kept.reportId)) {
+    journal.reportDue = true;
+    journal.reportId = kept.reportId;
+    journal.reportEpoch = kept.reportEpoch;
+    journal.report = kept.report;
+  }
+  if (kept.sentId > journal.sentId || (kept.sentId == journal.sentId && kept.sentEpoch > journal.sentEpoch)) {
+    journal.sentId = kept.sentId;
+    journal.sentEpoch = kept.sentEpoch;
+  }
+  if (kept.lookDue && !journal.lookDue && journal.lookSentEpoch == 0) {
+    journal.lookDue = true;
+    journal.lookEpoch = kept.lookEpoch;
+    journal.look = kept.look;
+  }
+  if (kept.lookSentEpoch > journal.lookSentEpoch) {
+    journal.lookSentEpoch = kept.lookSentEpoch;
+  }
+  const uint32_t keptIds[] = {answered, kept.answeredId, kept.requestId, kept.waitingId, kept.reportId};
+  for (uint8_t i = 0; i < sizeof(keptIds) / sizeof(keptIds[0]); ++i) {
+    if (journal.answeredId < keptIds[i]) {
+      journal.answeredId = keptIds[i];
+    }
+  }
   return journal;
 }
 
@@ -1904,6 +1973,7 @@ class Supervisor {
     dutyTries_ = 0;
     dutyTryMs_ = nowMs;
     reportMs_ = nowMs;
+    lookMs_ = nowMs;
     if (journal_.waitingId != 0) {
       // The client restarted while the request waited, or before its run reached the controller.
       const uint32_t requestId = journal_.waitingId;
@@ -2001,24 +2071,44 @@ class Supervisor {
     return true;
   }
 
-  // A result waits to be sent to the server: the request it answers, the client's millis() when
-  // it came about, and that moment as a time when the clock was set then (0 otherwise, or after
-  // a restart of the client: the time of reportMillis() is the best that is known). A newer
-  // result of the same request takes the place of one that was not sent yet, and so does the
-  // result of a newer request. A result of an older request never does: the server keeps the
-  // newest request's anyway.
-  bool reportDue() const { return journal_.reportDue; }
-  const ProgramResult &report() const { return journal_.report; }
-  uint32_t reportRequestId() const { return journal_.reportId; }
-  uint32_t reportMillis() const { return reportMs_; }
-  uint32_t reportEpoch() const { return journal_.reportEpoch; }
-  // The Notecard has the result. Not the client's note buffer: that drops its oldest records once
-  // it grows too large, and the journal keeps the result until the Notecard takes it.
-  void reportTaken(uint32_t nowMs) {
-    if (journal_.reportDue) {
+  // A result waits to be sent to the server: the request it answers (0 for a look, which answers
+  // none), the client's millis() when it came about, and that moment as a time when the clock
+  // was set then (0 otherwise, or after a restart of the client: the time of reportMillis() is
+  // the best that is known). A newer result of the same request takes the place of one that was
+  // not sent yet, and so does the result of a newer request. A result of an older request never
+  // does: the server keeps the newest request's anyway. A look has a place of its own, as at the
+  // server, and only a newer look takes it. When both wait, the one that came about first goes
+  // first: these speak of that one, until reportTaken().
+  bool reportDue() const { return journal_.reportDue || journal_.lookDue; }
+  const ProgramResult &report() const { return lookFirst() ? journal_.look : journal_.report; }
+  uint32_t reportRequestId() const { return lookFirst() ? 0u : journal_.reportId; }
+  uint32_t reportMillis() const { return lookFirst() ? lookMs_ : reportMs_; }
+  uint32_t reportEpoch() const { return lookFirst() ? journal_.lookEpoch : journal_.reportEpoch; }
+  // The time to send that result with, given `epoch`, the time it came about: later than the
+  // time the last result of the same request went out with (the last look, for a look). The
+  // server orders the results of a request by their time, and the looks by theirs: a recovery
+  // that settles a run must not read as older than the run's result because the client's clock
+  // was set back in between.
+  uint32_t sendEpoch(uint32_t epoch) const {
+    const uint32_t last = lookFirst() ? journal_.lookSentEpoch
+                                      : (journal_.sentId == journal_.reportId ? journal_.sentEpoch : 0u);
+    return last != 0 && last != 0xFFFFFFFFu && epoch <= last ? last + 1 : epoch;
+  }
+  // The Notecard has that result, sent with the time `sentEpoch`. Not the client's note buffer:
+  // that drops its oldest records once it grows too large, and the journal keeps the result until
+  // the Notecard takes it.
+  void reportTaken(uint32_t sentEpoch, uint32_t nowMs) {
+    if (lookFirst()) {
+      journal_.lookDue = false;
+      journal_.lookSentEpoch = sentEpoch;
+    } else if (journal_.reportDue) {
       journal_.reportDue = false;
-      saveJournal(nowMs);
+      journal_.sentId = journal_.reportId;
+      journal_.sentEpoch = sentEpoch;
+    } else {
+      return;
     }
+    saveJournal(nowMs);
   }
 
   // The client gives up the request that waits: a newer config no longer asks for it
@@ -2051,6 +2141,8 @@ class Supervisor {
   // and the Notecard does not have it yet. The client acknowledges no config while this holds, so
   // that the server sends it again, with the request it may carry, as long as it waits for the
   // acknowledgement: a client that restarted in that time takes the request on again.
+  // A look is not counted: no config brings it back, and a client that restarts before flash
+  // takes it owes the controller the look again (its duty is in flash until a journal without it is).
   bool resultOnlyInRam() const { return journal_.reportDue && journalUnsaved_; }
 
   const Journal &journal() const { return journal_; }
@@ -2117,6 +2209,7 @@ class Supervisor {
   uint8_t dutyTries_;
   uint32_t dutyTryMs_;
   uint32_t reportMs_;
+  uint32_t lookMs_;
   uint16_t stepLimit_;
 
   bool waitOver(uint32_t nowMs) const { return (uint32_t)(nowMs - waitingSinceMs_) >= REQUEST_WAIT_MS; }
@@ -2128,13 +2221,28 @@ class Supervisor {
     return dutyForced_ || (uint32_t)(nowMs - dutyTryMs_) >= gap;
   }
 
+  // Of the two results that wait, the look goes first when it came about first.
+  bool lookFirst() const {
+    return journal_.lookDue && (!journal_.reportDue || (int32_t)(lookMs_ - reportMs_) < 0);
+  }
+
   void post(uint32_t requestId, const ProgramResult &result, double epochNow, uint32_t nowMs) {
+    const uint32_t epoch = epochNow >= CLOCK_SET_EPOCH ? (uint32_t)epochNow : 0u;
+    if (requestId == 0) {
+      // A look for no request: a start that could not tell from its flash what was owed. The
+      // server keeps it apart from the results of requests, and so does the journal.
+      journal_.look = result;
+      journal_.lookEpoch = epoch;
+      journal_.lookDue = true;
+      lookMs_ = nowMs;
+      return;
+    }
     if (journal_.reportDue && journal_.reportId > requestId) {
       return;  // the result of a newer request has yet to go out
     }
     journal_.report = result;
     journal_.reportId = requestId;
-    journal_.reportEpoch = epochNow >= CLOCK_SET_EPOCH ? (uint32_t)epochNow : 0u;
+    journal_.reportEpoch = epoch;
     journal_.reportDue = true;
     reportMs_ = nowMs;
   }

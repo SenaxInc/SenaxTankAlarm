@@ -381,8 +381,10 @@ public:
   // Reset daily statistics (call at midnight or report time)
   void resetDailyStats();
 
-  // Force a poll execution on the next opportunity
-  void forcePollSoon() { _lastPollMillis = 0; }
+  // Force a poll execution on the next opportunity: the last poll is put one interval back, so
+  // that poll() finds the next one due however long the client has been running (0 would only
+  // be an interval back once millis() has passed one).
+  void forcePollSoon();
 
   // ---------------------------------------------------------------------------------------
   // Charger check: what the controller has stored (charging profile, LVD and LVR, DIP
@@ -465,11 +467,12 @@ public:
   bool chargerProgrammingWantsLine(double epochNow) const;
 
   // The result that waits to be sent (reportDue(), report(), reportRequestId(), reportMillis(),
-  // reportEpoch(), resultOnlyInRam()), the journal, and whether a request or a duty is open.
+  // reportEpoch(), sendEpoch(), resultOnlyInRam()), the journal, and whether a request or a duty
+  // is open.
   const sunsaver::Supervisor& chargerProgramming() const { return _programming; }
-  // The Notecard has the result (not the note buffer, which may drop it: see
-  // sunsaver::Supervisor::reportTaken()).
-  void chargerProgramReportTaken();
+  // The Notecard has the result, sent with the time `sentEpoch` (not the note buffer, which may
+  // drop it: see sunsaver::Supervisor::reportTaken()).
+  void chargerProgramReportTaken(uint32_t sentEpoch);
 
 private:
   SolarConfig _config;

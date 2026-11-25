@@ -923,10 +923,20 @@ static unsigned long gChargerReportTryMillis = 0;      // which was then
 // short be settled when it starts again. Every result goes to the server.
 #define CHARGER_JOURNAL_FILE "/cfg/charger_journal.json"
 #define CHARGER_JOURNAL_TMP_FILE CHARGER_JOURNAL_FILE ".tmp"  // where tankalarm_posix_write_file_atomic() writes it first
+#define CHARGER_JOURNAL_KEPT_FILE CHARGER_JOURNAL_FILE ".bad"  // one that could not be read, kept aside
 #if defined(POSIX_FILE_IO_AVAILABLE)
 // loadChargerJournal() read the journal from its .tmp, which holds its only copy until
-// saveChargerJournal() renames it into place, or found a .tmp there that it could not open.
+// saveChargerJournal() renames it into place.
 static bool gChargerJournalInTmp = false;
+// The journal could not be read at this start, nor kept aside (keepUnreadChargerJournal()):
+// nothing is written over it until the next start.
+static bool gChargerJournalHeld = false;
+// What readChargerJournalFile() found.
+static const uint8_t CHARGER_JOURNAL_READ = 0;    // the file's text
+static const uint8_t CHARGER_JOURNAL_ABSENT = 1;  // no such file
+static const uint8_t CHARGER_JOURNAL_UNREAD = 2;  // there, or maybe there, and it does not open or read
+#define CHARGER_JOURNAL_READ_TRIES 3
+#define CHARGER_JOURNAL_RETRY_PAUSE_MS 100UL
 #endif
 #define CHARGER_PROGRAM_REPORT_RETRY_MS (10UL * 60UL * 1000UL)  // after a result the Notecard did not take
 // The result that waits to go out (SolarManager::chargerProgramming()), as this sketch has seen
@@ -1243,6 +1253,7 @@ static void enableDfuMode();
 static void pollForConfigUpdates();
 static void applyConfigUpdate(const JsonDocument &doc);
 static bool sendConfigAck(bool success, const char *message, const char *configVersion);
+static void answerRepeatedConfig(const JsonDocument &doc, uint32_t inboundTs, const char *cv);
 static bool sendOtaReportNote(const char *st, const char *targetV, const char *reason);
 static void reportOtaOutcome();
 static void persistConfigIfDirty();
@@ -1575,8 +1586,15 @@ static void finishChargerCheck(unsigned long now);
 static void sendDueChargerReport(unsigned long now);
 static sunsaver::Journal loadChargerJournal();
 static bool saveChargerJournal(const sunsaver::Journal &journal);
+#if defined(POSIX_FILE_IO_AVAILABLE)
+static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size);
+static void keepUnreadChargerJournal(const char *path);
+static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent);
+#endif
 static void keepChargerLookAfterLostFiles();
 static void handleChargerProgramRequest(JsonObjectConst program);
+static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId);
+static void retakeChargerProgramRequest(JsonObjectConst program);
 static void withdrawUnsuitedChargerProgram();
 static bool serviceChargerProgramming(unsigned long now, bool allowed);
 static void sendDueChargerProgramReport(unsigned long now);
@@ -2751,15 +2769,17 @@ static float getEffectiveSpecificGravity(const MonitorConfig &cfg) {
  * If a .tmp file exists but the target does NOT, the rename failed
  * after a write completed — complete the rename now.
  * If BOTH exist, the original is still valid — delete stale .tmp.
- * (A charger journal whose rename fails here too is read from its .tmp:
- * see loadChargerJournal().)
+ * The charger journal is not done here: a journal that is there and
+ * fails to open would pass for one that is not, and a .tmp that a lost
+ * save left half written would take its place. loadChargerJournal() reads
+ * its .tmp only when the journal itself is not there (ENOENT), and
+ * saveChargerJournal() puts that .tmp in place before it writes another.
  */
 #ifdef POSIX_FILE_IO_AVAILABLE
 static void recoverOrphanedTmpFiles() {
   static const char * const criticalFiles[] = {
     "/cfg/client_config.json",
     "/cfg/pending_notes.log",
-    CHARGER_JOURNAL_FILE,
     nullptr
   };
 
@@ -4939,8 +4959,8 @@ static void pollForConfigUpdates() {
             Serial.print(inboundTs);
             Serial.print(F(" Active TS: "));
             Serial.println(gConfig.configEpoch);
-            // Send config ACK indicating that we took it but bypassed it to prevent overwriting
-            sendConfigAck(true, "Config bypassed: newer version already exists", cv);
+            // Acknowledged as taken but bypassed, to prevent overwriting (answerRepeatedConfig()).
+            answerRepeatedConfig(doc, inboundTs, cv);
             ackSent = true;
           } else {
             if (inboundTs > 0) {
@@ -5110,6 +5130,7 @@ static void attemptPendingConfigAckSend() {
   // yet. Until the config is acknowledged the server sends it again, a minute apart and up to five
   // times (its MAX_CONFIG_DISPATCH_RETRIES), and with it the request: a client that restarted in
   // that time takes the request on again. The next pass looks again (retryPendingConfigAckIfDue()).
+  // A config that arrives again and is set aside is acknowledged here too (answerRepeatedConfig()).
   static bool heldForResult = false;
   if (gSolarManager.chargerProgramming().resultOnlyInRam()) {
     if (!heldForResult) {
@@ -5124,6 +5145,31 @@ static void attemptPendingConfigAckSend() {
   } else {
     schedulePendingConfigAckRetry();
   }
+}
+
+// A config whose time ("_ts") is not later than that of the config this client holds, which is
+// not applied again. One with that very time is the config held, delivered once more (the server
+// gives each config it sends a later time than the one before, so its own retries are applied).
+// The charger request it carries is taken on if this client has no answer to it: a restart lost
+// the answer before flash or the Notecard had it, while the time of the config was in flash
+// already (retakeChargerProgramRequest()). It is acknowledged as an applied config is, when no
+// result of charger programming is in RAM alone (attemptPendingConfigAckSend()): that
+// acknowledgement stops the server from sending the config again, and with it the request. An
+// acknowledgement that waits already answers for this client.
+static void answerRepeatedConfig(const JsonDocument &doc, uint32_t inboundTs, const char *cv) {
+  if (inboundTs == gConfig.configEpoch) {
+    retakeChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
+  }
+  if (gPendingConfigAck) {
+    return;
+  }
+  strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
+  gPendingConfigAck = true;
+  gPendingConfigAckSuccess = true;
+  strlcpy(gPendingConfigAckMessage, "Config bypassed: newer version already exists", sizeof(gPendingConfigAckMessage));
+  gPendingConfigAckRetryAt = 0;
+  gPendingConfigAckRetryDelayMs = 5000UL;
+  attemptPendingConfigAckSend();
 }
 
 static void applyConfigUpdate(const JsonDocument &doc) {
@@ -7794,19 +7840,22 @@ static void keepChargerLookAfterLostFiles() {
 }
 
 // The journal in flash (sunsaver::Journal): the requests answered, a request that waits, how far
-// the last run came that reached the charger, and the result that has yet to go out. No file, and
-// no .tmp of one: nothing was ever asked. Only its .tmp: a save whose rename failed, and failed
-// again in this start's recoverOrphanedTmpFiles(), which is read as the journal that rename would
-// have made it (saveChargerJournal() puts it in place before it writes another, and does the
-// same with a .tmp that may be there and cannot be opened). A file that
-// cannot be read, no flash to read it from, or flash that lost its files at this start
-// (keepChargerLookAfterLostFiles() writes the cautious journal for it): the charger may wait for
-// a restart, and gets a look (firmware without programming owes it nothing, see
-// beginChargerProgramming(), and says nothing of a look).
+// the last run came that reached the charger, and the results that have yet to go out. No file,
+// and no .tmp of one: nothing was ever asked. Only its .tmp: a save whose rename failed, which is
+// read as the journal that rename would have made it (saveChargerJournal() puts it in place
+// before it writes another). A journal, or such a .tmp, that is there and does not open or does
+// not read (readChargerJournalFile() tries three times), or runs out of memory as it is read, is
+// kept aside (keepUnreadChargerJournal()), and the charger gets a look. So it does for a file that
+// holds no journal (which is not kept: it never reads as more than that), when there is no flash
+// to read it from, and when the flash lost its files at this start (keepChargerLookAfterLostFiles()
+// writes the cautious journal for it). A journal kept aside at an earlier start gives what it says
+// is owed once it reads (takeKeptChargerJournal()). Firmware without programming keeps what is
+// owed for firmware that has it (see beginChargerProgramming()), and says nothing of a look.
 static sunsaver::Journal loadChargerJournal() {
   const sunsaver::Journal none = sunsaver::emptyJournal();
 #if defined(POSIX_FILE_IO_AVAILABLE)
   gChargerJournalInTmp = false;
+  gChargerJournalHeld = false;
   if (!isStorageAvailable()) {
     // The journal may say that a run was cut short, and nothing can show otherwise. Without flash
     // nothing can be kept either, so saveChargerJournal() fails and no request is taken on: the
@@ -7817,40 +7866,50 @@ static sunsaver::Journal loadChargerJournal() {
 #endif
     return sunsaver::cautiousJournal();
   }
-  errno = 0;
-  FILE *file = fopen(CHARGER_JOURNAL_FILE, "r");
-  if (file == nullptr && errno == ENOENT) {
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
+  const char *path = CHARGER_JOURNAL_FILE;
+  uint8_t read = readChargerJournalFile(path, buf, sizeof(buf));
+  if (read == CHARGER_JOURNAL_ABSENT) {
     // Its .tmp alone is the journal, not a sign that none was ever written: reading none would
     // drop what it says, such as the look owed after a run cut short or a flash that lost its
-    // files. A .tmp beside the journal is a save that never took its place, and is not read. A
-    // .tmp that may be there and cannot be opened holds the only copy just the same: the charger
-    // gets a look, and saveChargerJournal() puts the .tmp in place before it writes another.
-    errno = 0;
-    file = fopen(CHARGER_JOURNAL_TMP_FILE, "r");
-    gChargerJournalInTmp = file != nullptr || errno != ENOENT;
-    if (file != nullptr) {
+    // files. A .tmp beside the journal is a save that never took its place, and is not read.
+    path = CHARGER_JOURNAL_TMP_FILE;
+    read = readChargerJournalFile(path, buf, sizeof(buf));
+    if (read == CHARGER_JOURNAL_READ) {
+      gChargerJournalInTmp = true;
       Serial.println(F("Charger programming: the journal is only in its .tmp, which could not be renamed, and is read from there"));
     }
   }
-  if (file == nullptr) {
-    if (errno == ENOENT && !gStorageLostFiles) {
-      return none;
+  if (read == CHARGER_JOURNAL_ABSENT) {
+    if (!gStorageLostFiles) {
+      return takeKeptChargerJournal(none, true);
     }
-    // A journal that cannot be opened, or none on a flash that lost its files at this start
-    // (keepChargerLookAfterLostFiles() wrote one there, so that is not to be expected).
+    // None on a flash that lost its files at this start: keepChargerLookAfterLostFiles() wrote
+    // one there, so that is not to be expected.
 #if TANKALARM_SUNSAVER_PROGRAMMING
     Serial.println(F("Charger programming: the journal could not be opened, so the charger gets a look"));
 #endif
     return sunsaver::cautiousJournal();
   }
-  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
-  const size_t len = fread(buf, 1, sizeof(buf) - 1, file);
-  const bool failed = ferror(file) != 0;
-  fclose(file);
-  buf[len] = '\0';
-  sunsaver::Journal journal = sunsaver::cautiousJournal();
   JsonDocument doc;
-  const bool readable = !failed && deserializeJson(doc, buf) == DeserializationError::Ok;
+  DeserializationError parsed = DeserializationError::Ok;
+  if (read == CHARGER_JOURNAL_READ) {
+    parsed = deserializeJson(doc, buf);
+    if (parsed == DeserializationError::NoMemory) {
+      read = CHARGER_JOURNAL_UNREAD;  // it may read at the next start: no file that holds no journal
+    }
+  }
+  if (read == CHARGER_JOURNAL_UNREAD) {
+#if TANKALARM_SUNSAVER_PROGRAMMING
+    Serial.println(F("Charger programming: the journal could not be read, so the charger gets a look"));
+    addSerialLog("Charger programming: the journal could not be read, so the charger gets a look");
+#endif
+    doc.clear();  // the memory it took goes to the save of the cautious journal
+    keepUnreadChargerJournal(path);
+    return sunsaver::cautiousJournal();
+  }
+  sunsaver::Journal journal = sunsaver::cautiousJournal();
+  const bool readable = parsed == DeserializationError::Ok;
   if (readable) {
     journal = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
   }
@@ -7872,23 +7931,119 @@ static sunsaver::Journal loadChargerJournal() {
   if (journal.waitingId != 0) {
     Serial.println(F("Charger programming: a request waited at this restart, and is answered as interrupted"));
   }
-  if (journal.reportDue) {
+  if (journal.reportDue || journal.lookDue) {
     Serial.println(F("Charger programming: a result had yet to go out at this restart, and is due again"));
   }
-  return journal;
+  return takeKeptChargerJournal(journal, false);
 #else
   return none;
 #endif
 }
 
+#if defined(POSIX_FILE_IO_AVAILABLE)
+// Reads a journal file into `buf` (`size` bytes: its text and the zero that ends it). Returns
+// CHARGER_JOURNAL_READ, CHARGER_JOURNAL_ABSENT when there is no such file, or
+// CHARGER_JOURNAL_UNREAD when it did not open for another reason or did not read. That is tried
+// CHARGER_JOURNAL_READ_TRIES times in all, CHARGER_JOURNAL_RETRY_PAUSE_MS apart: it can pass.
+static uint8_t readChargerJournalFile(const char *path, char *buf, size_t size) {
+  for (uint8_t attempt = 1;; ++attempt) {
+    errno = 0;
+    FILE *file = fopen(path, "r");
+    if (file == nullptr && errno == ENOENT) {
+      return CHARGER_JOURNAL_ABSENT;
+    }
+    if (file != nullptr) {
+      const size_t len = fread(buf, 1, size - 1, file);
+      const bool failed = ferror(file) != 0;
+      fclose(file);
+      if (!failed) {
+        buf[len] = '\0';
+        return CHARGER_JOURNAL_READ;
+      }
+    }
+    if (attempt >= CHARGER_JOURNAL_READ_TRIES) {
+      return CHARGER_JOURNAL_UNREAD;
+    }
+    delay(CHARGER_JOURNAL_RETRY_PAUSE_MS);
+  }
+}
+
+// A journal, or the .tmp that is its only copy, that is there and does not read at this start, or
+// runs out of memory as it is read. It is kept aside, so that the journal this start writes does
+// not take its place: it may say that a controller other than the one the config names now waits
+// for its restart, which the cautious look does not reach, and a later start takes that up once
+// it reads (takeKeptChargerJournal()). The cautious journal goes to flash at once, so that a
+// restart before the look still owes it. A file that cannot be moved, or a journal kept aside
+// before that is still there, is not written over at this start: no journal is
+// (saveChargerJournal()).
+static void keepUnreadChargerJournal(const char *path) {
+  errno = 0;
+  FILE *kept = fopen(CHARGER_JOURNAL_KEPT_FILE, "r");
+  const bool keptFree = kept == nullptr && errno == ENOENT;
+  if (kept != nullptr) {
+    fclose(kept);
+  }
+  // One kept aside at an earlier start and not taken up since is not put out of the way for it.
+  errno = 0;
+  if (keptFree && rename(path, CHARGER_JOURNAL_KEPT_FILE) == 0) {
+    gChargerJournalInTmp = false;  // a .tmp that was read is the kept file now
+    Serial.print(F("Charger programming: the journal that could not be read is kept as "));
+    Serial.println(CHARGER_JOURNAL_KEPT_FILE);
+    saveChargerJournal(sunsaver::cautiousJournal());
+    return;
+  }
+  if (keptFree && errno == ENOENT) {
+    return;  // nothing is there after all, to be kept or written over
+  }
+  gChargerJournalHeld = true;
+  Serial.println(F("Charger programming: the journal could not be read or kept aside, so no journal is written at this start"));
+  addSerialLog("Charger programming: the journal could not be read or kept aside");
+}
+
+// A journal kept aside at an earlier start because it could not be read then
+// (keepUnreadChargerJournal()). Once it reads, what it holds that `journal`, the journal read now,
+// does not comes into it (sunsaver::mergeKeptJournal()): above all the look owed to the controller
+// its run talked to, which the cautious look of that start did not reach when the config names
+// another one now, and the requests it answered. Where no journal was found (`absent`) it is the
+// journal. That goes to flash, and the kept file is removed once it is there. One that still does
+// not read, or runs out of memory as it is read, stays, and owes a look while no journal speaks
+// for this client.
+static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool absent) {
+  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
+  const uint8_t read = readChargerJournalFile(CHARGER_JOURNAL_KEPT_FILE, buf, sizeof(buf));
+  if (read == CHARGER_JOURNAL_ABSENT) {
+    return journal;
+  }
+  JsonDocument doc;
+  DeserializationError parsed = DeserializationError::Ok;
+  if (read == CHARGER_JOURNAL_READ) {
+    parsed = deserializeJson(doc, buf);
+  }
+  if (read == CHARGER_JOURNAL_UNREAD || parsed == DeserializationError::NoMemory) {
+    Serial.println(F("Charger programming: a journal kept aside at an earlier start still cannot be read"));
+    return absent ? sunsaver::cautiousJournal() : journal;
+  }
+  // One that holds no journal says no more than the cautious journal.
+  const sunsaver::Journal kept =
+      parsed == DeserializationError::Ok ? sunsaver::decodeJournal(doc.as<JsonObjectConst>()) : sunsaver::cautiousJournal();
+  journal = absent ? kept : sunsaver::mergeKeptJournal(journal, kept);
+  Serial.println(F("Charger programming: a journal kept aside at an earlier start reads now, and what it says is owed is taken up"));
+  addSerialLog("Charger programming: a journal kept aside at an earlier start reads now");
+  if (saveChargerJournal(journal)) {
+    remove(CHARGER_JOURNAL_KEPT_FILE);
+  }
+  return journal;
+}
+#endif
+
 // The journal's writer (SolarManager::ChargerJournalWriter): true only once the file holds it.
-// A journal that was read from its .tmp, or a .tmp in its place that could not be opened, is
-// renamed into place first, or nothing is written: the write goes to that .tmp, and would take
-// its only copy away before it took the journal's place. A .tmp that could not be opened and is
-// not there has nothing to keep.
+// A journal that was read from its .tmp is renamed into place first, or nothing is written: the
+// write goes to that .tmp, and would take its only copy away before it took the journal's place.
+// Nothing is written over a journal that could not be read or kept aside at this start
+// (keepUnreadChargerJournal()).
 static bool saveChargerJournal(const sunsaver::Journal &journal) {
 #if defined(POSIX_FILE_IO_AVAILABLE)
-  if (!isStorageAvailable()) {
+  if (!isStorageAvailable() || gChargerJournalHeld) {
     return false;
   }
   JsonDocument doc;
@@ -7958,6 +8113,11 @@ static void handleChargerProgramRequest(JsonObjectConst program) {
   if (requestId == 0) {
     return;  // the values only travel with the config: nothing is to be written
   }
+  takeChargerProgramRequest(program, requestId);
+}
+
+// The request of a config, with its id: taken on, or refused by the client itself.
+static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId) {
   sunsaver::Profile profile;
   const uint16_t profileErrors = sunsaver::readProfile(program, &profile);
   const uint32_t refusals = chargerProgramClientRefusals();
@@ -7970,6 +8130,16 @@ static void handleChargerProgramRequest(JsonObjectConst program) {
   Serial.println(gSolarManager.chargerProgramming().requestWaiting()
                      ? F(" waits for the clock and the charger")
                      : F(" refused"));
+}
+
+// The request of a config this client holds already, which arrived again (answerRepeatedConfig()):
+// taken on when this client has no answer to it, as when it applied the config. Nothing is
+// withdrawn: the config it holds is the same.
+static void retakeChargerProgramRequest(JsonObjectConst program) {
+  const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
+  if (requestId != 0) {
+    takeChargerProgramRequest(program, requestId);
+  }
 }
 
 // After each config: a request that waits is withdrawn once the client could no longer take it
@@ -8055,7 +8225,8 @@ static void printChargerProgramResult(uint32_t requestId, const sunsaver::Progra
 
 // Hands the result that is due to the Notecard, and keeps it due until the Notecard has it:
 // until then it is in the journal in flash too. A newer result takes the place of one that has
-// not gone out yet, unless it answers an older request (sunsaver::Supervisor).
+// not gone out yet, unless it answers an older request; a look for no request has a place of its
+// own, and when both wait the one that came about first goes first (sunsaver::Supervisor).
 static void sendDueChargerProgramReport(unsigned long now) {
   const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
   if (!programming.reportDue()) {
@@ -8074,17 +8245,19 @@ static void sendDueChargerProgramReport(unsigned long now) {
   // The server keeps the newest result of a request by its time, as it keeps charger reports
   // (see sendDueChargerReport()). The supervisor knows the time when the clock was set as the
   // result came about. Otherwise it is worked out once, when the clock has one: from the millis()
-  // of the result, which for a result kept across a restart is the moment of that restart.
+  // of the result, which for a result kept across a restart is the moment of that restart. It
+  // goes out later than the last result of the same request did, whatever the clock did since.
   if (gChargerProgramReportEpoch == 0) {
-    gChargerProgramReportEpoch = programming.reportEpoch();
-  }
-  if (gChargerProgramReportEpoch == 0) {
-    const double nowEpoch = currentEpoch();
-    if (nowEpoch <= 0.0) {
-      return;
+    uint32_t epoch = programming.reportEpoch();
+    if (epoch == 0) {
+      const double nowEpoch = currentEpoch();
+      if (nowEpoch <= 0.0) {
+        return;
+      }
+      const double at = nowEpoch - (double)(uint32_t)((uint32_t)millis() - resultAt) / 1000.0;
+      epoch = at >= 1.0 ? (uint32_t)at : 1u;
     }
-    const double at = nowEpoch - (double)(uint32_t)((uint32_t)millis() - resultAt) / 1000.0;
-    gChargerProgramReportEpoch = at >= 1.0 ? (uint32_t)at : 1u;
+    gChargerProgramReportEpoch = programming.sendEpoch(epoch);
   }
   if (gChargerProgramReportTried && (now - gChargerProgramReportTryMillis) < CHARGER_PROGRAM_REPORT_RETRY_MS) {
     return;
@@ -8111,7 +8284,7 @@ static void sendDueChargerProgramReport(unsigned long now) {
   if (gChargerProgramReportTried) {
     Serial.println(F("Charger programming: the result that waited has gone out"));
   }
-  gSolarManager.chargerProgramReportTaken();
+  gSolarManager.chargerProgramReportTaken(gChargerProgramReportEpoch);
 }
 
 // Append solar charger data to daily report (called from sendDailyReport)

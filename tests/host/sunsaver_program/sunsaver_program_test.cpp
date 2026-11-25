@@ -3506,12 +3506,28 @@ static void testRequestJson() {
           out.reportEpoch = phase == 1 ? 0u : (uint32_t)kClientNow;
           out.report = refused;
         }
+        // A look that waits, and the times the last results went out with, in every mix.
+        out.lookDue = phase != 1;
+        if (out.lookDue) {
+          out.lookEpoch = phase == 0 ? 0u : (uint32_t)kClientNow + 7;
+          ss::interruptedResult(&out.look);
+          out.look.restart = ss::RESTART_DONE;
+          out.look.notes = ss::NOTE_WAS_PENDING;
+        }
+        if (due == 1 || phase == 2) {
+          out.sentId = kRequestId + 400 + phase;
+          out.sentEpoch = (uint32_t)kClientNow - 60;
+        }
+        out.lookSentEpoch = phase == 1 ? 0u : (uint32_t)kClientNow - 30 - phase;
         JsonDocument file;
         ss::encodeJournal(out, file.to<JsonObject>());
         std::string text;
         serializeJson(file, text);
         CHECK_EQ(text.find("wait") != std::string::npos, due == 1);  // left out when nothing waits
         CHECK_EQ(text.find("rep") != std::string::npos, due == 1);   // and when nothing is due
+        CHECK_EQ(text.find("look") != std::string::npos, out.lookDue);
+        CHECK_EQ(text.find("sep") != std::string::npos, out.sentEpoch != 0);
+        CHECK_EQ(text.find("lep") != std::string::npos, out.lookSentEpoch != 0);
         JsonDocument back = parsed(text);
         const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
         CHECK_MSG(in.requestId == out.requestId && in.phase == out.phase && in.controller == out.controller &&
@@ -3523,7 +3539,24 @@ static void testRequestJson() {
           CHECK_EQ(in.reportEpoch, out.reportEpoch);
           CHECK(sameResult(in.report, refused));
         }
+        CHECK_EQ(in.lookDue, out.lookDue);
+        if (out.lookDue) {
+          CHECK_EQ(in.lookEpoch, out.lookEpoch);
+          CHECK(sameResult(in.look, out.look));
+        }
+        CHECK_EQ(in.sentId, out.sentId);
+        CHECK_EQ(in.sentEpoch, out.sentEpoch);
+        CHECK_EQ(in.lookSentEpoch, out.lookSentEpoch);
       }
+    }
+    // A look whose result this code cannot read is left out, and the rest still holds; times that
+    // are not whole numbers read as none.
+    {
+      JsonDocument file = parsed("{\"req\":5,\"ph\":0,\"ans\":9,\"look\":{\"ep\":7,\"v\":99},"
+                                 "\"srq\":9,\"sep\":-3,\"lep\":\"8\"}");
+      const ss::Journal in = ss::decodeJournal(file.as<JsonObjectConst>());
+      CHECK(!in.lookDue && in.answeredId == 9 && in.phase == ss::JOURNAL_IDLE);
+      CHECK(in.sentId == 0 && in.sentEpoch == 0 && in.lookSentEpoch == 0);
     }
 
     // The longest journal there can be fits the client's buffer.
@@ -3562,6 +3595,13 @@ static void testRequestJson() {
       for (uint8_t i = 0; i < ss::PLAN_ENTRIES; ++i) {
         result.entries[i].status = ss::ENTRY_STATUS_LAST;
       }
+      // A look holds no plan (a recovery builds none), but the bound does not count on that.
+      longest.lookDue = true;
+      longest.lookEpoch = 0xFFFFFFFFu;
+      longest.look = result;
+      longest.sentId = 0xFFFFFFFFu;
+      longest.sentEpoch = 0xFFFFFFFFu;
+      longest.lookSentEpoch = 0xFFFFFFFFu;
       JsonDocument file;
       ss::encodeJournal(longest, file.to<JsonObject>());
       CHECK(!file.overflowed());
@@ -4211,6 +4251,7 @@ struct Report {
   uint32_t requestId;
   uint32_t atMs;
   uint32_t epoch;  // Supervisor::reportEpoch()
+  uint32_t sent;   // the time it went out with: Supervisor::sendEpoch(), as the client works it out
   ss::ProgramResult result;
 };
 
@@ -4273,6 +4314,7 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
   int configured;                   // the Modbus id the config names: -1 for the one this desk talks to
   uint8_t pollFunction;             // the read function the poll found for that controller, 0 for none
   ss::FunctionChoice choice;        // what this pass reads with (ChargerProgramPort): set by pass()
+  bool notecardDown;                // the Notecard takes no result: they wait
   std::vector<Report> reports;
 
   Desk()
@@ -4294,7 +4336,8 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
         held(false),
         configured(-1),
         pollFunction(MB_FC_READ_INPUT),
-        choice(MB_FC_READ_INPUT) {
+        choice(MB_FC_READ_INPUT),
+        notecardDown(false) {
     sim.configure(9600, MB_8N2);
     flash = ss::emptyJournal();
   }
@@ -4369,14 +4412,27 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
 
   double clock() const { return clockSet ? epochBase + (double)clockMs / 1000.0 : 0.0; }
 
+  // Every result that waits goes out, as the client sends it (sendDueChargerProgramReport()): the
+  // one that came about first first, with the time it came about, worked out from millis() when
+  // the clock was not set then, and later than the last of the same request (sendEpoch()). A look
+  // and the result of a request can both wait.
   void collect(ss::Supervisor &supervisor) {
-    if (supervisor.reportDue()) {
-      const Report report = {supervisor.reportRequestId(), supervisor.reportMillis(), supervisor.reportEpoch(),
+    if (notecardDown) {
+      return;
+    }
+    for (int taken = 0; supervisor.reportDue() && taken < 2; ++taken) {
+      uint32_t epoch = supervisor.reportEpoch();
+      if (epoch == 0 && clockSet) {
+        const double at = clock() - (double)(uint32_t)(millisNow() - supervisor.reportMillis()) / 1000.0;
+        epoch = at >= 1.0 ? (uint32_t)at : 1u;
+      }
+      const uint32_t sent = supervisor.sendEpoch(epoch);
+      const Report report = {supervisor.reportRequestId(), supervisor.reportMillis(), supervisor.reportEpoch(), sent,
                              supervisor.report()};
       reports.push_back(report);
-      supervisor.reportTaken(millisNow());
-      CHECK(!supervisor.reportDue());
+      supervisor.reportTaken(sent, millisNow());
     }
+    CHECK(!supervisor.reportDue());
   }
 
   // The client's line rest: nothing is sent for one Modbus timeout after a request that got no
@@ -7487,6 +7543,551 @@ static void testSmallThings() {
   CHECK_EQ(ss::COIL_RESTART, 0x00FF);
 }
 
+// A look for no request (after a start that could not tell from its flash what was owed) and the
+// result of a request each have a place in the journal, as at the server: neither takes the
+// other's. When both wait, the one that came about first goes first. And each result goes out
+// with a later time than the last of the same request did, or than the last look for a look,
+// whatever the client's clock did in between: the server orders them by that time.
+static void testResultsApart() {
+  const ss::Profile profile = ss::lifepo4Profile();
+  {
+    // The request is refused while the look is owed, and the Notecard takes neither: the look
+    // that follows does not take the refusal's place, nor the refusal the look's.
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.notecardDown = true;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.ask(supervisor, kRequestId, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId);
+    desk.advance(1000);
+    CHECK(desk.pass(supervisor));  // the look
+    CHECK(!supervisor.dutyOwed());
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId);  // the refusal came first, and goes first
+    CHECK(desk.flash.reportDue && desk.flash.reportId == kRequestId);
+    CHECK(desk.flash.lookDue);
+    CHECK_EQ(desk.flash.look.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(!supervisor.resultOnlyInRam());
+    desk.notecardDown = false;
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports[0].requestId, kRequestId);
+    CHECK_EQ(desk.reports[0].result.refusals, ss::REFUSE_NOT_LIFEPO4);
+    CHECK_EQ(desk.reports[1].requestId, 0u);
+    CHECK_EQ(desk.reports[1].result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(!desk.flash.reportDue && !desk.flash.lookDue);
+    CHECK_EQ(desk.flash.sentId, kRequestId);
+    CHECK_EQ(desk.flash.sentEpoch, desk.reports[0].sent);
+    CHECK_EQ(desk.flash.lookSentEpoch, desk.reports[1].sent);
+  }
+  {
+    // The look first, then the refusal: the look stays the one that goes first, and the client
+    // that restarts with both waiting sends both.
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.notecardDown = true;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.pass(supervisor));
+    CHECK_EQ(supervisor.reportRequestId(), 0u);
+    desk.advance(1000);
+    CHECK(desk.ask(supervisor, kRequestId, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    CHECK_EQ(supervisor.reportRequestId(), 0u);
+    CHECK_EQ(supervisor.report().outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(supervisor.resultOnlyInRam() == false);
+    CHECK(desk.flash.reportDue && desk.flash.lookDue);
+    ss::Supervisor restarted;
+    desk.advance(5000);
+    desk.boot(restarted);
+    CHECK(restarted.reportDue());
+    CHECK(!restarted.dutyOwed());
+    desk.notecardDown = false;
+    desk.collect(restarted);
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports[0].requestId, kRequestId);  // both came about at that start: the request's first
+    CHECK_EQ(desk.reports[1].requestId, 0u);
+    CHECK_EQ(desk.reports[1].result.outcome, ss::OUTCOME_INTERRUPTED);
+  }
+  {
+    // A newer look takes the place of one that has not gone out, and leaves the request's result
+    // alone. A look alone in RAM holds back no config acknowledgement: a restart owes it again.
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.sim.powered = false;
+    desk.notecardDown = true;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.ask(supervisor, kRequestId, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    CHECK(desk.pass(supervisor));  // a look that cannot reach the controller
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId);
+    desk.sim.powered = true;
+    desk.failFrom = desk.saves.size();
+    desk.advance(ss::DUTY_RETRY_MS);
+    CHECK(desk.pass(supervisor));  // and one that does, which flash does not take
+    CHECK(!supervisor.dutyOwed());
+    CHECK(supervisor.journalUnsaved());
+    CHECK(supervisor.resultOnlyInRam());  // the refusal counts: flash did not take the journal as it is now
+    CHECK(sameJournal(desk.flash, 0, ss::JOURNAL_WRITING));
+    CHECK(desk.flash.lookDue && desk.flash.look.followUp);
+    desk.notecardDown = false;
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports[0].requestId, kRequestId);
+    CHECK_EQ(desk.reports[1].requestId, 0u);
+    CHECK(!desk.reports[1].result.followUp);  // the newer look
+    CHECK(!supervisor.resultOnlyInRam());
+    // With only a look in RAM.
+    Desk other;
+    other.flash = ss::cautiousJournal();
+    other.notecardDown = true;
+    other.failFrom = 0;
+    ss::Supervisor alone;
+    other.boot(alone);
+    CHECK(other.pass(alone));
+    CHECK(alone.reportDue() && alone.journalUnsaved());
+    CHECK_EQ(alone.reportRequestId(), 0u);
+    CHECK(!alone.resultOnlyInRam());
+  }
+
+  // The times. A run is cut short and its recovery cannot reach the controller: that result goes
+  // out. The client's clock is then set an hour back, and the recovery that settles the run goes
+  // out with a later time all the same, in the same start and after a restart.
+  for (int restart = 0; restart < 2; ++restart) {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.powered = false;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.pass(supervisor));
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK(desk.reports[0].result.followUp);
+    const uint32_t first = desk.reports[0].sent;
+    CHECK_EQ(first, desk.reports[0].epoch);  // nothing of this request went out before it
+    CHECK_EQ(desk.flash.sentId, kRequestId);
+    CHECK_EQ(desk.flash.sentEpoch, first);
+    desk.epochBase -= 3600.0;
+    desk.sim.powered = true;
+    ss::Supervisor restarted;
+    ss::Supervisor &now = restart == 1 ? restarted : supervisor;
+    if (restart == 1) {
+      desk.advance(20000);
+      desk.boot(restarted);
+    } else {
+      desk.advance(ss::DUTY_RETRY_MS);
+    }
+    CHECK(desk.pass(now));
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK(!desk.reports[1].result.followUp);
+    CHECK_EQ(desk.reports[1].requestId, kRequestId);
+    CHECK(desk.reports[1].epoch != 0 && desk.reports[1].epoch < first);  // by the client's clock
+    CHECK_EQ(desk.reports[1].sent, first + 1);
+    CHECK(ss::programResultReplaces(true, kRequestId, first, kRequestId, desk.reports[1].sent));
+    CHECK(!ss::programResultReplaces(true, kRequestId, first, kRequestId, desk.reports[1].epoch));
+    CHECK_EQ(desk.flash.sentEpoch, first + 1);
+    // The result of a newer request goes out with its own time.
+    CHECK(desk.ask(now, kRequestId + 1, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    CHECK_EQ(desk.reports.size(), 3);
+    CHECK_EQ(desk.reports[2].sent, desk.reports[2].epoch);
+    CHECK(desk.reports[2].sent < first);
+    CHECK_EQ(desk.flash.sentId, kRequestId + 1);
+  }
+  // A look, the same way.
+  {
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.sim.powered = false;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.pass(supervisor));
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports[0].requestId, 0u);
+    CHECK(desk.reports[0].result.followUp);
+    const uint32_t first = desk.reports[0].sent;
+    CHECK_EQ(desk.flash.lookSentEpoch, first);
+    CHECK_EQ(desk.flash.sentEpoch, 0u);
+    desk.epochBase -= 600.0;
+    desk.sim.powered = true;
+    desk.advance(ss::DUTY_RETRY_MS);
+    CHECK(desk.pass(supervisor));
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports[1].requestId, 0u);
+    CHECK(!desk.reports[1].result.followUp);
+    CHECK(desk.reports[1].epoch <= first);
+    CHECK_EQ(desk.reports[1].sent, first + 1);
+    // A later time is left as it is.
+    CHECK_EQ(supervisor.sendEpoch(first + 100), first + 100);
+  }
+  {
+    // Nothing went out before: a time is left as it is, 0 included; the last time there can be
+    // is not wrapped round to 0.
+    ss::Supervisor supervisor;
+    CHECK_EQ(supervisor.sendEpoch(0), 0u);
+    CHECK_EQ(supervisor.sendEpoch(12345), 12345u);
+    Desk desk;
+    desk.flash = ss::emptyJournal();
+    desk.flash.answeredId = kRequestId;
+    desk.flash.sentId = kRequestId + 1;
+    desk.flash.sentEpoch = 0xFFFFFFFFu;
+    desk.notecardDown = true;
+    ss::Supervisor last;
+    desk.boot(last);
+    CHECK(desk.ask(last, kRequestId + 1, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    CHECK_EQ(last.sendEpoch(5), 5u);
+    desk.flash.sentEpoch = 0xFFFFFFFEu;
+    ss::Supervisor nearLast;
+    desk.boot(nearLast);
+    CHECK_EQ(nearLast.sendEpoch(5), 0xFFFFFFFFu);
+  }
+  {
+    // Each result keeps its own moment. A refusal comes about while the clock is not set, and a
+    // look ten seconds after it; the clock is set before either goes out. The refusal goes first,
+    // and each goes out with the time worked out from its own moment.
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.clockSet = false;
+    desk.notecardDown = true;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.advance(5000);
+    CHECK(desk.ask(supervisor, kRequestId, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    const uint32_t refusedAt = desk.millisNow();
+    desk.advance(10000);
+    CHECK(desk.pass(supervisor));  // the look
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId);
+    CHECK_EQ(supervisor.reportMillis(), refusedAt);
+    CHECK_EQ(supervisor.reportEpoch(), 0u);
+    desk.clockSet = true;
+    desk.notecardDown = false;
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports[0].requestId, kRequestId);
+    CHECK_EQ(desk.reports[0].atMs, refusedAt);
+    CHECK_EQ(desk.reports[1].requestId, 0u);
+    CHECK(desk.reports[1].atMs >= refusedAt + 10000);
+    CHECK_EQ(desk.reports[1].epoch, 0u);
+    CHECK(desk.reports[1].sent >= desk.reports[0].sent + 10);
+    CHECK(desk.reports[1].sent <= desk.reports[0].sent + 11 + (desk.reports[1].atMs - refusedAt - 10000) / 1000);
+  }
+  {
+    // A look that comes about while the clock is set goes out with that time, though the clock
+    // was set back before it went.
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.notecardDown = true;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.pass(supervisor));
+    const uint32_t lookEpoch = supervisor.reportEpoch();
+    CHECK(lookEpoch >= (uint32_t)kClientNow);
+    CHECK_EQ(lookEpoch, supervisor.journal().lookEpoch);
+    CHECK_EQ(supervisor.journal().reportEpoch, 0u);
+    desk.epochBase -= 3600.0;
+    desk.notecardDown = false;
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports[0].epoch, lookEpoch);
+    CHECK_EQ(desk.reports[0].sent, lookEpoch);
+  }
+  {
+    // begin() gives the look in flash the moment of that start, as it gives the request's result:
+    // both came about then, and the request's goes first. The supervisor here lived before, and
+    // its last look came about at a millis() below that of this start.
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.notecardDown = true;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.advance(600000);
+    CHECK(desk.pass(supervisor));  // the look
+    desk.advance(1000);
+    CHECK(desk.ask(supervisor, kRequestId, profile, 0, ss::REFUSE_NOT_LIFEPO4));
+    CHECK_EQ(supervisor.reportRequestId(), 0u);  // the look came first
+    CHECK(desk.flash.lookDue && desk.flash.reportDue);
+    desk.advance(1000);
+    desk.millisAtBoot = 2000000;
+    desk.boot(supervisor);
+    CHECK(supervisor.reportDue());
+    CHECK_EQ(supervisor.reportRequestId(), kRequestId);
+    CHECK_EQ(supervisor.reportMillis(), 2000000u);
+    desk.notecardDown = false;
+    desk.collect(supervisor);
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports[0].requestId, kRequestId);
+    CHECK_EQ(desk.reports[1].requestId, 0u);
+    CHECK_EQ(desk.reports[1].atMs, 2000000u);
+  }
+}
+
+// Sixteenth review: a journal that a start could not read is kept aside, and taken into the one
+// written since once it reads (mergeKeptJournal()).
+static void testKeptJournal() {
+  const ss::Profile profile = ss::lifepo4Profile();
+  ss::ProgramResult refused;
+  ss::refusedResult(profile, 0, ss::REFUSE_NOT_LIFEPO4, &refused);
+  ss::ProgramResult looked;
+  ss::interruptedResult(&looked);
+  // A run on controller 7 that was cut short as it wrote.
+  ss::Journal cut = ss::emptyJournal();
+  cut.requestId = kRequestId;
+  cut.answeredId = kRequestId;
+  cut.phase = ss::JOURNAL_WRITING;
+  cut.controller = 7;
+  cut.readFunction = 4;
+  {
+    // Its duty comes into a journal that owes none, or owes the cautious look: that went to the
+    // controller the config names. One that a journal owes a known controller stays.
+    const ss::Journal idle = ss::mergeKeptJournal(ss::emptyJournal(), cut);
+    CHECK_EQ(idle.phase, ss::JOURNAL_WRITING);
+    CHECK_EQ(idle.controller, 7);
+    CHECK_EQ(idle.readFunction, 4);
+    CHECK_EQ(idle.requestId, kRequestId);
+    CHECK_EQ(idle.answeredId, kRequestId);
+    const ss::Journal cautious = ss::mergeKeptJournal(ss::cautiousJournal(), cut);
+    CHECK_EQ(cautious.phase, ss::JOURNAL_WRITING);
+    CHECK_EQ(cautious.controller, 7);
+    CHECK_EQ(cautious.requestId, kRequestId);
+    ss::Journal owed = ss::emptyJournal();
+    owed.requestId = kRequestId + 50;
+    owed.answeredId = kRequestId + 50;
+    owed.phase = ss::JOURNAL_RESTARTING;
+    owed.controller = 3;
+    owed.readFunction = 3;
+    const ss::Journal kept = ss::mergeKeptJournal(owed, cut);
+    CHECK_EQ(kept.phase, ss::JOURNAL_RESTARTING);
+    CHECK_EQ(kept.controller, 3);
+    CHECK_EQ(kept.readFunction, 3);
+    CHECK_EQ(kept.requestId, kRequestId + 50);
+    CHECK_EQ(kept.answeredId, kRequestId + 50);
+    // A kept journal that owes nothing, or knows no controller, brings no duty.
+    ss::Journal settled = cut;
+    settled.phase = ss::JOURNAL_IDLE;
+    CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), settled).phase, ss::JOURNAL_IDLE);
+    CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), settled).answeredId, kRequestId);
+    CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), ss::cautiousJournal()).phase, ss::JOURNAL_IDLE);
+    for (int phase = ss::JOURNAL_RESTARTING; phase <= ss::JOURNAL_PHASE_LAST; ++phase) {
+      ss::Journal at = cut;
+      at.phase = (uint8_t)phase;
+      CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), at).phase, phase);
+    }
+  }
+  {
+    // The requests answered: the newest of either, however each holds it.
+    ss::Journal kept = ss::emptyJournal();
+    const uint32_t ids[] = {kRequestId + 1, kRequestId + 2, kRequestId + 3, kRequestId + 4};
+    for (int which = 0; which < 4; ++which) {
+      kept = ss::emptyJournal();
+      if (which == 0) {
+        kept.answeredId = ids[0];
+      } else if (which == 1) {
+        kept.requestId = ids[1];
+      } else if (which == 2) {
+        kept.waitingId = ids[2];
+      } else {
+        kept.reportId = ids[3];
+      }
+      CHECK_EQ(ss::mergeKeptJournal(ss::emptyJournal(), kept).answeredId, ids[which]);
+      ss::Journal newer = ss::emptyJournal();
+      newer.answeredId = kRequestId + 9;
+      CHECK_EQ(ss::mergeKeptJournal(newer, kept).answeredId, kRequestId + 9);
+    }
+    ss::Journal own = ss::emptyJournal();  // a journal whose ids say more than its answeredId
+    own.requestId = kRequestId + 20;
+    own.waitingId = kRequestId + 21;
+    CHECK_EQ(ss::mergeKeptJournal(own, ss::emptyJournal()).answeredId, kRequestId + 21);
+  }
+  {
+    // A request that waited, newer than any the journal answered, unless one waits there.
+    ss::Journal kept = ss::emptyJournal();
+    kept.waitingId = kRequestId + 5;
+    kept.answeredId = kRequestId + 5;
+    ss::Journal journal = ss::emptyJournal();
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).waitingId, kRequestId + 5);
+    journal.answeredId = kRequestId + 5;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).waitingId, 0u);
+    journal.answeredId = kRequestId + 4;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).waitingId, kRequestId + 5);
+    journal.waitingId = kRequestId + 2;
+    journal.answeredId = kRequestId + 2;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).waitingId, kRequestId + 2);
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).answeredId, kRequestId + 5);
+    // A start answers it as interrupted, and the same config does not bring it back.
+    Desk desk;
+    desk.flash = ss::mergeKeptJournal(ss::emptyJournal(), kept);
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId + 5);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(!desk.ask(supervisor, kRequestId + 5));
+  }
+  {
+    // Its result that had yet to go out, unless the journal holds or sent one of the same request
+    // or a newer one.
+    ss::Journal kept = ss::emptyJournal();
+    kept.answeredId = kRequestId + 3;
+    kept.reportDue = true;
+    kept.reportId = kRequestId + 3;
+    kept.reportEpoch = 1795500100u;
+    kept.report = refused;
+    ss::Journal journal = ss::emptyJournal();
+    ss::Journal merged = ss::mergeKeptJournal(journal, kept);
+    CHECK(merged.reportDue);
+    CHECK_EQ(merged.reportId, kRequestId + 3);
+    CHECK_EQ(merged.reportEpoch, 1795500100u);
+    CHECK_EQ(merged.report.refusals, ss::REFUSE_NOT_LIFEPO4);
+    for (int other = -1; other <= 1; ++other) {
+      const uint32_t id = (uint32_t)((int64_t)kRequestId + 3 + other);
+      journal = ss::emptyJournal();
+      journal.reportDue = true;
+      journal.reportId = id;
+      journal.report = looked;
+      merged = ss::mergeKeptJournal(journal, kept);
+      CHECK_EQ(merged.reportId, other < 0 ? kRequestId + 3 : id);  // a due result of an older request gives way
+      CHECK_EQ(merged.report.outcome, other < 0 ? refused.outcome : looked.outcome);
+      journal = ss::emptyJournal();
+      journal.sentId = id;
+      journal.sentEpoch = 1795500200u;
+      merged = ss::mergeKeptJournal(journal, kept);
+      CHECK_EQ(merged.reportDue, other < 0);
+    }
+    kept.reportDue = false;
+    CHECK(!ss::mergeKeptJournal(ss::emptyJournal(), kept).reportDue);
+  }
+  {
+    // The time the last result went out with: of the newer request, or the later of the same one.
+    ss::Journal kept = ss::emptyJournal();
+    kept.sentId = kRequestId + 2;
+    kept.sentEpoch = 1795500500u;
+    ss::Journal journal = ss::emptyJournal();
+    ss::Journal merged = ss::mergeKeptJournal(journal, kept);
+    CHECK_EQ(merged.sentId, kRequestId + 2);
+    CHECK_EQ(merged.sentEpoch, 1795500500u);
+    journal.sentId = kRequestId + 2;
+    journal.sentEpoch = 1795500400u;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).sentEpoch, 1795500500u);
+    journal.sentEpoch = 1795500600u;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).sentEpoch, 1795500600u);
+    journal.sentId = kRequestId + 3;
+    journal.sentEpoch = 1795500100u;
+    merged = ss::mergeKeptJournal(journal, kept);
+    CHECK_EQ(merged.sentId, kRequestId + 3);
+    CHECK_EQ(merged.sentEpoch, 1795500100u);
+    journal.sentId = kRequestId + 1;
+    merged = ss::mergeKeptJournal(journal, kept);
+    CHECK_EQ(merged.sentId, kRequestId + 2);
+    CHECK_EQ(merged.sentEpoch, 1795500500u);
+    // And of the last look, the later.
+    kept.lookSentEpoch = 1795500700u;
+    journal = ss::emptyJournal();
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).lookSentEpoch, 1795500700u);
+    journal.lookSentEpoch = 1795500600u;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).lookSentEpoch, 1795500700u);
+    journal.lookSentEpoch = 1795500800u;
+    CHECK_EQ(ss::mergeKeptJournal(journal, kept).lookSentEpoch, 1795500800u);
+  }
+  {
+    // Its look that had yet to go out, while the journal has none and sent none.
+    ss::Journal kept = ss::emptyJournal();
+    kept.lookDue = true;
+    kept.lookEpoch = 1795500300u;
+    kept.look = looked;
+    ss::Journal merged = ss::mergeKeptJournal(ss::emptyJournal(), kept);
+    CHECK(merged.lookDue);
+    CHECK_EQ(merged.lookEpoch, 1795500300u);
+    CHECK_EQ(merged.look.outcome, ss::OUTCOME_INTERRUPTED);
+    ss::Journal journal = ss::emptyJournal();
+    journal.lookSentEpoch = 1795500400u;
+    CHECK(!ss::mergeKeptJournal(journal, kept).lookDue);
+    journal = ss::emptyJournal();
+    journal.lookDue = true;
+    journal.lookEpoch = 1795500400u;
+    journal.look = refused;
+    merged = ss::mergeKeptJournal(journal, kept);
+    CHECK_EQ(merged.lookEpoch, 1795500400u);
+    CHECK_EQ(merged.look.outcome, refused.outcome);
+  }
+  {
+    // A journal kept aside with nothing in it, and one taken into itself: nothing changes.
+    ss::Journal full = cut;
+    full.waitingId = kRequestId + 1;
+    full.answeredId = kRequestId + 1;
+    full.reportDue = true;
+    full.reportId = kRequestId;
+    full.report = refused;
+    full.lookDue = true;
+    full.look = looked;
+    full.sentId = kRequestId;
+    full.sentEpoch = 1795500050u;
+    full.lookSentEpoch = 1795500060u;
+    ss::Journal back = ss::mergeKeptJournal(full, ss::emptyJournal());
+    CHECK(memcmp(&back.report, &full.report, sizeof(full.report)) == 0);
+    CHECK_EQ(back.phase, full.phase);
+    CHECK_EQ(back.controller, full.controller);
+    CHECK_EQ(back.waitingId, full.waitingId);
+    CHECK_EQ(back.answeredId, full.answeredId);
+    CHECK_EQ(back.sentEpoch, full.sentEpoch);
+    CHECK_EQ(back.lookSentEpoch, full.lookSentEpoch);
+    back = ss::mergeKeptJournal(full, full);
+    CHECK_EQ(back.reportId, full.reportId);
+    CHECK_EQ(back.waitingId, full.waitingId);
+    CHECK_EQ(back.requestId, full.requestId);
+    CHECK_EQ(back.sentEpoch, full.sentEpoch);
+    CHECK(back.reportDue && back.lookDue);
+  }
+  {
+    // The whole way: a run on controller 7 is cut short as it restarts the controller, and its
+    // result goes out. The next start cannot read the journal, and its cautious look goes to the
+    // controller the config names now, 1. Once the kept journal reads, the duty goes to 7, whose
+    // edit still waits; its result goes out later than the first, though the clock was set back
+    // an hour since; and the request is not taken on again.
+    Desk desk;
+    desk.bus.slave = 7;
+    desk.sim.slaveId = 7;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.bus.before = [&desk](size_t, char kind, uint16_t) {
+      if (kind == 'c' && desk.bus.count('w') > 0) {
+        desk.sim.powered = false;
+      }
+    };
+    CHECK(desk.ask(supervisor, kRequestId));
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK(desk.reports.back().result.followUp);
+    const ss::Journal kept = desk.flash;
+    CHECK_EQ(kept.controller, 7);
+    CHECK_EQ(kept.sentId, kRequestId);
+    CHECK_EQ(kept.sentEpoch, desk.reports.back().sent);
+    // The start that could not read it: the cautious look was settled at controller 1.
+    ss::Journal since = ss::emptyJournal();
+    since.lookSentEpoch = kept.sentEpoch + 60;
+    desk.flash = ss::mergeKeptJournal(since, kept);
+    desk.configured = 1;
+    desk.epochBase -= 3600.0;
+    desk.advance(60000);
+    desk.bus.before = nullptr;
+    desk.sim.powered = true;
+    CHECK(editPending(desk.sim));
+    ss::Supervisor restarted;
+    desk.boot(restarted);
+    CHECK(restarted.dutyOwed());
+    CHECK_EQ(restarted.controllerToUse(1), 7);
+    CHECK(desk.pass(restarted));
+    CHECK(!restarted.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.reports.size(), 2);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK(desk.reports.back().sent > kept.sentEpoch);
+    CHECK_EQ(desk.flash.lookSentEpoch, since.lookSentEpoch);
+    CHECK(!desk.ask(restarted, kRequestId));
+    CHECK_EQ(restarted.controllerToUse(1), 1);
+  }
+}
+
 // Firmware that never talks to the controller (built without programming, or without RS-485)
 // calls maintain() and not service(): it writes again a journal that flash did not take, as
 // service() does. resultOnlyInRam() is what holds back the client's config acknowledgement.
@@ -7545,7 +8146,7 @@ static void testJournalMaintenance() {
     desk.failSaves = 2;
     CHECK(supervisor.request(kRequestId, profile, 0, ss::REFUSE_NOT_BUILT, true, desk.clock(), desk.millisNow()));
     CHECK(supervisor.resultOnlyInRam());
-    supervisor.reportTaken(desk.millisNow());
+    supervisor.reportTaken((uint32_t)desk.clock(), desk.millisNow());
     CHECK_EQ(desk.saves.size(), 2);
     CHECK(supervisor.journalUnsaved());
     CHECK(!supervisor.reportDue());
@@ -7605,6 +8206,8 @@ int main() {
   testWithdraw();
   testJournalKeeps();
   testJournalMaintenance();
+  testResultsApart();
+  testKeptJournal();
   testLineForDuty();
   testLineTurns();
   testReadFunction();

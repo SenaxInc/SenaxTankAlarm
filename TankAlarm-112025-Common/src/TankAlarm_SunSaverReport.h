@@ -555,10 +555,15 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
 //   rep            the result that has yet to go to the server (left out when there is none): the
 //                  compact result of encodeProgramResult(), with "rq", the request it answers,
 //                  and "ep", when it came about (0: not known)
+//   look           the look for no request that has yet to go to the server (left out when there
+//                  is none): the same, without "rq"
+//   srq, sep       the request of the last result that went out and the time it went out with
+//                  (left out while none has)
+//   lep            the time the last look went out with (left out while none has)
 // It is written whole, as a new file that takes the place of the old one, and is no longer than
 // JOURNAL_JSON_MAX.
 
-static const size_t JOURNAL_JSON_MAX = 640;
+static const size_t JOURNAL_JSON_MAX = 1200;
 
 inline void encodeJournal(const Journal &journal, JsonObject out) {
   out["req"] = journal.requestId;
@@ -574,6 +579,18 @@ inline void encodeJournal(const Journal &journal, JsonObject out) {
     report["rq"] = journal.reportId;
     report["ep"] = journal.reportEpoch;
     encodeProgramResult(journal.report, report);
+  }
+  if (journal.lookDue) {
+    JsonObject look = out["look"].to<JsonObject>();
+    look["ep"] = journal.lookEpoch;
+    encodeProgramResult(journal.look, look);
+  }
+  if (journal.sentEpoch != 0) {
+    out["srq"] = journal.sentId;
+    out["sep"] = journal.sentEpoch;
+  }
+  if (journal.lookSentEpoch != 0) {
+    out["lep"] = journal.lookSentEpoch;
   }
 }
 
@@ -601,6 +618,18 @@ inline Journal decodeJournal(JsonObjectConst in) {
   } else {
     clearResult(&journal.report);
   }
+  JsonObjectConst look = in["look"].as<JsonObjectConst>();
+  if (!look.isNull() && decodeProgramResult(look, &journal.look)) {
+    journal.lookDue = true;
+    journal.lookEpoch = look["ep"].is<uint32_t>() ? look["ep"].as<uint32_t>() : 0;
+  } else {
+    clearResult(&journal.look);
+  }
+  if (in["srq"].is<uint32_t>() && in["sep"].is<uint32_t>()) {
+    journal.sentId = in["srq"].as<uint32_t>();
+    journal.sentEpoch = in["sep"].as<uint32_t>();
+  }
+  journal.lookSentEpoch = in["lep"].is<uint32_t>() ? in["lep"].as<uint32_t>() : 0;
   return journal;
 }
 

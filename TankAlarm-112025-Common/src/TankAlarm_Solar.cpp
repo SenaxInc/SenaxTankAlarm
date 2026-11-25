@@ -459,6 +459,10 @@ void SolarManager::setConfig(const SolarConfig& config) {
   _config = config;
 }
 
+void SolarManager::forcePollSoon() {
+  _lastPollMillis = millis() - (unsigned long)_config.pollIntervalSec * 1000UL;
+}
+
 bool SolarManager::poll(unsigned long nowMillis) {
   if (!_config.enabled || !_initialized) {
     return false;  // Not active — no data
@@ -1216,15 +1220,10 @@ bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
 
 void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer) {
   _journalFile.writer = writer;
-#if TANKALARM_SUNSAVER_PROGRAMMING
+  // A build without programming never talks to the controller for it (serviceChargerProgramming()
+  // only writes a journal that flash did not take), but keeps what an earlier build left owed, and
+  // to which controller: a build with programming that comes after it still settles that.
   _programming.begin(journal, &_journalFile, (uint32_t)millis());
-#else
-  // A build without programming owes the controller nothing, whatever an earlier build left. It
-  // keeps the requests it answered and the result that has yet to go out.
-  sunsaver::Journal kept = journal;
-  kept.phase = sunsaver::JOURNAL_IDLE;
-  _programming.begin(kept, &_journalFile, (uint32_t)millis());
-#endif
 }
 
 bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
@@ -1241,8 +1240,8 @@ bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
   return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
 }
 
-void SolarManager::chargerProgramReportTaken() {
-  _programming.reportTaken((uint32_t)millis());
+void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
+  _programming.reportTaken(sentEpoch, (uint32_t)millis());
 }
 
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
@@ -1277,7 +1276,7 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   }
   if (talked) {
     _chargerCheck.cancel();  // it read the controller as it was before
-    _lastPollMillis = 0;     // and the poll reads it as it is now
+    forcePollSoon();         // and the poll reads it as it is now
   }
   return talked;
 #else
@@ -1317,6 +1316,7 @@ bool SolarManager::begin(const SolarConfig& config) {
 
 void SolarManager::end() {}
 void SolarManager::setConfig(const SolarConfig& config) { _config = config; }
+void SolarManager::forcePollSoon() { _lastPollMillis = 0; }
 bool SolarManager::poll(unsigned long nowMillis) { (void)nowMillis; return false; }
 bool SolarManager::lineResting() const { return false; }
 SolarAlertType SolarManager::checkAlerts() const { return SOLAR_ALERT_NONE; }
@@ -1347,9 +1347,9 @@ void SolarManager::cancelChargerCheck() {}
 bool SolarManager::serviceChargerCheck(unsigned long nowMillis) { (void)nowMillis; return false; }
 void SolarManager::beginChargerProgramming(const sunsaver::Journal &journal, ChargerJournalWriter writer) {
   _journalFile.writer = writer;
-  sunsaver::Journal kept = journal;
-  kept.phase = sunsaver::JOURNAL_IDLE;  // no controller here to owe anything
-  _programming.begin(kept, &_journalFile, (uint32_t)millis());
+  // Nothing here talks to a controller, but what the journal says is owed stays in it, for a
+  // build that can settle it.
+  _programming.begin(journal, &_journalFile, (uint32_t)millis());
 }
 bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Profile &profile, uint16_t profileErrors,
                                          uint32_t clientRefusals, bool loadCurrentAllowed, double epochNow) {
@@ -1360,8 +1360,8 @@ bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Pro
 bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
   return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
 }
-void SolarManager::chargerProgramReportTaken() {
-  _programming.reportTaken((uint32_t)millis());
+void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
+  _programming.reportTaken(sentEpoch, (uint32_t)millis());
 }
 bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   (void)epochNow;
