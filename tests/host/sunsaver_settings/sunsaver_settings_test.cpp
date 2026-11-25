@@ -107,7 +107,7 @@ static void makeLiFePO4(SimSunSaver &sim) {
 
 static std::string textOf(uint8_t index, uint16_t raw, uint8_t settingsScale = ss::SCALE_100,
                           uint8_t liveScale = ss::SCALE_100) {
-  char buffer[160];
+  char buffer[ss::VALUE_TEXT_BYTES];
   ss::Text text(buffer, sizeof(buffer));
   ss::describeValue(index, raw, settingsScale, liveScale, &text);
   CHECK(!text.truncated());
@@ -2466,9 +2466,10 @@ static void testFingerprint() {
 static void testFloatReference() {
   struct Rigged {
     // packVolts is the pack that was configured: 12, 24, or 0 for none.
-    static double reference(const SimSunSaver &sim, uint8_t firmwareScale = ss::SCALE_96667, uint8_t packVolts = 12) {
+    static double reference(const SimSunSaver &sim, uint8_t firmwareScale = ss::SCALE_96667, uint8_t packVolts = 12,
+                            uint8_t chemistry = ss::CHEMISTRY_LIFEPO4) {
       const ss::Snapshot snapshot = snapshotOf(sim);
-      const ss::Expectation want = {ss::CHEMISTRY_LIFEPO4, packVolts, firmwareScale};
+      const ss::Expectation want = {chemistry, packVolts, firmwareScale};
       ss::Evaluation evaluation;
       ss::evaluate(snapshot, want, &evaluation);
       return ss::floatReferenceVolts(snapshot, evaluation, firmwareScale);
@@ -2619,14 +2620,21 @@ static void testFloatReference() {
     // The charger regulates to no more than its ceiling (Evb_ref_lim), so a float voltage above
     // it holds the battery at the ceiling, as does an absorption voltage in a bank without float.
     // 0 is no ceiling; one that was not read could be anywhere. With the float at 13.50 V and the
-    // ceiling at 13.00 V, a reference of 13.50 V would raise the no-charge alert for a battery
-    // that the charger holds at 13.00 V as it should.
+    // ceiling at 13.30 V, a reference of 13.50 V would raise the no-charge alert for a battery
+    // that the charger holds at 13.30 V as it should.
     SimSunSaver sim(96.667, 100.0);
     makeLiFePO4(sim);
     CHECK_EQ(sim.regs[0xE01D], sim.setVolts(15.00));
     CHECK(near(Rigged::reference(sim), 13.50, 0.01));
+    sim.regs[0xE01D] = sim.setVolts(13.30);
+    CHECK(near(Rigged::reference(sim), 13.30, 0.01));
+    // A ceiling under the float voltages that hold a LiFePO4 battery full (from 13.20 V) holds it
+    // under them: no reference, and the no-charge alert keeps the battery's default. A battery
+    // without voltage ranges is held at the ceiling.
     sim.regs[0xE01D] = sim.setVolts(13.00);
-    CHECK(near(Rigged::reference(sim), 13.00, 0.01));
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_LEAD_SEALED), 13.00, 0.01));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_NOT_JUDGED), 13.00, 0.01));
     sim.regs[0xE01D] = sim.setVolts(13.50);
     CHECK(near(Rigged::reference(sim), 13.50, 0.01));
     // A bank under the ceiling keeps its own voltage, and the lower bank counts.
@@ -2700,6 +2708,188 @@ static void testFloatReference() {
     CHECK(ss::storedSettingsInEffect(snapshotOf(b.sim)));
     CHECK(near(Rigged::reference(b.sim, ss::SCALE_100), 13.50, 0.01));
   }
+  {
+    // A float voltage under the lowest one the check accepts for the battery (its range less
+    // SETPOINT_TOLERANCE_VOLTS) does not hold that battery full, and is no reference. The
+    // seventeenth review's case: a 12 V LiFePO4 battery whose charger floats at 10.50 V in both
+    // banks reads 12 V in daylight with no charge going in, and has to count as one that needs
+    // charge. The register's own bounds (10 to 17 V) let 10.50 V through, and still do for a
+    // battery without voltage ranges.
+    SimSunSaver sim(96.667, 100.0);
+    makeLiFePO4(sim);
+    sim.regs[0xE001] = sim.setVolts(10.50);
+    sim.regs[0xE00E] = sim.setVolts(10.50);
+    CHECK((judge(sim, ss::CHEMISTRY_LIFEPO4).findings & ss::FINDING_FLOAT_RANGE) != 0);
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_100), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_LI_ION), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_LEAD_SEALED), 10.50, 0.01));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_LEAD_FLOODED), 10.50, 0.01));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_NOT_JUDGED), 10.50, 0.01));
+    // One bank is enough: the jumper picks the bank, and cannot be read.
+    sim.regs[0xE001] = sim.setVolts(13.50);
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    sim.regs[0xE001] = sim.setVolts(10.50);
+    sim.regs[0xE00E] = sim.setVolts(13.50);
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    // Li-ion is held full from 11.70 V: a reference for it, and none for LiFePO4.
+    sim.regs[0xE001] = sim.setVolts(11.70);
+    sim.regs[0xE00E] = sim.setVolts(12.30);
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_LI_ION), 11.70, 0.01));
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    // A bank without float holds the battery at its absorption voltage, judged the same way.
+    sim.regs[0xE001] = 0;
+    sim.regs[0xE00E] = 0;
+    CHECK(near(Rigged::reference(sim), 14.20, 0.01));
+    sim.regs[0xE00D] = sim.setVolts(13.00);
+    CHECK(near(Rigged::reference(sim), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 12, ss::CHEMISTRY_LEAD_SEALED), 13.00, 0.01));
+    // Above the range the reference stands: a battery under the voltage its charger holds it at,
+    // with no charge going in, is not being charged. (The client caps the target at the
+    // high-battery limit.)
+    makeLiFePO4(sim);
+    sim.regs[0xE001] = sim.setVolts(14.00);
+    sim.regs[0xE00E] = sim.setVolts(14.00);
+    CHECK((judge(sim, ss::CHEMISTRY_LIFEPO4).findings & ss::FINDING_FLOAT_RANGE) != 0);
+    CHECK(near(Rigged::reference(sim), 14.00, 0.01));
+    // A 24 V system: the stored voltages are 12 V figures, judged against the 12 V ranges.
+    sim.regs[0x0008] = sim.volts(27.00);
+    sim.regs[0x001C] = sim.volts(26.20);
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 24), 28.00, 0.02));
+    sim.regs[0xE001] = sim.setVolts(10.50);
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 24), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 0), 0.0, 1e-12));
+    CHECK(near(Rigged::reference(sim, ss::SCALE_96667, 24, ss::CHEMISTRY_LEAD_SEALED), 21.00, 0.02));
+  }
+  {
+    // At the edge, word by word, with both encodings of the stored voltages and both lithium
+    // batteries: a float voltage, or a ceiling that holds the battery under its float voltage,
+    // is a reference from the lowest word the check accepts, and none under it, where the check
+    // finds it wrong for the battery.
+    const double encodings[2] = {100.0, 96.667};
+    const uint8_t scaleIds[2] = {ss::SCALE_100, ss::SCALE_96667};
+    const uint8_t chemistries[2] = {ss::CHEMISTRY_LIFEPO4, ss::CHEMISTRY_LI_ION};
+    const double others[2] = {13.50, 12.30};  // a float voltage in range for each
+    for (int e = 0; e < 2; ++e) {
+      for (int c = 0; c < 2; ++c) {
+        ss::VoltRange absorb = {0.0, 0.0};
+        ss::VoltRange floating = {0.0, 0.0};
+        CHECK(ss::chargeRanges(chemistries[c], &absorb, &floating));
+        uint16_t lowest = 0;  // the lowest word the check accepts
+        while (ss::voltsFromRaw(lowest, scaleIds[e]) < floating.low - ss::SETPOINT_TOLERANCE_VOLTS) {
+          ++lowest;
+        }
+        for (int viaCeiling = 0; viaCeiling < 2; ++viaCeiling) {
+          for (int step = -3; step <= 3; ++step) {
+            const uint16_t word = (uint16_t)(lowest + step);
+            SimSunSaver sim(96.667, encodings[e]);
+            makeLiFePO4(sim);
+            sim.regs[0xE00E] = sim.setVolts(others[c]);
+            if (viaCeiling != 0) {
+              sim.regs[0xE001] = sim.setVolts(others[c]);
+              sim.regs[0xE01D] = word;
+            } else {
+              sim.regs[0xE001] = word;
+            }
+            const ss::Snapshot snapshot = snapshotOf(sim);
+            const ss::Expectation want = {chemistries[c], 12, ss::SCALE_96667};
+            ss::Evaluation evaluation;
+            ss::evaluate(snapshot, want, &evaluation);
+            CHECK_EQ(evaluation.settingsScale.scale, scaleIds[e]);
+            const bool under = step < 0;
+            CHECK_MSG(((evaluation.findings & ss::FINDING_FLOAT_RANGE) != 0) == under,
+                      "encoding %d, %s, %s word %d from the lowest", e, ss::chemistryName(chemistries[c]),
+                      viaCeiling != 0 ? "ceiling" : "float", step);
+            const double reference = ss::floatReferenceVolts(snapshot, evaluation, ss::SCALE_96667);
+            const double expected =
+                under ? 0.0 : ss::voltsFromRaw(word, scaleIds[e]) * ss::readingFactor(evaluation.liveScale, ss::SCALE_96667);
+            CHECK_MSG(near(reference, expected, 1e-9), "encoding %d, %s, %s word %d from the lowest: %.5f, not %.5f", e,
+                      ss::chemistryName(chemistries[c]), viaCeiling != 0 ? "ceiling" : "float", step, reference,
+                      expected);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Room for the text of every value
+// ============================================================================
+static void testValueTextRoom() {
+  // Every word of every register, with each encoding of the voltages, fits VALUE_TEXT_BYTES whole.
+  // A register uses one of the two scales, so the same scale for both covers every case.
+  const uint8_t scales[3] = {ss::SCALE_100, ss::SCALE_96667, ss::SCALE_UNKNOWN};
+  char buffer[ss::VALUE_TEXT_BYTES];
+  size_t longest = 0;
+  uint8_t longestItem = 0;
+  uint16_t longestRaw = 0;
+  long cut = 0;
+  for (uint8_t i = 0; i < ss::ITEM_COUNT; ++i) {
+    for (uint32_t raw = 0; raw <= 0xFFFFu; ++raw) {
+      for (int s = 0; s < 3; ++s) {
+        ss::Text text(buffer, sizeof(buffer));
+        ss::describeValue(i, (uint16_t)raw, scales[s], scales[s], &text);
+        if (text.truncated() || strlen(buffer) != text.length()) {
+          ++cut;
+        }
+        if (text.length() > longest) {
+          longest = text.length();
+          longestItem = i;
+          longestRaw = (uint16_t)raw;
+        }
+      }
+    }
+  }
+  CHECK_EQ(cut, 0);
+  CHECK_EQ(longest, 235);
+  CHECK_EQ(longestItem, ss::I_ARRAY_FAULT);
+  CHECK_EQ(longestRaw, 0xFFFF);
+
+  // The seventeenth review's case: every named bit of the array faults, the last name whole.
+  const std::string arrayNamed =
+      "Overcurrent, FETs shorted, Software bug, Battery HVD, Array HVD, EEPROM setting edit (reset required), "
+      "RTS shorted, RTS was valid, now disconnected, Local temperature sensor failed";
+  CHECK(textOf(ss::I_ARRAY_FAULT, 0x01FF) == arrayNamed);
+  const std::string arrayAll = arrayNamed + ", bit 9, bit 10, bit 11, bit 12, bit 13, bit 14, bit 15";
+  CHECK(textOf(ss::I_ARRAY_FAULT, 0xFFFF) == arrayAll);
+  const std::string loadAll =
+      "External short circuit, Overcurrent, FETs shorted, Software bug, HVD, Heatsink over-temperature, "
+      "EEPROM setting edit (reset required), bit 7, bit 8, bit 9, bit 10, bit 11, bit 12, bit 13, bit 14, bit 15";
+  CHECK(textOf(ss::I_LOAD_FAULT, 0xFFFF) == loadAll);
+  CHECK_EQ(arrayAll.size(), 235);
+
+  // And on the server's page, which used to cut a value at 159 characters.
+  const uint16_t words[3] = {0x01FF, 0xFFFF, 0x8001};
+  for (int w = 0; w < 3; ++w) {
+    SimSunSaver sim;
+    makeLiFePO4(sim);
+    sim.regs[0x0012] = words[w];
+    sim.regs[0x001B] = words[w];
+    const ss::Snapshot snapshot = snapshotOf(sim);
+    const ss::Evaluation evaluation = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    JsonDocument page;
+    ss::describeReport(snapshot, evaluation, page.to<JsonObject>());
+    CHECK(!page.overflowed());
+    int seen = 0;
+    for (JsonObjectConst group : page["groups"].as<JsonArrayConst>()) {
+      for (JsonArrayConst row : group["rows"].as<JsonArrayConst>()) {
+        const std::string name = row[0].as<std::string>();
+        const std::string value = row[2].as<std::string>();
+        if (name == ss::item(ss::I_ARRAY_FAULT).name) {
+          CHECK_MSG(value == textOf(ss::I_ARRAY_FAULT, words[w]), "array faults 0x%04X: '%s'", (unsigned)words[w],
+                    value.c_str());
+          ++seen;
+        } else if (name == ss::item(ss::I_LOAD_FAULT).name) {
+          CHECK_MSG(value == textOf(ss::I_LOAD_FAULT, words[w]), "load faults 0x%04X: '%s'", (unsigned)words[w],
+                    value.c_str());
+          ++seen;
+        }
+      }
+    }
+    CHECK_EQ(seen, 2);
+  }
+  CHECK(textOf(ss::I_ARRAY_FAULT, 0x8001) == "Overcurrent, bit 15");
 }
 
 // ============================================================================
@@ -3254,6 +3444,7 @@ int main() {
   testEvaluate();
   testFingerprint();
   testFloatReference();
+  testValueTextRoom();
   testReport();
   testReportOrder();
   CHECK_EQ(gAllocLive, 0);
