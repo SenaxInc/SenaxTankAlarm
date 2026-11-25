@@ -670,8 +670,8 @@ enum Finding : uint32_t {
   FINDING_EQUALIZE_SWITCH = 1ul << 1,   // SW3 ON
   FINDING_EQUALIZE_STORED = 1ul << 2,   // an equalize voltage is stored in a custom bank
   FINDING_TEMPCOMP = 1ul << 3,          // temperature compensation is stored as on
-  FINDING_ABSORB_RANGE = 1ul << 4,      // a stored absorption voltage is outside the battery's range
-  FINDING_FLOAT_RANGE = 1ul << 5,       // a stored float voltage is outside the battery's range
+  FINDING_ABSORB_RANGE = 1ul << 4,      // an absorption voltage (stored, or under the ceiling) is out of range
+  FINDING_FLOAT_RANGE = 1ul << 5,       // a float voltage (stored, or under the ceiling) is out of range
   FINDING_SCALE_UNPROVEN = 1ul << 6,    // the stored voltages could not be judged, but for any of 0 V
   FINDING_NOT_READ = 1ul << 7,          // a register the judgement needs did not answer
   FINDING_RESET_PENDING = 1ul << 8,     // settings were written, the controller has not restarted
@@ -697,9 +697,11 @@ inline const char *findingText(uint32_t finding) {
     case FINDING_TEMPCOMP:
       return "Temperature compensation is on in the custom charge settings.";
     case FINDING_ABSORB_RANGE:
-      return "A stored absorption voltage is outside the range for this battery.";
+      return "An absorption voltage, as stored or as the regulation ceiling holds it, is outside the "
+             "range for this battery.";
     case FINDING_FLOAT_RANGE:
-      return "A stored float voltage is outside the range for this battery.";
+      return "A float voltage, as stored or as the regulation ceiling holds it, is outside the range "
+             "for this battery.";
     case FINDING_SCALE_UNPROVEN:
       return "Stored voltages other than 0 V were not judged: how this charger encodes them could not "
              "be proven from its setpoints.";
@@ -804,10 +806,14 @@ struct Evaluation {
   uint8_t systemVolts;  // 12 or 24 as measured, 0 when not known
 };
 
-// One stored voltage against its range. A tolerance of 0.005 V covers the rounding to a raw word.
+// How far outside its range a stored voltage may lie and still count as inside it: the rounding
+// to a raw word. The client's no-charge alert allows for it too (TankAlarm_Solar.cpp).
+static const double SETPOINT_TOLERANCE_VOLTS = 0.005;
+
+// One stored voltage against its range.
 inline bool outsideRange(uint16_t raw, uint8_t scale, const VoltRange &range) {
   const double volts = voltsFromRaw(raw, scale);
-  return volts < range.low - 0.005 || volts > range.high + 0.005;
+  return volts < range.low - SETPOINT_TOLERANCE_VOLTS || volts > range.high + SETPOINT_TOLERANCE_VOLTS;
 }
 
 inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluation *out) {
@@ -902,6 +908,16 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
       judged = true;
     }
     const bool twelveVolts = out->systemVolts == 12;  // 0 when the battery voltage was not read
+    // The charger regulates to no more than its ceiling (Evb_ref_lim, not compensated; 0 is none:
+    // see floatReferenceVolts()), so a voltage stored above it holds the battery at the ceiling.
+    // Each voltage is judged as stored and as the ceiling leaves it, and both have to suit the
+    // battery: the stored one is what the charger goes back to when the ceiling is raised. A
+    // ceiling that did not answer could be anywhere, and leaves the judgement open.
+    const bool haveCeiling = have(snapshot, I_EVB_REF_LIM);
+    const uint16_t ceiling = haveCeiling ? snapshot.raw[I_EVB_REF_LIM] : (uint16_t)0;
+    if (!haveCeiling) {
+      findings |= FINDING_NOT_READ;
+    }
     const uint8_t setpoints[4] = {I_EV_REG, I_EV_REG2, I_EV_FLOAT, I_EV_FLOAT2};
     for (uint8_t i = 0; i < 4; ++i) {
       const bool isAbsorb = i < 2;
@@ -910,8 +926,12 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
         continue;
       }
       const uint16_t raw = snapshot.raw[setpoints[i]];
+      // Both are stored words of one scale.
+      const uint16_t held = (ceiling != 0 && raw > ceiling) ? ceiling : raw;
+      const VoltRange &range = isAbsorb ? absorb : floating;
       if ((twelveVolts && raw == 0) ||
-          (judged && outsideRange(raw, out->settingsScale.scale, isAbsorb ? absorb : floating))) {
+          (judged && (outsideRange(raw, out->settingsScale.scale, range) ||
+                      outsideRange(held, out->settingsScale.scale, range)))) {
         findings |= isAbsorb ? FINDING_ABSORB_RANGE : FINDING_FLOAT_RANGE;
       }
     }

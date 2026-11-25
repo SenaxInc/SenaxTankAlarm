@@ -433,10 +433,11 @@ public:
 
   // The battery's chemistry as the config names it, a sunsaver::Chemistry: CHEMISTRY_NOT_JUDGED
   // (the default) when it names none. While the float voltage is not known, the no-charge alert
-  // keeps its default target within 0.2 V of the lowest float voltage that the charger check
-  // accepts for that chemistry (sunsaver::chargeRanges()): a battery a charger holds there is
-  // full. Lead-acid's 13.4 V had a full Li-ion battery, at 12.6 V, count as one that is not being
-  // charged. Kept across begin() and end(), like the pack.
+  // keeps its default target within 0.2 V of the lowest reading of a battery held at the lowest
+  // float voltage that the charger check accepts for that chemistry (sunsaver::chargeRanges(),
+  // with its tolerance): a battery a charger holds there is full. Lead-acid's 13.4 V had a full
+  // Li-ion battery, at 12.6 V, count as one that is not being charged. Kept across begin() and
+  // end(), like the pack.
   void setPackChemistry(uint8_t chemistry) { _packChemistry = chemistry; }
   uint8_t getPackChemistry() const { return _packChemistry; }
 
