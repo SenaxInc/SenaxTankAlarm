@@ -5135,11 +5135,14 @@ static void testScaleCheck() {
     CHECK(!report.live.meterGiven);
     // It was read from the controller, not taken from the round test's reads: one more request.
     CHECK_EQ(rig.sim.requests.size() - sent, (size_t)(14 + 3 + 1));
-    // A register on another scale is not used (the console refuses it before this), nor one on
-    // that scale that 'set' cannot change.
-    CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("adc_vb_f"), 13.68, &report));
-    CHECK(report.settings.known == nullptr);
-    CHECK_EQ(report.settings.verdict, -1);
+    // A register on another scale is not used, whether 'set' can change it or not (the console
+    // refuses it before this), nor one on that scale that 'set' cannot change.
+    const char *const others[] = {"adc_vb_f", "EV_tempcomp", "Et_float"};
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); ++i) {
+      CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister(others[i]), 13.68, &report));
+      CHECK_MSG(report.settings.known == nullptr, "%s was used", others[i]);
+      CHECK_EQ(report.settings.verdict, -1);
+    }
     rig.sim.regs[0x0039] = rig.sim.regs[0xE001];  // as if the float voltage were the fixed target
     CHECK(rig.device.scaleCheck(0.0, rig.profile.findRegister("va_ref_fixed"), 13.70, &report));
     CHECK(report.settings.known == nullptr);
@@ -5386,6 +5389,16 @@ static void testSettingsCopies() {
     CHECK_HAS(rig.run("yes"), "The controller answers again");
     CHECK(rig.sim.regs.find(0x0039) == rig.sim.regs.end());
     CHECK(rig.sim.regs.find(0x003A) == rig.sim.regs.end());
+  }
+  {  // Nor does a restart make a copy that a test has taken away, with its setting still there:
+     // the simulated controller answers for the registers it has, before a restart and after it.
+    Rig rig;
+    rig.sim.regs.erase(0x0039);
+    rig.sim.regs[0xE037] = 179;
+    rig.run("reset");
+    CHECK_HAS(rig.run("yes"), "The controller answers again");
+    CHECK(rig.sim.regs.find(0x0039) == rig.sim.regs.end());
+    CHECK_EQ(rig.sim.regs[0x003A], 179);
   }
 }
 
