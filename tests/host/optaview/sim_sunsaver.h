@@ -69,6 +69,7 @@ class SimSunSaver : public optaview::MbTransport {
   double settingsNumerator = 100.0;    // the voltage settings in its EEPROM
   double referenceNumerator = 96.667;  // its regulation target, Vb_ref
   uint16_t storeMask = 0xFFFF;       // FC06 stores (value & storeMask): a controller that alters what it is given
+  uint16_t keepBits = 0;             // FC06 leaves these bits of the register as they were
   bool refuseWrites = false;         // FC06 gets exception 4
 
   // --- the log ---
@@ -546,7 +547,7 @@ class SimSunSaver : public optaview::MbTransport {
         *reply = exception(request, 4);
         return true;
       }
-      regs[addr] = (uint16_t)(value & storeMask);
+      regs[addr] = (uint16_t)((regs[addr] & keepBits) | (value & storeMask & ~keepBits));
       regs[0x0012] = (uint16_t)(regs[0x0012] | (1u << 5));  // "EEPROM setting edit" until a reset
       regs[0x001B] = (uint16_t)(regs[0x001B] | (1u << 6));
       reply->assign(request, request + len);

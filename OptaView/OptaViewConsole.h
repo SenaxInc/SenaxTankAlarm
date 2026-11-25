@@ -1973,6 +1973,11 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
         return;
       }
       raw = (uint16_t)number;
+      if ((raw & (uint16_t)~ovUsedBits(*reg)) != 0) {
+        out_.print(reg->name);
+        out_.println(" is one byte: its raw value is a whole number from 0 to 255, or 0x00 to 0xFF.");
+        return;
+      }
       // The limits apply to what the raw value means.
       const uint16_t words[2] = {raw, 0};
       uint16_t unused = 0;
@@ -2020,7 +2025,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
     out_.printPadded(text, 14);
     printRawWords(next, 1);
     out_.println();
-    if (now[0] == raw) {
+    if (ovSameValue(*reg, now[0], raw)) {
       out_.println("It already holds that value. Nothing to write.");
       return;
     }
@@ -2081,7 +2086,7 @@ class OvConsole : public MbTraceSink, public OvProbeListener, public OvAbortChec
       out_.print(")");
     }
     if (outcome.readBack.status == MB_OK) {
-      const bool asBefore = outcome.readBackRaw == action.before;
+      const bool asBefore = ovSameValue(reg, outcome.readBackRaw, action.before);
       out_.print(acknowledged ? ", but " : ", and ");
       out_.print(reg.name);
       out_.print(asBefore ? " still reads " : " reads ");

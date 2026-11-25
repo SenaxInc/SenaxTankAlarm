@@ -1329,10 +1329,27 @@ static void testProfileCodec() {
   CHECK(formatted(*profile.findRegister("T_amb"), 0xFFEC) == "-20 C");
   CHECK(formatted(*profile.findRegister("T_rts"), 0x0080) == "not connected");
   CHECK(formatted(*profile.findRegister("T_rts"), 0x0019) == "25 C");
-  // An unsigned byte is the low byte as well. (This profile has none.)
+  // An unsigned byte is the low byte as well.
   OvRegister unsignedByte = *profile.findRegister("T_hs");
   unsignedByte.type = OV_U8;
   CHECK(formatted(unsignedByte, 0xFFEC) == "236 C");
+  // The temperature compensation is one: the controller uses only the low byte, so a stored
+  // 0x0114 is 0.0305 V/C, not the 0.4211 V/C of the whole word.
+  const OvRegister &tempcomp = *profile.findRegister("EV_tempcomp");
+  CHECK_EQ(tempcomp.type, OV_U8);
+  CHECK(formatted(tempcomp, 0x0114) == "0.0305 V/C");
+  CHECK(formatted(tempcomp, 0x0014) == "0.0305 V/C");
+  CHECK(formatted(tempcomp, 0xFF1E) == "0.0458 V/C");
+  // Two words hold the same value when they agree in the bits that are used.
+  CHECK_EQ(ovUsedBits(tempcomp), 0x00FF);
+  CHECK_EQ(ovUsedBits(*profile.findRegister("T_hs")), 0x00FF);  // a signed byte
+  CHECK_EQ(ovUsedBits(*profile.findRegister("EV_lvd")), 0xFFFF);
+  CHECK(ovSameValue(tempcomp, 0x0114, 0x0014));
+  CHECK(ovSameValue(tempcomp, 0xFF14, 0x0014));
+  CHECK(!ovSameValue(tempcomp, 0x0114, 0x0115));
+  CHECK(!ovSameValue(tempcomp, 0x0114, 0x0194));
+  CHECK(!ovSameValue(*profile.findRegister("EV_lvd"), 0x0114, 0x0014));
+  CHECK(ovSameValue(*profile.findRegister("EV_lvd"), 0x0114, 0x0114));
   // Two-word counters: high word first in RAM, low word first in EEPROM.
   CHECK(formatted(*profile.findRegister("Ahc_t"), 0x0001, 0x1170) == "7000.0 Ah");
   CHECK(formatted(*profile.findRegister("EAhc_t"), 0x1170, 0x0001) == "7000.0 Ah");
@@ -1391,6 +1408,20 @@ static void testProfileCodec() {
   CHECK_EQ(raw, 0x7FFF);
   CHECK_EQ(ovEncode(offset, 32768, &raw), OV_ENCODE_OUT_OF_RANGE);
   CHECK_EQ(ovEncode(offset, -32769, &raw), OV_ENCODE_OUT_OF_RANGE);
+  // An unsigned byte is written in the low byte, with 0 in the high byte, and stops at 255.
+  CHECK_EQ(ovEncode(tempcomp, 0.0458, &raw), OV_ENCODE_OK);
+  CHECK_EQ(raw, 0x001E);
+  CHECK_EQ(ovEncode(tempcomp, 0.0, &raw), OV_ENCODE_OK);  // off
+  CHECK_EQ(raw, 0);
+  CHECK_EQ(ovEncode(tempcomp, 0.11, &raw), OV_ENCODE_ABOVE_MAX);
+  OvRegister byteSetting = tempcomp;
+  byteSetting.hasMax = false;
+  CHECK_EQ(ovEncode(byteSetting, 0.389, &raw), OV_ENCODE_OK);  // 254.9
+  CHECK_EQ(raw, 0x00FF);
+  CHECK_EQ(ovEncode(byteSetting, 0.39, &raw), OV_ENCODE_OUT_OF_RANGE);  // 255.6
+  // A signed byte cannot be written.
+  byteSetting.type = OV_I8;
+  CHECK_EQ(ovEncode(byteSetting, 0.0458, &raw), OV_ENCODE_NOT_WRITABLE);
   // Only one word can be written, whatever the register says about itself.
   OvRegister wide = absorbTime;
   wide.words = 2;
@@ -1565,15 +1596,15 @@ static void testProfileRejects() {
     CHECK_EQ(profile.findRegister("b")->type, OV_ENUM);
     CHECK_EQ(profile.findRegister("c")->type, OV_U32);
   }
-  {  // Each type name gives its own type, and of the one-word types only the two plain 16-bit
-     // numbers may be writable.
+  {  // Each type name gives its own type, and of the one-word types only the plain 16-bit numbers
+     // and the unsigned byte may be writable.
     const struct {
       const char *json;
       uint8_t type;
       bool mayBeWritable;
     } kinds[] = {{"\"type\":\"u16\"", OV_U16, true},
                  {"\"type\":\"i16\"", OV_I16, true},
-                 {"\"type\":\"u8\"", OV_U8, false},
+                 {"\"type\":\"u8\"", OV_U8, true},
                  {"\"type\":\"i8\"", OV_I8, false},
                  {"\"type\":\"enum\",\"labels\":\"st\"", OV_ENUM, false},
                  {"\"type\":\"bits\",\"labels\":\"st\"", OV_BITS, false}};
@@ -1597,7 +1628,7 @@ static void testProfileRejects() {
         }
       }
       if (!kinds[i].mayBeWritable) {
-        expectRejected(writable, "only one-word u16 and i16 registers can be writable");
+        expectRejected(writable, "only one-word u16, i16 and u8 registers can be writable");
       }
     }
   }
@@ -2838,6 +2869,13 @@ static void testConsoleSet() {
     CHECK_HAS(rig.run("set EV_lvd raw 70000"), "A raw value is a whole number from 0 to 65535");
     CHECK_HAS(rig.run("set EV_lvd raw"), "A raw value is a whole number");
     CHECK_HAS(rig.run("set EV_lvd raw 100"), "That is below");  // 0.31 V: the limits apply to raw values too
+    // A one-byte setting takes a byte.
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x0114"),
+              "EV_tempcomp is one byte: its raw value is a whole number from 0 to 255, or 0x00 to 0xFF.");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 256"), "EV_tempcomp is one byte");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x0100"), "EV_tempcomp is one byte");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x00FF"), "That is above");  // 0.3891 V/C
+    CHECK_HAS(rig.run("set EV_lvd raw 0x0114"), "That is below");       // a whole word takes any word
     CHECK_HAS(rig.run("set Et_float 70000"), "That value does not fit the register.");
     const std::string readOnly = rig.run("set Emodbus_id 2");
     CHECK_HAS(readOnly, "Emodbus_id is read-only in this profile.");
@@ -3211,6 +3249,96 @@ static void testConsoleSet() {
     const std::string status = rig.run("status");
     CHECK_HAS(status, kChanged);
     CHECK_HASNT(status, "may have been changed");
+  }
+  {  // A one-byte setting. The controller uses only the low byte of EV_tempcomp, and its other
+     // byte may hold anything: the value is read, shown and compared by the low byte alone.
+    Rig rig;
+    rig.sim.regs[0xE01A] = 0x0114;
+    const std::string got = rig.run("get EV_tempcomp");
+    CHECK_HAS(got, "0.0305 V/C");
+    CHECK_HAS(got, "[0x0114]");
+    CHECK_HASNT(got, "0.4211");
+    // The value it holds is not written again, whatever the high byte holds.
+    const std::string same = rig.run("set EV_tempcomp 0.0305");
+    CHECK_HAS(lineWith(same, "  now  "), "0.0305 V/C");
+    CHECK_HAS(lineWith(same, "  new  "), "[0x0014]");
+    CHECK_HAS(same, "It already holds that value. Nothing to write.");
+    CHECK_HAS(rig.run("set EV_tempcomp raw 0x14"), "It already holds that value.");
+    CHECK(!rig.console.awaitingConfirmation());
+    CHECK_EQ(rig.sent(0x06), 0);
+    // A new value goes in the low byte, with 0 in the high byte. This controller keeps its high
+    // byte, so it reads back 0x011E: that is the value that was written.
+    rig.sim.keepBits = 0xFF00;
+    const std::string ask = rig.run("set EV_tempcomp 0.0458");
+    CHECK_HAS(lineWith(ask, "  new  "), "0.0458 V/C");
+    CHECK_HAS(lineWith(ask, "  new  "), "[0x001E]");
+    const std::string done = rig.run("yes");
+    CHECK_HAS(done, "Written and read back: EV_tempcomp = 0.0458 V/C [0x011E]");
+    CHECK(rig.sim.requests[rig.sim.requests.size() - 2] ==
+          SimSunSaver::frame(bytes({0x01, 0x06, 0xE0, 0x1A, 0x00, 0x1E})));
+    CHECK_EQ(rig.sim.regs[0xE01A], 0x011E);
+    CHECK(rig.device.resetNeeded());
+    CHECK_HAS(rig.run("set EV_tempcomp 0.0305"), "Type yes to write it.");
+    CHECK_HAS(rig.run("yes"), "Written and read back: EV_tempcomp = 0.0305 V/C [0x0114]");
+  }
+  {  // The byte that is not used may change while the value stays. A write that is refused, or
+     // lost on the way, then leaves the setting as it was, and no restart is due for it.
+    Rig rig;
+    rig.sim.regs[0xE01A] = 0x0114;
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.regs[0xE01A] = 0x0214;
+    rig.sim.refuseWrites = true;
+    const std::string refused = rig.run("yes");
+    CHECK_HAS(refused, "The controller refused the write (exception 4 (device failure)), and EV_tempcomp still "
+                       "reads 0.0305 V/C [0x0214].\r\n");
+    CHECK_HASNT(refused, "restart");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    rig.sim.refuseWrites = false;
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.regs[0xE01A] = 0x0314;
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY);
+    const std::string lost = rig.run("yes");
+    CHECK_HAS(lost, "The controller did not acknowledge the write (no reply), and EV_tempcomp still reads "
+                    "0.0305 V/C [0x0314]: it was not written.\r\n");
+    CHECK(!rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
+    // Nothing comes back at all, so the write is in doubt. The next read finds the value as it
+    // was, under another high byte: the write was not taken.
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    CHECK_HAS(rig.run("yes"), "whether it was written is not known.");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.sim.regs[0xE01A] = 0x0414;
+    CHECK_HAS(rig.run("get EV_tempcomp"), "[0x0414]");
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK(!rig.device.resetNeeded());
+    // A change of the low byte is a change.
+    rig.run("set EV_tempcomp 0.0458");
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 3);
+    rig.run("yes");
+    CHECK(rig.device.resetMaybeNeeded());
+    rig.sim.regs[0xE01A] = 0x0415;
+    rig.run("get EV_tempcomp");
+    CHECK(!rig.device.resetMaybeNeeded());
+    CHECK(rig.device.resetNeeded());
+  }
+  {  // A whole word counts whole: a new value that differs from the old one only in its high
+     // byte is a change (9000 s is 0x2328, 9256 s is 0x2428).
+    Rig rig;
+    const std::string ask = rig.run("set Et_float 9256");
+    CHECK_HAS(lineWith(ask, "  new  "), "[0x2428]");
+    CHECK_HAS(ask, "Type yes to write it.");
+    // The acknowledgement and the read-back are lost, so the write is in doubt. The next read
+    // finds the new value, and the restart is due.
+    rig.sim.failNext(SimSunSaver::FAULT_LOST_REPLY);
+    rig.sim.failNext(SimSunSaver::FAULT_NO_REPLY, 2);
+    CHECK_HAS(rig.run("yes"), "whether it was written is not known.");
+    CHECK_EQ(rig.sim.regs[0xE002], 0x2428);
+    CHECK(rig.device.resetMaybeNeeded());
+    CHECK_HAS(rig.run("get Et_float"), "9256 s");
+    CHECK(rig.device.resetNeeded());
+    CHECK(!rig.device.resetMaybeNeeded());
   }
   {  // A profile without a reset command has nothing to say about restarts.
     const std::string noReset = replaced(kMiniProfile, ",\"resetCoil\":\"reset\"", "");

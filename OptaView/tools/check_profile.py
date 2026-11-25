@@ -115,8 +115,8 @@ def check(path):
             errors.append("register %s: \"order\" must be \"hi-lo\" or \"lo-hi\"" % name)
         if reg.get("verified", "spec") not in ("spec", "bench"):
             errors.append("register %s: \"verified\" must be \"spec\" or \"bench\"" % name)
-        if reg.get("writable") and (words != 1 or kind not in ("u16", "i16")):
-            errors.append("register %s: only one-word u16 and i16 registers can be writable" % name)
+        if reg.get("writable") and (words != 1 or kind not in ("u16", "i16", "u8")):
+            errors.append("register %s: only one-word u16, i16 and u8 registers can be writable" % name)
         if "min" in reg and "max" in reg and reg["min"] > reg["max"]:
             errors.append("register %s: \"min\" is above \"max\"" % name)
         if ("min" in reg or "max" in reg or "zeroOk" in reg) and not reg.get("writable"):

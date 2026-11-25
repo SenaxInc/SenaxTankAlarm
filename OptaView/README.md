@@ -441,10 +441,12 @@ The host tests fail when the header is out of date. A register entry looks like 
   "group": "load", "writable": true, "min": 9.0, "max": 15.0 }
 ```
 
-`type` is `u16` (the default), `i16`, `u8`, `i8`, `u32`, `enum` or `bits`. `"verified": "bench"`
-marks a register that was seen on our hardware; the others show `~` in the lists. Only
-one-word `u16` and `i16` registers can be writable. The limits are OptaView's own sanity limits
-for a 12 V system, not Morningstar's.
+`type` is `u16` (the default), `i16`, `u8`, `i8`, `u32`, `enum` or `bits`. A `u8` or `i8` is the
+low byte of its word: the high byte is not part of the value and is not compared, and `set`
+writes 0 there (a raw value for a `u8` is 0 to 255). `"verified": "bench"` marks a register that
+was seen on our hardware; the others show `~` in the lists. Only one-word `u16`, `i16` and `u8`
+registers can be writable. The limits are OptaView's own sanity limits for a 12 V system, not
+Morningstar's.
 
 ## Tests
 

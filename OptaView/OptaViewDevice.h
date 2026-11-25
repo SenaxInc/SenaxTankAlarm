@@ -448,6 +448,7 @@ class OvDevice {
         unknownOpen_(false),
         unknownAddr_(0),
         unknownBefore_(0),
+        unknownUsed_(0xFFFF),
         writtenCount_(0),
         writtenFull_(false) {
     memset(written_, 0, sizeof(written_));
@@ -895,8 +896,8 @@ class OvDevice {
     readOne(reg.addr, &stored, &out.readBack);
     out.readBackRaw = stored;
     const bool read = out.readBack.status == MB_OK;
-    out.verified = read && stored == raw;
-    if (out.verified || out.write.status == MB_OK || (read && stored != before)) {
+    out.verified = read && ovSameValue(reg, stored, raw);
+    if (out.verified || out.write.status == MB_OK || (read && !ovSameValue(reg, stored, before))) {
       out.effect = OV_WRITE_TAKEN;
       resetNeeded_ = true;
     } else if (read || !mbIsLinkFailure(out.write.status)) {
@@ -910,6 +911,7 @@ class OvDevice {
         unknownOpen_ = true;
         unknownAddr_ = reg.addr;
         unknownBefore_ = before;
+        unknownUsed_ = ovUsedBits(reg);
       }
       // Otherwise this is a second write in doubt to the same register. What the register held
       // before the first of them stays the value to compare with: if the first was taken, the
@@ -1057,6 +1059,7 @@ class OvDevice {
   bool unknownOpen_;        // a write of unknown outcome that the next read of its register settles
   uint16_t unknownAddr_;    // that register
   uint16_t unknownBefore_;  // what it held before the write
+  uint16_t unknownUsed_;    // the bits of it that the controller uses (ovUsedBits)
   uint16_t written_[OV_WRITTEN_MAX];  // the registers written since OptaView started
   uint8_t writtenCount_;
   bool writtenFull_;        // more than that: every register counts as written
@@ -1220,7 +1223,7 @@ class OvDevice {
         link.slave == settled_.slave && link.baud == settled_.baud && link.format == settled_.format) {
       // The register of a write whose outcome was unknown has been read, on the same controller.
       unknownOpen_ = false;
-      if (out[unknownAddr_ - addr] != unknownBefore_) {
+      if (((uint16_t)(out[unknownAddr_ - addr] ^ unknownBefore_) & unknownUsed_) != 0) {
         resetNeeded_ = true;
       }
     }
