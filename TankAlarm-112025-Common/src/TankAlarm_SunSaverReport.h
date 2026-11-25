@@ -262,7 +262,8 @@ inline bool reportReplaces(bool haveKept, double keptCheckTime, double newCheckT
 // A register that an older client did not read is left out, and one the controller refused or
 // did not answer shows "no answer".
 inline void describeReport(const Snapshot &snapshot, const Evaluation &evaluation, JsonObject out) {
-  char line[160];
+  // The longest text here is a register's value: a fault word with many bits set.
+  char line[VALUE_TEXT_BYTES];
   out["vd"] = evaluation.verdict;
   out["verdict"] = verdictName(evaluation.verdict);
   out["battery"] = chemistryName(evaluation.chemistry);

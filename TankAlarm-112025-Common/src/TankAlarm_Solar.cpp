@@ -785,6 +785,10 @@ bool SolarManager::readRegisters() {
         floatThreshold = lowestRead + 0.2f;
       }
     }
+    // The charger check's figure (setFloatReference()) takes the place of the default. It is
+    // never one under the lowest float voltage the check accepts for this battery
+    // (sunsaver::floatReferenceVolts() gives none then): a charger that floats a LiFePO4 battery
+    // at 10.50 V does not hold it full, and the default stays.
     if (_floatReferenceV > 8.0f) {
       floatThreshold = _floatReferenceV;
     }

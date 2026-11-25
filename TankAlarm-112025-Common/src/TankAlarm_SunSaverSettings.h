@@ -1018,6 +1018,16 @@ inline double readingFactor(uint8_t liveScale, uint8_t firmwareScale) {
 // Nor is it known while the measured system is not the pack that was configured
 // (FINDING_PACK_VOLTAGE): a 12 V pack read at 18 V fits a 24 V system, and its 13.50 V float
 // would become a 27 V reference. The caller then keeps the default of the configured pack.
+//
+// Nor while either bank holds the battery under the lowest float voltage the check accepts for
+// the battery it was judged against (chargeRanges(), less SETPOINT_TOLERANCE_VOLTS; the ceiling
+// counts): such a charger does not hold that battery full. A LiFePO4 battery whose charger floats
+// at 10.50 V reads 12 V in daylight with no charge going in, nearly empty, and has to count as
+// one that needs charge. The caller then keeps the default of that battery
+// (SolarManager::setPackChemistry()). A battery without voltage ranges keeps the bounds of the
+// register. Above the range the reference stands: a battery under the voltage its charger holds
+// it at, with no charge going in, is not being charged, and the caller caps the target at the
+// high-battery limit.
 inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &evaluation, uint8_t firmwareScale) {
   const uint8_t scale = evaluation.settingsScale.scale;
   if (scale == SCALE_UNKNOWN || firmwareScale == SCALE_UNKNOWN || evaluation.systemVolts == 0) {
@@ -1039,6 +1049,9 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
     return 0.0;
   }
   const uint16_t ceiling = snapshot.raw[I_EVB_REF_LIM];
+  VoltRange absorbRange = {0.0, 0.0};
+  VoltRange floatRange = {0.0, 0.0};
+  const bool ranged = chargeRanges(evaluation.chemistry, &absorbRange, &floatRange);
   const uint8_t absorbItems[2] = {I_EV_REG, I_EV_REG2};
   const uint8_t floatItems[2] = {I_EV_FLOAT, I_EV_FLOAT2};
   double lowest = 0.0;
@@ -1052,6 +1065,7 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
     if (volts < (double)entry.loVolts || volts > (double)entry.hiVolts) {
       return 0.0;  // not a voltage a battery is held at
     }
+    uint16_t held = raw;
     if (ceiling != 0 && raw > ceiling) {
       // Both are stored words of one scale. A ceiling below the voltages a battery is held at
       // says the settings are not what they seem, so nothing is known then either.
@@ -1059,6 +1073,10 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
       if (volts < (double)entry.loVolts || volts > (double)entry.hiVolts) {
         return 0.0;
       }
+      held = ceiling;
+    }
+    if (ranged && belowRange(held, scale, floatRange)) {
+      return 0.0;  // not a voltage that holds this battery full
     }
     if (bank == 0 || volts < lowest) {
       lowest = volts;
@@ -1238,8 +1256,14 @@ inline const char *loadFaultName(uint8_t bit) {
   return bit < sizeof(kNames) / sizeof(kNames[0]) ? kNames[bit] : nullptr;
 }
 
+// Room for the longest text describeValue() gives, with its NUL. That is an array fault word with
+// all 16 bits set: its nine names and "bit 9" to "bit 15", 235 characters. The settings suite
+// checks every word of every register against it.
+static const size_t VALUE_TEXT_BYTES = 256;
+
 // What a raw word means, as text: "14.00 V", "900 s (15 min)", "FLOAT", "SW1 ON, SW2 OFF, ...".
 // A voltage whose scale is not known is shown both ways. settingsScale and liveScale are ScaleIds.
+// A fault word names every bit that is set, so its text can be long: see VALUE_TEXT_BYTES.
 inline void describeValue(uint8_t index, uint16_t raw, uint8_t settingsScale, uint8_t liveScale, Text *out) {
   const Item &entry = item(index);
   if (entry.kind == KIND_TEMPCO) {
