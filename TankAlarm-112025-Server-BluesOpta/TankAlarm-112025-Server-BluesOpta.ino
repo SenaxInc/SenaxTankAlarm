@@ -604,6 +604,9 @@ struct ClientMetadata {
   double chargerReportEpoch;               // when the client made the check, 0 = not known
   sunsaver::Snapshot chargerSnapshot;      // the registers
   sunsaver::Evaluation chargerEvaluation;  // the client's judgement
+  // The client was in the metadata cache at this start, and the file of reports, which may hold
+  // one for it, has not been read yet (see loadChargerReports()).
+  bool chargerReportUnread;
 };
 
 struct SerialLogEntry {
@@ -1363,7 +1366,12 @@ static unsigned long gLastRegistrySaveMillis = 0;
 // last write that worked. See saveChargerReportsIfDirty().
 static bool gChargerReportsDirty = false;
 static unsigned long gChargerReportsTryMillis = 0;  // when it was last written or tried
-#define CHARGER_REPORTS_RETRY_MS 300000UL           // after a write that failed
+// The file was read whole at this start, or was not there, or was set aside as one that can never
+// be read. Until then nothing writes it: a write would replace the reports it holds with those in
+// RAM. See loadChargerReports().
+static bool gChargerReportsLoaded = false;
+static unsigned long gChargerReportsReadMillis = 0;  // when it was last read or tried
+#define CHARGER_REPORTS_RETRY_MS 300000UL           // after a write or a read that failed
 static unsigned long gLastStaleCheckMillis = 0;
 
 // ----------------------------------------------------------------------------
@@ -2717,7 +2725,9 @@ static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *co
 static bool addChargerSummary(JsonObject clientObj, const ClientMetadata *meta, const ClientConfigSnapshot *config);
 static bool saveChargerReports();
 static void saveChargerReportsIfDirty(bool force);
+static void beginChargerReports();
 static void loadChargerReports();
+static void setChargerReportsAside(const char *why);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static void handleTelemetryRequestPost(EthernetClient &client, const String &body);
@@ -4606,7 +4616,7 @@ void setup() {
 #endif
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
-  loadChargerReports();       // and each client's last charger check
+  beginChargerReports();      // and each client's last charger check
   printHardwareRequirements();
 
   Wire.begin();
@@ -13005,11 +13015,26 @@ static bool saveChargerReports() {
 // written. So the cache is written first, every time, and the reports count as kept only when
 // both writes worked. gClientMetadataDirty cannot tell: other savers clear it after a write
 // that failed.
+//
+// Until the file has been read at this start (gChargerReportsLoaded), neither is written from
+// here: the file is read again instead, every CHARGER_REPORTS_RETRY_MS, and once that works what
+// came in meanwhile is written at once.
 static void saveChargerReportsIfDirty(bool force) {
+  const unsigned long nowMs = millis();
+  if (!gChargerReportsLoaded) {
+    if (!gClientMetadataLoaded || (nowMs - gChargerReportsReadMillis) < CHARGER_REPORTS_RETRY_MS) {
+      return;
+    }
+    gChargerReportsReadMillis = nowMs;
+    loadChargerReports();
+    if (!gChargerReportsLoaded) {
+      return;
+    }
+    force = true;
+  }
   if (!gChargerReportsDirty) {
     return;
   }
-  const unsigned long nowMs = millis();
   if (!force && (nowMs - gChargerReportsTryMillis) < CHARGER_REPORTS_RETRY_MS) {
     return;
   }
@@ -13029,71 +13054,144 @@ static void saveChargerReportsIfDirty(bool force) {
   }
 }
 
-// Call after loadClientMetadataCache(): a report is kept only for a client that has metadata, so
-// one that was removed does not come back. Such a report is still in the file when it was not
-// written since the client went (a write that failed, and a restart): once the metadata cache
-// was read whole, the file is written again without it at the next save, so that it does not
-// come back with the client should that be added again.
-static void loadChargerReports() {
-#ifdef FILESYSTEM_AVAILABLE
-  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS || !posix_file_exists("/fs" CHARGER_REPORTS_PATH)) {
-      return;
-    }
-    FILE *fp = fopen("/fs" CHARGER_REPORTS_PATH, "r");
-    if (!fp) {
-      posix_log_error("fopen", "/fs" CHARGER_REPORTS_PATH);
-      return;
-    }
-    // A report is under 600 bytes of JSON with every register refused and the longest client id.
-    const long fileSize = posix_file_size(fp);
-    if (fileSize <= 0 || fileSize > (long)MAX_CLIENT_METADATA * 640L + 64L) {
-      fclose(fp);
-      Serial.println(F("Charger reports file size invalid"));
-      return;
-    }
-    fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)fileSize + 1);
-    if (!buf) {
-      fclose(fp);
-      Serial.println(F("ERROR: Cannot allocate charger report load buffer"));
-      return;
-    }
-    const size_t bytesRead = fread(buf, 1, (size_t)fileSize, fp);
-    fclose(fp);
-    buf[bytesRead] = '\0';
+// At a start, after loadClientMetadataCache(): every client the metadata cache holds may have a
+// report in the file.
+static void beginChargerReports() {
+  for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+    gClientMetadata[i].chargerReportUnread = true;
+  }
+  gChargerReportsReadMillis = millis();
+  loadChargerReports();
+}
 
-    JsonDocument doc;
-    const DeserializationError err = deserializeJson(doc, buf);
+// The file has been read, or need not be: it may be written from now on.
+static void chargerReportsRead() {
+  gChargerReportsLoaded = true;
+  for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+    gClientMetadata[i].chargerReportUnread = false;
+  }
+}
+
+// A report is kept only for a client that has metadata, so one that was removed does not come
+// back. Such a report is still in the file when it was not written since the client went (a
+// write that failed, and a restart): the file is written again without it at the next save, so
+// that it does not come back with the client should that be added again.
+//
+// A file that is there and cannot be read now (it does not open, a read fails part way, or there
+// is no memory to read or parse it) is not written over: the reports that come in meanwhile wait
+// in RAM, and saveChargerReportsIfDirty() reads the file again every CHARGER_REPORTS_RETRY_MS.
+// Such a later read takes a report only for a client the metadata held at the start
+// (chargerReportUnread), so that one removed since does not come back, also when it was added
+// again, and only when it is newer than the one this server took since. A file that can never be
+// read (empty, too large, not a list of reports) is kept as CHARGER_REPORTS_PATH ".bad", and the
+// reports start afresh. Without the metadata cache read whole the file is not read at all: no
+// report could find its client, and a write would drop them all.
+static void loadChargerReports() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) {
+    return;  // nothing is written either
+  }
+  if (!gClientMetadataLoaded) {
+    Serial.println(F("Charger reports not read: the client metadata could not be read at this start"));
+    return;
+  }
+  if (!posix_file_exists("/fs" CHARGER_REPORTS_PATH)) {
+    chargerReportsRead();
+    return;
+  }
+  FILE *fp = fopen("/fs" CHARGER_REPORTS_PATH, "r");
+  if (!fp) {
+    posix_log_error("fopen", "/fs" CHARGER_REPORTS_PATH);
+    Serial.println(F("ERROR: Charger reports file did not open, trying again in 5 minutes"));
+    return;
+  }
+  // A report is under 600 bytes of JSON with every register refused and the longest client id.
+  const long fileSize = posix_file_size(fp);
+  if (fileSize < 0) {
+    fclose(fp);
+    Serial.println(F("ERROR: Charger reports file size not read, trying again in 5 minutes"));
+    return;
+  }
+  if (fileSize == 0 || fileSize > (long)MAX_CLIENT_METADATA * 640L + 64L) {
+    fclose(fp);
+    setChargerReportsAside("its size");
+    return;
+  }
+  fseek(fp, 0, SEEK_SET);
+  char *buf = (char *)malloc((size_t)fileSize + 1);
+  if (!buf) {
+    fclose(fp);
+    Serial.println(F("ERROR: Cannot allocate charger report load buffer, trying again in 5 minutes"));
+    return;
+  }
+  const size_t bytesRead = fread(buf, 1, (size_t)fileSize, fp);
+  fclose(fp);
+  if (bytesRead != (size_t)fileSize) {
     free(buf);
-    if (err) {
-      Serial.print(F("ERROR: Charger reports parse failed: "));
-      Serial.println(err.c_str());
-      return;
+    Serial.println(F("ERROR: Charger reports file read failed, trying again in 5 minutes"));
+    return;
+  }
+  buf[bytesRead] = '\0';
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, buf);
+  free(buf);
+  if (err == DeserializationError::NoMemory) {
+    Serial.println(F("ERROR: Out of memory for the charger report file, trying again in 5 minutes"));
+    return;
+  }
+  if (err) {
+    setChargerReportsAside(err.c_str());
+    return;
+  }
+  if (!doc.is<JsonArrayConst>()) {
+    setChargerReportsAside("not a list");
+    return;
+  }
+  uint8_t loaded = 0;
+  for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
+    ClientMetadata *meta = findClientMetadata(obj["c"] | "");
+    if (!meta || !meta->chargerReportUnread) {
+      gChargerReportsDirty = true;  // its client is gone, or came (back) since: the next save leaves it out
+      continue;
     }
-    uint8_t loaded = 0;
-    for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
-      ClientMetadata *meta = findClientMetadata(obj["c"] | "");
-      if (!meta) {
-        if (gClientMetadataLoaded) {
-          gChargerReportsDirty = true;  // saveChargerReportsIfDirty() leaves it out
-        }
-        continue;
-      }
-      sunsaver::Snapshot snapshot;
-      sunsaver::Evaluation evaluation;
-      if (!sunsaver::decodeReport(obj, &snapshot, &evaluation)) {
-        continue;
-      }
-      meta->chargerReportValid = true;
-      meta->chargerReportEpoch = obj["e"] | 0.0;
-      meta->chargerSnapshot = snapshot;
-      meta->chargerEvaluation = evaluation;
-      ++loaded;
+    sunsaver::Snapshot snapshot;
+    sunsaver::Evaluation evaluation;
+    if (!sunsaver::decodeReport(obj, &snapshot, &evaluation)) {
+      continue;
     }
-    Serial.print(F("Charger reports loaded: "));
-    Serial.println(loaded);
-  #endif
+    const double checkedAt = obj["e"] | 0.0;
+    if (!sunsaver::reportReplaces(meta->chargerReportValid, meta->chargerReportEpoch, checkedAt)) {
+      continue;  // the one that came in since is newer, and is due to be written
+    }
+    meta->chargerReportValid = true;
+    meta->chargerReportEpoch = checkedAt;
+    meta->chargerSnapshot = snapshot;
+    meta->chargerEvaluation = evaluation;
+    ++loaded;
+  }
+  chargerReportsRead();
+  Serial.print(F("Charger reports loaded: "));
+  Serial.println(loaded);
+#else
+  chargerReportsRead();  // no file of reports in this build
+#endif
+}
+
+// A file of reports that can never be read. Kept for a look, out of the way, and the reports
+// start afresh with those in RAM. A rename that fails is tried again with the next read.
+static void setChargerReportsAside(const char *why) {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  Serial.print(F("ERROR: Charger reports file cannot be read ("));
+  Serial.print(why);
+  if (rename("/fs" CHARGER_REPORTS_PATH, "/fs" CHARGER_REPORTS_PATH ".bad") != 0) {
+    Serial.println(F("), and could not be set aside: trying again in 5 minutes"));
+    return;
+  }
+  Serial.println(F("): kept as " CHARGER_REPORTS_PATH ".bad"));
+  chargerReportsRead();
+#else
+  (void)why;
 #endif
 }
 
