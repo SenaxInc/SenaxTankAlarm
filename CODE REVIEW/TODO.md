@@ -135,7 +135,8 @@
   - v2.2.16 adds the `host-tests` CI job (C++ suites with ASan/UBSan and -O2, plus a node suite for the email bridge). Still open: the firmware jobs install the core and libraries unpinned (the host tests pin ArduinoJson 7.4.3).
 - [ ] **X-R02 (P3) (A)** Documentation, Published Artifacts, and Trust Model — _INDEPENDENT R-21/R-22; CLAUDE M-18, L-01, L-11, L-12, L-54; FULL documentation/security recommendations_
   - Also: the committed `firmware/112025/viewer/*.bin` dates from 2026-06-12 because `build-firmware` does not export the viewer (the release asset is current).
-- [ ] **X-R03 (P2) (A)** Provisioning and Diagnostic Utilities — _FULL/COPILOT F-25/F-26; CLAUDE prior appendix_
+- [~] **X-R03 (P2) (A)** Provisioning and Diagnostic Utilities — _FULL/COPILOT F-25/F-26; CLAUDE prior appendix_
+  - OptaView 0.2 covers the OptaView part (F-26): a reply is checked against its request (slave, function, length, echo) before it is decoded, an exception never counts as data or as a found controller, currents are signed, settings are written by name within limits with a confirmation and a read-back, and raw writes need `expert on`. Host tests are in `tests/host/optaview`. Not yet run on hardware. Still open: key provisioning (F-25) and the FTPS test helper.
 - [ ] **X-R04 (open) (A)** Suggestions Requiring Measurement or Further Evidence — _CLAUDE section 9 and efficiency sections; other review recommendations_
 
 ---
