@@ -19,7 +19,6 @@
 #include <map>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "OptaViewModbus.h"
@@ -233,10 +232,17 @@ class SimSunSaver : public optaview::MbTransport {
     for (unsigned i = 0; i < times; ++i) faults_.push_back(fault);
   }
 
-  // Bytes that appear on the bus by themselves, `afterMs` from now and one every millisecond.
-  // Where they overlap a reply, the two mix (see putOnBus).
+  // Bytes that appear on the bus by themselves, as from another device: the first can be read
+  // `afterMs` from now, and the others follow one every millisecond, or back to back where one
+  // character takes longer than that (1.15 ms at 9600 baud 8N2). Where they are on the wire at
+  // the same time as a reply, or as other injected bytes, both are spoiled (see putOnBus).
   void inject(uint32_t afterMs, const std::vector<uint8_t> &bytes) {
-    for (size_t i = 0; i < bytes.size(); ++i) putOnBus(now_ + afterMs + i, bytes[i]);
+    const uint64_t charUs = charMicros();
+    const uint64_t stepUs = charUs > 1000 ? charUs : 1000;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      const uint64_t dueUs = (now_ + afterMs) * 1000 + (uint64_t)i * stepUs;
+      putOnBus(dueUs > charUs ? dueUs - charUs : 0, dueUs, bytes[i]);
+    }
   }
 
   // The battery is at `v` volts: both of its filtered readings say so, and the lowest and highest
@@ -346,38 +352,66 @@ class SimSunSaver : public optaview::MbTransport {
     }
 
     // The reply starts responseDelayMs after the request, or once the reply before it is out
-    // (see answersInOrder), and each byte can be read once its last bit is in: one character
-    // time after the one before, at the baud rate and format of the link (1.15 ms at 9600 baud
-    // 8N2, 36.7 ms at 300).
-    uint64_t at = now_ + responseDelayMs;
-    if (answersInOrder && busyUntil_ > at) at = busyUntil_;
+    // (see answersInOrder). Its bytes go out back to back, one character time each at the baud
+    // rate and format of the link (1.15 ms at 9600 baud 8N2, 96 microseconds at 115200, 36.7 ms
+    // at 300), and each can be read once its last bit is in.
+    const uint64_t charUs = charMicros();
+    uint64_t atUs = (now_ + responseDelayMs) * 1000;
+    if (answersInOrder && busyUntilUs_ > atUs) atUs = busyUntilUs_;
     std::vector<uint8_t> wire((size_t)leadingNoiseBytes, (uint8_t)0x00);
     wire.insert(wire.end(), reply.begin(), reply.end());
-    for (size_t i = 0; i < wire.size(); ++i) putOnBus(at + wireMs(i + 1), wire[i]);
-    if (at + wireMs(wire.size()) > busyUntil_) busyUntil_ = at + wireMs(wire.size());
+    for (size_t i = 0; i < wire.size(); ++i) {
+      putOnBus(atUs + (uint64_t)i * charUs, atUs + (uint64_t)(i + 1) * charUs, wire[i]);
+    }
+    const uint64_t endUs = atUs + (uint64_t)wire.size() * charUs;
+    if (endUs > busyUntilUs_) busyUntilUs_ = endUs;
   }
 
-  // Puts one byte on the bus, readable from `at`, behind the bytes that are due no later. Two
-  // senders on the bus at once mix their bytes in time order, so that neither frame survives,
-  // as two transmitters on one RS-485 pair garble each other.
-  void putOnBus(uint64_t at, uint8_t value) {
-    std::deque<std::pair<uint64_t, uint8_t> >::iterator it = incoming_.end();
-    while (it != incoming_.begin() && (it - 1)->first > at) --it;
-    incoming_.insert(it, std::make_pair(at, value));
+  // Puts one byte on the bus: it is on the wire from startUs, and can be read from dueUs, when
+  // its last bit is in. The bus keeps the bytes in the order they are due, each behind those due
+  // no later. Two transmitters on one RS-485 pair at once garble each other, so a byte that
+  // shares any time on the wire with another is spoiled, and so is the other. One sender's own
+  // bytes follow one another and never share it. The master's requests are not on this wire:
+  // the real port does not listen while it sends (see OptaView.ino), and the echo that some
+  // adapters give back is the request itself, heard as it goes out.
+  void putOnBus(uint64_t startUs, uint64_t dueUs, uint8_t value) {
+    OnWire byte;
+    byte.startUs = startUs;
+    byte.dueUs = dueUs;
+    byte.value = value;
+    byte.garbled = false;
+    std::deque<OnWire>::iterator at = incoming_.end();
+    while (at != incoming_.begin() && (at - 1)->dueUs > dueUs) --at;
+    // In front of it: the bytes that are not yet in when it starts.
+    for (std::deque<OnWire>::iterator it = at; it != incoming_.begin() && (it - 1)->dueUs > startUs; --it) {
+      (it - 1)->garbled = true;
+      byte.garbled = true;
+    }
+    // Behind it: the bytes that start before it is in.
+    for (std::deque<OnWire>::iterator it = at; it != incoming_.end(); ++it) {
+      if (it->startUs < dueUs) {
+        it->garbled = true;
+        byte.garbled = true;
+      }
+    }
+    incoming_.insert(at, byte);
   }
 
-  // How long `bytes` characters take on the wire at the link's baud rate and format, rounded up
-  // to the millisecond clock.
-  uint64_t wireMs(size_t bytes) const {
-    const uint64_t charUs = optaview::mbCharMicros(linkBaud_ == 0 ? 9600 : linkBaud_, linkFormat_);
-    return ((uint64_t)bytes * charUs + 999) / 1000;
+  // One character on the wire at the link's baud rate and format, in microseconds.
+  uint64_t charMicros() const {
+    return optaview::mbCharMicros(linkBaud_ == 0 ? 9600 : linkBaud_, linkFormat_);
   }
 
+  // How long `bytes` characters take on the wire, rounded up to the millisecond clock.
+  uint64_t wireMs(size_t bytes) const { return ((uint64_t)bytes * charMicros() + 999) / 1000; }
+
+  // A spoiled byte arrives with its bits inverted: whatever the receiver makes of two senders at
+  // once, it is not what either of them sent.
   int read() override {
-    if (incoming_.empty() || incoming_.front().first > now_) return -1;
-    const uint8_t b = incoming_.front().second;
+    if (incoming_.empty() || incoming_.front().dueUs > now_ * 1000) return -1;
+    const OnWire byte = incoming_.front();
     incoming_.pop_front();
-    return b;
+    return byte.garbled ? (uint8_t)~byte.value : byte.value;
   }
 
   // The clock starts just below the 32-bit wrap, so every test crosses it.
@@ -400,8 +434,14 @@ class SimSunSaver : public optaview::MbTransport {
   uint32_t linkBaud_ = 0;
   uint8_t linkFormat_ = 0;
   std::deque<Fault> faults_;
-  std::deque<std::pair<uint64_t, uint8_t> > incoming_;  // in time order
-  uint64_t busyUntil_ = 0;  // when the last byte of the controller's last reply is in
+  struct OnWire {
+    uint64_t startUs;  // its start bit goes out (microseconds on the clock of elapsedMs)
+    uint64_t dueUs;    // its last bit is in: from then it can be read
+    uint8_t value;     // what its sender sent
+    bool garbled;      // another byte was on the wire at the same time
+  };
+  std::deque<OnWire> incoming_;  // in the order they are due
+  uint64_t busyUntilUs_ = 0;     // when the last byte of the controller's last reply is in
 
   static std::vector<uint8_t> exception(const uint8_t *request, uint8_t code) {
     std::vector<uint8_t> body;

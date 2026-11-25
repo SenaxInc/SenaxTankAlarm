@@ -72,7 +72,9 @@ check-profile:
 	$(PYTHON) $(OPTAVIEW_DIR)/tools/embed_profile.py --check
 
 # web/index.html keeps to what its Content-Security-Policy allows, and OptaViewWebPage.h is it.
+# The self-test first shows that the rules for that refuse what they should.
 check-page:
+	$(PYTHON) $(OPTAVIEW_DIR)/tools/embed_web.py --selftest
 	$(PYTHON) $(OPTAVIEW_DIR)/tools/embed_web.py --check
 
 $(BUILD)/optaview_test_san: $(SOURCES) $(HEADERS) | check-arduinojson

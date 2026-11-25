@@ -457,7 +457,8 @@ make -C tests/host/optaview test ARDUINOJSON_DIR=/tmp/ArduinoJson/src
 
 Two suites run the same headers the sketch compiles. `optaview_test` drives the console against
 a simulated SunSaver that can drop, cut, corrupt and delay replies, refuse blocks, answer at
-another address or speed, and restart. `optaview_web_test` writes HTTP requests as text and has
+another address or speed, and restart. Its bus times each byte to the microsecond, and two
+senders that are on the wire at once spoil each other's bytes. `optaview_web_test` writes HTTP requests as text and has
 the web server answer them on top of that simulation. It plays browsers that never stop
 sending or that take an answer a byte at a time, and it walks the address policy through
 cables that go in late and DHCP servers that never answer. Run
@@ -506,7 +507,9 @@ python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
 
 The script also works out the hashes that the page's policy names for its style sheet and its
 script, and refuses a page that needs more than that policy allows (an inline event handler, a
-file from another server). The host tests fail when the header is out of date.
+style sheet brought in with `@import`, a font, any file but a `data:` image).
+`embed_web.py --selftest` shows that each of those rules refuses what it should. The host tests
+run it, and fail when the header is out of date.
 
 ## Files
 

@@ -655,23 +655,95 @@ static void testLateReplies() {
               (unsigned long long)(b.sim.requestTimes[2] - gaveUp));
   }
   {  // Two senders on the bus at once garble each other, and neither frame is taken: here the
-     // late reply and the answer to the next request, which begins at the same moment.
-    Bare b;
-    b.sim.answersInOrder = false;
-    b.sim.responseDelayMs = 1200;
-    uint16_t word = 0xAAAA;
-    CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
-    // Both requests are 8 bytes long, so the same delay after each puts their replies on top
-    // of each other.
-    b.sim.responseDelayMs = (uint32_t)(b.sim.requestTimes[0] + 1200 - b.sim.elapsedMs());
-    const MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
-    CHECK_MSG(r.status != MB_OK, "%s", mbStatusText(r.status));
-    CHECK_EQ(word, 0xAAAA);
+     // late reply and the answer to the next request, which begins at the same moment or while
+     // the late reply is still going out. At 115200 baud a reply of seven bytes takes 0.7 ms, so
+     // two that begin in the same millisecond are on the wire together, and two that begin a
+     // millisecond apart do not touch: then the answer is taken, behind the late reply.
+    struct Case {
+      uint32_t baud;
+      uint32_t laterMs;  // how long after the late reply the answer begins
+      bool taken;
+    };
+    const Case cases[] = {{9600, 0, false}, {9600, 5, false}, {115200, 0, false}, {115200, 1, true}};
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); ++k) {
+      const Case &c = cases[k];
+      Bare b;
+      b.sim.deviceBaud = c.baud;
+      CHECK(b.master.configure(c.baud, MB_8N2));
+      b.sim.answersInOrder = false;
+      b.sim.responseDelayMs = 1200;
+      uint16_t word = 0xAAAA;
+      CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
+      // Both requests are 8 bytes long, and the next goes out once the bus has been quiet for
+      // the gap between frames.
+      b.sim.responseDelayMs = (uint32_t)(b.sim.requestTimes[0] + 1200 + c.laterMs - b.sim.elapsedMs() -
+                                         b.master.interFrameGapMs);
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_HOLDING, 0xE022, 1, &word);
+      CHECK_EQ(b.sim.requestTimes[1] + b.sim.responseDelayMs, b.sim.requestTimes[0] + 1200 + c.laterMs);
+      if (c.taken) {
+        CHECK_MSG(r.status == MB_OK, "%u baud, %u ms later: %s", (unsigned)c.baud, (unsigned)c.laterMs,
+                  mbStatusText(r.status));
+        CHECK_EQ(word, b.sim.regs[0xE022]);
+        CHECK_EQ(r.noiseBytes, 7);
+      } else {
+        CHECK_MSG(r.status != MB_OK, "%u baud, %u ms later: %s", (unsigned)c.baud, (unsigned)c.laterMs,
+                  mbStatusText(r.status));
+        CHECK_EQ(word, 0xAAAA);
+      }
+    }
     // The same with bytes from elsewhere in the middle of a reply.
     Bare c;
+    uint16_t word = 0xAAAA;
     c.sim.inject(20, std::vector<uint8_t>(40, 0xFF));
     CHECK(c.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status != MB_OK);
     CHECK_EQ(word, 0xAAAA);
+  }
+  {  // One byte from elsewhere that is on the wire with the first byte of a reply spoils the
+     // reply. One that is in just as the reply begins only stands in front of it. At 9600 baud
+     // 8N2 a character takes 1.15 ms, so a byte that can be read 1 ms after the reply begins
+     // went out before the reply did.
+    for (uint32_t late = 0; late <= 1; ++late) {
+      Bare b;
+      uint16_t word = 0xAAAA;
+      const uint64_t t0 = b.sim.elapsedMs();
+      // A fresh master sends at once, its request takes 10 ms, and the reply begins after the
+      // controller's delay.
+      b.sim.inject(10 + b.sim.responseDelayMs + late, bytes({0x55}));
+      const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word);
+      CHECK_EQ(b.sim.requestTimes[0], t0);
+      if (late == 0) {
+        CHECK_MSG(r.status == MB_OK, "%s", mbStatusText(r.status));
+        CHECK_EQ(r.noiseBytes, 1);
+        CHECK_EQ(word, 0x1183);
+      } else {
+        CHECK_MSG(r.status != MB_OK, "%s", mbStatusText(r.status));
+        CHECK_EQ(word, 0xAAAA);
+      }
+    }
+  }
+  {  // On the simulated bus itself: bytes on the wire at the same time arrive spoiled, each with
+     // its bits inverted, and bytes that only follow one another arrive as they were sent.
+    Bare b;
+    b.sim.inject(10, bytes({0x12, 0x34}));  // at 9600 baud: in 10 ms and 11.15 ms from now
+    b.sim.inject(10, bytes({0x56}));        // on the wire with the 0x12, and in as the 0x34 starts
+    b.sim.inject(13, bytes({0x78}));        // starts 0.7 ms after the 0x34 is in
+    b.sim.advance(20);
+    CHECK_EQ(b.sim.read(), 0xED);
+    CHECK_EQ(b.sim.read(), 0xA9);
+    CHECK_EQ(b.sim.read(), 0x34);
+    CHECK_EQ(b.sim.read(), 0x78);
+    CHECK_EQ(b.sim.read(), -1);
+    // Where a character takes less than a millisecond, injected bytes still come one a
+    // millisecond.
+    Bare fast;
+    CHECK(fast.master.configure(115200, MB_8N2));
+    fast.sim.inject(10, bytes({0x9A, 0xBC, 0xDE}));
+    fast.sim.advance(11);
+    CHECK_EQ(fast.sim.read(), 0x9A);
+    CHECK_EQ(fast.sim.read(), 0xBC);
+    CHECK_EQ(fast.sim.read(), -1);
+    fast.sim.advance(1);
+    CHECK_EQ(fast.sim.read(), 0xDE);
   }
   {  // The bus keeps every byte in time order, whenever it was put there: bytes from elsewhere
      // that are due before a reply already on its way come in first.
@@ -736,12 +808,12 @@ static void testLateReplies() {
     CHECK_EQ(b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0008, 1, &word).status, MB_TIMEOUT);
     const uint64_t gaveUp = b.sim.elapsedMs();
     const std::vector<uint8_t> late = SimSunSaver::frame(bytes({0x01, 0x04, 0x02, 0x11, 0x83}));
-    b.sim.inject(997, late);  // its seven bytes arrive from 997 to 1003 ms: across the end of the wait
+    b.sim.inject(997, late);  // its seven bytes arrive from 997 to 1004 ms: across the end of the wait
     const MbResult r = b.master.readRegisters(1, MB_FC_READ_INPUT, 0x0009, 1, &word);
     CHECK_EQ(r.status, MB_OK);
     CHECK_EQ(word, b.sim.regs[0x0009]);
     CHECK_EQ(r.noiseBytes, 0);
-    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1003 + b.master.quietMs, "sent %llu ms after",
+    CHECK_MSG(b.sim.requestTimes[1] >= gaveUp + 1004 + b.master.quietMs, "sent %llu ms after",
               (unsigned long long)(b.sim.requestTimes[1] - gaveUp));
   }
   {  // Noise that never stops does not hold the master for ever.
