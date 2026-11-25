@@ -134,7 +134,10 @@ What to know before you rely on it:
 While it waits for DHCP the Opta cannot tell a cable that is out from a network without DHCP.
 A cable that was out for more than 20 s therefore finds the fixed address in use when it goes
 back in, and DHCP gets its one more try then. (A cable that goes back in within 3 s of the
-change to the fixed address looks like one that was in all along, and keeps the fixed address.)
+change to the fixed address looks like one that was in all along, and keeps the fixed address.
+So does one that goes in while a long command on the USB console, a scan for one, holds the Opta
+from before those 3 s were up: the Opta takes a link for a cable that went in only when it has
+seen the link missing.)
 A router that needs longer than 20 s to hand out addresses again, as after a power cut, can
 leave the Opta on the fixed address, so on a network that always has DHCP use `dhcp`. Once the
 fixed address is in use and the extra try is spent, a cable moved from a laptop to a network
@@ -528,13 +531,16 @@ python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
 The script also works out the hashes that the page's policy names for its style sheet and its
 script, and refuses a page that needs more than that policy allows (an inline event handler, a
 style sheet brought in with `@import` or a link, a font, a script file, any file but a `data:`
-image). It reads the page the way a browser does where the two could differ: each tag attribute
-by attribute with its character references decoded, tag names in any case, a block that ends at
-the first `</script` or `</style`, and the escapes of the style sheet and of the script's names.
-So a `>` inside a quoted value, a `&#9;` in a `srcset` or `@\69mport` hides nothing.
-`embed_web.py --selftest` shows that each of those rules refuses what it should, and that a
-`data:` image passes wherever an image can go. The host tests run it, and fail when the header
-is out of date.
+image, a string run as code). It reads the page the way a browser does where the two could
+differ: each tag attribute by attribute with its character references decoded, tag names in any
+case, a `srcset` split where a browser splits it, a block that ends at the first `</script` or
+`</style`, the escapes of the style sheet and of the script, and HTML names and the schemes of
+addresses in any case. So a `>` inside a quoted value, a `&#9;` in a `srcset`, `@\69mport` or
+`setAttribute('STYLE', ...)` hides nothing. An SVG animation that changes an address is refused,
+since the check cannot see what it loads. What the script puts together while it runs is left to
+the browser test. `embed_web.py --selftest` shows that each of those rules refuses what it
+should, and that a `data:` image passes wherever an image can go. The host tests run it, and fail
+when the header is out of date.
 
 ## Files
 

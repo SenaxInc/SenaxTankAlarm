@@ -1631,6 +1631,28 @@ static void testNetPolicy() {
     CHECK_EQ(n.port.startsWithoutStop, 0);
   }
   {
+    // The same laptop, while a long command on the USB console (a scan, a sniff) holds the loop
+    // from just after the switch to the fixed address. The link it finds then was there all
+    // along: it is not taken for a cable that went in late, and no DHCP try of twenty seconds
+    // more keeps the page away.
+    NetRig n;
+    n.port.cable = true;
+    CHECK(n.net.begin(n.config(OV_NET_AUTO)));
+    n.run(20000);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    n.run(10);  // the link takes a moment to come up with the fixed address
+    CHECK(!n.net.up());
+    n.clock.now += 10000;
+    n.run(1);
+    CHECK(n.net.up());
+    CHECK(n.address() == "192.168.1.16");
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    n.run(30000);
+    CHECK(n.status() == "Network   address 192.168.1.16, the fixed one: DHCP did not answer\r\n");
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    CHECK_EQ(n.changes, 1);
+  }
+  {
     // Auto, switched on with no cable in. The first DHCP try was made on no network at all, so
     // when the cable goes in later, DHCP gets one more try on the network it leads to.
     NetRig n;
@@ -1650,6 +1672,56 @@ static void testNetPolicy() {
     CHECK(n.status() == "Network   address 192.168.1.57 from DHCP\r\n");
     CHECK_EQ(n.changes, 1);
     CHECK_EQ(n.port.startsWithoutStop, 0);
+    // The cable then moves to a laptop, which hands out no address. The lost address gives DHCP
+    // its twenty seconds and its one more try again, but the link is there when the fixed address
+    // is set, so that try is not made: the missing link of the first time does not count now.
+    n.port.plug(false);
+    n.port.dhcpServer = false;
+    n.port.plug(true);
+    n.run(20100);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart + "stop;dhcp;stop;" + kStaticStart);
+    CHECK(n.status() == "Network   address 192.168.1.16, the fixed one: DHCP did not answer\r\n");
+    n.run(30000);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart + "stop;dhcp;stop;" + kStaticStart);
+    CHECK_EQ(n.port.startsWithoutStop, 0);
+  }
+  {
+    // Switched on with no cable in, and the link is seen missing 3 s after the switch to the
+    // fixed address, the earliest that counts. The cable then goes in while a long command holds
+    // the loop: DHCP gets its one more try all the same. (Without mbed's late DHCP, which would
+    // bring the lease by itself and hide whether the try was made.)
+    NetRig n;
+    n.port.dhcpServer = true;
+    n.port.lateDhcp = false;
+    CHECK(n.net.begin(n.config(OV_NET_AUTO)));
+    n.run(23000);
+    CHECK(!n.net.up());
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
+    n.clock.now += 2000;
+    n.port.plug(true);
+    n.clock.now += 5000;
+    n.run(1);
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart + "stop;dhcp;");
+    n.run(2000);
+    CHECK(n.status() == "Network   address 192.168.1.57 from DHCP\r\n");
+  }
+  {
+    // The limit of that: a long command that holds the loop from just before the 3 s are up to
+    // well past them, with the cable going in meanwhile. The link was last seen missing too soon
+    // to tell a cable that went in from one that was in all along, so the fixed address stays.
+    // (mbed's own late DHCP, which lateDhcp leaves out here, would then still bring the lease; see
+    // below.)
+    NetRig n;
+    n.port.dhcpServer = true;
+    n.port.lateDhcp = false;
+    CHECK(n.net.begin(n.config(OV_NET_AUTO)));
+    n.run(22999);
+    n.clock.now += 1000;
+    n.port.plug(true);
+    n.clock.now += 9000;
+    n.run(60000);
+    CHECK(n.address() == "192.168.1.16");
+    CHECK(n.port.log == std::string("dhcp;stop;") + kStaticStart);
   }
   {
     // The same, but the network the cable leads to has no DHCP either: the fixed address after
