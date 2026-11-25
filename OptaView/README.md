@@ -302,9 +302,11 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   that it does not know, and it keeps saying that a restart may be due until the register has
   been read again.
 - Pairs that must stay in order are checked when you `set` one of them and again before
-  `reset`: each reconnect on its side of its disconnect, and every charge voltage of both banks
+  `reset`: each reconnect on its side of its disconnect, every charge voltage of both banks
   (absorption, float, equalize) below the battery's high voltage disconnect, which would stop
-  charging before the battery got there. A 0 switches a pair off only where it switches the
+  charging before the battery got there, and the battery LED's thresholds in order: green to
+  yellow below yellow to green and yellow to red below red to yellow, so that the LED does not
+  flicker, and yellow between red and green. A 0 switches a pair off only where it switches the
   setting off, as in the high voltage disconnects and a float or equalize stage at 0. A
   reconnect cannot be 0: the battery never falls to 0 V, so the output would not come back.
   `set` refuses that, and a 0 that the controller already holds there stands in the way of

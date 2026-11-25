@@ -258,6 +258,33 @@ static void checkCommonHeaders(const Reply &reply, const char *file, int line) {
 }
 #define CHECK_HEADERS(reply) checkCommonHeaders((reply), __FILE__, __LINE__)
 
+// What HTTP asks of an answer because of its status (RFC 9110), checked on every answer that
+// WebRig gets: a 204 has neither a body nor a Content-Length, a 401 says how to log in and no
+// other answer does, a 405 says which method works, and a Content-Length is the body's own
+// (review 21).
+static void checkStatusRules(const Reply &reply, const char *file, int line) {
+  ++gChecks;
+  if (!reply.answered) {
+    return;  // the checks of the answer itself say so
+  }
+  const size_t lengths = reply.headerCount("Content-Length");
+  const size_t challenges = reply.headerCount("WWW-Authenticate");
+  std::string problem;
+  if (reply.status == 204 && (lengths != 0 || !reply.body.empty())) {
+    problem = "a 204 with a length or a body";
+  } else if (reply.status == 401 ? challenges != 1 || reply.header("WWW-Authenticate") != "OptaView-PIN realm=\"OptaView\""
+                                 : challenges != 0) {
+    problem = "WWW-Authenticate";
+  } else if (reply.status == 405 && reply.headerCount("Allow") != 1) {
+    problem = "Allow";
+  } else if (lengths > 1 || (lengths == 1 && reply.header("Content-Length") != std::to_string(reply.body.size()))) {
+    problem = "Content-Length";
+  }
+  if (!problem.empty()) {
+    reportFailure(file, line, "the answer keeps what HTTP asks of its status", problem + "\n" + excerpt(reply.head));
+  }
+}
+
 static std::string jsonQuote(const std::string &text) {
   std::string out = "\"";
   for (size_t i = 0; i < text.size(); ++i) {
@@ -797,6 +824,23 @@ static void testHttpResponse() {
     response.print("after");
     response.flush();
     CHECK_EQ(bare.sent.size(), response.sent());
+
+    // An answer that has no body by its status gives no length, even when it is handed one: RFC
+    // 9110 forbids Content-Length on a 1xx and a 204 (review 21). Any other answer gives the one
+    // it is handed, 0 as well.
+    const int statuses[] = {100, 101, 199, 204, 200, 205, 304, 400};
+    for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); ++i) {
+      FakeConn one;
+      one.clock = conn.clock;
+      response.attach(one, clock);
+      response.begin(statuses[i], nullptr, nullptr, 0);
+      response.flush();
+      const bool bodyless = statuses[i] == 204 || statuses[i] < 200;
+      CHECK_MSG(countOf(one.sent, "\r\nContent-Length: 0\r\n") == (bodyless ? 0u : 1u), "status %d: %s",
+                statuses[i], one.sent.c_str());
+      CHECK(one.sent.compare(0, 13, fmtStr("HTTP/1.1 %d ", statuses[i])) == 0);
+      response.detach();
+    }
   }
   {
     // A long answer goes out in pieces of the buffer's size, in order and complete.
@@ -2114,6 +2158,7 @@ struct WebRig {
     CHECK_EQ(conn->writesAfterClose, 0);
     CHECK_EQ(conn->writesAfterFailure, 0);
     Reply reply = parseReply(conn->sent);
+    checkStatusRules(reply, __FILE__, __LINE__);
     // A browser keeps what Set-Cookie gives it, and drops a cookie that is set to nothing.
     const std::string set = reply.header("Set-Cookie");
     const std::string name = std::string(OV_WEB_COOKIE) + "=";
@@ -2302,7 +2347,7 @@ static void testWebRouting() {
     const Reply icon = w.get("/favicon.ico");
     CHECK_EQ(icon.status, 204);
     CHECK(icon.body.empty());
-    CHECK(icon.header("Content-Length") == "0");
+    CHECK_EQ(icon.headerCount("Content-Length"), 0);  // forbidden on a 204 (RFC 9110, review 21)
     CHECK_HEADERS(icon);
   }
   {
@@ -2658,7 +2703,12 @@ static void testWebLogin() {
     for (size_t i = 0; i < sizeof(closed) / sizeof(closed[0]); ++i) {
       CHECK_ERROR(w.get(closed[i]), 401, "login");
     }
-    CHECK_ERROR(w.post("/api/console", "{\"line\":\"live\"}"), 401, "login");
+    const Reply shut = w.post("/api/console", "{\"line\":\"live\"}");
+    CHECK_ERROR(shut, 401, "login");
+    // A 401 names how to log in (RFC 9110), in a scheme of OptaView's own, which no browser
+    // answers with a box for a user name and password (review 21).
+    CHECK(shut.header("WWW-Authenticate") == "OptaView-PIN realm=\"OptaView\"");
+    CHECK_HEADERS(shut);
     CHECK_EQ(w.rig.sim.requests.size(), 0);
     // There is no PIN to log in with yet.
     CHECK_ERROR(w.post("/api/login", "{\"pin\":\"1234\"}"), 409, "no-pin");

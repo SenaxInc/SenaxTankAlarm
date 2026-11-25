@@ -1291,7 +1291,7 @@ static void testBuiltinProfile() {
     CHECK_EQ(profile.coilCount(), 8);
     CHECK_EQ(profile.groupCount(), 13);
     CHECK_EQ(profile.liveGroupCount(), 2);
-    CHECK_EQ(profile.checkCount(), 9);
+    CHECK_EQ(profile.checkCount(), 13);
     CHECK(profile.noteCount() >= 3);
     CHECK(profile.writeNoteCount() >= 2);
     CHECK(profile.wiringCount() >= 8);
@@ -3643,6 +3643,69 @@ static void testConsoleSet() {
     rig.sim.regs[0xE022] = rig.sim.setVolts(11.50);
     rig.sim.regs[0xE024] = 0;
 
+    // The battery LED's four thresholds keep their order (review 21): each change of color has
+    // its way back above or below it, or the LED flickers between the two colors, and yellow
+    // lies between red and green, or the battery passes it by. As the simulated controller has
+    // them: red at 11.80 V, back to yellow at 12.40 V, yellow at 12.80 V, back to green at 13.10 V.
+    static const char kGreenBack[] =
+        "Careful: LED yellow to green (EV_soc_y2g) must be above LED green to yellow (EV_soc_g2y), or the battery LED can "
+        "flicker between the two.";
+    static const char kRedBack[] =
+        "Careful: LED red to yellow (EV_soc_r2y) must be above LED yellow to blinking red (EV_soc_y2r0), or the battery "
+        "LED can flicker between the two.";
+    static const char kRedBelow[] =
+        "Careful: LED yellow to blinking red (EV_soc_y2r0) must be below LED green to yellow (EV_soc_g2y), or a falling "
+        "battery skips yellow.";
+    static const char kYellowFirst[] =
+        "Careful: LED red to yellow (EV_soc_r2y) must be below LED yellow to green (EV_soc_y2g), or a rising battery skips "
+        "yellow.";
+    const auto unwrapped = [](std::string out) {
+      for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
+        out.replace(at, 6, " ");  // a long message is wrapped
+      }
+      return out;
+    };
+    const std::string green = unwrapped(rig.run("set EV_soc_g2y 13.10"));  // equal is not below
+    CHECK_MSG(has(green, kGreenBack), "%s", green.c_str());
+    CHECK_HAS(green, "After this write, EV_soc_g2y = 13.10 V and EV_soc_y2g = 13.10 V.");
+    CHECK_EQ(countOf(green, "Careful: LED"), 1);
+    rig.run("no");
+    const std::string back = unwrapped(rig.run("set EV_soc_y2g 12.70"));
+    CHECK_MSG(has(back, kGreenBack), "%s", back.c_str());
+    CHECK_HAS(back, "After this write, EV_soc_g2y = 12.80 V and EV_soc_y2g = 12.70 V.");
+    CHECK_EQ(countOf(back, "Careful: LED"), 1);
+    rig.run("no");
+    const std::string red = unwrapped(rig.run("set EV_soc_y2r0 12.50"));
+    CHECK_MSG(has(red, kRedBack), "%s", red.c_str());
+    CHECK_HAS(red, "After this write, EV_soc_y2r0 = 12.50 V and EV_soc_r2y = 12.40 V.");
+    CHECK_EQ(countOf(red, "Careful: LED"), 1);
+    rig.run("no");
+    // Above green to yellow as well: both of its pairs are named.
+    const std::string both = unwrapped(rig.run("set EV_soc_y2r0 12.80"));
+    CHECK_MSG(has(both, kRedBack) && has(both, kRedBelow), "%s", both.c_str());
+    CHECK_HAS(both, "After this write, EV_soc_y2r0 = 12.80 V and EV_soc_r2y = 12.40 V.");
+    CHECK_HAS(both, "After this write, EV_soc_y2r0 = 12.80 V and EV_soc_g2y = 12.80 V.");
+    CHECK_EQ(countOf(both, "Careful: LED"), 2);
+    rig.run("no");
+    const std::string rising = unwrapped(rig.run("set EV_soc_r2y 13.20"));
+    CHECK_MSG(has(rising, kYellowFirst), "%s", rising.c_str());
+    CHECK_HAS(rising, "After this write, EV_soc_r2y = 13.20 V and EV_soc_y2g = 13.10 V.");
+    CHECK_EQ(countOf(rising, "Careful: LED"), 1);  // still above yellow to blinking red
+    rig.run("no");
+    const std::string falling = unwrapped(rig.run("set EV_soc_g2y 11.80"));
+    CHECK_MSG(has(falling, kRedBelow), "%s", falling.c_str());
+    CHECK_HAS(falling, "After this write, EV_soc_y2r0 = 11.80 V and EV_soc_g2y = 11.80 V.");
+    CHECK_EQ(countOf(falling, "Careful: LED"), 1);
+    rig.run("no");
+    // In order, nothing is said, and the way back from red may lie above green to yellow.
+    CHECK_EQ(countOf(rig.run("set EV_soc_r2y 12.90"), "Careful: LED"), 0);
+    rig.run("no");
+    CHECK_EQ(countOf(rig.run("set EV_soc_g2y 11.90"), "Careful: LED"), 0);
+    rig.run("no");
+    CHECK_EQ(countOf(rig.run("set EV_soc_y2g 12.85"), "Careful: LED"), 0);
+    rig.run("no");
+    CHECK_EQ(rig.sent(0x06), 0);
+
     // Refusals. None of them reaches the bus as a write.
     CHECK_HAS(rig.run("set"), "Usage: set");
     CHECK_HAS(rig.run("set EV_lvd"), "Usage: set");
@@ -4422,25 +4485,44 @@ static void testConsoleCoilsAndReset() {
     CHECK_EQ(rig.sim.resets, 0);
   }
   {  // Each pair check of the built-in profile stops a restart with its own message and no other:
-     // the lower register of the pair above the upper one, everything else as the simulated
-     // controller has it.
+     // the lower register of the pair 0.50 V above the upper one, everything else as the
+     // simulated controller has it. The pairs share registers (the LED thresholds hang
+     // together), so the pair goes in at the highest height, in steps of 0.10 V down from
+     // 17.00 V, where it is the only one out of order; each pair has one.
     Rig first;
-    CHECK_EQ(first.profile.checkCount(), 9);
+    CHECK_EQ(first.profile.checkCount(), 13);
     for (size_t i = 0; i < first.profile.checkCount(); ++i) {
       Rig rig;
       const OvCheck &check = rig.profile.check(i);
-      rig.sim.regs[check.below->addr] = rig.sim.setVolts(15.50);
-      rig.sim.regs[check.above->addr] = rig.sim.setVolts(15.00);
-      std::string out = rig.run("reset");
-      for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
-        out.replace(at, 6, " ");  // a long message is wrapped
+      const uint16_t belowWas = rig.sim.regs[check.below->addr];
+      const uint16_t aboveWas = rig.sim.regs[check.above->addr];
+      bool alone = false;
+      for (int tenths = 170; tenths >= 90 && !alone; --tenths) {
+        const double upper = tenths / 10.0;
+        rig.sim.regs[check.below->addr] = rig.sim.setVolts(upper + 0.50);
+        rig.sim.regs[check.above->addr] = rig.sim.setVolts(upper);
+        std::string out = rig.run("reset");
+        CHECK(!rig.console.awaitingConfirmation());  // it is out of order: no question
+        for (size_t at = out.find("\r\n    "); at != std::string::npos; at = out.find("\r\n    ")) {
+          out.replace(at, 6, " ");  // a long message is wrapped
+        }
+        if (countOf(out, "Problem:") != 1) {
+          continue;  // another pair is out of order with it
+        }
+        alone = true;
+        CHECK_MSG(has(out, (std::string("Problem: ") + check.message + " Now " + check.below->name + " = " +
+                            fmtStr("%.2f", upper + 0.50) + " V and " + check.above->name + " = " +
+                            fmtStr("%.2f", upper) + " V.")
+                               .c_str()),
+                  "check %u: %s", (unsigned)i, out.c_str());
       }
-      CHECK_MSG(has(out, (std::string("Problem: ") + check.message + " Now " + check.below->name + " = 15.50 V and " +
-                          check.above->name + " = 15.00 V.")
-                             .c_str()),
-                "check %u: %s", (unsigned)i, out.c_str());
-      CHECK_MSG(countOf(out, "Problem:") == 1, "check %u: %s", (unsigned)i, out.c_str());
+      CHECK_MSG(alone, "check %u is never the only one out of order", (unsigned)i);
       CHECK_EQ(rig.sim.resets, 0);
+      // In order again, the restart is asked about.
+      rig.sim.regs[check.below->addr] = belowWas;
+      rig.sim.regs[check.above->addr] = aboveWas;
+      CHECK_HAS(rig.run("reset"), "Type yes to restart it.");
+      rig.run("no");
     }
   }
   {  // A pair that cannot be checked stands in the way like one that is out of order, whichever
