@@ -567,7 +567,8 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
 //   wait           the request that waits (left out when none does)
 //   rep            the result that has yet to go to the server (left out when there is none): the
 //                  compact result of encodeProgramResult(), with "rq", the request it answers,
-//                  and "ep", when it came about (0: not known)
+//                  "ep", when it came about (0: not known), and "out", the time it went out with
+//                  (left out while it has not gone out)
 //   look           the look for no request that has yet to go to the server (left out when there
 //                  is none): the same, without "rq"
 //   srq, sep       the request of the last result that went out, or goes out now, and the time
@@ -581,7 +582,7 @@ inline bool decodeProgramResult(JsonObjectConst in, ProgramResult *result) {
 // It is written whole, as a new file that takes the place of the old one, and is no longer than
 // JOURNAL_JSON_MAX.
 
-static const size_t JOURNAL_JSON_MAX = 1200;
+static const size_t JOURNAL_JSON_MAX = 1240;
 
 inline void encodeJournal(const Journal &journal, JsonObject out) {
   out["req"] = journal.requestId;
@@ -596,11 +597,17 @@ inline void encodeJournal(const Journal &journal, JsonObject out) {
     JsonObject report = out["rep"].to<JsonObject>();
     report["rq"] = journal.reportId;
     report["ep"] = journal.reportEpoch;
+    if (journal.reportOut != 0) {
+      report["out"] = journal.reportOut;
+    }
     encodeProgramResult(journal.report, report);
   }
   if (journal.lookDue) {
     JsonObject look = out["look"].to<JsonObject>();
     look["ep"] = journal.lookEpoch;
+    if (journal.lookOut != 0) {
+      look["out"] = journal.lookOut;
+    }
     encodeProgramResult(journal.look, look);
   }
   if (journal.sentEpoch != 0) {
@@ -645,6 +652,7 @@ inline Journal decodeJournal(JsonObjectConst in) {
     journal.reportDue = true;
     journal.reportId = report["rq"].as<uint32_t>();
     journal.reportEpoch = report["ep"].is<uint32_t>() ? report["ep"].as<uint32_t>() : 0;
+    journal.reportOut = report["out"].is<uint32_t>() ? report["out"].as<uint32_t>() : 0;
   } else {
     clearResult(&journal.report);
   }
@@ -652,6 +660,7 @@ inline Journal decodeJournal(JsonObjectConst in) {
   if (!look.isNull() && decodeProgramResult(look, &journal.look)) {
     journal.lookDue = true;
     journal.lookEpoch = look["ep"].is<uint32_t>() ? look["ep"].as<uint32_t>() : 0;
+    journal.lookOut = look["out"].is<uint32_t>() ? look["out"].as<uint32_t>() : 0;
   } else {
     clearResult(&journal.look);
   }
@@ -671,7 +680,10 @@ inline Journal decodeJournal(JsonObjectConst in) {
 // Whether a result of the same request as the one the server keeps, or a look when it keeps a
 // look, came after it. A client sends each one with a later time ("epoch") than the last one it
 // sent (Supervisor::sendEpoch()), whatever its clock did, and has that time in flash before the
-// result goes out (Supervisor::reportSending()). That time as it came, `keptSent` and `newSent`,
+// result goes out (Supervisor::reportSending()). One it sends again, after a restart that came
+// before the Notecard's answer was in flash, goes out with the time it went out with: never
+// later than a result that followed it, which may have gone out while flash took nothing, so the
+// one sent again does not take that one's place. That time as it came, `keptSent` and `newSent`,
 // orders the two while the one kept came with a time the server took: a later one may come with
 // a time reportCheckTime() does not take, as when the server's clock went back by more than a
 // day, and it came later all the same. When the one kept came with a time the server did not take,

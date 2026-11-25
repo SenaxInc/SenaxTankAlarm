@@ -945,8 +945,13 @@ static bool gChargerJournalHeld = false;
 static bool gChargerKeptToRemove = false;
 // The journal kept aside was taken in without the duty it owes a controller, because the journal
 // owed one to another controller (sunsaver::keptDutyLeftOut()): its file stays, and the duty is
-// taken up once none is owed (takeKeptChargerDuty()).
+// taken up once none is owed (takeKeptChargerDuty()), from the journal this start read from that
+// file and the check value of its text, held here until then. Read again then, a file that did
+// not read, or a parse that ran out of memory, would lose the duty for the rest of this run, and
+// a request could run before it.
 static bool gChargerKeptDutyWaits = false;
+static sunsaver::Journal gChargerKeptJournal;
+static uint32_t gChargerKeptCheck = 0;
 // What readChargerJournalFile() found.
 static const uint8_t CHARGER_JOURNAL_READ = 0;    // the file's text
 static const uint8_t CHARGER_JOURNAL_ABSENT = 1;  // no such file
@@ -961,10 +966,20 @@ static bool gChargerProgramReportSeen = false;          // it has been shown on 
 static uint32_t gChargerProgramReportId = 0;            // the request it answers
 static uint32_t gChargerProgramReportAt = 0;            // the millis() it came about
 static uint32_t gChargerProgramReportEpoch = 0;         // that moment as a time, once the clock has one
-// While it has no time, its age is counted in every pass, as a charger report's is (see
-// ageChargerReport()): whole seconds, and the millis() they run to.
-static uint32_t gChargerProgramReportAgeSeconds = 0;
-static uint32_t gChargerProgramReportAgedMillis = 0;
+// The age of each result that waits without a time of its own, counted in every pass as a
+// charger report's is (see ageChargerReport()): whole seconds, and the millis() they run to. The
+// journal keeps two that may both wait, the result of a request and a look (sunsaver::Supervisor),
+// and both are counted, the one that waits behind the other too: counted only once its turn
+// came, its age would be one millis() difference, short by 49.7 days for each turn of millis()
+// it waited. See ageChargerProgramResults().
+struct ChargerResultAge {
+  bool counted;        // a result is counted: the one of `requestId` that came about at `at`
+  uint32_t requestId;  // 0 for the look
+  uint32_t at;         // the supervisor's millis() of it (resultMillis(), lookMillis())
+  uint32_t seconds;
+  uint32_t agedMillis;
+};
+static ChargerResultAge gChargerResultAges[2];          // [0] the result of a request, [1] the look
 static bool gChargerProgramReportTried = false;         // the Notecard did not take it at the last try
 static unsigned long gChargerProgramReportTryMillis = 0;
 
@@ -1589,6 +1604,7 @@ static float readVinDividerVoltage();
 static void checkRelayMomentaryTimeout(unsigned long now);
 static const char *relayTimeUp(uint8_t r, unsigned long now);
 static void switchOffRelaysTimeUp();
+static bool relayTimeRunsOutDuringChargerRun();
 static bool fetchNotecardLocation(float &latitude, float &longitude);
 static void resetRelayForMonitor(uint8_t idx);
 static void initializeClearButton();
@@ -1638,6 +1654,7 @@ static void retakeChargerProgramRequest(JsonObjectConst program);
 static void withdrawUnsuitedChargerProgram();
 static unsigned long sampleIntervalMs();
 static bool chargerRunWouldHoldSample();
+static void takeSampleDueAfterChargerRun();
 static bool serviceChargerProgramming(unsigned long now, bool allowed);
 static void sendDueChargerProgramReport(unsigned long now);
 static void recoverI2CBus();
@@ -2481,7 +2498,7 @@ void loop() {
     // staged.
     const bool othersWant =
         (!chargerCheckHeldBack() && gSolarManager.chargerCheckActive()) ||
-        (!gDfuInProgress && !chargerRunWouldHoldSample() &&
+        (!gDfuInProgress && !chargerRunWouldHoldSample() && !relayTimeRunsOutDuringChargerRun() &&
          gSolarManager.chargerProgrammingWantsLine(currentEpoch()));
     solarPolled = !gSolarTurns.pollWaits(othersWant) && gSolarManager.poll(now);
     gSolarTurns.afterPoll(solarPolled, gSolarManager.lineResting());
@@ -2727,8 +2744,8 @@ void loop() {
   // For sleep durations longer than the watchdog timeout, we sleep in chunks
   // and kick the watchdog between each chunk to prevent a hardware reset.
   // Not after a pass in which charger programming talked to the charger: that held the pass for
-  // up to a minute, and the next one takes a sample that came due meanwhile, and then sends the
-  // run's result (serviceChargerProgramming()).
+  // up to a minute, and the next one sends the run's result. A sample that came due meanwhile was
+  // taken as the run returned (serviceChargerProgramming()).
   if (!programmed) {
     unsigned long sleepMs = getPowerStateSleepMs(gPowerState);
     safeSleep(sleepMs);
@@ -8251,6 +8268,8 @@ static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool 
     Serial.println(line);
     addSerialLog(line);
     gChargerKeptDutyWaits = true;
+    gChargerKeptJournal = kept;
+    gChargerKeptCheck = check;
     saveChargerJournal(journal);  // the kept file stays
     return journal;
   }
@@ -8264,31 +8283,20 @@ static sunsaver::Journal takeKeptChargerJournal(sunsaver::Journal journal, bool 
 
 // The duty of the journal kept aside that this start left out, because the journal owed a duty
 // to another controller (gChargerKeptDutyWaits): taken up in the first pass in which none is owed
-// any more, from the kept file read again, and the file removed once flash holds a journal that
-// says so. A file that does not read then is taken in at the next start.
+// any more, before serviceChargerProgramming() lets a request run, from the journal this start
+// read from the kept file (gChargerKeptJournal), and the file removed once flash holds a journal
+// that says so. Nothing is read again: the handing over cannot fail.
 static void takeKeptChargerDuty() {
   if (!gChargerKeptDutyWaits || gSolarManager.chargerProgramming().dutyOwed()) {
     return;
   }
   gChargerKeptDutyWaits = false;
-  static char buf[sunsaver::JOURNAL_JSON_MAX + 1];
-  if (readChargerJournalFile(CHARGER_JOURNAL_KEPT_FILE, buf, sizeof(buf)) != CHARGER_JOURNAL_READ) {
-    return;
-  }
-  sunsaver::Journal kept;
-  {
-    JsonDocument doc;
-    if (deserializeJson(doc, buf) != DeserializationError::Ok) {
-      return;
-    }
-    kept = sunsaver::decodeJournal(doc.as<JsonObjectConst>());
-  }
-  if (!gSolarManager.takeKeptChargerDuty(kept, keptChargerJournalCheck(buf))) {
-    return;
+  if (!gSolarManager.takeKeptChargerDuty(gChargerKeptJournal, gChargerKeptCheck)) {
+    return;  // cannot happen: no duty is owed, and the kept journal owes one (keptDutyLeftOut())
   }
   char line[96];
   snprintf(line, sizeof(line), "Charger programming: the look a journal kept aside owes charger %u is taken up now",
-           (unsigned)kept.controller);
+           (unsigned)gChargerKeptJournal.controller);
   Serial.println(line);
   addSerialLog(line);
   gChargerKeptToRemove = true;
@@ -8458,7 +8466,8 @@ static unsigned long sampleIntervalMs() {
 // answers), and with it the sampling of the monitors, which also decides their alarms. So the
 // run of a request does not start while the next sample is due within that minute: it starts
 // once that sample has been taken. Samples two minutes apart or less leave no such time, and
-// then a run may hold one up, by a minute at most. A look that a run left owed is not held (the
+// then a run may hold one up, by a minute at most: it is taken as the run returns
+// (takeSampleDueAfterChargerRun()). A look that a run left owed is not held (the
 // charger may wait for its restart), and nothing is held where no sample is due: in hibernation,
 // or without monitors.
 static bool chargerRunWouldHoldSample() {
@@ -8473,6 +8482,21 @@ static bool chargerRunWouldHoldSample() {
   }
   const unsigned long since = millis() - gLastTelemetryMillis;
   return since >= interval || interval - since <= sunsaver::RUN_LIMIT_MS;
+}
+
+// A sample of the monitors that came due while a charger programming run held loop(), taken as
+// soon as the run returns, with the time it returned: so a run holds a sample up by its own time
+// alone (a minute at most), and not by what the rest of that pass does as well. Not in
+// hibernation, and not without monitors, as at the top of loop().
+static void takeSampleDueAfterChargerRun() {
+  if (gPowerState == POWER_STATE_CRITICAL_HIBERNATE || gConfig.monitorCount == 0) {
+    return;
+  }
+  const unsigned long at = millis();
+  if (at - gLastTelemetryMillis >= sampleIntervalMs()) {
+    gLastTelemetryMillis = at;
+    sampleMonitors();
+  }
 }
 
 // Call from every pass of loop(). `allowed` is false in a pass in which a poll talked to the
@@ -8507,22 +8531,27 @@ static bool serviceChargerProgramming(unsigned long now, bool allowed) {
     }
   }
   const bool talked = gSolarManager.serviceChargerProgramming(
-      currentEpoch(), allowed && !gDfuInProgress && !chargerRunWouldHoldSample());
+      currentEpoch(),
+      allowed && !gDfuInProgress && !chargerRunWouldHoldSample() && !relayTimeRunsOutDuringChargerRun());
   if (talked) {
     // The run held loop() for up to a minute, and its hook (switchOffRelaysTimeUp()) does not run
     // after its last request. Before anything is reported, a relay whose time ran out goes off,
     // and what waits for checkRelayMomentaryTimeout() goes out too: the command that switches a
     // remote relay off and the alarm of a safety timeout. Not in hibernation, where loop() does
-    // not call it either.
+    // not call it either. A run does not start while a relay's time would run out before it ends
+    // (relayTimeRunsOutDuringChargerRun()): this is for a run that took longer than its limit, as
+    // a request can take longer than the bus says one may (sunsaver::modbusRequestLimitMs()).
     switchOffRelaysTimeUp();
     if (gPowerState != POWER_STATE_CRITICAL_HIBERNATE) {
       checkRelayMomentaryTimeout(millis());
     }
+    // A sample of the monitors that came due during the run is taken now, before what is left of
+    // this pass: a firmware check, the daily report and the rest of the Notecard's work could
+    // hold it up for some seconds more.
+    takeSampleDueAfterChargerRun();
     // The charger may hold other settings now: check them again, and send that report at once.
     requestChargerCheck();
-    // Its result goes out in the next pass, which loop() begins without a sleep: a sample that
-    // came due during the run is taken first. Sent now, the result and the buffered notes its
-    // send flushes could hold that sample up for as long as the Notecard takes.
+    // Its result goes out in the next pass, which loop() begins without a sleep.
     return true;
   }
   sendDueChargerProgramReport(now);
@@ -8584,12 +8613,46 @@ static void printChargerProgramResult(uint32_t requestId, const sunsaver::Progra
   }
 }
 
+// Counts the age of one result that waits without a time of its own (ChargerResultAge), from the
+// supervisor's millis() of it: a new one starts at 0.
+static void ageChargerProgramResult(ChargerResultAge &age, bool waits, uint32_t requestId, uint32_t at) {
+  if (!waits) {
+    age.counted = false;
+    return;
+  }
+  if (!age.counted || age.requestId != requestId || age.at != at) {
+    age.counted = true;
+    age.requestId = requestId;
+    age.at = at;
+    age.seconds = 0;
+    age.agedMillis = at;
+  }
+  const uint32_t seconds = ((uint32_t)millis() - age.agedMillis) / 1000u;
+  age.seconds += seconds;
+  age.agedMillis += seconds * 1000u;
+}
+
+// The age of both results that may wait, in every pass, before anything that makes one wait, so
+// that no millis() difference comes near a turn of millis() (49.7 days). Taken once, after the
+// device UID or the clock took that long, or after the other result went out first, it would date
+// a result as hours old, and the server could keep an older result of the same request over it.
+// A result with a time of its own needs none (sunsaver::Journal::reportEpoch).
+static void ageChargerProgramResults() {
+  const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  const sunsaver::Journal &journal = programming.journal();
+  ageChargerProgramResult(gChargerResultAges[0], journal.reportDue && journal.reportEpoch == 0, journal.reportId,
+                          programming.resultMillis());
+  ageChargerProgramResult(gChargerResultAges[1], journal.lookDue && journal.lookEpoch == 0, 0,
+                          programming.lookMillis());
+}
+
 // Hands the result that is due to the Notecard, and keeps it due until the Notecard has it:
 // until then it is in the journal in flash too. A newer result takes the place of one that has
 // not gone out yet, unless it answers an older request; a look for no request has a place of its
 // own, and when both wait the one that came about first goes first (sunsaver::Supervisor).
 static void sendDueChargerProgramReport(unsigned long now) {
   const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
+  ageChargerProgramResults();
   if (!programming.reportDue()) {
     return;
   }
@@ -8600,22 +8663,11 @@ static void sendDueChargerProgramReport(unsigned long now) {
     gChargerProgramReportId = requestId;
     gChargerProgramReportAt = resultAt;
     gChargerProgramReportEpoch = 0;
-    gChargerProgramReportAgeSeconds = 0;
-    gChargerProgramReportAgedMillis = resultAt;
     gChargerProgramReportTried = false;
     printChargerProgramResult(requestId, programming.report());
     if (!deviceUidKnown()) {
       Serial.println(F("Charger programming: the result goes out once the Notecard has given this client its device UID"));
     }
-  }
-  // Its age, while it has no time: in every pass, before anything that makes it wait, so that the
-  // millis() difference never comes near a turn of millis() (49.7 days). Taken once, after the
-  // device UID or the clock took that long, it would date the result as hours old, and the server
-  // could keep an older result of the same request over it.
-  if (gChargerProgramReportEpoch == 0) {
-    const uint32_t seconds = ((uint32_t)millis() - gChargerProgramReportAgedMillis) / 1000u;
-    gChargerProgramReportAgeSeconds += seconds;
-    gChargerProgramReportAgedMillis += seconds * 1000u;
   }
   // Under the device label the server takes no note, and the result would count as taken (see
   // sendDueChargerReport()): it waits in the journal for the client's id.
@@ -8628,8 +8680,7 @@ static void sendDueChargerProgramReport(unsigned long now) {
   // of the result, which for a result kept across a restart is the moment of that restart. It
   // goes out later than the last result of the same request did, whatever the clock did since,
   // and from then on it is the result's own (Supervisor::reportSending()): a restart that brings
-  // the result back sends it with that time again (a second later), not with the time of the
-  // restart.
+  // the result back sends it with that time again, not with the time of the restart.
   if (gChargerProgramReportEpoch == 0) {
     uint32_t epoch = programming.reportEpoch();
     if (epoch == 0) {
@@ -8637,8 +8688,9 @@ static void sendDueChargerProgramReport(unsigned long now) {
       if (nowEpoch <= 0.0) {
         return;
       }
-      const double at = nowEpoch - (double)gChargerProgramReportAgeSeconds -
-                        (double)(uint32_t)((uint32_t)millis() - gChargerProgramReportAgedMillis) / 1000.0;
+      const ChargerResultAge &age = gChargerResultAges[requestId == 0 ? 1 : 0];
+      const double at =
+          nowEpoch - (double)age.seconds - (double)(uint32_t)((uint32_t)millis() - age.agedMillis) / 1000.0;
       epoch = at >= 1.0 ? (uint32_t)at : 1u;
     }
     gChargerProgramReportEpoch = programming.sendEpoch(epoch);
@@ -11146,6 +11198,27 @@ static void switchOffRelaysTimeUp() {
       setRelayState(r, false);
     }
   }
+}
+
+// The longest a charger programming run holds loop(): its own limit, and room for the journal it
+// writes as it ends.
+#define CHARGER_RUN_HOLD_MS (sunsaver::RUN_LIMIT_MS + 5000UL)
+
+// Whether the time of a relay that is on runs out before a charger programming run that starts
+// now would end (relayTimeUp()). The run then waits until checkRelayMomentaryTimeout() has
+// switched that relay off, a minute or so at most: within a run, the hook
+// (switchOffRelaysTimeUp()) runs between requests only, and one request can hold loop() for twice
+// the Modbus timeout and more (sunsaver::modbusRequestLimitMs()), about 9 seconds at the longest
+// timeout. Relays go on in loop() alone, never while a run holds it, so no other time runs out
+// during the run.
+static bool relayTimeRunsOutDuringChargerRun() {
+  const unsigned long now = millis();
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    if (gRelayState[r] && relayTimeUp(r, now + CHARGER_RUN_HOLD_MS) != nullptr) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Reset relay for a specific monitor (called from server manual reset command)

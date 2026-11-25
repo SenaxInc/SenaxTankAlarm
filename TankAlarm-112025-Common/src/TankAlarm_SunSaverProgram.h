@@ -1750,9 +1750,12 @@ struct Journal {
   uint32_t reportEpoch;  // when it came about, in whole seconds; while the client's clock was not set,
                          // 0 until it goes out, and then the time it went out with (reportSending())
   ProgramResult report;
+  uint32_t reportOut;    // the time `report` went out with, 0 while it has not gone out: a restart
+                         // before the Notecard has it sends it again with that time (Supervisor::sendEpoch())
   bool lookDue;          // `look` has yet to go to the server: the result of a look for request 0
   uint32_t lookEpoch;    // when it came about, as reportEpoch
   ProgramResult look;
+  uint32_t lookOut;      // the time `look` went out with, as reportOut
   uint32_t sentId;       // the request of the last result that went out (not a look), or goes out now; 0 for none
   uint32_t sentEpoch;    // the time that result went out with, 0 for none
   uint32_t lookSentEpoch;  // the time the last look went out with, 0 for none
@@ -1797,7 +1800,8 @@ inline Journal cautiousJournal() {
 //   - a request that waited, newer than any that `journal` answered: begin() answers it as
 //     interrupted, unless `journal` has one that waits;
 //   - its result that had yet to go out, unless `journal` holds one of the same request or a
-//     newer one, or sent one; and its look, while `journal` has none and sent none;
+//     newer one, or sent one; and its look, while `journal` has none and sent none; each with the
+//     time it went out with, if it had gone out (Journal::reportOut);
 //   - the times its last result and its last look went out with, where they are later: a later
 //     result of the same request, and a later look, go out later still (Supervisor::sendEpoch());
 //   - the time from which its record of the requests answered is whole, where it is later: the
@@ -1826,6 +1830,7 @@ inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
     journal.reportId = kept.reportId;
     journal.reportEpoch = kept.reportEpoch;
     journal.report = kept.report;
+    journal.reportOut = kept.reportOut;
   }
   if (kept.sentId > journal.sentId || (kept.sentId == journal.sentId && kept.sentEpoch > journal.sentEpoch)) {
     journal.sentId = kept.sentId;
@@ -1835,6 +1840,7 @@ inline Journal mergeKeptJournal(Journal journal, const Journal &kept) {
     journal.lookDue = true;
     journal.lookEpoch = kept.lookEpoch;
     journal.look = kept.look;
+    journal.lookOut = kept.lookOut;
   }
   if (kept.lookSentEpoch > journal.lookSentEpoch) {
     journal.lookSentEpoch = kept.lookSentEpoch;
@@ -2180,46 +2186,62 @@ class Supervisor {
   const ProgramResult &report() const { return lookFirst() ? journal_.look : journal_.report; }
   uint32_t reportRequestId() const { return lookFirst() ? 0u : journal_.reportId; }
   uint32_t reportMillis() const { return lookFirst() ? lookMs_ : reportMs_; }
+  // The same moment for each of the two, whichever goes first: the result of a request, and the
+  // look. A client that counts the age of a result while it has no time counts both in every
+  // pass, the one that waits behind the other too.
+  uint32_t resultMillis() const { return reportMs_; }
+  uint32_t lookMillis() const { return lookMs_; }
   uint32_t reportEpoch() const { return lookFirst() ? journal_.lookEpoch : journal_.reportEpoch; }
   // The time to send that result with, given `epoch`, the time it came about: later than the
   // time the last result of the same request went out with (the last look, for a look). The
   // server orders the results of a request by their time, and the looks by theirs: a recovery
   // that settles a run must not read as older than the run's result because the client's clock
-  // was set back in between.
+  // was set back in between. A result that has gone out once (Journal::reportOut, lookOut) goes
+  // out again with the time it went out with, and not a second later: a later result of the same
+  // request went out a second later than it at least, possibly while flash took nothing, and with
+  // the same time the server would take the older one back.
   uint32_t sendEpoch(uint32_t epoch) const {
+    const uint32_t out = lookFirst() ? journal_.lookOut : journal_.reportOut;
+    if (out != 0) {
+      return out;
+    }
     const uint32_t last = lookFirst() ? journal_.lookSentEpoch
                                       : (journal_.sentId == journal_.reportId ? journal_.sentEpoch : 0u);
     return last != 0 && last != 0xFFFFFFFFu && epoch <= last ? last + 1 : epoch;
   }
   // That result is about to go out with the time `sentEpoch` (sendEpoch()). The time goes into the
   // journal first, as the time the last result of its request (the last look, for a look) went
-  // out with: the Notecard may take the result and the client restart before reportTaken() is in
-  // flash, and a later result of the same request, or a later look, must still go out with a later
-  // time. A newer result that takes the place of this one before it goes out keeps that time
-  // too. The result stays due until reportTaken(). A result that came about while the clock was
-  // not set has no time of its own (reportEpoch() is 0): from here on that time is its own, in
-  // the journal with it. A restart before reportTaken() then sends it again with the time it went
-  // out with, a second later (sendEpoch()), and not with the time of that restart: a later
-  // result of the same request, which went out meanwhile and which flash did not take, stays the
-  // later one at the server. Returns false when flash did not take the journal: a restart may
-  // then lose the time, as it would lose the result. Nothing is written when the journal in flash
-  // holds that time already.
+  // out with, and as the time this result went out with (Journal::reportOut, lookOut): the
+  // Notecard may take the result and the client restart before reportTaken() is in flash, and a
+  // later result of the same request, or a later look, must still go out with a later time. A
+  // newer result that takes the place of this one before it goes out goes out later than that
+  // time too. The result stays due until reportTaken(). A result that came about while the clock
+  // was not set has no time of its own (reportEpoch() is 0): from here on that time is its own,
+  // in the journal with it. A restart before reportTaken() then sends it again with the time it
+  // went out with (sendEpoch()), and not with the time of that restart: a later result of the
+  // same request, which went out meanwhile a second later at least and which flash did not
+  // take, stays the later one at the server. Returns false when flash did not take the journal:
+  // a restart may then lose the time, as it would lose the result. Nothing is written when the
+  // journal in flash holds that time already.
   bool reportSending(uint32_t sentEpoch, uint32_t nowMs) {
     if (lookFirst()) {
-      if (journal_.lookSentEpoch == sentEpoch && journal_.lookEpoch != 0 && !journalUnsaved_) {
+      if (journal_.lookSentEpoch == sentEpoch && journal_.lookOut == sentEpoch && journal_.lookEpoch != 0 &&
+          !journalUnsaved_) {
         return true;
       }
       journal_.lookSentEpoch = sentEpoch;
+      journal_.lookOut = sentEpoch;
       if (journal_.lookEpoch == 0) {
         journal_.lookEpoch = sentEpoch;
       }
     } else if (journal_.reportDue) {
-      if (journal_.sentId == journal_.reportId && journal_.sentEpoch == sentEpoch && journal_.reportEpoch != 0 &&
-          !journalUnsaved_) {
+      if (journal_.sentId == journal_.reportId && journal_.sentEpoch == sentEpoch && journal_.reportOut == sentEpoch &&
+          journal_.reportEpoch != 0 && !journalUnsaved_) {
         return true;
       }
       journal_.sentId = journal_.reportId;
       journal_.sentEpoch = sentEpoch;
+      journal_.reportOut = sentEpoch;
       if (journal_.reportEpoch == 0) {
         journal_.reportEpoch = sentEpoch;
       }
@@ -2234,9 +2256,11 @@ class Supervisor {
   void reportTaken(uint32_t sentEpoch, uint32_t nowMs) {
     if (lookFirst()) {
       journal_.lookDue = false;
+      journal_.lookOut = 0;
       journal_.lookSentEpoch = sentEpoch;
     } else if (journal_.reportDue) {
       journal_.reportDue = false;
+      journal_.reportOut = 0;
       journal_.sentId = journal_.reportId;
       journal_.sentEpoch = sentEpoch;
     } else {
@@ -2400,6 +2424,7 @@ class Supervisor {
       // server keeps it apart from the results of requests, and so does the journal.
       journal_.look = result;
       journal_.lookEpoch = epoch;
+      journal_.lookOut = 0;  // it has yet to go out
       journal_.lookDue = true;
       lookMs_ = nowMs;
       return;
@@ -2410,6 +2435,7 @@ class Supervisor {
     journal_.report = result;
     journal_.reportId = requestId;
     journal_.reportEpoch = epoch;
+    journal_.reportOut = 0;  // it has yet to go out
     journal_.reportDue = true;
     reportMs_ = nowMs;
   }

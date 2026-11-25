@@ -3511,12 +3511,14 @@ static void testRequestJson() {
         if (out.reportDue) {
           out.reportId = kRequestId + 300;
           out.reportEpoch = phase == 1 ? 0u : (uint32_t)kClientNow;
+          out.reportOut = phase == 0 ? 0u : (uint32_t)kClientNow + 1 + phase;  // gone out or not
           out.report = refused;
         }
         // A look that waits, and the times the last results went out with, in every mix.
         out.lookDue = phase != 1;
         if (out.lookDue) {
           out.lookEpoch = phase == 0 ? 0u : (uint32_t)kClientNow + 7;
+          out.lookOut = phase == 2 ? 0u : (uint32_t)kClientNow + 9 + phase;
           ss::interruptedResult(&out.look);
           out.look.restart = ss::RESTART_DONE;
           out.look.notes = ss::NOTE_WAS_PENDING;
@@ -3539,6 +3541,11 @@ static void testRequestJson() {
         CHECK_EQ(text.find("lep") != std::string::npos, out.lookSentEpoch != 0);
         CHECK_EQ(text.find("\"kt\"") != std::string::npos, out.keptTaken != 0);
         CHECK_EQ(text.find("\"hf\"") != std::string::npos, out.historyFrom != 0);
+        // The time a result went out with, left out while it has not gone out.
+        CHECK_EQ(text.find("\"out\"") != std::string::npos,
+                 (out.reportDue && out.reportOut != 0) || (out.lookDue && out.lookOut != 0));
+        CHECK_EQ(!file.as<JsonObjectConst>()["rep"]["out"].isNull(), out.reportDue && out.reportOut != 0);
+        CHECK_EQ(!file.as<JsonObjectConst>()["look"]["out"].isNull(), out.lookDue && out.lookOut != 0);
         JsonDocument back = parsed(text);
         const ss::Journal in = ss::decodeJournal(back.as<JsonObjectConst>());
         CHECK_MSG(in.requestId == out.requestId && in.phase == out.phase && in.controller == out.controller &&
@@ -3548,12 +3555,18 @@ static void testRequestJson() {
         if (due == 1) {
           CHECK_EQ(in.reportId, out.reportId);
           CHECK_EQ(in.reportEpoch, out.reportEpoch);
+          CHECK_EQ(in.reportOut, out.reportOut);
           CHECK(sameResult(in.report, refused));
+        } else {
+          CHECK_EQ(in.reportOut, 0u);
         }
         CHECK_EQ(in.lookDue, out.lookDue);
         if (out.lookDue) {
           CHECK_EQ(in.lookEpoch, out.lookEpoch);
+          CHECK_EQ(in.lookOut, out.lookOut);
           CHECK(sameResult(in.look, out.look));
+        } else {
+          CHECK_EQ(in.lookOut, 0u);
         }
         CHECK_EQ(in.sentId, out.sentId);
         CHECK_EQ(in.sentEpoch, out.sentEpoch);
@@ -3565,12 +3578,35 @@ static void testRequestJson() {
     // A look whose result this code cannot read is left out, and the rest still holds; times that
     // are not whole numbers read as none.
     {
-      JsonDocument file = parsed("{\"req\":5,\"ph\":0,\"ans\":9,\"look\":{\"ep\":7,\"v\":99},"
+      JsonDocument file = parsed("{\"req\":5,\"ph\":0,\"ans\":9,\"look\":{\"ep\":7,\"out\":8,\"v\":99},"
                                  "\"srq\":9,\"sep\":-3,\"lep\":\"8\",\"kt\":-1}");
       const ss::Journal in = ss::decodeJournal(file.as<JsonObjectConst>());
       CHECK(!in.lookDue && in.answeredId == 9 && in.phase == ss::JOURNAL_IDLE);
+      CHECK_EQ(in.lookOut, 0u);
       CHECK(in.sentId == 0 && in.sentEpoch == 0 && in.lookSentEpoch == 0);
       CHECK_EQ(in.keptTaken, 0u);
+      // A result and a look that read, with a time they went out with that does not: they are
+      // due as if they had not gone out.
+      for (const char *bad : {"1.5", "\"7\"", "4294967296", "-1", "true", "null", "[8]"}) {
+        ss::Journal due = ss::emptyJournal();
+        due.reportDue = true;
+        due.reportId = kRequestId;
+        due.reportEpoch = (uint32_t)kClientNow;
+        ss::refusedResult(ss::lifepo4Profile(), ss::PROFILE_LVD, ss::REFUSE_PROFILE, &due.report);
+        due.lookDue = true;
+        due.lookEpoch = (uint32_t)kClientNow;
+        ss::interruptedResult(&due.look);
+        JsonDocument doc;
+        ss::encodeJournal(due, doc.to<JsonObject>());
+        doc["rep"]["out"] = serialized(bad);
+        doc["look"]["out"] = serialized(bad);
+        std::string text;
+        serializeJson(doc, text);
+        JsonDocument back = parsed(text);
+        const ss::Journal read = ss::decodeJournal(back.as<JsonObjectConst>());
+        CHECK_MSG(read.reportDue && read.lookDue && read.reportOut == 0u && read.lookOut == 0u, "out %s: %s", bad,
+                  text.c_str());
+      }
       for (const char *kt : {"1.5", "\"7\"", "4294967296", "true"}) {
         JsonDocument other = parsed((std::string("{\"req\":5,\"ph\":0,\"kt\":") + kt + "}").c_str());
         CHECK_MSG(ss::decodeJournal(other.as<JsonObjectConst>()).keptTaken == 0u, "kt %s", kt);
@@ -3625,6 +3661,8 @@ static void testRequestJson() {
       longest.lookDue = true;
       longest.lookEpoch = 0xFFFFFFFFu;
       longest.look = result;
+      longest.reportOut = 0xFFFFFFFFu;
+      longest.lookOut = 0xFFFFFFFFu;
       longest.sentId = 0xFFFFFFFFu;
       longest.sentEpoch = 0xFFFFFFFFu;
       longest.lookSentEpoch = 0xFFFFFFFFu;
@@ -5623,8 +5661,8 @@ static void checkAfterRestart(Desk &desk, const SimSunSaver &fresh, const ss::Pr
 // The time a result goes out with is in flash before it goes out (Supervisor::reportSending()).
 // The Notecard takes a result whose run its recovery could not settle, and the client restarts
 // before the journal says so. The client's clock is then an hour back: the result goes out
-// again, and the recovery that settles the run after it, each later than the one before. A look
-// for no request the same way.
+// again with the time it went out with, and the recovery that settles the run after it, later.
+// A look for no request the same way.
 static void testSendTimeFirst() {
   for (int look = 0; look < 2; ++look) {
     Desk desk;
@@ -5691,16 +5729,16 @@ static void testSendTimeFirst() {
     desk.floorFirst = true;
     ss::Supervisor restarted;
     desk.boot(restarted);
-    CHECK_EQ(desk.reports.size(), 1);  // that result again, later than it went out before
+    CHECK_EQ(desk.reports.size(), 1);  // that result again, with the time it went out with before
     CHECK(desk.reports[0].result.followUp);
-    CHECK_EQ(desk.reports[0].sent, second + 1);
+    CHECK_EQ(desk.reports[0].sent, second);
     CHECK(desk.pass(restarted));  // the recovery that settles the run
     CHECK_EQ(desk.reports.size(), 2);
     CHECK(!desk.reports[1].result.followUp);
     CHECK_EQ(desk.reports[1].requestId, look == 1 ? 0u : kRequestId);
     CHECK(desk.reports[1].epoch != 0 && desk.reports[1].epoch < first);  // by the client's clock
-    CHECK_EQ(desk.reports[1].sent, second + 2);
-    CHECK(look == 1 ? desk.flash.lookSentEpoch == second + 2 : desk.flash.sentEpoch == second + 2);
+    CHECK_EQ(desk.reports[1].sent, second + 1);
+    CHECK(look == 1 ? desk.flash.lookSentEpoch == second + 1 : desk.flash.sentEpoch == second + 1);
     // The server keeps it, though its clock went back more than a day since it took the one before.
     CHECK(ss::resultFollows((double)second, second, 0.0, desk.reports[1].sent));
     CHECK(!restarted.dutyOwed());
@@ -5711,74 +5749,132 @@ static void testSendTimeFirst() {
 // with as its own, in the journal with it (Supervisor::reportSending()). The Notecard does not
 // take it. The recovery that settles the run follows and reaches the Notecard while flash takes
 // nothing, and the client restarts an hour later. The first result comes back from flash and
-// goes out again with its own time, a second later, not with the time of the restart: the server
+// goes out again with the time it went out with, not with the time of the restart: the server
 // keeps the recovery. The client looks again, as its flash says it owes, and that result is the
 // latest. A look for no request the same way.
+//
+// With the client's clock set back an hour before the recovery, the recovery goes out a second
+// after the first result (sendEpoch()), and the first result, sent again, keeps its own time: a
+// second later, it would go out with the recovery's time, and the server would take it back in
+// the recovery's place (the twentieth review). The client restarts a minute later then, its clock
+// still behind: the look it owes goes out with the recovery's time, and takes the place of either.
 static void testReplayKeepsItsTime() {
+  for (int rollback = 0; rollback < 2; ++rollback) {
+    for (int look = 0; look < 2; ++look) {
+      Desk desk;
+      desk.flash = look == 1 ? ss::cautiousJournal() : journalOf(kRequestId, ss::JOURNAL_WRITING);
+      desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+      desk.sim.powered = false;
+      desk.notecardDown = true;  // nothing goes out by itself: this test sends
+      desk.clockSet = false;
+      ss::Supervisor supervisor;
+      desk.boot(supervisor);
+      CHECK(desk.pass(supervisor));  // the look: the controller does not answer
+      CHECK(supervisor.reportDue() && supervisor.report().followUp);
+      CHECK_EQ(supervisor.reportRequestId(), look == 1 ? 0u : kRequestId);
+      CHECK_EQ(supervisor.reportEpoch(), 0u);
+      // The clock comes. The result goes out with the time worked out from millis(), as the client
+      // works it out (sendDueChargerProgramReport()), and the Notecard does not take it.
+      desk.advance(60000);
+      desk.clockSet = true;
+      const double at = desk.clock() - (double)(uint32_t)(desk.millisNow() - supervisor.reportMillis()) / 1000.0;
+      const uint32_t first = supervisor.sendEpoch(at >= 1.0 ? (uint32_t)at : 1u);
+      CHECK(supervisor.reportSending(first, desk.millisNow()));
+      CHECK_EQ(supervisor.reportEpoch(), first);
+      CHECK_EQ(look == 1 ? desk.flash.lookEpoch : desk.flash.reportEpoch, first);
+      CHECK_EQ(look == 1 ? desk.flash.lookOut : desk.flash.reportOut, first);
+      CHECK_EQ(supervisor.sendEpoch(first + 50), first);  // from now on its own time
+      // Once in flash, it is not written again.
+      size_t saves = desk.saves.size();
+      CHECK(supervisor.reportSending(first, desk.millisNow()));
+      CHECK_EQ(desk.saves.size(), saves);
+      // The controller answers again, and flash takes nothing from here: the recovery settles the
+      // run, and its result reaches the Notecard.
+      desk.sim.powered = true;
+      desk.failFrom = desk.saves.size();
+      if (rollback == 1) {
+        desk.epochBase -= 3600.0;
+      }
+      desk.advance(ss::DUTY_RETRY_MS);
+      CHECK(desk.pass(supervisor));
+      CHECK(supervisor.reportDue() && !supervisor.report().followUp);
+      const uint32_t settled = supervisor.sendEpoch(supervisor.reportEpoch());
+      if (rollback == 1) {
+        CHECK(supervisor.reportEpoch() < first);
+        CHECK_EQ(settled, first + 1);
+      } else {
+        CHECK(settled > first + 1);
+      }
+      CHECK(!supervisor.reportSending(settled, desk.millisNow()));
+      CHECK_EQ(look == 1 ? supervisor.journal().lookOut : supervisor.journal().reportOut, settled);
+      supervisor.reportTaken(settled, desk.millisNow());
+      CHECK(!supervisor.reportDue());
+      CHECK(supervisor.journal().reportOut == 0u && supervisor.journal().lookOut == 0u);  // none waits
+      // Flash holds the first result, due, with its time, and the duty.
+      CHECK(look == 1 ? desk.flash.lookDue && desk.flash.lookEpoch == first && desk.flash.lookOut == first
+                      : desk.flash.reportDue && desk.flash.reportEpoch == first && desk.flash.reportOut == first &&
+                            desk.flash.sentEpoch == first);
+      CHECK(desk.flash.phase == ss::JOURNAL_WRITING);
+      // The client restarts an hour later, or a minute later with its clock still an hour back.
+      desk.failFrom = kNever;
+      desk.advance(rollback == 1 ? 60000 : 3600000);
+      desk.notecardDown = false;
+      desk.floorFirst = true;
+      ss::Supervisor restarted;
+      desk.boot(restarted);
+      CHECK_EQ(desk.reports.size(), 1);
+      CHECK(desk.reports[0].result.followUp);
+      CHECK_EQ(desk.reports[0].sent, first);
+      CHECK(!restarted.reportDue());  // the Notecard took it
+      CHECK(restarted.journal().reportOut == 0u && restarted.journal().lookOut == 0u);
+      CHECK(!ss::resultFollows((double)settled, settled, (double)desk.reports[0].sent, desk.reports[0].sent));
+      CHECK(look == 1 || !ss::programResultReplaces(true, kRequestId, (double)settled, settled, kRequestId,
+                                                    (double)desk.reports[0].sent, desk.reports[0].sent));
+      // The look the journal says is owed: the controller restarted already, and it settles again,
+      // no earlier than either.
+      desk.advance(ss::DUTY_RETRY_MS);
+      desk.loopFor(restarted, 2 * ss::DUTY_RETRY_MS);
+      CHECK(!restarted.dutyOwed());
+      CHECK(desk.reports.size() >= 2);
+      CHECK(!desk.reports.back().result.followUp);
+      CHECK(rollback == 1 ? desk.reports.back().sent == settled : desk.reports.back().sent > settled);
+      CHECK(ss::resultFollows((double)settled, settled, (double)desk.reports.back().sent, desk.reports.back().sent));
+      CHECK(look == 1 || ss::programResultReplaces(true, kRequestId, (double)settled, settled, kRequestId,
+                                                   (double)desk.reports.back().sent, desk.reports.back().sent));
+    }
+  }
+  // reportSending() always leaves the time in flash as the one this result went out with, also
+  // where the journal holds it as the last one sent already: the journal of the firmware before,
+  // which kept no such time, for a result and for a look.
   for (int look = 0; look < 2; ++look) {
     Desk desk;
-    desk.flash = look == 1 ? ss::cautiousJournal() : journalOf(kRequestId, ss::JOURNAL_WRITING);
-    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
-    desk.sim.powered = false;
-    desk.notecardDown = true;  // nothing goes out by itself: this test sends
-    desk.clockSet = false;
+    ss::Journal before = ss::emptyJournal();
+    const uint32_t sent = (uint32_t)kClientNow - 120;
+    if (look == 1) {
+      before.lookDue = true;
+      before.lookEpoch = sent;
+      ss::interruptedResult(&before.look);
+      before.lookSentEpoch = sent;
+    } else {
+      before.answeredId = kRequestId;
+      before.reportDue = true;
+      before.reportId = kRequestId;
+      before.reportEpoch = sent;
+      ss::interruptedResult(&before.report);
+      before.sentId = kRequestId;
+      before.sentEpoch = sent;
+    }
+    desk.flash = before;
+    desk.notecardDown = true;
     ss::Supervisor supervisor;
     desk.boot(supervisor);
-    CHECK(desk.pass(supervisor));  // the look: the controller does not answer
-    CHECK(supervisor.reportDue() && supervisor.report().followUp);
-    CHECK_EQ(supervisor.reportRequestId(), look == 1 ? 0u : kRequestId);
-    CHECK_EQ(supervisor.reportEpoch(), 0u);
-    // The clock comes. The result goes out with the time worked out from millis(), as the client
-    // works it out (sendDueChargerProgramReport()), and the Notecard does not take it.
-    desk.advance(60000);
-    desk.clockSet = true;
-    const double at = desk.clock() - (double)(uint32_t)(desk.millisNow() - supervisor.reportMillis()) / 1000.0;
-    const uint32_t first = supervisor.sendEpoch(at >= 1.0 ? (uint32_t)at : 1u);
-    CHECK(supervisor.reportSending(first, desk.millisNow()));
-    CHECK_EQ(supervisor.reportEpoch(), first);
-    CHECK_EQ(look == 1 ? desk.flash.lookEpoch : desk.flash.reportEpoch, first);
-    // Once in flash, it is not written again.
-    size_t saves = desk.saves.size();
-    CHECK(supervisor.reportSending(first, desk.millisNow()));
-    CHECK_EQ(desk.saves.size(), saves);
-    // The controller answers again, and flash takes nothing from here: the recovery settles the
-    // run, and its result reaches the Notecard.
-    desk.sim.powered = true;
-    desk.failFrom = desk.saves.size();
-    desk.advance(ss::DUTY_RETRY_MS);
-    CHECK(desk.pass(supervisor));
-    CHECK(supervisor.reportDue() && !supervisor.report().followUp);
-    const uint32_t settled = supervisor.sendEpoch(supervisor.reportEpoch());
-    CHECK(settled > first + 1);
-    CHECK(!supervisor.reportSending(settled, desk.millisNow()));
-    supervisor.reportTaken(settled, desk.millisNow());
-    CHECK(!supervisor.reportDue());
-    // Flash holds the first result, due, with its time, and the duty.
-    CHECK(look == 1 ? desk.flash.lookDue && desk.flash.lookEpoch == first
-                    : desk.flash.reportDue && desk.flash.reportEpoch == first && desk.flash.sentEpoch == first);
-    CHECK(desk.flash.phase == ss::JOURNAL_WRITING);
-    // The client restarts an hour later.
-    desk.failFrom = kNever;
-    desk.advance(3600000);
-    desk.notecardDown = false;
-    desk.floorFirst = true;
-    ss::Supervisor restarted;
-    desk.boot(restarted);
-    CHECK_EQ(desk.reports.size(), 1);
-    CHECK(desk.reports[0].result.followUp);
-    CHECK_EQ(desk.reports[0].sent, first + 1);
-    CHECK(!ss::resultFollows((double)settled, settled, (double)desk.reports[0].sent, desk.reports[0].sent));
-    CHECK(look == 1 || !ss::programResultReplaces(true, kRequestId, (double)settled, settled, kRequestId,
-                                                  (double)desk.reports[0].sent, desk.reports[0].sent));
-    // The look the journal says is owed: the controller restarted already, and it settles again,
-    // later than either.
-    desk.advance(ss::DUTY_RETRY_MS);
-    desk.loopFor(restarted, 2 * ss::DUTY_RETRY_MS);
-    CHECK(!restarted.dutyOwed());
-    CHECK(desk.reports.size() >= 2);
-    CHECK(!desk.reports.back().result.followUp);
-    CHECK(desk.reports.back().sent > settled);
-    CHECK(ss::resultFollows((double)settled, settled, (double)desk.reports.back().sent, desk.reports.back().sent));
+    CHECK(supervisor.reportDue());
+    CHECK_EQ(supervisor.sendEpoch(sent), sent + 1);  // no time of its own: a second after the last
+    const size_t saves = desk.saves.size();
+    CHECK(supervisor.reportSending(sent, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves + 1);
+    CHECK_EQ(look == 1 ? desk.flash.lookOut : desk.flash.reportOut, sent);
+    CHECK_EQ(supervisor.sendEpoch(sent + 60), sent);
   }
 }
 
@@ -8576,22 +8672,26 @@ static void testKeptJournal() {
     kept.reportDue = true;
     kept.reportId = kRequestId + 3;
     kept.reportEpoch = 1795500100u;
+    kept.reportOut = 1795500150u;  // it had gone out with that time
     kept.report = refused;
     ss::Journal journal = ss::emptyJournal();
     ss::Journal merged = ss::mergeKeptJournal(journal, kept);
     CHECK(merged.reportDue);
     CHECK_EQ(merged.reportId, kRequestId + 3);
     CHECK_EQ(merged.reportEpoch, 1795500100u);
+    CHECK_EQ(merged.reportOut, 1795500150u);
     CHECK_EQ(merged.report.refusals, ss::REFUSE_NOT_LIFEPO4);
     for (int other = -1; other <= 1; ++other) {
       const uint32_t id = (uint32_t)((int64_t)kRequestId + 3 + other);
       journal = ss::emptyJournal();
       journal.reportDue = true;
       journal.reportId = id;
+      journal.reportOut = other == 0 ? 1795500160u : 0u;
       journal.report = looked;
       merged = ss::mergeKeptJournal(journal, kept);
       CHECK_EQ(merged.reportId, other < 0 ? kRequestId + 3 : id);  // a due result of an older request gives way
       CHECK_EQ(merged.report.outcome, other < 0 ? refused.outcome : looked.outcome);
+      CHECK_EQ(merged.reportOut, other < 0 ? 1795500150u : journal.reportOut);  // with its own time
       journal = ss::emptyJournal();
       journal.sentId = id;
       journal.sentEpoch = 1795500200u;
@@ -8638,10 +8738,12 @@ static void testKeptJournal() {
     ss::Journal kept = ss::emptyJournal();
     kept.lookDue = true;
     kept.lookEpoch = 1795500300u;
+    kept.lookOut = 1795500350u;
     kept.look = looked;
     ss::Journal merged = ss::mergeKeptJournal(ss::emptyJournal(), kept);
     CHECK(merged.lookDue);
     CHECK_EQ(merged.lookEpoch, 1795500300u);
+    CHECK_EQ(merged.lookOut, 1795500350u);
     CHECK_EQ(merged.look.outcome, ss::OUTCOME_INTERRUPTED);
     ss::Journal journal = ss::emptyJournal();
     journal.lookSentEpoch = 1795500400u;
@@ -8652,6 +8754,7 @@ static void testKeptJournal() {
     journal.look = refused;
     merged = ss::mergeKeptJournal(journal, kept);
     CHECK_EQ(merged.lookEpoch, 1795500400u);
+    CHECK_EQ(merged.lookOut, 0u);  // its own look has not gone out: the kept one's time stays out
     CHECK_EQ(merged.look.outcome, refused.outcome);
   }
   {
