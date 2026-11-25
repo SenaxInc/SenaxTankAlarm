@@ -929,6 +929,9 @@ static unsigned long gChargerReportAgedMillis = 0;     // as of this millis(): s
 static bool gChargerReportWaited = false;              // it could not go out when its pass ended
 static bool gChargerReportTried = false;               // nothing would take it at the last try
 static unsigned long gChargerReportTryMillis = 0;      // which was then
+// What the server may hold besides the last report that went out: see sendDueChargerReport().
+static uint32_t gChargerReportLastEpoch = 0;           // the time of the last report tried this run, 0 for none
+static bool gChargerReportUnsure = false;              // a try has failed since a report last went out
 
 // Charger programming: a config can ask the client to write a LiFePO4 charging profile and the
 // LVD and LVR into the SunSaver ("solarCharger.program", with the id the server gives a
@@ -8058,8 +8061,13 @@ static void finishChargerCheck(unsigned long endedAt) {
     addSerialLog(line);
   }
 
+  // A pass that finds what the last report that went out held drops a report that still waits:
+  // the server has that one. Not once a try has failed since then: publishNoteToNotecard() does
+  // not tell a note.add whose answer was lost, which the Notecard may have taken and sent on,
+  // from one that never reached it, and the server may then hold the report that was tried. This
+  // pass then reports again, later than that one (see sendDueChargerReport()).
   const bool stale = gChargerReportStale || (endedAt - gChargerReportMillis) >= CHARGER_REPORT_REFRESH_MS;
-  if (!changed && !gChargerReportSyncNow && !stale) {
+  if (!changed && !gChargerReportSyncNow && !stale && !gChargerReportUnsure) {
     gChargerReportDue = false;  // the server has this report
     return;
   }
@@ -8145,7 +8153,20 @@ static void sendDueChargerReport(unsigned long now) {
     ageChargerReport();
     const double checkedAt =
         nowEpoch - (double)gChargerReportAgeSeconds - (double)(millis() - gChargerReportAgedMillis) / 1000.0;
-    gChargerReportEpoch = checkedAt >= 1.0 ? (uint32_t)checkedAt : 1u;  // whole seconds: see below
+    uint32_t epoch = checkedAt >= 1.0 ? (uint32_t)checkedAt : 1u;  // whole seconds: see below
+    // And later than the last report tried this run, which the server may hold. After the
+    // Notecard has set the clock back (syncTimeFromNotecard()), a report from before the clock
+    // is back where it was would be older, and the server would drop it while the client counts
+    // it as sent. It then takes the second after that one, no further off than that one's time
+    // was. Not after a time a day or more ahead of its own: that came from a clock wrong by as
+    // much, which the server does not take as a time (sunsaver::reportCheckTime()), and the
+    // report keeps its own. The time is kept for this run only: the first report after a
+    // restart has its own, which a report dated ahead before it would still outrank.
+    const uint32_t last = gChargerReportLastEpoch;
+    if (epoch <= last && last < 0xFFFFFFFFu && last - epoch < (uint32_t)sunsaver::REPORT_CLOCK_AHEAD_SECONDS) {
+      epoch = last + 1u;
+    }
+    gChargerReportEpoch = epoch;
   }
   if (gChargerReportTried && (now - gChargerReportTryMillis) < CHARGER_REPORT_RETRY_MS) {
     return;
@@ -8159,14 +8180,17 @@ static void sendDueChargerReport(unsigned long now) {
   body["st"] = "chg-check";
   body["epoch"] = gChargerReportEpoch;  // whole seconds: ArduinoJson writes some doubles with 7 digits
   sunsaver::encodeReport(gChargerReportSnapshot, gChargerReportEvaluation, body);
+  gChargerReportLastEpoch = gChargerReportEpoch;  // before the try: one that fails may still get through
   if (!publishNoteToNotecard(CONFIG_ACK_OUTBOX_FILE, doc, gChargerReportSyncNow)) {
-    // The Notecard did not take it. It stays due, with everything that keeps a report from being
-    // sent twice left as it was.
+    // The Notecard did not take it, or took it and its answer was lost. It stays due, with
+    // everything that keeps a report from being sent twice left as it was, and until a report
+    // goes out a pass reports even what the last one that went out held (see finishChargerCheck()).
     if (!gChargerReportTried) {
       Serial.println(F("Charger check: the Notecard did not take the report, trying again every 10 minutes"));
     }
     gChargerReportTried = true;
     gChargerReportTryMillis = now;
+    gChargerReportUnsure = true;
     return;
   }
   if (gChargerReportWaited || gChargerReportTried) {
@@ -8178,6 +8202,7 @@ static void sendDueChargerReport(unsigned long now) {
   gChargerReportMillis = now;
   gChargerReportStale = false;
   gChargerReportSyncNow = false;
+  gChargerReportUnsure = false;  // the newest report the server can hold is this one
 }
 
 // ============================================================================
