@@ -106,6 +106,10 @@ inline double voltsFromRaw(uint16_t raw, uint8_t scale) {
 
 inline double ohmsFromRaw(uint16_t raw) { return (double)raw * 1.263 / 65536.0; }
 
+// EV_tempcomp: the controller uses only its low byte, with the sign implied negative, so a word
+// whose low byte is 0 is compensation off, whatever its high byte holds.
+inline uint16_t tempcompWord(uint16_t raw) { return (uint16_t)(raw & 0x00FFu); }
+
 // Distance from value to the nearest multiple of grid.
 inline double gridDistance(double value, double grid) {
   const double nearest = floor(value / grid + 0.5) * grid;
@@ -548,6 +552,11 @@ inline uint8_t systemVolts(const Snapshot &snapshot) {
 static const double LVD_COMPENSATION_ROOM_VOLTS = 0.30;
 static const double LVD_READING_ROOM_VOLTS = 0.05;
 static const double LOAD_RATED_AMPS = 15.0;
+// The controller works the LVD in effect out in whole words, so at the full compensation its
+// reading can be a word or two below the figure worked out here (0.30 V less at 0.0200 ohm and
+// 15 A, from EV_lvd 3051 with x96.667: V_lvd 2949, which reads 8.6997 V against 8.7006 V). The
+// room below takes in a few words more, so that the right scale is not left out there.
+static const double LVD_ROUNDING_ROOM_VOLTS = 0.01;
 
 // With switch 2 ON the compensation is the stored one (ER_icomp), which can be set far higher.
 // The test below then holds only while that stays within the room at the rated load current,
@@ -598,7 +607,8 @@ inline void judgeLiveScale(const Snapshot &snapshot, uint8_t settingsScale, uint
   uint8_t match = SCALE_UNKNOWN;
   for (uint8_t c = 0; c < SCALE_CANDIDATES; ++c) {
     const double reading = voltsFromRaw(snapshot.raw[I_V_LVD], candidateScale(c));
-    if (reading >= wanted - LVD_COMPENSATION_ROOM_VOLTS * times && reading <= wanted + LVD_READING_ROOM_VOLTS * times) {
+    if (reading >= wanted - (LVD_COMPENSATION_ROOM_VOLTS + LVD_ROUNDING_ROOM_VOLTS) * times &&
+        reading <= wanted + LVD_READING_ROOM_VOLTS * times) {
       ++matches;
       match = candidateScale(c);
     }
@@ -866,7 +876,7 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
   if (lithium) {
     if (!have(snapshot, I_EV_TEMPCOMP)) {
       findings |= FINDING_NOT_READ;
-    } else if (snapshot.raw[I_EV_TEMPCOMP] != 0) {
+    } else if (tempcompWord(snapshot.raw[I_EV_TEMPCOMP]) != 0) {
       findings |= FINDING_TEMPCOMP;
     }
     VoltRange absorb = {0.0, 0.0};
@@ -921,7 +931,9 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
 // a write to the EEPROM the controller charges by the settings it started with until it restarts
 // (see storedSettingsInEffect()). The battery jumper picks the bank and cannot be read, so the
 // lower of the two banks counts. A bank without a float voltage holds the battery at its
-// absorption voltage.
+// absorption voltage. The charger regulates to no more than its ceiling (Evb_ref_lim, which is not
+// compensated; 0 is none), so one below that voltage holds the battery at the ceiling, and a
+// ceiling that was not read could be anywhere.
 //
 // With the scale of the live readings proven the figure is exact. Without it the lower of the
 // two possible readings is returned, so that a battery at its float voltage never reads as
@@ -934,12 +946,16 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
   if (!have(snapshot, I_DIP_SWITCH) || (snapshot.raw[I_DIP_SWITCH] & DIP_CUSTOM_CHARGE) == 0) {
     return 0.0;
   }
-  if (!have(snapshot, I_EV_TEMPCOMP) || snapshot.raw[I_EV_TEMPCOMP] != 0) {
+  if (!have(snapshot, I_EV_TEMPCOMP) || tempcompWord(snapshot.raw[I_EV_TEMPCOMP]) != 0) {
     return 0.0;
   }
   if (!storedSettingsInEffect(snapshot)) {
     return 0.0;
   }
+  if (!have(snapshot, I_EVB_REF_LIM)) {
+    return 0.0;
+  }
+  const uint16_t ceiling = snapshot.raw[I_EVB_REF_LIM];
   const uint8_t absorbItems[2] = {I_EV_REG, I_EV_REG2};
   const uint8_t floatItems[2] = {I_EV_FLOAT, I_EV_FLOAT2};
   double lowest = 0.0;
@@ -948,10 +964,18 @@ inline double floatReferenceVolts(const Snapshot &snapshot, const Evaluation &ev
       return 0.0;
     }
     const uint16_t raw = snapshot.raw[floatItems[bank]] != 0 ? snapshot.raw[floatItems[bank]] : snapshot.raw[absorbItems[bank]];
-    const double volts = voltsFromRaw(raw, scale);
     const Item &entry = item(floatItems[bank]);
+    double volts = voltsFromRaw(raw, scale);
     if (volts < (double)entry.loVolts || volts > (double)entry.hiVolts) {
       return 0.0;  // not a voltage a battery is held at
+    }
+    if (ceiling != 0 && raw > ceiling) {
+      // Both are stored words of one scale. A ceiling below the voltages a battery is held at
+      // says the settings are not what they seem, so nothing is known then either.
+      volts = voltsFromRaw(ceiling, scale);
+      if (volts < (double)entry.loVolts || volts > (double)entry.hiVolts) {
+        return 0.0;
+      }
     }
     if (bank == 0 || volts < lowest) {
       lowest = volts;
@@ -1146,6 +1170,9 @@ inline const char *loadFaultName(uint8_t bit) {
 // A voltage whose scale is not known is shown both ways. settingsScale and liveScale are ScaleIds.
 inline void describeValue(uint8_t index, uint16_t raw, uint8_t settingsScale, uint8_t liveScale, Text *out) {
   const Item &entry = item(index);
+  if (entry.kind == KIND_TEMPCO) {
+    raw = tempcompWord(raw);
+  }
   if ((entry.flags & ITEM_ZERO_IS_OFF) != 0 && raw == 0) {
     out->add("0 (off)");
     return;

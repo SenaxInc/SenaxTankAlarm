@@ -1542,6 +1542,7 @@ static void requestChargerCheck();
 static bool chargerCheckHeldBack();
 static void serviceChargerCheck(unsigned long now, bool lineFree);
 static void finishChargerCheck(unsigned long now);
+static bool deviceUidKnown();
 static void sendDueChargerReport(unsigned long now);
 static void recoverI2CBus();
 static void logI2CRecoveryEvent(I2CRecoveryTrigger trigger);
@@ -7408,6 +7409,10 @@ static void requestChargerCheck() {
   gChargerCheckFailures = 0;
   gSolarManager.cancelChargerCheck();  // a pass under way would be judged against the old config
   gChargerReportDue = false;           // so was a report that still waits to go out
+  // And so was the float voltage the no-charge alert takes from the last pass: the charger may
+  // have been set up for the new battery. The alert goes back to its default until a pass
+  // completes again.
+  gSolarManager.setFloatReference(0.0f);
 }
 
 // Not while a firmware update is being staged, and not in hibernation: the check can wait.
@@ -7540,6 +7545,17 @@ static void finishChargerCheck(unsigned long endedAt) {
   if (currentEpoch() <= 0.0) {
     Serial.println(F("Charger check: the report goes out once the clock is set"));
   }
+  if (!deviceUidKnown()) {
+    Serial.println(F("Charger check: the report goes out once the Notecard has given this client its device UID"));
+  }
+}
+
+// The client's id is the Notecard's device UID ("dev:..."), once the Notecard has given it at this
+// start or the config kept it from an earlier one. Until then gDeviceUID holds the device label,
+// and the server takes no note under that (its isValidClientUid()). checkNotecardHealth() asks
+// the Notecard again.
+static bool deviceUidKnown() {
+  return strncmp(gDeviceUID, "dev:", 4) == 0;
 }
 
 // Hands the report that is due to the Notecard, and keeps it due until that has worked. Not to
@@ -7548,6 +7564,12 @@ static void finishChargerCheck(unsigned long endedAt) {
 // but the first pass after it reports again, whatever it finds.
 static void sendDueChargerReport(unsigned long now) {
   if (!gChargerReportDue) {
+    return;
+  }
+  // Sent under the device label, the report would count as sent while the server drops it, and
+  // an unchanged one would not go again for a week: it waits for the client's id.
+  if (!deviceUidKnown()) {
+    gChargerReportWaited = true;
     return;
   }
   // The server keeps the newest report by the time of the check, so a report does not go out
@@ -9073,9 +9095,12 @@ static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool
     return kept;
   }
 
-  JAddStringToObject(req, "file", fileName);
+  // note-c leaves out a member it has no memory for, and says so only in what it returns. A
+  // note.add without "file" goes to data.qo, which nothing reads, and one without "body" carries
+  // nothing, while the Notecard takes either: such a request is not sent.
+  bool whole = JAddStringToObject(req, "file", fileName) != nullptr;
   if (syncNow) {
-    JAddBoolToObject(req, "sync", true);
+    whole = JAddBoolToObject(req, "sync", true) != nullptr && whole;
   }
 
   J *body = JParse(buffer);
@@ -9090,7 +9115,14 @@ static bool sendNote(const char *fileName, JsonDocument &doc, bool syncNow, bool
   // _sv is already present in the serialized payload (stamped into doc above), so no
   // post-serialization stamp is needed here.
 
-  JAddItemToObject(req, "body", body);
+  JAddItemToObject(req, "body", body);  // which frees the body when it cannot be added
+  if (!whole || JGetObject(req, "body") == nullptr) {
+    Serial.println(F("publishNote: out of memory while the request was made"));
+    JDelete(req);
+    const bool kept = mayBuffer && bufferNoteForRetry(fileName, buffer, syncNow);
+    if (dynamicBuf) free(dynamicBuf);
+    return kept;
+  }
 
 #ifdef TANKALARM_WATCHDOG_AVAILABLE
   // Kick watchdog before the potentially long-blocking I2C transaction
@@ -9311,9 +9343,10 @@ static void flushBufferedNotes() {
         fprintf(tmp, "%s\n", lineBuffer);
         continue;
       }
-      JAddStringToObject(req, "file", fileName);
+      // A request that is not whole (see sendNote()) is not sent, and the note stays.
+      bool whole = JAddStringToObject(req, "file", fileName) != nullptr;
       if (syncNow) {
-        JAddBoolToObject(req, "sync", true);
+        whole = JAddBoolToObject(req, "sync", true) != nullptr && whole;
       }
 
       J *body = JParse(payload);
@@ -9322,6 +9355,13 @@ static void flushBufferedNotes() {
         continue;
       }
       JAddItemToObject(req, "body", body);
+      if (!whole || JGetObject(req, "body") == nullptr) {
+        JDelete(req);
+        wroteFailures = true;
+        *tab1 = '\t'; *tab2 = '\t';  // restore tabs for re-serialization
+        fprintf(tmp, "%s\n", lineBuffer);
+        continue;
+      }
 
       J *addRsp = notecard.requestAndResponse(req);
       if (!addRsp) {
@@ -9425,9 +9465,10 @@ static void flushBufferedNotes() {
         tmp.println(lineBuffer);
         continue;
       }
-      JAddStringToObject(req, "file", fileName);
+      // A request that is not whole (see sendNote()) is not sent, and the note stays.
+      bool whole = JAddStringToObject(req, "file", fileName) != nullptr;
       if (syncNow) {
-        JAddBoolToObject(req, "sync", true);
+        whole = JAddBoolToObject(req, "sync", true) != nullptr && whole;
       }
 
       J *body = JParse(payload);
@@ -9436,6 +9477,13 @@ static void flushBufferedNotes() {
         continue;
       }
       JAddItemToObject(req, "body", body);
+      if (!whole || JGetObject(req, "body") == nullptr) {
+        JDelete(req);
+        wroteFailures = true;
+        *tab1 = '\t'; *tab2 = '\t';  // restore tabs for re-serialization
+        tmp.println(lineBuffer);
+        continue;
+      }
 
       J *addRsp = notecard.requestAndResponse(req);
       if (!addRsp) {
