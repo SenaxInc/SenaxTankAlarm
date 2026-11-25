@@ -13292,7 +13292,8 @@ static void chargerReportsRead() {
 // in RAM, and saveChargerReportsIfDirty() reads the file again every CHARGER_REPORTS_RETRY_MS.
 // Such a later read takes a report only for a client the metadata held at the start
 // (chargerReportUnread), so that one removed since does not come back, also when it was added
-// again, and only when it is newer than the one this server took since. A file that can never be
+// again, and only when the one this server took since would not have replaced it: by the time of
+// the check, and on a tie the later to arrive (reportReplaces()). A file that can never be
 // read (empty, too large, not a list of reports) is kept as CHARGER_REPORTS_PATH ".bad", and the
 // reports start afresh. Without the metadata cache read whole the file is not read at all: no
 // report could find its client, and a write would drop them all.
@@ -13371,8 +13372,8 @@ static void loadChargerReports() {
       continue;
     }
     const double checkedAt = obj["e"] | 0.0;
-    if (!sunsaver::reportReplaces(meta->chargerReportValid, meta->chargerReportEpoch, checkedAt)) {
-      continue;  // the one that came in since is newer, and is due to be written
+    if (meta->chargerReportValid && sunsaver::reportReplaces(true, checkedAt, meta->chargerReportEpoch)) {
+      continue;  // the one that came in since would have replaced it, and is due to be written
     }
     meta->chargerReportValid = true;
     meta->chargerReportEpoch = checkedAt;
