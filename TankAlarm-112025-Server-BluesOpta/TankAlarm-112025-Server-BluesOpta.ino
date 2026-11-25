@@ -2713,11 +2713,11 @@ static void reconcileClientOta(ClientMetadata *meta, double now);
 static void noteClientFirmwareAndReconcile(const char *clientUid, const char *fwVer, double epoch);
 static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, double now);
 static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now);
-static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc, double now);
+static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc);
 static void handleChargerGet(EthernetClient &client, const String &query);
 // What configuredChargerChemistry() could tell.
 enum ConfigChemistry : uint8_t {
-  CONFIG_CHEMISTRY_NONE = 0,  // no config, or one that names no battery type
+  CONFIG_CHEMISTRY_NONE = 0,  // no config, or one that names no battery type and leaves monitoring on
   CONFIG_CHEMISTRY_KNOWN,     // the chemistry is set
   CONFIG_CHEMISTRY_NO_MEMORY  // the config could not be read for lack of memory
 };
@@ -12812,7 +12812,7 @@ static void handleOtaResult(const char *clientUid, const char *status, JsonDocum
 // rules are in TankAlarm_SunSaverReport.h and TankAlarm_SunSaverSettings.h (Common library),
 // shared with the client and tested in tests/host/sunsaver_settings.
 
-static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc, double now) {
+static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc) {
   if (strcmp(status, "chg-check") != 0) {
     return;  // a report of a newer client, which this server has no use for
   }
@@ -12833,11 +12833,14 @@ static void handleChargerReport(const char *clientUid, const char *status, JsonD
   // older one must not replace a newer one. A report without a time, or with one that is plainly
   // wrong, keeps 0 for "not known" and replaces only another such report (see reportCheckTime()).
   // A client of this firmware sends no report without a time: it waits for its clock.
-  const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, now);
-  // The time of the report held is judged again, by this server's clock now: one that came while
-  // the clock was not set can be more than a day ahead of it, and would rank above every report
-  // after it.
-  const double heldAt = sunsaver::reportCheckTime(meta->chargerReportEpoch, currentEpoch());
+  //
+  // Both are judged by this server's clock, not by the time the note carries: that is the
+  // clock of the Notecard that sent it, and a report whose time is days ahead with it would
+  // pass and rank above every report after it. The time of the report held is judged again:
+  // one that came while the clock was not set can be more than a day ahead of it.
+  const double serverNow = currentEpoch();
+  const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, serverNow);
+  const double heldAt = sunsaver::reportCheckTime(meta->chargerReportEpoch, serverNow);
   if (!sunsaver::reportReplaces(meta->chargerReportValid, heldAt, checkedAt)) {
     Serial.print(F("Charger check from "));
     Serial.print(clientUid);
@@ -12915,16 +12918,19 @@ static void handleChargerGet(EthernetClient &client, const String &query) {
 
 // The chemistry that the battery type in the config this server holds for a client is judged as,
 // as the client judges it (sunsaver::chemistryForBatteryType()). A config that waits to be sent,
-// or that the client turned down, counts as well: it is the one the config page shows. NONE when
-// there is no config, or it names no battery type: the client then keeps the battery it had,
-// which is not known here. NO_MEMORY when the config could not be read: a caller that shows a
-// verdict answers with an error then, as it does when its own document runs out.
+// or that the client turned down, counts as well: it is the one the config page shows. One that
+// switches battery monitoring off ("enabled": false) is judged as no battery, whatever its type
+// says, as the client judges it. NONE when there is no config, or it names no battery type and
+// does not switch the monitoring off: the client then keeps the battery it had, which is not
+// known here. NO_MEMORY when the config could not be read: a caller that shows a verdict answers
+// with an error then, as it does when its own document runs out.
 static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *config, uint8_t *chemistry) {
   if (!config || config->payload[0] == '\0') {
     return CONFIG_CHEMISTRY_NONE;
   }
   JsonDocument filter;
   filter["batteryConfig"]["batteryType"] = true;
+  filter["batteryConfig"]["enabled"] = true;
   if (filter.overflowed()) {
     return CONFIG_CHEMISTRY_NO_MEMORY;  // a filter cut short would keep nothing
   }
@@ -12935,6 +12941,12 @@ static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *co
   }
   if (error != DeserializationError::Ok) {
     return CONFIG_CHEMISTRY_NONE;
+  }
+  // The client reads the flag as true unless it is the boolean false.
+  JsonVariantConst enabled = cfg["batteryConfig"]["enabled"];
+  if (enabled.is<bool>() && !enabled.as<bool>()) {
+    *chemistry = sunsaver::CHEMISTRY_NOT_JUDGED;
+    return CONFIG_CHEMISTRY_KNOWN;
   }
   JsonVariantConst type = cfg["batteryConfig"]["batteryType"];
   if (!type.is<int>()) {
@@ -17174,7 +17186,7 @@ static void handleConfigAck(JsonDocument &doc, double epoch) {
   }
   // So do the reports about the client's SunSaver MPPT, under "chg-".
   if (strncmp(status, "chg-", 4) == 0) {
-    handleChargerReport(clientUid, status, doc, (epoch > 0.0) ? epoch : currentEpoch());
+    handleChargerReport(clientUid, status, doc);  // judged by this server's clock
     return;
   }
 
