@@ -1389,6 +1389,11 @@ bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
   return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
 }
 
+bool SolarManager::bindChargerDuty(uint8_t controller) {
+  // In every build: what the journal says is owed stays in it, for a build that can settle it.
+  return _programming.bindDuty(controller, (uint32_t)millis());
+}
+
 void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
   _programming.reportTaken(sentEpoch, (uint32_t)millis());
 }
@@ -1519,6 +1524,9 @@ bool SolarManager::requestChargerProgram(uint32_t requestId, const sunsaver::Pro
 }
 bool SolarManager::withdrawChargerProgram(uint32_t refusals, double epochNow) {
   return _programming.withdraw(refusals, epochNow, (uint32_t)millis());
+}
+bool SolarManager::bindChargerDuty(uint8_t controller) {
+  return _programming.bindDuty(controller, (uint32_t)millis());
 }
 void SolarManager::chargerProgramReportTaken(uint32_t sentEpoch) {
   _programming.reportTaken(sentEpoch, (uint32_t)millis());

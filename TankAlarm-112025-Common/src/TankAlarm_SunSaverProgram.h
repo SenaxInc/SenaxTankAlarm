@@ -2115,6 +2115,25 @@ class Supervisor {
     return true;
   }
 
+  // The client's config is about to name another controller than `controller`, the one it named
+  // until now. A duty owed to no controller that the journal names (cautiousJournal(): a start
+  // that could not tell what its journal held) goes to the one the config names at each try
+  // (controllerToUse()), and stands for a run that talked to the one named then. A look at the
+  // other one would settle it without asking the controller that may wait for its restart, so the
+  // duty is bound to `controller` here, as a duty whose run the journal knows is. The controller's
+  // read function is not known: the port finds out (readFunctionToUse()). The journal is written:
+  // whether flash took it, journalUnsaved() says. Returns false, and does nothing, when no duty is
+  // owed, the journal names its controller already, or `controller` is 0.
+  bool bindDuty(uint8_t controller, uint32_t nowMs) {
+    if (!dutyOwed() || journal_.controller != 0 || controller == 0) {
+      return false;
+    }
+    journal_.controller = controller;
+    journal_.readFunction = 0;
+    saveJournal(nowMs);
+    return true;
+  }
+
   // A config carried a request. `profileErrors` is what readProfile() found, `clientRefusals`
   // the Refusal bits the client found by itself (REFUSE_NOT_BUILT, REFUSE_NOT_LIFEPO4,
   // REFUSE_NO_CHARGER). `askedAt` is the server's time when it was asked for (readRequestAt()),

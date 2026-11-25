@@ -6226,6 +6226,119 @@ static void testKeptDuty() {
   }
 }
 
+static void testBindDuty() {
+  // bindDuty(): only a duty owed to no controller that the journal names, and only to a controller.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);  // nothing owed
+    CHECK(!supervisor.bindDuty(1, desk.millisNow()));
+    CHECK(desk.saves.empty());
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_RESTARTING);
+    desk.flash.controller = 7;
+    desk.boot(supervisor);  // owed to controller 7, which the journal names
+    const size_t saves = desk.saves.size();
+    CHECK(!supervisor.bindDuty(1, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves);
+    CHECK_EQ(supervisor.journal().controller, 7);
+    CHECK_EQ(supervisor.controllerToUse(2), 7);
+  }
+  // The twenty-ninth review's case: a start could not read its journal, so the look is owed to
+  // the controller the config names, 1, which does not answer. A config names controller 2 now:
+  // unbound, the look would go to 2 and settle the duty without asking 1. Bound to 1, it goes to
+  // 1 on its timetable, and the duty stays owed until 1 answers, then sends the restart its
+  // pending edit waits for.
+  {
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.sim.powered = false;  // controller 1
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(supervisor.journal().controller, 0);
+    CHECK_EQ(supervisor.controllerToUse(1), 1);
+    CHECK_EQ(supervisor.controllerToUse(2), 2);  // unbound: whichever the config names
+    CHECK(!supervisor.bindDuty(0, desk.millisNow()));
+    const size_t saves = desk.saves.size();
+    CHECK(supervisor.bindDuty(1, desk.millisNow()));
+    CHECK_EQ(desk.saves.size(), saves + 1);
+    CHECK(!supervisor.journalUnsaved());
+    CHECK_EQ(supervisor.journal().controller, 1);
+    CHECK_EQ(supervisor.journal().readFunction, 0);
+    CHECK_EQ(desk.flash.controller, 1);  // in flash
+    CHECK_EQ(desk.flash.phase, ss::JOURNAL_WRITING);
+    CHECK_EQ(desk.flash.historyFrom, ss::HISTORY_FROM_UNKNOWN);  // and nothing else of it changed
+    CHECK(!supervisor.bindDuty(2, desk.millisNow()));  // bound once
+    CHECK_EQ(supervisor.journal().controller, 1);
+    CHECK_EQ(supervisor.controllerToUse(2), 1);
+    CHECK_EQ(supervisor.readFunctionToUse(2, MB_FC_READ_INPUT), 0);  // not known: the port finds out
+    // The client polls controller 2 now, which answers. The look goes to 1, as the client's port
+    // for it does (controllerToUse()), without waiting for a poll of 1.
+    desk.configured = 2;
+    desk.bus.slave = supervisor.controllerToUse(2);
+    CHECK(supervisor.mayTalk(desk, desk.line()));
+    CHECK(desk.pass(supervisor));
+    CHECK(supervisor.dutyOwed());
+    CHECK(!desk.bus.log.empty());
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK((desk.reports.back().result.notes & ss::NOTE_NOT_ANSWERED) != 0);
+    CHECK(desk.reports.back().result.followUp);
+    CHECK_EQ(desk.flash.controller, 1);
+    // A restart of the client keeps it bound.
+    desk.boot(supervisor);
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(supervisor.controllerToUse(2), 1);
+    // Controller 1 answers again: the next try settles it.
+    desk.sim.powered = true;
+    desk.bus.slave = supervisor.controllerToUse(2);
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_RETRY_MS + 1000, 1000), 1);
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.sim.resets, 1);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(desk.reports.back().result.notes & ss::NOTE_NOT_ANSWERED, 0);
+    CHECK(!desk.reports.back().result.followUp);
+    CHECK_EQ(supervisor.controllerToUse(2), 2);  // settled: the controller the config names
+  }
+  // A journal that names no controller but holds a read function (written by hand, say): bound,
+  // the function is not taken for the bound controller's, and the port finds out.
+  {
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    desk.flash.readFunction = MB_FC_READ_HOLDING;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(supervisor.dutyOwed());
+    CHECK_EQ(supervisor.readFunctionToUse(1, MB_FC_READ_INPUT), MB_FC_READ_INPUT);
+    CHECK(supervisor.bindDuty(1, desk.millisNow()));
+    CHECK_EQ(supervisor.journal().readFunction, 0);
+    CHECK_EQ(desk.flash.readFunction, 0);
+    CHECK_EQ(supervisor.readFunctionToUse(2, MB_FC_READ_INPUT), 0);
+  }
+  // Flash does not take the journal that binds it: the binding holds in RAM, journalUnsaved()
+  // says so, and maintain() writes it once flash takes it.
+  {
+    Desk desk;
+    desk.flash = ss::cautiousJournal();
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.failSaves = 1;
+    CHECK(supervisor.bindDuty(1, desk.millisNow()));
+    CHECK(supervisor.journalUnsaved());
+    CHECK_EQ(supervisor.journal().controller, 1);
+    CHECK_EQ(desk.flash.controller, 0);
+    CHECK_EQ(supervisor.controllerToUse(2), 1);
+    supervisor.maintain(desk.millisNow());
+    CHECK(supervisor.journalUnsaved());  // not before JOURNAL_RETRY_MS
+    desk.advance(ss::JOURNAL_RETRY_MS);
+    supervisor.maintain(desk.millisNow());
+    CHECK(!supervisor.journalUnsaved());
+    CHECK_EQ(desk.flash.controller, 1);
+  }
+}
+
 static void testWantsPass() {
   // A request waits for a poll that answered; so does a duty owed to the controller the config
   // names. A duty owed to another one does not, and neither does one while no poll runs.
@@ -9126,6 +9239,7 @@ int main() {
   testWantsLine();
   testHistoryLost();
   testKeptDuty();
+  testBindDuty();
   testWantsPass();
   testSendTimeFirst();
   testReplayKeepsItsTime();

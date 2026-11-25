@@ -516,6 +516,11 @@ public:
   // waits.
   bool withdrawChargerProgram(uint32_t refusals, double epochNow);
 
+  // The config is about to name another charger than `controller`: a duty owed to no controller
+  // that the journal names is bound to that one (see sunsaver::Supervisor::bindDuty()). Returns
+  // whether it was. Whether flash took the journal: chargerProgramming().journalUnsaved().
+  bool bindChargerDuty(uint8_t controller);
+
   // Call from every pass of loop(), whether the charger is enabled or not: a request that waits
   // runs out of time here too. `allowed` is false while the client must not talk to the
   // controller (a firmware update is being staged, or a poll has just talked to it). Nothing is
