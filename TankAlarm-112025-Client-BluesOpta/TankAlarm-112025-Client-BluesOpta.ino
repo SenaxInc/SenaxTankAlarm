@@ -843,9 +843,11 @@ struct MonitorRuntime {
   float currentSensorVoltage;   // Raw sensor reading in volts (for analog voltage sensors)
   double lastReadingEpoch;      // Epoch when current reading was actually acquired
   bool sampleReused;            // True when this cycle reused the previous reading
-  bool sampleStandsIn;          // True when this cycle's reading is a pulse monitor's from before a
-                                // charger programming run: neither a measurement nor a failed read
+  bool sampleBeforeRun;         // True when this cycle's reading is a pulse monitor's from before a
+                                // charger programming run: not taken for an unload
                                 // (readPulseSensor(), sampleMonitors())
+  bool sampleStandsIn;          // And neither a measurement nor a failed read: not validated either,
+                                // until a count that started after the run has ended
   bool lastLoopPowerOk;        // result of the last loop power-up (v2.1.0: DAC loop-power config)
   bool clipSuspected;           // v2.1.3: last mA reading may be supply-voltage clipped (see assessLoopClipping)
   float lastSupplyVoltage;      // v2.1.3: loop supply voltage used for the clip assessment (0 = unknown)
@@ -1226,6 +1228,10 @@ static bool gRpmAccumulatedCutByRun[MAX_MONITORS] = {false};
 // the run measures something: the monitor reads as before the run, and that reading is not a new
 // measurement (readPulseSensor()).
 static bool gRpmReadingBeforeRun[MAX_MONITORS] = {false};
+// While that mark holds, a count of the time between two pulses that started after the run saw no
+// second one. The reading is still the one from before the run, but it is validated from here on,
+// as such a count's reading is without a run (readPulseSensor()).
+static bool gRpmTimedOutAfterRun[MAX_MONITORS] = {false};
 
 // Atomic access helpers for volatile pulse counter (protects against future interrupt use)
 // On 32-bit ARM (Cortex-M7 in STM32H747XI), 32-bit aligned reads/writes are atomic,
@@ -1967,6 +1973,7 @@ void setup() {
     gMonitorState[i].currentSensorVoltage = 0.0f;
     gMonitorState[i].lastReadingEpoch = 0.0;
     gMonitorState[i].sampleReused = false;
+    gMonitorState[i].sampleBeforeRun = false;
     gMonitorState[i].sampleStandsIn = false;
     gMonitorState[i].lastReportedValue = -9999.0f;
     gMonitorState[i].lastDailySentValue = -9999.0f;
@@ -6578,13 +6585,23 @@ static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx) {
   // measurement (restartPulseCountsAfterChargerRun()). Nor is a result that only stands in for one
   // (resultStandsIn): that of the count the run cut into, and that of a count of the time between
   // two pulses that saw no second one, which is the reading from before the run again.
-  // sampleMonitors() neither validates such a reading nor takes it for an unload (sampleStandsIn).
+  // sampleMonitors() does not take such a reading for an unload (sampleBeforeRun), nor validate it
+  // (sampleStandsIn) until a count that started after the run has ended. Every count of the time
+  // between two pulses that ends while the mark holds started after the run (the run's count was
+  // started again), and from the first that saw no second pulse on, the reading is validated, as a
+  // time-out's reading is without a run: a sensor that gives no pulses any more is found stuck as
+  // it would be without the run, and does not hide behind the mark for good.
   if (gRpmReadingBeforeRun[idx]) {
     if (pctx.resultReady && !pctx.resultStandsIn) {
       gRpmReadingBeforeRun[idx] = false;
+      gRpmTimedOutAfterRun[idx] = false;
     } else {
+      if (pctx.resultReady && pctx.useTimeBased) {
+        gRpmTimedOutAfterRun[idx] = true;
+      }
       gMonitorState[idx].sampleReused = true;
-      gMonitorState[idx].sampleStandsIn = true;
+      gMonitorState[idx].sampleBeforeRun = true;
+      gMonitorState[idx].sampleStandsIn = !gRpmTimedOutAfterRun[idx];
     }
   }
 
@@ -6603,6 +6620,7 @@ static float readMonitorSensor(uint8_t idx) {
 
   // Default to fresh each cycle; specific sensor paths mark reuse when needed.
   gMonitorState[idx].sampleReused = false;
+  gMonitorState[idx].sampleBeforeRun = false;
   gMonitorState[idx].sampleStandsIn = false;
 
   const MonitorConfig &cfg = gConfig.monitors[idx];
@@ -6661,7 +6679,9 @@ static void sampleMonitors() {
       // A pulse monitor's reading from before a charger programming run (readPulseSensor()): no new
       // measurement, and no failed read either. It is not validated, so it counts towards no stuck
       // sensor, no failure and no recovery, and the last valid value stands. Marked reused, it
-      // keeps its time and evaluateAlarms() holds its counters; the unload is not evaluated.
+      // keeps its time and evaluateAlarms() holds its counters; the unload is not evaluated
+      // (sampleBeforeRun). Once a count that started after the run has timed out, such a reading
+      // is validated below as any other, still marked reused and not taken for an unload.
       inches = gMonitorState[i].currentValue;
     } else if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
@@ -6677,7 +6697,7 @@ static void sampleMonitors() {
     if (!deferPublishes) {
       // No current-loop monitor present: keep the original interleaved evaluate + publish.
       evaluateAlarms(i);
-      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleStandsIn) {
+      if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleBeforeRun) {
         evaluateUnload(i);
       }
       if (gConfig.monitors[i].enableServerUpload && !gMonitorState[i].sensorFailed) {
@@ -6708,7 +6728,7 @@ static void sampleMonitors() {
 
     // Evaluate tank unload if tracking is enabled for this tank (not for a pulse monitor's reading
     // from before a charger programming run, see Phase A)
-    if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleStandsIn) {
+    if (gConfig.monitors[i].trackUnloads && !gMonitorState[i].sensorFailed && !gMonitorState[i].sampleBeforeRun) {
       evaluateUnload(i);
     }
 
@@ -8632,8 +8652,10 @@ static bool chargerRunWouldHoldSample() {
 // Until a count that started after the run measures something (a count of the time between two
 // pulses that sees no second one gives the last reading again), the monitor reads as before the
 // run, and that reading is marked reused, as one that is not a new measurement: it neither latches
-// nor clears an alarm, counts towards no stuck sensor, failure or recovery and no unload, and does
-// not count as a reading taken now (readPulseSensor(), sampleMonitors()).
+// nor clears an alarm, counts towards no unload, and does not count as a reading taken now. Until
+// a count that started after the run has ended, it counts towards no stuck sensor, failure or
+// recovery either; from a count of the time between two pulses that saw no second one on, it does,
+// as without the run (readPulseSensor(), sampleMonitors()).
 // takeSampleDueAfterChargerRun() calls this only after a run that held up a sample: one that held
 // up none took no such moment.
 static void restartPulseCountsAfterChargerRun() {
@@ -8644,11 +8666,13 @@ static void restartPulseCountsAfterChargerRun() {
     PulseSamplerContext &ctx = gPulseSampler[i];
     if (ctx.useAccumulatedMode) {
       gRpmAccumulatedCutByRun[i] = true;
-      gRpmReadingBeforeRun[i] = true;
     } else if (ctx.state == PULSE_STATE_SAMPLING) {
       ctx.state = PULSE_STATE_IDLE;  // readPulseSensor() starts it again
-      gRpmReadingBeforeRun[i] = true;
+    } else {
+      continue;  // the run cut into no count
     }
+    gRpmReadingBeforeRun[i] = true;
+    gRpmTimedOutAfterRun[i] = false;  // it stands in again until a count after this run has ended
   }
 }
 

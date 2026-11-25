@@ -510,10 +510,12 @@ public:
   // run that was cut short goes to the controller that run talked to, whatever the config names
   // now, and is made on its own timetable when no poll speaks for that controller: with the
   // charger off in the config, the link is started for it and stopped after it (see
-  // sunsaver::Supervisor::mayTalk()). Returns true when a run talked to it: that held loop() for the whole run
-  // (about 10 seconds, never more than a minute: see sunsaver::RUN_LIMIT_MS; with the watchdog
-  // fed), and the controller may hold other settings now. A charger check under way is dropped
-  // then, and the next poll is due at once.
+  // sunsaver::Supervisor::mayTalk()). A link that does not start costs the duty a try, as a
+  // controller that does not answer would, and its result says so (sunsaver::NoLinkPort): the
+  // next try comes on the timetable. Returns true when a run talked to it: that held loop() for
+  // the whole run (about 10 seconds, never more than a minute: see sunsaver::RUN_LIMIT_MS; with
+  // the watchdog fed), and the controller may hold other settings now. A charger check under way
+  // is dropped then, and the next poll is due at once.
   bool serviceChargerProgramming(double epochNow, bool allowed);
 
   // Whether programming would talk to the controller now if the line were free: a run or a look

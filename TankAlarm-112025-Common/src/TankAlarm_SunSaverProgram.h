@@ -677,10 +677,11 @@ enum Note : uint16_t {
   NOTE_NOTHING_WRITTEN = 1u << 6,      // an interrupted run that had not begun to write
   NOTE_AT_FIRST_RESTART = 1u << 7,     // the client restarted while the charger restarted for the first time
   NOTE_TIME_LIMIT = 1u << 8,           // the run reached its time limit and was cut short
-  NOTE_NOT_ANSWERED = 1u << 9          // a look after a run that was cut short could not read the controller
+  NOTE_NOT_ANSWERED = 1u << 9,         // a look after a run that was cut short could not read the controller
+  NOTE_NO_LINK = 1u << 10              // a look could not ask the controller: the client's link did not start
 };
 
-static const uint8_t NOTE_BITS = 10;
+static const uint8_t NOTE_BITS = 11;
 
 inline const char *noteText(uint16_t note) {
   switch (note) {
@@ -710,6 +711,9 @@ inline const char *noteText(uint16_t note) {
     case NOTE_NOT_ANSWERED:
       return "The charger did not answer when the client looked at it after its own restart, so it is not "
              "known whether the charger waits for a restart.";
+    case NOTE_NO_LINK:
+      return "The client could not start its RS-485 link, so it could not ask the charger whether it waits "
+             "for a restart. The client tries again later.";
     default: return "A note this firmware has no text for.";
   }
 }
@@ -1887,6 +1891,41 @@ class Port : public Bus {
   // The Modbus function it reads registers with: 3 or 4, or 0 while it has yet to find one that
   // the controller answers (see FunctionChoice).
   virtual uint8_t readFunction() const = 0;
+  // False for a port whose link did not start (NoLinkPort): nothing it sends reaches the line.
+  virtual bool linkStarted() const { return true; }
+};
+
+// The port of a pass in which the client could not start its link to the controller, for a duty
+// whose turn has come (Supervisor::wantsLine()). The duty is tried on it all the same: every
+// request ends at once without a reply, as on a line where the controller does not answer, so
+// the try counts, its result goes out with NOTE_NO_LINK, and the next try comes on the duty's
+// timetable (DUTY_RETRY_MS), not in the next pass. Nothing was sent, so the line does not rest
+// after it.
+class NoLinkPort : public Port {
+ public:
+  NoLinkPort(uint8_t controller, uint8_t readFunction, uint32_t nowMs)
+      : controller_(controller), readFunction_(readFunction), nowMs_(nowMs) {}
+
+  IoStatus readRegister(uint16_t, uint16_t *raw) override {
+    if (raw != nullptr) {
+      *raw = 0;
+    }
+    return SSIO_NO_REPLY;
+  }
+  IoStatus writeRegister(uint16_t, uint16_t) override { return SSIO_NO_REPLY; }
+  IoStatus writeCoil(uint16_t) override { return SSIO_NO_REPLY; }
+  uint32_t millisNow() override { return nowMs_; }  // no request takes any time
+  uint16_t timeoutMs() const override { return 0; }
+  uint32_t requestLimitMs() const override { return 0; }
+  void rest(uint16_t, bool) override {}
+  uint8_t controller() const override { return controller_; }
+  uint8_t readFunction() const override { return readFunction_; }
+  bool linkStarted() const override { return false; }
+
+ private:
+  uint8_t controller_;
+  uint8_t readFunction_;
+  uint32_t nowMs_;
 };
 
 // Reads one register in one request, with Modbus function 3 (holding registers) or 4 (input
@@ -2330,7 +2369,9 @@ class Supervisor {
   // try. A duty owed to another controller (the config names a new id now), or one that is owed
   // while no poll runs (the charger is off in the config), does without: the poll says nothing of
   // its controller, and a controller that waits for its restart may not charge. Its first request
-  // asks the controller, and a miss leaves the duty owed until its next turn (dutyTurn()).
+  // asks the controller, and a miss leaves the duty owed until its next turn (dutyTurn()). So does
+  // a link that the client starts for the duty and that does not start: the try is made on a
+  // NoLinkPort.
   bool mayTalk(const Port &port, const Line &line) const { return mayTalkTo(port.controller(), line); }
   // The same for a port that talks to the controller `controller`.
   bool mayTalkTo(uint8_t controller, const Line &line) const {
@@ -2502,6 +2543,11 @@ class Supervisor {
       // duty, and a recovery settles it: resume() takes up no run that has not ended.
       result.outcome = OUTCOME_STOPPED;
       result.followUp = dutyOwed();
+    }
+    if (!port.linkStarted()) {
+      // Nothing reached the controller: the result says that the client could not ask it, and
+      // not that it did not answer.
+      result.notes = (uint16_t)((result.notes & ~(uint16_t)NOTE_NOT_ANSWERED) | NOTE_NO_LINK);
     }
     if (journal_.waitingId == runId_) {
       journal_.waitingId = 0;  // a run that ended before its first commit point

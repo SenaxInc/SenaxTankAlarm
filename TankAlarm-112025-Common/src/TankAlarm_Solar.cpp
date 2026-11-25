@@ -1413,11 +1413,16 @@ bool SolarManager::serviceChargerProgramming(double epochNow, bool allowed) {
   const bool linkForDuty = !line.polling && _programming.mayTalk(port, line) &&
                            _programming.wantsLine(epochNow, (uint32_t)millis());
   if (linkForDuty && !startModbusLink()) {
-    line.free = false;  // nothing talks: the duty waits, and the next pass tries again
+    // The link does not start. The duty's turn is taken all the same, on a port that reaches no
+    // controller: the try counts, its result goes out (the client could not ask the controller),
+    // and the next try comes on the duty's timetable, not in the next pass.
+    sunsaver::NoLinkPort none(port.controller(), port.readFunction(), (uint32_t)millis());
+    _programming.service(none, epochNow, true);
+    return false;  // nothing talked to the controller
   }
   const bool talked = line.polling ? _programming.service(port, epochNow, line)
-                                   : _programming.service(port, epochNow, linkForDuty && line.free);
-  if (linkForDuty && line.free) {
+                                   : _programming.service(port, epochNow, linkForDuty);
+  if (linkForDuty) {
     ModbusRTUClient.end();
   }
   if (talked) {

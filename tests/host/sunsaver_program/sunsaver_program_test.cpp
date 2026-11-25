@@ -4443,6 +4443,8 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
   double epochBase;                 // the wall clock when the simulator's clock read 0
   bool ready;                       // the controller the config names answered its last poll
   bool polling;                     // the client polls: the charger is on in its config
+  bool linkFails;                   // and when it does not, the link it starts for a duty does not start
+                                    // (SolarManager::startModbusLink())
   bool held;                        // a firmware update is being staged: nobody talks to the charger
   int configured;                   // the Modbus id the config names: -1 for the one this desk talks to
   uint8_t pollFunction;             // the read function the poll found for that controller, 0 for none
@@ -4468,6 +4470,7 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
         epochBase(kClientNow),
         ready(true),
         polling(true),
+        linkFails(false),
         held(false),
         configured(-1),
         pollFunction(MB_FC_READ_INPUT),
@@ -4606,7 +4609,17 @@ struct Desk : ss::Port, ss::JournalStore, ss::FunctionReader {
     choice = ss::FunctionChoice(supervisor.readFunctionToUse(now.configured, now.pollAnswered ? pollFunction : 0));
     const bool mayTalk = supervisor.mayTalk(*this, now);
     const bool passWanted = supervisor.wantsPass(clock(), millisNow(), now);
-    const bool ran = supervisor.service(*this, clock(), now);
+    bool ran = false;
+    if (linkFails && !now.polling && wanted && mayTalk) {
+      // The link this pass starts for the duty does not start: the duty's turn is taken on a port
+      // that reaches no controller, and nothing goes on the line.
+      const size_t asked = bus.log.size();
+      ss::NoLinkPort none(controller(), choice.function(), millisNow());
+      ran = supervisor.service(none, clock(), true);
+      CHECK_EQ(bus.log.size(), asked);
+    } else {
+      ran = supervisor.service(*this, clock(), now);
+    }
     CHECK_MSG(ran == (wanted && mayTalk), "wantsLine() said %s, mayTalk() said %s, and service() %s",
               wanted ? "yes" : "no", mayTalk ? "yes" : "no", ran ? "ran" : "did not run");
     // And the pass it asks a poll to leave it (wantsPass()) is one it talks in, when the line is
@@ -6824,6 +6837,102 @@ static void testLineForDuty() {
     CHECK(!desk.reports.back().result.followUp);
     CHECK_EQ(desk.reports.back().requestId, kRequestId);
   }
+  // The same, and the link that the client starts for the duty does not start. The tries are
+  // made all the same, on a port that reaches no controller (NoLinkPort), and keep the duty's
+  // timetable, rather than coming in every pass: each sends nothing, and its result answers the
+  // request that the client's restart cut short, as interrupted, with NOTE_NO_LINK in place of
+  // NOTE_NOT_ANSWERED. The duty stays owed, and the try after the link starts settles it.
+  {
+    Desk desk;
+    desk.flash = journalOf(kRequestId, ss::JOURNAL_WRITING);
+    desk.sim.regs[A_ARRAY_FAULT] = EDIT_ARRAY;
+    desk.sim.regs[A_LOAD_FAULT] = EDIT_LOAD;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    CHECK(desk.reports.empty());  // the journal speaks for the request: the look answers it
+    desk.polling = false;
+    desk.ready = false;
+    desk.linkFails = true;
+    CHECK(desk.pass(supervisor));
+    CHECK(desk.bus.log.empty());
+    CHECK(supervisor.dutyOwed());
+    CHECK(sameJournal(desk.flash, kRequestId, ss::JOURNAL_WRITING));
+    CHECK_EQ(desk.reports.size(), 1);
+    if (desk.reports.size() == 1) {
+      const ss::ProgramResult &result = desk.reports.back().result;
+      CHECK_EQ(desk.reports.back().requestId, kRequestId);
+      CHECK_EQ(result.outcome, ss::OUTCOME_INTERRUPTED);
+      CHECK_EQ(result.notes, ss::NOTE_NO_LINK);
+      CHECK(result.followUp);
+      CHECK(!result.wroteAny);
+      CHECK_EQ(result.seen, 0);
+    }
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_RETRY_MS - 1000, 1000), 0);
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_RETRY_MS + 30000, 1000), ss::DUTY_FAST_TRIES - 1);
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_SLOW_RETRY_MS - ss::DUTY_RETRY_MS, 60000), 0);
+    CHECK_EQ(desk.loopFor(supervisor, 2 * ss::DUTY_RETRY_MS, 60000), 1);
+    CHECK(desk.bus.log.empty());
+    CHECK_EQ(desk.reports.size(), 1 + ss::DUTY_FAST_TRIES);
+    CHECK_EQ(desk.reports.back().result.notes, ss::NOTE_NO_LINK);
+    CHECK(supervisor.dutyOwed());
+    CHECK(editPending(desk.sim));
+    // The link starts again: the next try reads the controller, and restarts it.
+    desk.linkFails = false;
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_SLOW_RETRY_MS, 60000), 1);
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.sim.resets, 1);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_INTERRUPTED);
+    CHECK_EQ(desk.reports.back().result.notes, ss::NOTE_WAS_PENDING);
+    CHECK(!desk.reports.back().result.followUp);
+    CHECK_EQ(desk.reports.back().requestId, kRequestId);
+  }
+  // A run of this start that wrote, and did not learn whether its restart worked. Then the poll
+  // stops (the charger is switched off in the config), and the link that its look starts does not
+  // start: the run's result goes out again with NOTE_NO_LINK, on the timetable, and the run is
+  // taken up again once the link starts.
+  {
+    Desk desk;
+    ss::Supervisor supervisor;
+    desk.boot(supervisor);
+    desk.bus.before = [&desk](size_t, char kind, uint16_t) {
+      if (kind == 'c' && desk.bus.count('w') > 0) {
+        desk.sim.powered = false;
+      }
+    };
+    CHECK(desk.ask(supervisor, kRequestId));
+    CHECK(desk.pass(supervisor));
+    desk.bus.before = nullptr;
+    desk.sim.powered = true;
+    CHECK_EQ(desk.reports.size(), 1);
+    CHECK(supervisor.dutyOwed());
+    CHECK(editPending(desk.sim));
+    desk.polling = false;
+    desk.ready = false;
+    desk.linkFails = true;
+    const size_t asked = desk.bus.log.size();
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_RETRY_MS + 30000, 1000), 1);
+    CHECK_EQ(desk.bus.log.size(), asked);
+    CHECK_EQ(desk.reports.size(), 2);
+    if (desk.reports.size() == 2) {
+      const ss::ProgramResult &result = desk.reports.back().result;
+      CHECK_EQ(desk.reports.back().requestId, kRequestId);
+      CHECK_EQ(result.outcome, ss::OUTCOME_RESTART_FAILED);
+      CHECK_EQ(result.restart, ss::RESTART_NO_ANSWER);
+      CHECK_EQ(result.notes, desk.reports.front().result.notes | ss::NOTE_NO_LINK);
+      CHECK(result.followUp);
+      CHECK(result.wroteAny);
+    }
+    CHECK(supervisor.dutyOwed());
+    desk.linkFails = false;
+    CHECK_EQ(desk.loopFor(supervisor, ss::DUTY_RETRY_MS, 1000), 1);
+    CHECK(!supervisor.dutyOwed());
+    CHECK(!editPending(desk.sim));
+    CHECK_EQ(desk.reports.size(), 3);
+    CHECK_EQ(desk.reports.back().result.outcome, ss::OUTCOME_PROGRAMMED);
+    CHECK_EQ(desk.reports.back().result.notes & ss::NOTE_NO_LINK, 0);
+    CHECK(holdsProfile(desk.sim, ss::lifepo4Profile()));
+  }
   // While no poll runs a request never runs: after its hour it is refused, and nothing is sent.
   {
     Desk desk;
@@ -8087,12 +8196,14 @@ static void testText() {
   CHECK(has(ss::noteText(0), "no text for"));
   // A run cut short by its time limit promises its restart command only where the time allowed it.
   CHECK(has(ss::noteText(ss::NOTE_TIME_LIMIT), "then the look that follows sends it"));
+  CHECK(has(ss::noteText(ss::NOTE_NO_LINK), "could not start its RS-485 link"));
   // The bits are where a server of another version expects them.
   CHECK_EQ(ss::REFUSE_PROFILE, 1u);
   CHECK_EQ(ss::REFUSE_NO_RESTART, 0x80u);
   CHECK_EQ(ss::REFUSE_NOT_BUILT, 0x100u);
   CHECK_EQ(ss::REFUSE_JOURNAL, 0x1000u);
   CHECK_EQ(ss::NOTE_AT_FIRST_RESTART, 0x80u);
+  CHECK_EQ(ss::NOTE_NO_LINK, 0x400u);
   CHECK_EQ(ss::OUTCOME_INTERRUPTED, 8);
   CHECK_EQ(ss::ENTRY_LOST, 7);
   CHECK_EQ(ss::RESTART_UNCONFIRMED, 5);
@@ -8178,6 +8289,30 @@ static void testText() {
 // Small things
 // ============================================================================
 static void testSmallThings() {
+  // A port whose link did not start: every request ends at once without a reply, and a run on it
+  // writes nothing. A port that talks says that its link started.
+  {
+    ss::NoLinkPort none(7, MB_FC_READ_INPUT, 12345u);
+    uint16_t raw = 0xFFFF;
+    CHECK_EQ(none.readRegister(ss::item(ss::I_ARRAY_FAULT).addr, &raw), ss::SSIO_NO_REPLY);
+    CHECK_EQ(raw, 0);
+    CHECK_EQ(none.writeRegister(ss::item(ss::I_EV_LVD).addr, 1), ss::SSIO_NO_REPLY);
+    CHECK_EQ(none.writeCoil(ss::COIL_RESTART), ss::SSIO_NO_REPLY);
+    none.rest(500, true);
+    CHECK_EQ(none.millisNow(), 12345u);
+    CHECK_EQ(none.controller(), 7);
+    CHECK_EQ(none.readFunction(), MB_FC_READ_INPUT);
+    CHECK(!none.linkStarted());
+    ss::Programmer programmer;
+    programmer.start(ss::lifepo4Profile(), true);
+    for (int step = 0; step < 100 && !programmer.step(none, 4); ++step) {
+    }
+    CHECK(programmer.ended());
+    CHECK_EQ(programmer.result().outcome, ss::OUTCOME_NO_LINK);
+    CHECK(!programmer.result().wroteAny);
+    Desk desk;
+    CHECK(desk.linkStarted());
+  }
   // A programmer nothing was started on.
   {
     Station station;
