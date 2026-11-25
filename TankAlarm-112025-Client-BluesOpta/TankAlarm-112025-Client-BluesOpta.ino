@@ -8746,12 +8746,20 @@ static void takeSampleDueAfterChargerRun() {
 // starts with next does not ask for. So the config is saved first, and a request whose config
 // flash does not take is refused (REFUSE_CONFIG_UNSAVED). A look that a run cut short left owed
 // does not wait for the config: it writes nothing, and goes first anyway.
+//
+// The config is saved first too while a result is in RAM alone (Supervisor::resultOnlyInRam()),
+// before that result goes out below (sendDueChargerProgramReport()). A request refused at once
+// because flash did not take the journal (REFUSE_JOURNAL) is answered in RAM alone, and the
+// config file is then where its answer is kept (gChargerAnsweredKept). Sent first, the answer
+// could reach the server while flash had it in neither file, and a restart before the save at
+// the end of this pass would take the request on again from the config the server sends again.
+// When flash does not take the config either, the result still goes out: nothing can keep it.
 static bool serviceChargerProgramming(unsigned long now, bool allowed) {
 #if defined(POSIX_FILE_IO_AVAILABLE)
   takeKeptChargerDuty();
 #endif
   const sunsaver::Supervisor &programming = gSolarManager.chargerProgramming();
-  if (gConfigDirty && programming.requestWaiting()) {
+  if (gConfigDirty && (programming.requestWaiting() || programming.resultOnlyInRam())) {
     persistConfigIfDirty();
     const uint32_t waitingId = programming.waitingRequestId();
     if (gConfigDirty &&
