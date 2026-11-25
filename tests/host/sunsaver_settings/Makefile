@@ -29,9 +29,11 @@ SAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-
 OPT_FLAGS := -O2 -Werror
 
 SRC  := $(SUITE_DIR)/sunsaver_settings_test.cpp
+# Every header the test includes, directly or through another header, outside ArduinoJson.
 DEPS := $(SRC) \
         $(COMMON_DIR)/TankAlarm_SunSaverSettings.h \
         $(COMMON_DIR)/TankAlarm_SunSaverReport.h \
+        $(COMMON_DIR)/TankAlarm_Battery.h \
         $(SIM_DIR)/sim_sunsaver.h \
         $(SIM_DIR)/test_support.h \
         $(OPTAVIEW_DIR)/OptaViewText.h \
