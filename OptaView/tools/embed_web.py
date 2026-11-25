@@ -13,10 +13,12 @@ The page is one file with one <style> and one <script>. The header also carries 
 Content-Security-Policy, which names those two blocks by their hashes: the browser then runs
 that style sheet and that script and nothing else, whatever ends up in the page. This script
 therefore refuses a page that needs more than the policy allows (an inline event handler, a
-style attribute, a style sheet it imports, a font, any file but a data: image), because such a
-page would work when opened from disk and fail when the Opta serves it. The self-test adds one
-such thing at a time to the page and checks that it is refused, and that the page as it is
-passes.
+style attribute, a style sheet it imports, a font, a script file, any file but a data: image),
+because such a page would work when opened from disk and fail when the Opta serves it. It reads
+each tag of the markup as a browser does, attribute by attribute; the style sheet and the script
+it reads as text, so what the script puts together while it runs is left to the browser test,
+which runs the page under the policy. The self-test adds one forbidden thing at a time to the
+page and checks that it is refused, and that the page as it is passes.
 """
 
 import base64
@@ -33,17 +35,9 @@ DELIMITER = "OVWEB"
 LINE_WIDTH = 110
 
 # What the page must not contain, and why. The groups are matched against the markup, the style
-# sheet and the script.
+# sheet and the script; the tags of the markup are also read one by one (markup_problem()).
 MARKUP_RULES = [
-    (r"<[^>]*\son[a-z]+\s*=", "an inline event handler (the policy blocks it; use addEventListener)"),
-    (r"<[^>]*\sstyle\s*=", "a style attribute (the policy blocks it; use a class)"),
     (r"javascript:", "a javascript: address"),
-    (r"<[^>]*\s(?:src|href|action)\s*=\s*[\"']?(?:https?:)?//", "a file from another server"),
-    (r"<(?:iframe|object|embed|base)\b", "an element the policy does not allow"),
-    (r"<[^>]*\s(?:src|srcset|poster)\s*=(?!\s*[\"']?data:)",
-     "a file the policy blocks (it allows only data: images)"),
-    (r"<link\b[^>]*\shref\s*=(?!\s*[\"']?data:)", "a file the policy blocks (it allows only data: images)"),
-    (r"<[^>]*\s(?:form)?action\s*=", "a form action (the policy sends no form; the script sends it)"),
 ]
 STYLE_RULES = [
     (r"@import\b", "an @import (the policy blocks the style sheet it brings in)"),
@@ -58,8 +52,35 @@ SCRIPT_RULES = [
     (r"\beval\s*\(", "eval (the policy blocks it)"),
     (r"\bnew\s+Function\b", "new Function (the policy blocks it)"),
     (r"setAttribute\(\s*[\"']style[\"']", "a style attribute (the policy blocks it; use a class)"),
-    (r"https?://", "an address on another server"),
+    (r"(?:https?|wss?)://", "an address on another server"),
+    (r"[\"'`]//[^/\s\"'`]", "an address on another server"),
+    (r"javascript:", "a javascript: address"),
+    (r"\bnew\s+(?:Shared)?Worker\b|\bimportScripts\b|\bimport\s*\(|\bserviceWorker\b"
+     r"|createElement\(\s*[\"']script[\"']", "a script file (the policy runs this script and no other)"),
+    (r"\bset(?:Timeout|Interval)\s*\(\s*[\"'`]", "a string run as code (the policy blocks it)"),
+    (r"\.src(?:set)?\s*=(?!=)(?!\s*[\"'`]data:)"
+     r"|setAttribute\(\s*[\"']src(?:set)?[\"']\s*,(?!\s*[\"'`]data:)",
+     "a file named by the script (the policy allows only data: images)"),
+    (r"createElement\(\s*[\"'](?:style|link|iframe|frame|object|embed|base)[\"']",
+     "an element the policy blocks (made by the script)"),
 ]
+
+# Elements the policy does not let the page use.
+ELEMENTS_REFUSED = ("iframe", "frame", "frameset", "object", "embed", "applet", "base")
+# The attributes that make the browser load a file, and those that load an image, which the
+# policy lets come from a data: address. Any other file is blocked, data: or not: a style sheet,
+# a sound, a video, its subtitles, a font, a script.
+FILE_ATTRIBUTES = ("src", "srcset", "imagesrcset", "poster", "background", "href", "xlink:href")
+IMAGE_ATTRIBUTES = {("img", "src"), ("img", "srcset"), ("source", "srcset"), ("input", "src"),
+                    ("video", "poster"), ("image", "href"), ("image", "xlink:href"),
+                    ("feimage", "href"), ("feimage", "xlink:href")}
+ICON_LINKS = ("icon", "shortcut icon")
+# How a browser reads a tag (start_tags()).
+TAG_NAME = re.compile(r"[a-zA-Z][^\s/>]*")
+ATTRIBUTE_NAME = re.compile(r"[^\s/>][^\s/>=]*")
+EQUALS = re.compile(r"\s*=\s*")
+UNQUOTED_VALUE = re.compile(r"[^\s>]*")
+COMMENT_END = re.compile(r"--!?>")
 
 
 def fail(message):
@@ -76,6 +97,99 @@ def only_block(page, tag):
     if end < 0 or page.count("</%s>" % tag) != 1:
         fail("there must be exactly one </%s>" % tag)
     return page[start:end], start, end
+
+
+def start_tags(markup):
+    """Each start tag in the markup as a browser reads it: its name and its attributes in lower
+    case, each value without its quotes, and the tag's text. A quoted value may hold ">" and "<".
+    Comments are skipped; a comment ends at the first "-->" or "--!>", "<!-->" included."""
+    at = 0
+    while True:
+        at = markup.find("<", at)
+        if at < 0:
+            return
+        if markup.startswith("<!--", at):
+            end = COMMENT_END.search(markup, at + 2)
+            at = end.end() if end else len(markup)
+            continue
+        name = TAG_NAME.match(markup, at + 1)
+        if not name:
+            at += 1
+            continue
+        start = at
+        at = name.end()
+        attributes = []
+        while True:
+            while at < len(markup) and (markup[at].isspace() or markup[at] == "/"):
+                at += 1
+            if at >= len(markup) or markup[at] == ">":
+                break
+            attribute = ATTRIBUTE_NAME.match(markup, at)
+            at = attribute.end()
+            value = ""
+            equals = EQUALS.match(markup, at)
+            if equals:
+                at = equals.end()
+                if markup[at:at + 1] in ("\"", "'"):
+                    end = markup.find(markup[at], at + 1)
+                    end = len(markup) if end < 0 else end
+                    value = markup[at + 1:end]
+                    at = end + 1
+                else:
+                    unquoted = UNQUOTED_VALUE.match(markup, at)
+                    value = unquoted.group(0)
+                    at = unquoted.end()
+            attributes.append((attribute.group(0).lower(), value))
+        yield name.group(0).lower(), attributes, markup[start:at + 1]
+        at += 1
+
+
+def srcset_addresses(value):
+    """The addresses in a srcset, by the HTML rules: an address runs to the next space, and a
+    comma at its end or after its sizes ends that candidate."""
+    addresses = []
+    rest = value
+    while True:
+        rest = rest.lstrip(" \n,")
+        if not rest:
+            return addresses
+        address = re.match(r"[^ \n]*", rest).group(0)
+        rest = rest[len(address):]
+        if address.endswith(","):
+            addresses.append(address.rstrip(","))
+        else:
+            addresses.append(address)
+            rest = rest.split(",", 1)[1] if "," in rest else ""
+
+
+def markup_problem(markup):
+    """The first thing in the tags of the markup that the policy blocks, as (what, the tag)."""
+    for name, attributes, text in start_tags(markup):
+        if name in ELEMENTS_REFUSED:
+            return "an element the policy does not allow", text
+        rel = next((" ".join(value.lower().split()) for key, value in attributes if key == "rel"), "")
+        for key, value in attributes:
+            if re.match(r"on[a-z]+$", key):
+                return "an inline event handler (the policy blocks it; use addEventListener)", text
+            if key == "style":
+                return "a style attribute (the policy blocks it; use a class)", text
+            if key in ("action", "formaction"):
+                return "a form action (the policy sends no form; the script sends it)", text
+            if key not in FILE_ATTRIBUTES:
+                continue
+            address = value.strip()
+            if re.match(r"(?:https?:)?//", address, re.IGNORECASE):
+                return "a file from another server", text
+            # A link to another page, or to a part of this one, loads nothing.
+            if key in ("href", "xlink:href"):
+                if name in ("a", "area") or (address.startswith("#") and name not in ("link", "image")):
+                    continue
+            image = ((name, key) in IMAGE_ATTRIBUTES or key == "background"
+                     or (name == "link" and rel in ICON_LINKS))
+            for each in (srcset_addresses(value) if key.endswith("srcset") else [address]):
+                if not (image and each[:5].lower() == "data:"):
+                    return "a file the policy blocks (it allows only data: images)", text
+    return None
 
 
 def csp_hash(text):
@@ -126,6 +240,9 @@ def render(page_path):
         found = re.search(pattern, markup, re.IGNORECASE)
         if found:
             fail("the markup has %s: %r" % (what, found.group(0)[:80]))
+    problem = markup_problem(markup)
+    if problem:
+        fail("the markup has %s: %r" % (problem[0], problem[1][:80]))
     for pattern, what in STYLE_RULES:
         found = re.search(pattern, style, re.IGNORECASE)
         if found:
@@ -215,6 +332,39 @@ SELFTEST_REFUSED = [
     ("markup", '<a href="javascript:go()">x</a>', "a javascript: address"),
     ("markup", '<a href="https://elsewhere.example/">x</a>', "a file from another server"),
     ("markup", "<iframe></iframe>", "an element the policy does not allow"),
+    ("markup", "<IFRAME></IFRAME>", "an element the policy does not allow"),
+    ("markup", "<p class=x><iframe></iframe>", "an element the policy does not allow"),
+    ("markup", '<object data="x.svg"></object>', "an element the policy does not allow"),
+    ("markup", '<embed src="x.svg">', "an element the policy does not allow"),
+    ("markup", '<base href="/">', "an element the policy does not allow"),
+    ("markup", '<frame src="x.html">', "an element the policy does not allow"),
+    ("markup", "<frameset></frameset>", "an element the policy does not allow"),
+    ("markup", '<applet code="x"></applet>', "an element the policy does not allow"),
+    # A data: address is allowed only where the policy allows it: in an image.
+    ("markup", '<link rel="stylesheet" href="data:text/css,p{color:red}">', "a file the policy blocks"),
+    ("markup", '<link rel="preload" href="data:,">', "a file the policy blocks"),
+    ("markup", '<link rel="icon" href="#top">', "a file the policy blocks"),
+    ("markup", '<link rel="preload" as="image" imagesrcset="data:,">', "a file the policy blocks"),
+    ("markup", '<audio src="data:audio/wav;base64,AAAA"></audio>', "a file the policy blocks"),
+    ("markup", '<video><source src="data:video/mp4;base64,AAAA"></video>', "a file the policy blocks"),
+    ("markup", '<img alt="" srcset="data:image/png;base64,A 1x, logo.png 2x">', "a file the policy blocks"),
+    ("markup", '<img alt="" srcset="data:image/png;base64,AAAA, logo.png">', "a file the policy blocks"),
+    ("markup", '<svg><image href="logo.png"/></svg>', "a file the policy blocks"),
+    ("markup", '<svg><image xlink:href="#top"/></svg>', "a file the policy blocks"),
+    ("markup", '<svg><use href="icons.svg#a"/></svg>', "a file the policy blocks"),
+    ("markup", '<table background="paper.png"></table>', "a file the policy blocks"),
+    ("markup", '<IMG SRC="logo.png" ALT="">', "a file the policy blocks"),
+    ("markup", '<img/src="logo.png" alt="">', "a file the policy blocks"),
+    ("markup", '<img src="HTTPS://elsewhere.example/a.png" alt="">', "a file from another server"),
+    ("markup", "<img src=//elsewhere.example/a.png alt=x>", "a file from another server"),
+    # A quoted value may hold ">": what comes after it is still in the tag.
+    ("markup", '<p title="a > b" onclick="go()">x</p>', "an inline event handler"),
+    ("markup", "<p title='a > b' style=\"color: red\">x</p>", "a style attribute"),
+    ("markup", '<img alt="a > b" src="logo.png">', "a file the policy blocks"),
+    # A comment ends where a browser ends it.
+    ("markup", '<!-- <b title="a --> <img src="logo.png" alt="">', "a file the policy blocks"),
+    ("markup", '<!--> <img src="logo.png" alt=""> -->', "a file the policy blocks"),
+    ("markup", '<!-- a --!> <img src="logo.png" alt="">', "a file the policy blocks"),
     ("script", "x.innerHTML = y;", "innerHTML"),
     ("script", "x.insertAdjacentHTML('beforeend', y);", "insertAdjacentHTML"),
     ("script", "document.write(y);", "document.write"),
@@ -222,12 +372,49 @@ SELFTEST_REFUSED = [
     ("script", "new Function(y);", "new Function"),
     ("script", "x.setAttribute('style', y);", "a style attribute"),
     ("script", "fetch('https://elsewhere.example/');", "an address on another server"),
+    ("script", "new WebSocket('wss://elsewhere.example/');", "an address on another server"),
+    ("script", "fetch('//elsewhere.example/');", "an address on another server"),
+    ("script", "location = 'javascript:go()';", "a javascript: address"),
+    ("script", "new Worker('w.js');", "a script file"),
+    ("script", "new SharedWorker('w.js');", "a script file"),
+    ("script", "importScripts('w.js');", "a script file"),
+    ("script", "import('./more.js');", "a script file"),
+    ("script", "navigator.serviceWorker.register('/sw.js');", "a script file"),
+    ("script", "document.createElement('script');", "a script file"),
+    ("script", "setTimeout('go()', 10);", "a string run as code"),
+    ("script", 'setInterval("go()", 10);', "a string run as code"),
+    ("script", "image.src = 'logo.png';", "a file named by the script"),
+    ("script", "image.srcset = name;", "a file named by the script"),
+    ("script", "image.setAttribute('src', name);", "a file named by the script"),
+    ("script", "document.createElement('style');", "an element the policy blocks"),
+    ("script", "document.createElement('link');", "an element the policy blocks"),
+    ("script", "document.createElement('iframe');", "an element the policy blocks"),
+    ("script", "document.createElement('frame');", "an element the policy blocks"),
+    ("script", "document.createElement('object');", "an element the policy blocks"),
+    ("script", "document.createElement('embed');", "an element the policy blocks"),
+    ("script", "document.createElement('base');", "an element the policy blocks"),
 ]
 SELFTEST_ALLOWED = [
     ("style", ".x { background: url(data:image/png;base64,AAAA); }"),
     ("style", '.x { background: url( "data:image/svg+xml,%3Csvg%3E" ); }'),
     ("markup", '<img src = "data:image/png;base64,AAAA" alt="">'),
+    ("markup", '<img src="Data:image/png;base64,AAAA" alt="">'),
     ("markup", '<a href="#live">x</a>'),
+    ("markup", '<a href="/snapshot">x</a>'),
+    ("markup", '<link rel="Shortcut  Icon" href="data:,">'),
+    ("markup", '<img alt="" srcset="data:image/png;base64,AAAA 1x, data:image/png;base64,BBBB 2x">'),
+    ("markup", '<picture><source srcset="data:image/png;base64,AAAA"><img src="data:,a" alt=""></picture>'),
+    ("markup", '<input type="image" src="data:image/png;base64,AAAA" alt="Go">'),
+    ("markup", '<video poster="data:image/png;base64,AAAA"></video>'),
+    ("markup", '<table background="data:image/png;base64,AAAA"></table>'),
+    ("markup", '<svg><image href="data:image/png;base64,AAAA"/><image xlink:href="data:,"/></svg>'),
+    ("markup", '<svg><filter><feImage href="data:,"/><feImage xlink:href="data:,a"/></filter></svg>'),
+    ("markup", '<svg><use href="#f"/><a xlink:href="/snapshot">x</a></svg>'),
+    ("markup", '<p data-src="logo.png" title="a > b">x</p>'),
+    ("markup", '<!-- <img src="logo.png"> -->'),
+    ("script", "image.src = 'data:image/png;base64,AAAA';"),
+    ("script", "image.setAttribute('src', 'data:image/png;base64,AAAA');"),
+    ("script", "if (image.src == other) { setTimeout(go, 10); } // see //notes"),
 ]
 
 
