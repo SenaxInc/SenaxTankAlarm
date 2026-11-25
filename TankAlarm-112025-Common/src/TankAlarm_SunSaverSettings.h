@@ -285,7 +285,7 @@ inline const Item &item(uint8_t index) {
       {0xE023, KIND_VOLT_SETTING, GROUP_LOAD, 9, 15, ITEM_WITNESS, "EV_lvr", "Low voltage reconnect"},
       {0xE024, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, ITEM_ZERO_IS_OFF, "EV_lhvd", "Load high voltage disconnect"},
       {0xE025, KIND_VOLT_SETTING, GROUP_LOAD, 10, 18, 0, "EV_lhvr", "Load high voltage reconnect"},
-      {0xE026, KIND_OHMS, GROUP_LOAD, 0, 0, ITEM_ZERO_IS_OFF, "ER_icomp", "LVD load current compensation"},
+      {0xE026, KIND_OHMS, GROUP_LOAD, 0, 0, ITEM_ZERO_IS_OFF, "ER_icomp", "Load current compensation"},
       {0xE027, KIND_TENTHS, GROUP_LOAD, 0, 0, 0, "Et_lvd_warn", "LVD warning time"},
 
       {0xE030, KIND_VOLT_SETTING, GROUP_LED, 9, 15, ITEM_WITNESS, "EV_soc_y2g", "LED yellow to green (rising)"},
