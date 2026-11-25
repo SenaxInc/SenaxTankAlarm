@@ -1618,6 +1618,36 @@ static void testScaleCheckRejects() {
   }
   CHECK_EQ(gAllocLive, 0);
 
+  // Each list may fill the room the loader has for it. One more is refused: cut short, the
+  // numerators, setpoints or states past the room would have dropped out of the test unseen.
+  std::string setpoints24 = "[\"sp1\"";
+  for (int i = 1; i < 24; ++i) {
+    setpoints24 += i % 2 != 0 ? ",\"sp2\"" : ",\"sp1\"";
+  }
+  const std::string setpoints25 = setpoints24 + ",\"sp1\"]";
+  setpoints24 += "]";
+  {
+    OvProfile profile;
+    char error[200];
+    const std::string full = replaced(replaced(replaced(good, "[96.667]", "[90,95,96.667,100]"), "[\"sp1\",\"sp2\"]",
+                                               setpoints24.c_str()),
+                                      "\"regulating\":[1]", "\"regulating\":[0,1,2,3,4,5,6,7]");
+    CHECK_MSG(profile.load(full.c_str(), full.size(), error, sizeof(error)), "%s", error);
+    const OvScaleCheck &check = profile.scaleCheck();
+    CHECK_EQ(check.alternateCount, 4);
+    CHECK(check.alternates[3] == 100.0);
+    CHECK_EQ(check.setpointCount, 24);
+    CHECK(check.setpoints[23] == profile.findRegister("sp2"));
+    CHECK_EQ(check.regulatingCount, 8);
+    CHECK_EQ(check.regulating[7], 7);
+  }
+  CHECK_EQ(gAllocLive, 0);
+  expectRejected(replaced(good, "[96.667]", "[90,95,96.667,100,105]"), "scaleCheck.alternates holds at most 4 numerators");
+  expectRejected(replaced(good, "[\"sp1\",\"sp2\"]", setpoints25.c_str()),
+                 "scaleCheck.settings.setpoints names at most 24 registers");
+  expectRejected(replaced(good, "\"regulating\":[1]", "\"regulating\":[0,1,2,3,4,5,6,7,8]"),
+                 "scaleCheck.live.regulating lists at most 8 states");
+
   expectRejected(replaced(good, "\"grid\":0.05", "\"grid\":0"), "scaleCheck.grid");
   expectRejected(replaced(good, "\"grid\":0.05", "\"grid\":\"0.05\""), "\"grid\" must be a number on scaleCheck");
   // A numerator that is not a number above 0 is refused, where it used to drop out unseen.
@@ -1809,6 +1839,22 @@ static void testProfileRejects() {
   expectRejected("{\"schema\":1,\"profile\":\"x\",\"registers\":[]}", "no registers");
   expectRejected(replaced(mini, "\"name\":\"a\"", "\"name\":\"9a\""), "needs a \"name\"");
   expectRejected(replaced(mini, "\"name\":\"a\"", "\"name\":\"a b\""), "needs a \"name\"");
+  expectRejected(replaced(mini, "\"name\":\"a\"", "\"name\":\"a\\n\""), "needs a \"name\"");  // as check_profile.py
+  // An address written as text is decimal digits, or 0x and hex digits, and nothing else.
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"+57361\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\" 57361\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"57361 \""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"57_361\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"0xE0_11\""), "bad or missing \"addr\"");
+  expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":57361.0"), "bad or missing \"addr\"");
+  for (const char *spelling : {"\"addr\":\"0XE011\"", "\"addr\":\"0xe011\"", "\"addr\":\"057361\""}) {
+    OvProfile profile;
+    char error[200];
+    const std::string text = replaced(mini, "\"addr\":57361", spelling);
+    CHECK_MSG(profile.load(text.c_str(), text.size(), error, sizeof(error)), "%s: %s", spelling, error);
+    CHECK_EQ(profile.findRegister("b")->addr, 0xE011);
+  }
+  CHECK_EQ(gAllocLive, 0);
   expectRejected(replaced(mini, "\"name\":\"b\"", "\"name\":\"A\""), "share a name");
   expectRejected(replaced(mini, "\"addr\":57361", "\"addr\":\"0xE010\""), "share an address");
   expectRejected(replaced(mini, "\"addr\":\"0xE012\"", "\"addr\":\"0xE013\""), "share an address");  // the u32 runs into d
@@ -1941,6 +1987,28 @@ static void testProfileRejects() {
                  "\"words\"");
   expectRejected(replaced(mini, "\"den\":32768", "\"den\":0"), "above zero");
   expectRejected(replaced(mini, "\"num\":100,", ""), "needs \"num\" and \"den\"");
+  // Values are shown with at most 6 decimals: 7 or -1 was cut to 6 or 0 without a word.
+  expectRejected(replaced(mini, "\"decimals\":2", "\"decimals\":7"), "\"decimals\" must be 0 to 6 on scale: v");
+  expectRejected(replaced(mini, "\"decimals\":2", "\"decimals\":-1"), "\"decimals\" must be 0 to 6 on scale: v");
+  expectRejected(replaced(mini, "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":7"),
+                 "\"decimals\" must be 0 to 6 on register: d");
+  expectRejected(replaced(mini, "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":-1"),
+                 "\"decimals\" must be 0 to 6 on register: d");
+  {  // 0 and 6 are fine, on a scale and on a register, which takes its scale's unless it says.
+    OvProfile profile;
+    char error[200];
+    const std::string six =
+        replaced(replaced(mini, "\"decimals\":2", "\"decimals\":6"), "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":0");
+    CHECK_MSG(profile.load(six.c_str(), six.size(), error, sizeof(error)), "%s", error);
+    CHECK_EQ(profile.findRegister("a")->decimals, 6);
+    CHECK_EQ(profile.findRegister("d")->decimals, 0);
+    const std::string zero =
+        replaced(replaced(mini, "\"decimals\":2", "\"decimals\":0"), "\"name\":\"d\"", "\"name\":\"d\",\"decimals\":6");
+    CHECK_MSG(profile.load(zero.c_str(), zero.size(), error, sizeof(error)), "%s", error);
+    CHECK_EQ(profile.findRegister("a")->decimals, 0);
+    CHECK_EQ(profile.findRegister("d")->decimals, 6);
+  }
+  CHECK_EQ(gAllocLive, 0);
   expectRejected(replaced(mini, "[\"A\",\"B\"]", "[]"), "label set");
   expectRejected(replaced(mini, "{\"name\":\"g\",\"title\":\"G\"}", "{\"title\":\"G\"}"), "a group needs");
   expectRejected(replaced(mini, "\"slaveId\":1", "\"slaveId\":0"), "slaveId");

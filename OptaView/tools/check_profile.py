@@ -6,22 +6,32 @@
 
 With no argument it checks every file in OptaView/profiles. The firmware's own loader
 (OptaViewProfile.h) rejects a broken profile too; this script says more about what is wrong and
-also enforces house rules the loader does not care about (ASCII text, addresses in order,
-every group declared).
+also enforces house rules the loader does not care about (printable ASCII text, addresses in
+order, every group declared, no member the loader would ignore).
 """
 
 import copy
 import glob
 import json
-import math
 import os
 import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Used with fullmatch: with match and "$", a name ending in a newline would have passed.
+NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# An address or raw value written as text, as the firmware reads it (ovParseU32 in OptaViewText.h):
+# decimal digits, or 0x and hex digits, and nothing else. int() would also take a sign, spaces and _.
+NUMBER_TEXT = re.compile(r"0[xX][0-9A-Fa-f]+|[0-9]+")
 TYPES = {"u16", "i16", "u8", "i8", "u32", "enum", "bits"}
 FORMATS = {"8N1", "8N2", "8E1", "8O1"}
+# What ArduinoJson, which reads the profile in the firmware, refuses where Python's json would not:
+# a number of more than 63 characters (parseNumericValue reads at most 63) and lists and objects
+# nested more than 10 deep (ARDUINOJSON_DEFAULT_NESTING_LIMIT). NaN and Infinity are not JSON.
+NUMBER_TOKEN_MAX = 63
+NESTING_MAX = 10
+# The room the loader has for each list of the scale check (OvScaleCheck). It refuses a longer one.
+ALTERNATES_MAX, SETPOINTS_MAX, REGULATING_MAX = 4, 24, 8
 
 # The JSON type each member must have when it is there, as the firmware's loader requires
 # (membersFit() in OptaViewProfile.h). Read with a default, a member of another type would fall
@@ -64,10 +74,9 @@ def fits(value, kind):
         return False
     if kind == WHOLE:
         return isinstance(value, int) and -2 ** 31 <= value < 2 ** 31  # the loader reads an int
-    try:
-        return math.isfinite(value)
-    except OverflowError:  # an integer too long for a double
-        return False
+    # The loader's bound (memberFits): neither NaN nor infinite, nor beyond 1e300 either way. An
+    # int is compared exactly, so one too long for a double is refused without an OverflowError.
+    return -1e300 <= value <= 1e300
 
 
 def present(item):
@@ -83,31 +92,93 @@ def wrong_members(item, members, where):
             for key, kind in members.items() if key in item and not fits(item[key], kind)]
 
 
+def unknown_members(item, members, where, known=()):
+    """An error for each member of `item` that is neither in `members` nor in `known`. The loader
+    ignores a member it does not know, so a misspelt "mn" would leave a setting without its
+    lower limit, and nothing would say so."""
+    return ["%s: \"%s\" is not a member the firmware reads, so it would be ignored" % (where, key)
+            for key in item if key not in members and key not in known]
+
+
 def number(value, what, errors):
-    """An address or raw value: an int, or a string such as "0xE022"."""
+    """An address or raw value: a whole number, or text such as "0xE022" or "57378"."""
     if isinstance(value, bool):
         errors.append("%s: expected a number, got %r" % (what, value))
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, str):
-        try:
-            return int(value, 16) if value.lower().startswith("0x") else int(value, 10)
-        except ValueError:
-            pass
+    if isinstance(value, str) and NUMBER_TEXT.fullmatch(value):
+        return int(value, 16) if value[1:2] in ("x", "X") else int(value, 10)
     errors.append("%s: expected a number such as 8 or \"0x0008\", got %r" % (what, value))
     return None
 
 
+def nesting(value):
+    """How many levels of lists and objects deep `value` goes: 1 for [1], 2 for [[1]]."""
+    deepest, stack = 0, [(value, 1)]
+    while stack:
+        item, level = stack.pop()
+        if isinstance(item, (dict, list)):
+            deepest = max(deepest, level)
+            stack.extend((child, level + 1) for child in (item.values() if isinstance(item, dict) else item))
+    return deepest
+
+
+def load_json(text):
+    """The profile as the firmware's JSON parser reads it, or ValueError where that parser would
+    refuse it: NaN and Infinity, a number of more than 63 characters, or nesting beyond 10."""
+    def constant(name):
+        raise ValueError("%s is not a JSON number" % name)
+
+    def short(parse):
+        def read(token):
+            if len(token) > NUMBER_TOKEN_MAX:
+                raise ValueError("a number of %d characters, where the firmware reads at most %d"
+                                 % (len(token), NUMBER_TOKEN_MAX))
+            return parse(token)
+        return read
+
+    try:
+        data = json.loads(text, parse_constant=constant, parse_int=short(int), parse_float=short(float))
+    except RecursionError:
+        raise ValueError("lists and objects nested more than %d deep" % NESTING_MAX)
+    if nesting(data) > NESTING_MAX:
+        raise ValueError("lists and objects nested more than %d deep" % NESTING_MAX)
+    return data
+
+
+def not_printable(data):
+    """An error for each text in the profile, member names included, that holds a character
+    other than printable ASCII. A \\u escape gets past the file's own ASCII check."""
+    errors, stack = [], [data]
+    while stack:
+        item = stack.pop()
+        texts = []
+        if isinstance(item, dict):
+            texts = list(item)
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, str):
+            texts = [item]
+        for text in texts:
+            if any(not " " <= char <= "~" for char in text):
+                errors.append("%r: not printable ASCII; the console prints text as it is" % text)
+    return errors
+
+
 def check(path):
     with open(path, "rb") as handle:
-        raw = handle.read()
+        return check_text(handle.read())
+
+
+def check_text(raw):
     try:
         text = raw.decode("ascii")
     except UnicodeDecodeError as error:
         return ["not plain ASCII (byte %d): the console prints these strings as they are" % error.start]
     try:
-        data = json.loads(text)
+        data = load_json(text)
     except ValueError as error:
         return ["not valid JSON: %s" % error]
     return check_data(data)
@@ -117,12 +188,14 @@ def check_data(data):
     errors = []
     if not isinstance(data, dict):
         return ["the profile must be a JSON object"]
+    errors.extend(not_printable(data))
     schema = data.get("schema")
     if isinstance(schema, bool) or not isinstance(schema, int) or schema != 1:  # true == 1 in Python
         errors.append("\"schema\" must be 1")
     wrong = wrong_members(present(data), ROOT_MEMBERS, "the profile")
     if wrong:
         return errors + wrong  # the rest would be read from the wrong kind of thing
+    errors.extend(unknown_members(present(data), ROOT_MEMBERS, "the profile", known=("schema",)))
     data = present(data)  # null members are left out, here as in the loader
     if not data.get("profile"):
         errors.append("missing \"profile\" name")
@@ -137,8 +210,12 @@ def check_data(data):
         if wrong:
             errors.extend(wrong)
             continue
+        errors.extend(unknown_members(scale, SCALE_MEMBERS, "scale %s" % name))
         if not ("num" in scale and scale["num"] > 0 and "den" in scale and scale["den"] > 0):
             errors.append("scale %s: \"num\" and \"den\" must be numbers above zero" % name)
+        if not 0 <= scale.get("decimals", 0) <= 6:
+            # The firmware shows at most 6 (ovFormatFixed), and its loader refuses more.
+            errors.append("scale %s: \"decimals\" must be 0 to 6" % name)
 
     labels = data.get("labels", {})
     for name, items in labels.items():
@@ -152,6 +229,7 @@ def check_data(data):
         group = present(group)
         wrong = wrong_members(group, GROUP_MEMBERS, "group %s" % group.get("name"))
         errors.extend(wrong)
+        errors.extend(unknown_members(group, GROUP_MEMBERS, "group %s" % group.get("name")))
         if not wrong and not group.get("name"):
             errors.append("a group needs a \"name\"")
         if not wrong:
@@ -168,7 +246,7 @@ def check_data(data):
     for reg in registers:
         reg = present(reg)
         name = reg.get("name")
-        if not isinstance(name, str) or not NAME.match(name):
+        if not isinstance(name, str) or not NAME.fullmatch(name):
             errors.append("register name %r: use letters, digits and _, not starting with a digit" % (name,))
             continue
         if name.lower() in by_name:
@@ -178,6 +256,9 @@ def check_data(data):
         if wrong:
             errors.extend(wrong)
             continue
+        errors.extend(unknown_members(reg, REGISTER_MEMBERS, "register %s" % name, known=("name", "addr")))
+        if not 0 <= reg.get("decimals", 0) <= 6:
+            errors.append("register %s: \"decimals\" must be 0 to 6" % name)
         addr = number(reg.get("addr"), "register %s addr" % name, errors)
         if addr is None:
             continue
@@ -221,6 +302,7 @@ def check_data(data):
                 errors.append("register %s: the sentinel's raw value must be 0 to 65535" % name)
             if not isinstance(reg["sentinel"].get("text"), str):
                 errors.append("register %s: the sentinel needs \"text\"" % name)
+            errors.extend(unknown_members(present(reg["sentinel"]), ("raw", "text"), "register %s sentinel" % name))
     spans.sort()
     for (_, end, first), (start, _, second) in zip(spans, spans[1:]):
         if start < end:
@@ -230,7 +312,7 @@ def check_data(data):
     for coil in data.get("coils", []):
         coil = present(coil)
         name = coil.get("name")
-        if not isinstance(name, str) or not NAME.match(name):
+        if not isinstance(name, str) or not NAME.fullmatch(name):
             errors.append("coil name %r: use letters, digits and _" % (name,))
             continue
         if name.lower() in coils:
@@ -240,6 +322,7 @@ def check_data(data):
         if addr is not None and not 0 <= addr <= 0xFFFF:
             errors.append("coil %s: address out of range" % name)
         errors.extend(wrong_members(coil, COIL_MEMBERS, "coil %s" % name))
+        errors.extend(unknown_members(coil, COIL_MEMBERS, "coil %s" % name, known=("name", "addr")))
 
     def register(name, what, numeric=False):
         reg = by_name.get(str(name).lower())
@@ -252,6 +335,7 @@ def check_data(data):
     modbus = present(data.get("modbus", {}))
     wrong = wrong_members(modbus, MODBUS_MEMBERS, "modbus")
     errors.extend(wrong)
+    errors.extend(unknown_members(modbus, MODBUS_MEMBERS, "modbus"))
     if not wrong:
         if not 1 <= modbus.get("slaveId", 1) <= 247:
             errors.append("modbus.slaveId must be 1 to 247")
@@ -282,6 +366,7 @@ def check_data(data):
         if wrong:
             errors.extend(wrong)
             continue
+        errors.extend(unknown_members(item, CHECK_MEMBERS, "check"))
         register(item.get("below"), "check \"below\"", numeric=True)
         register(item.get("above"), "check \"above\"", numeric=True)
         if not item.get("message"):
@@ -321,6 +406,9 @@ def check_scale_check(scale_check, scales, register):
         for key in scale_check.get(half) or {}:
             if key not in known:
                 errors.append("scaleCheck.%s.%s: not an entry of scaleCheck.%s" % (half, key, half))
+    # The loader has room for 4 numerators, 24 setpoints and 8 states, and refuses a longer list.
+    if len(scale_check.get("alternates", [])) > ALTERNATES_MAX:
+        errors.append("scaleCheck.alternates holds at most %d numerators" % ALTERNATES_MAX)
     for alternate in scale_check.get("alternates", []):
         if not fits(alternate, NUMBER) or alternate <= 0:
             errors.append("scaleCheck.alternates: %r is not a number above zero" % (alternate,))
@@ -339,6 +427,8 @@ def check_scale_check(scale_check, scales, register):
         setpoints = settings.get("setpoints", [])
         if len(setpoints) < 4:
             errors.append("scaleCheck.settings.setpoints: the test needs at least 4 setpoints to tell anything")
+        if len(setpoints) > SETPOINTS_MAX:
+            errors.append("scaleCheck.settings.setpoints names at most %d registers" % SETPOINTS_MAX)
         for name in setpoints:
             reg = register(name, "scaleCheck.settings.setpoints")
             if reg is None:
@@ -380,6 +470,8 @@ def check_scale_check(scale_check, scales, register):
             errors.append("scaleCheck.live: the regulation test needs \"battery\", \"reference\" and \"state\" together")
         if len(regulation) == 3 and not live.get("regulating"):
             errors.append("scaleCheck.live.regulating: list the state values in which the battery is held at the target")
+        if len(live.get("regulating", [])) > REGULATING_MAX:
+            errors.append("scaleCheck.live.regulating lists at most %d states" % REGULATING_MAX)
         for value in live.get("regulating", []):
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFF:
                 errors.append("scaleCheck.live.regulating: %r is not a state value" % (value,))
@@ -480,7 +572,95 @@ SELF_TESTS = [
     (("coil", "clear_kwh"), "addr", 65536, "coil clear_kwh: address out of range"),
     (("coil", "clear_kwh"), "addr", -1, "coil clear_kwh: address out of range"),
     (("sentinel", "T_rts"), "raw", 65536, "register T_rts: the sentinel's raw value must be 0 to 65535"),
+    # Names as the loader's validName() reads them: "$" would have let a final newline through.
+    (("register", "adc_va_f"), "name", "adc_va_f\n", "register name 'adc_va_f\\n': use letters"),
+    (("coil", "clear_kwh"), "name", "clear_kwh\n", "coil name 'clear_kwh\\n': use letters"),
+    (("register", "adc_va_f"), "name", "adc va", "register name 'adc va': use letters"),
+    # Numbers written as text, as ovParseU32() reads them: int() would take a sign, spaces and _.
+    (("register", "EV_lvd"), "addr", "0xE0_22", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "0x_E022", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "57_378", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "+57378", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "-0", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", " 57378", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "57378 ", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "57378\n", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "0x", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "0xE022h", "register EV_lvd addr: expected a number"),
+    (("register", "EV_lvd"), "addr", "".join(map(chr, (0xFF15, 0xFF17, 0xFF13, 0xFF17, 0xFF18))),
+     "register EV_lvd addr: expected a number"),  # full-width digits, which int() reads as 57378
+    (("register", "EV_lvd"), "addr", 57378.0, "register EV_lvd addr: expected a number"),
+    (("coil", "clear_kwh"), "addr", "0x0_10", "coil clear_kwh addr: expected a number"),
+    (("coil", "clear_kwh"), "addr", " 18", "coil clear_kwh addr: expected a number"),
+    (("sentinel", "T_rts"), "raw", "+5", "register T_rts sentinel raw: expected a number"),
+    (("sentinel", "T_rts"), "raw", "0x8_0", "register T_rts sentinel raw: expected a number"),
+    # Lists longer than the loader has room for, which it refuses rather than cut short.
+    (("scaleCheck",), "alternates", [90, 95, 96.667, 100, 105], "scaleCheck.alternates holds at most 4 numerators"),
+    (("live",), "regulating", list(range(9)), "scaleCheck.live.regulating lists at most 8 states"),
+    # Decimals the loader would otherwise have cut to 0 or 6 without a word.
+    (("register", "EV_lvd"), "decimals", 7, 'register EV_lvd: "decimals" must be 0 to 6'),
+    (("register", "EV_lvd"), "decimals", -1, 'register EV_lvd: "decimals" must be 0 to 6'),
+    (("scale", "vset"), "decimals", 7, 'scale vset: "decimals" must be 0 to 6'),
+    (("scale", "vset"), "decimals", -1, 'scale vset: "decimals" must be 0 to 6'),
+    # A number beyond the loader's bound of 1e300, which a double can still hold.
+    (("register", "EV_lvd"), "max", 1e301, 'register EV_lvd: "max" must be a number'),
+    (("register", "EV_lvd"), "min", -1.5e300, 'register EV_lvd: "min" must be a number'),
+    (("register", "EV_lvd"), "max", 10 ** 301, 'register EV_lvd: "max" must be a number'),
+    (("scale", "vset"), "num", 2e300, 'scale vset: "num" must be a number'),
+    (("scaleCheck",), "grid", 1e301, 'scaleCheck: "grid" must be a number'),
+    (("scaleCheck",), "alternates", [1e301], "scaleCheck.alternates: 1e+301 is not a number above zero"),
+    # Members the loader does not read, which it would ignore without a word.
+    (("register", "EV_lvd"), "mn", 9.0, 'register EV_lvd: "mn" is not a member the firmware reads'),
+    (("register", "EV_lvd"), "Max", 15.0, 'register EV_lvd: "Max" is not a member the firmware reads'),
+    (("register", "EV_lvd"), "writeable", True, 'register EV_lvd: "writeable" is not a member the firmware reads'),
+    ((), "scheme", 1, 'the profile: "scheme" is not a member the firmware reads'),
+    ((), "check", [], 'the profile: "check" is not a member the firmware reads'),
+    (("scale", "vset"), "decimal", 2, 'scale vset: "decimal" is not a member the firmware reads'),
+    (("coil", "clear_kwh"), "triger", True, 'coil clear_kwh: "triger" is not a member the firmware reads'),
+    (("modbus",), "slave", 2, 'modbus: "slave" is not a member the firmware reads'),
+    (("check", 0), "messge", "x", 'check: "messge" is not a member the firmware reads'),
+    (("group", 0), "titel", "x", 'group live: "titel" is not a member the firmware reads'),
+    (("sentinel", "T_rts"), "txt", "x", 'register T_rts sentinel: "txt" is not a member the firmware reads'),
+    # Text that is not printable ASCII, which an escape in the file gets past its own check.
+    (("register", "EV_lvd"), "label", "caf" + chr(0xE9), "not printable ASCII"),
+    (("register", "EV_lvd"), "note", "a bell" + chr(7), "not printable ASCII"),
+    (("register", "EV_lvd"), "units", "V" + chr(0), "not printable ASCII"),
+    (("register", "EV_lvd"), "units", "V" + chr(0x7F), "not printable ASCII"),
+    (("coil", "clear_kwh"), "note", "line one\nline two", "not printable ASCII"),
+    ((), "notes", ["a tab\there"], "not printable ASCII"),
+    (("labels",), "alarm", ["RTS open" + chr(0x1B) + "[2J"], "not printable ASCII"),
+    ((), "title" + chr(0xA0), "x", "not printable ASCII"),
 ]
+
+# Changes after which the profile must still pass: the edges of each rule above.
+ALLOWED_TESTS = [
+    (("register", "EV_lvd"), "addr", "0XE022"),
+    (("register", "EV_lvd"), "addr", "0xe022"),
+    (("register", "EV_lvd"), "addr", "057378"),
+    (("register", "EV_lvd"), "addr", 57378),
+    (("coil", "clear_kwh"), "addr", "18"),
+    (("coil", "clear_kwh"), "addr", "0X12"),
+    (("sentinel", "T_rts"), "raw", "0x0080"),
+    (("sentinel", "T_rts"), "raw", "128"),
+    (("sentinel", "T_rts"), "raw", 128),
+    (("scaleCheck",), "alternates", [90, 95, 96.667, 100]),
+    (("live",), "regulating", list(range(8))),
+    (("register", "EV_lvd"), "decimals", 0),
+    (("register", "EV_lvd"), "decimals", 6),
+    (("scale", "vset"), "decimals", 0),
+    (("scale", "vset"), "decimals", 6),
+    (("register", "EV_lvd"), "max", 1e300),
+    (("register", "EV_lvd"), "min", -1e300),
+    (("register", "EV_lvd"), "note", "Printable: ~ { } \" \\ ' ` | < > & %"),
+]
+
+# Text the firmware's JSON parser refuses, and text it reads, to check load_json() against.
+JSON_REFUSED = ["[NaN]", "[Infinity]", "[-Infinity]", "[" + "9" * 64 + "]", "[-" + "9" * 63 + "]",
+                "[1." + "0" * 62 + "]", "[1e" + "0" * 62 + "]", "[" * 11 + "]" * 11,
+                '{"a":' * 11 + "1" + "}" * 11, '{"a":[' * 6 + "1" + "]}" * 6, "[" * 100000 + "]" * 100000]
+JSON_READ = ["[" + "9" * 63 + "]", "[-" + "9" * 62 + "]", "[1." + "0" * 61 + "]", "[" * 10 + "]" * 10,
+             '{"a":' * 10 + "1" + "}" * 10, '{"a":[' * 5 + "1" + "]}" * 5, "[1e300, -1e300, 0.5, -0]"]
 
 
 def member_owner(data, where):
@@ -512,26 +692,70 @@ def selftest():
     with open(path, encoding="ascii") as handle:
         profile = json.load(handle)
     failures = ["the profile as it is: %s" % error for error in check_data(copy.deepcopy(profile))]
-    for where, key, value, expected in SELF_TESTS:
+
+    def changed(where, key, value):
         data = copy.deepcopy(profile)
         member_owner(data, where)[key] = value
+        return data
+
+    def errors_of(run, argument):
         try:
-            errors = check_data(data)
+            return run(argument)
         except Exception as error:  # a crash is no answer either
-            errors = ["crashed: %r" % error]
+            return ["crashed: %r" % error]
+
+    setpoints = profile["scaleCheck"]["settings"]["setpoints"] * 2
+    refused = SELF_TESTS + [(("settings",), "setpoints", setpoints[:SETPOINTS_MAX + 1],
+                             "scaleCheck.settings.setpoints names at most 24 registers")]
+    for where, key, value, expected in refused:
+        errors = errors_of(check_data, changed(where, key, value))
         if not any(expected in error for error in errors):
             failures.append("%s = %r: expected %r, got %r" % (key, value, expected, errors[:2]))
     # A null member counts as left out, as it does for the loader.
-    for where, key in ((("register", "EV_lvd"), "note"), ((), "wiring"), (("scaleCheck",), "grid"),
-                       ((), "notes"), (("group", 0), "title")):
-        data = copy.deepcopy(profile)
-        member_owner(data, where)[key] = None
-        failures += ["a null %s: %s" % (key, error) for error in check_data(data)]
+    allowed = ALLOWED_TESTS + [(("settings",), "setpoints", setpoints[:SETPOINTS_MAX])] + [
+        (where, key, None) for where, key in ((("register", "EV_lvd"), "note"), ((), "wiring"),
+                                              (("scaleCheck",), "grid"), ((), "notes"), (("group", 0), "title"),
+                                              (("register", "EV_lvd"), "mn"))]
+    for where, key, value in allowed:
+        failures += ["%s = %r: %s" % (key, value, error) for error in errors_of(check_data, changed(where, key, value))]
+
+    # The file as written: what the firmware's JSON parser refuses, whatever the member.
+    def text_with(where, key, token):
+        return json.dumps(changed(where, key, "@token@")).replace('"@token@"', token).encode("ascii")
+
+    backslash = chr(92)
+    texts = [((("register", "EV_lvd"), "max", "NaN"), "not valid JSON: NaN is not a JSON number"),
+             ((("register", "EV_lvd"), "max", "-Infinity"), "not valid JSON: -Infinity is not a JSON number"),
+             ((("register", "EV_lvd"), "mn", "Infinity"), "not valid JSON: Infinity is not a JSON number"),
+             ((("scaleCheck",), "alternates", "[96.667" + "0" * 58 + "]"), "not valid JSON: a number of 64 characters"),
+             ((("live",), "regulating", "[" * 8 + "6" + "]" * 8), "not valid JSON: lists and objects nested more than 10"),
+             ((("register", "EV_lvd"), "label", '"caf' + backslash + 'u00e9"'), "not printable ASCII")]
+    for (where, key, token), expected in texts:
+        errors = errors_of(check_text, text_with(where, key, token))
+        if not any(expected in error for error in errors):
+            failures.append("%s as %s: expected %r, got %r" % (key, token[:20], expected, errors[:2]))
+    longest = text_with(("scaleCheck",), "alternates", "[96.667" + "0" * 57 + "]")  # 63 characters
+    failures += ["a number of 63 characters: %s" % error for error in errors_of(check_text, longest)]
+    for text in JSON_REFUSED:
+        try:
+            load_json(text)
+            failures.append("read %s..., which the firmware refuses" % text[:24])
+        except ValueError:
+            pass
+        except Exception as error:
+            failures.append("%s...: crashed: %r" % (text[:24], error))
+    for text in JSON_READ:
+        try:
+            load_json(text)
+        except Exception as error:
+            failures.append("refused %s..., which the firmware reads: %s" % (text[:24], error))
+
     for failure in failures:
         print("check_profile.py self-test: " + failure)
     if failures:
         return 1
-    print("check_profile.py self-test: all %d wrong members refused" % len(SELF_TESTS))
+    print("check_profile.py self-test: %d wrong profiles refused, %d right ones passed, %d texts read as the "
+          "firmware reads them" % (len(refused) + len(texts), len(allowed) + 2, len(JSON_REFUSED) + len(JSON_READ)))
     return 0
 
 
