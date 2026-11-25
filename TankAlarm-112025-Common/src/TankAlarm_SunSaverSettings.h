@@ -672,7 +672,7 @@ enum Finding : uint32_t {
   FINDING_TEMPCOMP = 1ul << 3,          // temperature compensation is stored as on
   FINDING_ABSORB_RANGE = 1ul << 4,      // a stored absorption voltage is outside the battery's range
   FINDING_FLOAT_RANGE = 1ul << 5,       // a stored float voltage is outside the battery's range
-  FINDING_SCALE_UNPROVEN = 1ul << 6,    // the stored voltages could not be judged
+  FINDING_SCALE_UNPROVEN = 1ul << 6,    // the stored voltages could not be judged, but for any of 0 V
   FINDING_NOT_READ = 1ul << 7,          // a register the judgement needs did not answer
   FINDING_RESET_PENDING = 1ul << 8,     // settings were written, the controller has not restarted
   FINDING_CHARGER_FAULT = 1ul << 9,     // the controller reports another fault
@@ -701,8 +701,8 @@ inline const char *findingText(uint32_t finding) {
     case FINDING_FLOAT_RANGE:
       return "A stored float voltage is outside the range for this battery.";
     case FINDING_SCALE_UNPROVEN:
-      return "The stored voltages were not judged: how this charger encodes them could not be proven "
-             "from its setpoints.";
+      return "Stored voltages other than 0 V were not judged: how this charger encodes them could not "
+             "be proven from its setpoints.";
     case FINDING_NOT_READ:
       return "A register that the judgement needs did not answer.";
     case FINDING_RESET_PENDING:
@@ -885,6 +885,10 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
     chargeRanges(want.chemistry, &absorb, &floating);
     // The stored voltages are judged as those of a 12 V system whose encoding is proven. Where
     // that cannot be said of this controller, they are not judged and the judgement stays open.
+    // But a word of 0 is 0 V in either encoding, so on a 12 V system it is wrong for the battery
+    // with the encoding unproven too: a float voltage of 0 means "no float", and the charger then
+    // holds the battery at its absorption voltage. A 24 V system, or one that is not known, is
+    // not judged even then.
     bool judged = false;
     if (!have(snapshot, I_ADC_VB_F)) {
       findings |= FINDING_NOT_READ;
@@ -897,14 +901,17 @@ inline void evaluate(const Snapshot &snapshot, const Expectation &want, Evaluati
     } else {
       judged = true;
     }
+    const bool twelveVolts = out->systemVolts == 12;  // 0 when the battery voltage was not read
     const uint8_t setpoints[4] = {I_EV_REG, I_EV_REG2, I_EV_FLOAT, I_EV_FLOAT2};
     for (uint8_t i = 0; i < 4; ++i) {
       const bool isAbsorb = i < 2;
       if (!have(snapshot, setpoints[i])) {
         findings |= FINDING_NOT_READ;
-      } else if (judged &&
-                 outsideRange(snapshot.raw[setpoints[i]], out->settingsScale.scale, isAbsorb ? absorb : floating)) {
-        // A float voltage of 0 means "no float": the charger then stays at the absorption voltage.
+        continue;
+      }
+      const uint16_t raw = snapshot.raw[setpoints[i]];
+      if ((twelveVolts && raw == 0) ||
+          (judged && outsideRange(raw, out->settingsScale.scale, isAbsorb ? absorb : floating))) {
         findings |= isAbsorb ? FINDING_ABSORB_RANGE : FINDING_FLOAT_RANGE;
       }
     }
@@ -1227,6 +1234,11 @@ inline void describeValue(uint8_t index, uint16_t raw, uint8_t settingsScale, ui
       out->addUnsigned(raw).add(raw == 1 ? " day" : " days");
       break;
     case KIND_TEMPCO:
+      // The word is the size of the coefficient, whose sign is implied negative: the charger
+      // lowers its voltages as the battery warms.
+      if (raw != 0) {
+        out->add("-");
+      }
       out->addFixed((double)raw * 100.0 / 65536.0, 4).add(" V/C");
       break;
     case KIND_OHMS:

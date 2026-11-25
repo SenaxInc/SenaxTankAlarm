@@ -450,6 +450,15 @@ public:
   void setPackVolts(uint8_t volts) { _packVolts = (volts == 12 || volts == 24) ? volts : 0; }
   uint8_t getPackVolts() const { return _packVolts; }
 
+  // The battery's chemistry as the config names it, a sunsaver::Chemistry: CHEMISTRY_NOT_JUDGED
+  // (the default) when it names none. While the float voltage is not known, the no-charge alert
+  // keeps its default target within 0.2 V of the lowest float voltage that the charger check
+  // accepts for that chemistry (sunsaver::chargeRanges()): a battery a charger holds there is
+  // full. Lead-acid's 13.4 V had a full Li-ion battery, at 12.6 V, count as one that is not being
+  // charged. Kept across begin() and end(), like the pack.
+  void setPackChemistry(uint8_t chemistry) { _packChemistry = chemistry; }
+  uint8_t getPackChemistry() const { return _packChemistry; }
+
   // ---------------------------------------------------------------------------------------
   // Charger programming: writes a LiFePO4 charging profile and the LVD and LVR into the
   // controller when the client's config asks for it (sunsaver::Supervisor in
@@ -530,6 +539,7 @@ private:
   float _floatReferenceV;   // See setFloatReference(). 0 = not known.
   float _readingFactor;     // See setFloatReference(): what this firmware reads per volt of battery
   uint8_t _packVolts;       // See setPackVolts(). 0 = the config names none.
+  uint8_t _packChemistry;   // See setPackChemistry(). sunsaver::CHEMISTRY_NOT_JUDGED = none.
 
   // Charger check
   sunsaver::SnapshotReader _chargerCheck;

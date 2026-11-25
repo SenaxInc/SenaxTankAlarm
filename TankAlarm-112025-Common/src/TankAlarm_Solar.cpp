@@ -100,11 +100,31 @@ static bool          sSolarMissSeen = false;
 static unsigned long sSolarTimeoutMs = 0;      // the timeout ModbusRTUClient was last given
 static uint8_t       sSolarPollMisses = 0;     // misses since the poll under way began: see pollMayGoOn()
 
-// True for the text of a Modbus exception a SunSaver answers with: the controller is there and
-// said no. Anything else that ModbusRTUClient.lastError() gives means that no usable reply came.
+// True for the text of a Modbus exception that the controller itself answered with: exception
+// codes 1 to 8, as ModbusRTUClient.lastError() words them (libmodbus's modbus_strerror()). The
+// controller is there and has answered, if only to say it is busy, and the line is free again.
+// Anything else means that no usable reply came from the controller. Codes 10 and 11 among them ("Gateway path
+// unavailable", "Target device failed to respond"): a gateway sends them when the device behind
+// it did not answer. And "Invalid exception code", which libmodbus also gives for an exception
+// frame of the wrong length or for another function code: that can be a late reply to an earlier
+// request.
 static bool solarErrorIsRefusal(const char *text) {
-  return strcmp(text, "Illegal data address") == 0 || strcmp(text, "Illegal function") == 0 ||
-         strcmp(text, "Illegal data value") == 0 || strcmp(text, "Slave device or server failure") == 0;
+  static const char *const kExceptions[] = {
+      "Illegal function",                // 1
+      "Illegal data address",            // 2
+      "Illegal data value",              // 3
+      "Slave device or server failure",  // 4
+      "Acknowledge",                     // 5
+      "Slave device or server is busy",  // 6
+      "Negative acknowledge",            // 7
+      "Memory parity error",             // 8
+  };
+  for (size_t i = 0; i < sizeof(kExceptions) / sizeof(kExceptions[0]); ++i) {
+    if (strcmp(text, kExceptions[i]) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Drain any stale bytes left in the RS-485 UART RX buffer before a new Modbus
@@ -356,7 +376,7 @@ static bool readRegistersIndividually(uint8_t slaveId, uint16_t startAddress, ui
 SolarManager::SolarManager() 
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
     _floatReferenceV(0.0f), _readingFactor((float)sunsaver::readingFactor(sunsaver::SCALE_UNKNOWN, SS_VOLTAGE_SCALE_ID)),
-    _packVolts(0), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
+    _packVolts(0), _packChemistry(sunsaver::CHEMISTRY_NOT_JUDGED), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
     _chargerSettingsRead(false), _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
@@ -745,6 +765,21 @@ bool SolarManager::readRegisters() {
       scale = 1.0f;
     }
     float floatThreshold = BATTERY_VOLTAGE_FLOAT * scale * packs * _readingFactor;
+    // A battery the config names, whose float voltages the charger check knows (setPackChemistry()):
+    // a charger set anywhere in that range holds it full, and a full battery at the lowest of them
+    // is no battery that needs charge. The default is then never more than 0.2 V above that
+    // voltage, the margin of the comparison below, for the pack and as this firmware reads it.
+    // That takes a Li-ion battery, full at 12.6 V and held as low as 11.7 V per 12 V, from
+    // lead-acid's 13.4 V to 11.9 V. A LiFePO4 battery, held from 13.2 V, keeps 13.4 V on a 12 V
+    // pack, and has 26.6 V in place of 26.8 V on a 24 V one.
+    sunsaver::VoltRange absorbRange = {0.0, 0.0};
+    sunsaver::VoltRange floatRange = {0.0, 0.0};
+    if (sunsaver::chargeRanges(_packChemistry, &absorbRange, &floatRange)) {
+      const float lowestFull = (float)floatRange.low * packs * _readingFactor + 0.2f;
+      if (floatThreshold > lowestFull) {
+        floatThreshold = lowestFull;
+      }
+    }
     if (_floatReferenceV > 8.0f) {
       floatThreshold = _floatReferenceV;
     }
@@ -1405,7 +1440,8 @@ bool SolarManager::chargerProgrammingWantsLine(double epochNow) const {
 // Stub implementation for non-RS485 platforms
 SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
-    _floatReferenceV(0.0f), _readingFactor(1.0f), _packVolts(0), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
+    _floatReferenceV(0.0f), _readingFactor(1.0f), _packVolts(0), _packChemistry(sunsaver::CHEMISTRY_NOT_JUDGED),
+    _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
     _chargerSettingsRead(false), _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));

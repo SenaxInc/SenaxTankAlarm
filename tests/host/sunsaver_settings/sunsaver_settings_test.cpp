@@ -377,6 +377,9 @@ static void testValuesAgainstOptaView() {
       std::string expected = theirs;
       if ((entry.flags & ss::ITEM_ZERO_IS_OFF) != 0 && used == 0) {
         expected = "0 (off)";
+      } else if (entry.kind == ss::KIND_TEMPCO) {
+        // OptaView shows the size of the coefficient; its sign is negative.
+        expected = "-" + expected;
       } else if (entry.kind == ss::KIND_SECONDS && raw >= 60) {
         expected = std::string(mine).substr(0, expected.size()) == expected ? std::string(mine) : expected;
         if (!has(mine, " min)")) {
@@ -435,10 +438,13 @@ static void testValuesAgainstOptaView() {
   CHECK(textOf(ss::I_ET_EQCALENDAR, 28) == "28 days");
   CHECK(textOf(ss::I_ET_EQCALENDAR, 1) == "1 day");
   CHECK(textOf(ss::I_ET_EQCALENDAR, 0) == "0 days");
-  CHECK(textOf(ss::I_EV_TEMPCOMP, 20) == "0.0305 V/C");
+  // The coefficient is negative: the word holds its size.
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 20) == "-0.0305 V/C");
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 1) == "-0.0015 V/C");
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 255) == "-0.3891 V/C");
   CHECK(textOf(ss::I_EV_TEMPCOMP, 0) == "0 (off)");
   // Only the low byte is used.
-  CHECK(textOf(ss::I_EV_TEMPCOMP, 0x0114) == "0.0305 V/C");
+  CHECK(textOf(ss::I_EV_TEMPCOMP, 0x0114) == "-0.0305 V/C");
   CHECK(textOf(ss::I_EV_TEMPCOMP, 0x0100) == "0 (off)");
   CHECK(textOf(ss::I_EV_TEMPCOMP, 0xFF00) == "0 (off)");
   CHECK(textOf(ss::I_ER_ICOMP, 778) == "0.0150 ohm");
@@ -1712,6 +1718,73 @@ static void testEvaluate() {
     CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
   }
   {
+    // But a setpoint of 0 is 0 V with either scale: on a 12 V system it is wrong for a lithium
+    // battery with the scale unproven too. A float voltage of 0 is no float, and the charger
+    // holds the battery at its absorption voltage. Each bank, each setpoint, both chemistries.
+    const uint16_t setpoints[4] = {0xE000, 0xE00D, 0xE001, 0xE00E};  // EV_reg, EV_reg2, EV_float, EV_float2
+    const uint8_t chemistries[2] = {ss::CHEMISTRY_LIFEPO4, ss::CHEMISTRY_LI_ION};
+    for (size_t i = 0; i < 4; ++i) {
+      for (size_t c = 0; c < 2; ++c) {
+        SimSunSaver sim;
+        makeLiFePO4(sim);
+        for (uint8_t w = 0; w < ss::SETTING_ITEMS; ++w) {
+          if ((ss::item(w).flags & ss::ITEM_WITNESS) != 0 && sim.regs[ss::item(w).addr] != 0) {
+            sim.regs[ss::item(w).addr] = (uint16_t)(sim.regs[ss::item(w).addr] + 7);
+          }
+        }
+        if (chemistries[c] == ss::CHEMISTRY_LI_ION) {
+          // Li-ion voltages, out of the scale's sight as well, so that only the 0 is wrong.
+          for (size_t k = 0; k < 4; ++k) {
+            sim.regs[setpoints[k]] = (uint16_t)(sim.setVolts(k < 2 ? 12.40 : 12.20) + 7);
+          }
+        }
+        const uint32_t wrong = i < 2 ? ss::FINDING_ABSORB_RANGE : ss::FINDING_FLOAT_RANGE;
+        ss::Evaluation e = judge(sim, chemistries[c]);
+        CHECK_EQ(e.settingsScale.scale, ss::SCALE_UNKNOWN);
+        CHECK_EQ(e.findings, ss::FINDING_SCALE_UNPROVEN);
+        sim.regs[setpoints[i]] = 0;
+        e = judge(sim, chemistries[c]);
+        CHECK_EQ(e.settingsScale.scale, ss::SCALE_UNKNOWN);
+        CHECK_EQ(e.systemVolts, 12);
+        CHECK_MSG(e.findings == (ss::FINDING_SCALE_UNPROVEN | wrong) && e.verdict == ss::VERDICT_MISMATCH,
+                  "setpoint 0x%04X at 0, chemistry %u: findings 0x%lX, verdict %d", (unsigned)setpoints[i],
+                  (unsigned)chemistries[c], (unsigned long)e.findings, (int)e.verdict);
+        // The same 0 with the scale proven, as before.
+        SimSunSaver proven;
+        makeLiFePO4(proven);
+        proven.regs[setpoints[i]] = 0;
+        e = judge(proven, ss::CHEMISTRY_LIFEPO4);
+        CHECK_EQ(e.findings, wrong);
+        CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      }
+    }
+    // A word of 1 is no 0: with the scale unproven it is not judged.
+    SimSunSaver sim;
+    makeLiFePO4(sim);
+    for (uint8_t w = 0; w < ss::SETTING_ITEMS; ++w) {
+      if ((ss::item(w).flags & ss::ITEM_WITNESS) != 0 && sim.regs[ss::item(w).addr] != 0) {
+        sim.regs[ss::item(w).addr] = (uint16_t)(sim.regs[ss::item(w).addr] + 7);
+      }
+    }
+    sim.regs[0xE00E] = 1;
+    ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.settingsScale.scale, ss::SCALE_UNKNOWN);
+    CHECK_EQ(e.findings, ss::FINDING_SCALE_UNPROVEN);
+    CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+    // Nor is a 0 for a battery whose voltages this check does not judge.
+    sim.regs[0xE00E] = 0;
+    sim.regs[0xE001] = 0;
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).findings, kNone);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
+    CHECK_EQ(judge(sim, ss::CHEMISTRY_NOT_JUDGED).verdict, ss::VERDICT_NOT_JUDGED);
+    // Nor for a controller whose battery voltage did not answer: its system is not known.
+    sim.regs.erase(0x0008);
+    e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+    CHECK_EQ(e.systemVolts, 0);
+    CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+    CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+  }
+  {
     // A register the judgement needs did not answer.
     const uint16_t needed[] = {0x0025, 0xE007, 0xE014, 0xE01A, 0xE000, 0xE00D, 0xE001, 0xE00E};
     for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); ++i) {
@@ -1858,6 +1931,15 @@ static void testEvaluate() {
       CHECK_EQ(e.systemVolts, 0);
       CHECK_MSG(e.findings == ss::FINDING_SYSTEM_UNKNOWN && e.verdict == ss::VERDICT_CANNOT_TELL,
                 "battery at %.2f V: findings 0x%lX, verdict %d", odd[i], (unsigned long)e.findings, (int)e.verdict);
+      {
+        // A setpoint of 0 is not judged on a system that is not known either.
+        SimSunSaver zero = sim;
+        zero.regs[0xE001] = 0;
+        zero.regs[0xE00D] = 0;
+        const ss::Evaluation z = judge(zero, ss::CHEMISTRY_LIFEPO4);
+        CHECK_MSG(z.findings == ss::FINDING_SYSTEM_UNKNOWN && z.verdict == ss::VERDICT_CANNOT_TELL,
+                  "battery at %.2f V, setpoints of 0: findings 0x%lX", odd[i], (unsigned long)z.findings);
+      }
       sim.regs[0xE000] = sim.setVolts(16.00);  // not judged
       sim.regs.erase(0xE00E);                  // and still counted as missing
       e = judge(sim, ss::CHEMISTRY_LIFEPO4);
@@ -1903,6 +1985,22 @@ static void testEvaluate() {
     e = judge(sim, ss::CHEMISTRY_LIFEPO4, 24);
     CHECK_EQ(e.findings, ss::FINDING_SYSTEM_24V | ss::FINDING_NOT_READ);
     CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+  }
+  {
+    // Nor a setpoint of 0 on a 24 V system, in either bank: those are not judged at all.
+    const uint16_t setpoints[4] = {0xE000, 0xE00D, 0xE001, 0xE00E};
+    for (size_t i = 0; i < 4; ++i) {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs[0x0008] = sim.volts(26.60);
+      sim.regs[0x001C] = sim.volts(26.20);
+      sim.regs[setpoints[i]] = 0;
+      ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4, 24);
+      CHECK_EQ(e.systemVolts, 24);
+      CHECK_EQ(e.findings, ss::FINDING_SYSTEM_24V);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LI_ION, 24).findings, ss::FINDING_SYSTEM_24V);
+    }
   }
 
   // Notes: they are reported and change no verdict.

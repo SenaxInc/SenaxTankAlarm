@@ -1640,6 +1640,7 @@ static bool deviceUidKnown();
 static bool lookUpDeviceUid();
 static void keepClock();
 static uint8_t configuredPackVolts();
+static uint8_t chargerCheckChemistry();
 static void sendDueChargerReport(unsigned long now);
 static sunsaver::Journal loadChargerJournal();
 static bool saveChargerJournal(const sunsaver::Journal &journal);
@@ -1983,7 +1984,8 @@ void setup() {
   initializeUserButton();
   
   // Initialize solar/battery charger monitoring (SunSaver MPPT via RS-485)
-  gSolarManager.setPackVolts(configuredPackVolts());  // kept across begin() and end()
+  gSolarManager.setPackVolts(configuredPackVolts());  // both kept across begin() and end()
+  gSolarManager.setPackChemistry(chargerCheckChemistry());
   if (gConfig.solarCharger.enabled) {
     if (gSolarManager.begin(gConfig.solarCharger)) {
       if (gSolarManager.isCommunicationOk()) {
@@ -5381,6 +5383,7 @@ static void applyConfigUpdate(const JsonDocument &doc) {
     initBatteryConfig(&gConfig.batteryMonitor, bt, nominalV);
     gConfig.batteryMonitor.enabled = batEnabled && (bt != BATTERY_TYPE_NONE);
     gSolarManager.setPackVolts(configuredPackVolts());
+    gSolarManager.setPackChemistry(chargerCheckChemistry());
     // The voltage as initBatteryConfig() keeps it: the server sends 0 for no battery, which is
     // kept as 12, and the same config sent again would otherwise ask for a charger check each time.
     if (prevType != bt || prevNominal != gConfig.batteryMonitor.nominalVoltage ||
@@ -7744,7 +7747,8 @@ static void sendSolarAlarm(SolarAlertType alertType) {
 // The battery the charger's settings are judged against. None while battery monitoring is off:
 // the 12 V AGM that a config without a batteryConfig block starts with, or one that switches the
 // monitoring off, is a placeholder that nobody chose, and an OK or WRONG verdict on it would be
-// about a battery that may not be there.
+// about a battery that may not be there. The no-charge alert takes a full battery's voltage from
+// the same chemistry while the charger's float voltage is not known (SolarManager::setPackChemistry()).
 static uint8_t chargerCheckChemistry() {
   // The server maps the battery of the config it holds the same way, to tell whether the report
   // it keeps is about the battery that config names.

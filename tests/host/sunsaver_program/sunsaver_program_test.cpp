@@ -1043,7 +1043,7 @@ static void testPlan() {
                     regs[A_ER_ICOMP] = icomp;
                     regs[A_EV_EQ] = (extras & 1) != 0 ? word(14.60) : 0;
                     regs[A_EV_EQ2] = (extras & 1) != 0 ? word(14.90) : 0;
-                    regs[A_EV_TEMPCOMP] = (extras & 2) != 0 ? 20 : 0;  // the factory's 0.0305 V/C
+                    regs[A_EV_TEMPCOMP] = (extras & 2) != 0 ? 20 : 0;  // the factory's -0.0305 V/C
                     ss::PlanEntry entries[ss::PLAN_ENTRIES];
                     ss::buildPlan(snapshotOf(regs), wanted, ss::SCALE_100, entries);
                     std::map<uint16_t, uint16_t> after = regs;
@@ -8077,7 +8077,7 @@ static void testText() {
         "EV_float2: 13.70 V -> 13.50 V, written",
         "Et_float2: 9000 s (150 min) -> 900 s (15 min), written",
         "Et_floatlb2: 10800 s (180 min) -> 900 s (15 min), written",
-        "EV_tempcomp: 0.0305 V/C -> 0 (off), written",
+        "EV_tempcomp: -0.0305 V/C -> 0 (off), written",
         "EV_reg: 14.00 V -> 14.20 V, written",
         "ER_icomp: 0 (off), already set",
         "EV_lvr: 12.60 V -> 13.25 V, written",
