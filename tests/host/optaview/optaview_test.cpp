@@ -2938,6 +2938,54 @@ static void testConsoleSet() {
     CHECK_EQ(countOf(hvd, "After this write, "), 3);
     rig.run("no");
 
+    // A 0 switches a disconnect off, but not a reconnect: the battery never falls to 0 V, so
+    // after a high voltage disconnect charging, or the load, would not come back.
+    const std::string hvr = rig.run("get EV_hvr");
+    CHECK_HAS(hvr, "'set' accepts from 10.00 V to 18.00 V.");
+    CHECK_HAS(hvr, "0 does not switch it off");
+    CHECK_HAS(rig.run("get EV_lhvr"), "'set' accepts from 10.00 V to 18.00 V.");
+    CHECK_HAS(rig.run("get EV_hvd"), "'set' accepts from 10.00 V to 18.00 V, or 0 to switch it off.");
+    CHECK_HAS(rig.run("get EV_lhvd"), "'set' accepts from 10.00 V to 18.00 V, or 0 to switch it off.");
+    CHECK_HAS(rig.run("set EV_hvr 0"), "That is below what this profile allows for EV_hvr: from 10.00 V to 18.00 V.");
+    CHECK_HAS(rig.run("set EV_lhvr 0"), "That is below what this profile allows for EV_lhvr: from 10.00 V to 18.00 V.");
+    CHECK_HAS(rig.run("set EV_lhvr raw 0"), "That is below");
+    CHECK(!rig.console.awaitingConfirmation());
+    // Nor is a 0 that the controller already holds there a reconnect. This one's load high
+    // voltage disconnect is off and its reconnect 0: switching the disconnect on alone would
+    // leave the load off after the first disconnect.
+    const std::string lhvd = rig.run("set EV_lhvd 15.00");
+    CHECK_HAS(lhvd, "Careful: Load high voltage reconnect (EV_lhvr) must be below load high voltage disconnect");
+    CHECK_HAS(lhvd, "After this write, EV_lhvr = 0.00 V and EV_lhvd = 15.00 V. Put the other one right before you 'reset'.\r\n"
+                    "    EV_lhvr cannot be 0: 0 does not switch it off.\r\n");
+    CHECK_EQ(countOf(lhvd, "cannot be 0"), 1);
+    CHECK_EQ(countOf(lhvd, "After this write, "), 1);
+    rig.run("no");
+    // The same pair with the reconnect set is in order, and a 0 in the disconnect switches the
+    // pair off, whatever the reconnect holds.
+    rig.sim.regs[0xE025] = rig.sim.setVolts(14.50);
+    CHECK_HASNT(rig.run("set EV_lhvd 15.00"), "Careful: Load high voltage");
+    rig.run("no");
+    rig.sim.regs[0xE024] = rig.sim.setVolts(15.00);
+    rig.sim.regs[0xE025] = 0;
+    CHECK_HASNT(rig.run("set EV_lhvd 0"), "Careful: Load high voltage");
+    rig.run("no");
+    // The low voltage pair has no 0 that switches it off: a 0 in either is named.
+    rig.sim.regs[0xE023] = 0;  // EV_lvr
+    const std::string lvd = rig.run("set EV_lvd 11.40");
+    CHECK_HAS(lvd, "After this write, EV_lvd = 11.40 V and EV_lvr = 0.00 V.");
+    CHECK_HAS(lvd, "    EV_lvr cannot be 0: 0 does not switch it off.");
+    CHECK_HASNT(lvd, "EV_lvd cannot be 0");
+    rig.run("no");
+    rig.sim.regs[0xE023] = rig.sim.setVolts(12.60);
+    rig.sim.regs[0xE022] = 0;  // EV_lvd
+    const std::string lvr = rig.run("set EV_lvr 12.70");
+    CHECK_HAS(lvr, "Careful: Low voltage reconnect (EV_lvr) must be above low voltage disconnect (EV_lvd).");
+    CHECK_HAS(lvr, "    EV_lvd cannot be 0: 0 does not switch it off.");
+    CHECK_HASNT(lvr, "EV_lvr cannot be 0");
+    rig.run("no");
+    rig.sim.regs[0xE022] = rig.sim.setVolts(11.50);
+    rig.sim.regs[0xE024] = 0;
+
     // Refusals. None of them reaches the bus as a write.
     CHECK_HAS(rig.run("set"), "Usage: set");
     CHECK_HAS(rig.run("set EV_lvd"), "Usage: set");
@@ -3646,6 +3694,27 @@ static void testConsoleCoilsAndReset() {
     CHECK_HASNT(restart, "Problem:");
     CHECK_HAS(restart, "Type yes to restart it.");
     rig.run("no");
+    // A 0 that switches nothing off is no setting: a reconnect at 0 V stands in the way of the
+    // restart while its disconnect is on, like one that is out of order. The disconnect at 0
+    // switches the pair off again.
+    rig.sim.regs[0xE024] = rig.sim.setVolts(15.00);  // EV_lhvd on, EV_lhvr still 0
+    const std::string zero = rig.run("reset");
+    CHECK_HAS(zero, "Problem: Load high voltage reconnect (EV_lhvr) must be below load high voltage disconnect");
+    CHECK_HAS(zero, "    Now EV_lhvr = 0.00 V and EV_lhvd = 15.00 V.\r\n    EV_lhvr cannot be 0: 0 does not switch it off.\r\n");
+    CHECK_EQ(countOf(zero, "Problem:"), 1);
+    CHECK_HAS(zero, "Put that right first, or use 'reset anyway'.");
+    CHECK(!rig.console.awaitingConfirmation());
+    CHECK_EQ(rig.sim.resets, 0);
+    rig.sim.regs[0xE025] = rig.sim.setVolts(14.50);
+    CHECK_HASNT(rig.run("reset"), "Problem:");
+    rig.run("no");
+    rig.sim.regs[0xE01B] = rig.sim.setVolts(15.20);  // EV_hvd on again, EV_hvr at 0
+    rig.sim.regs[0xE01C] = 0;
+    const std::string hvr = rig.run("reset");
+    CHECK_HAS(hvr, "    Now EV_hvr = 0.00 V and EV_hvd = 15.20 V.\r\n    EV_hvr cannot be 0: 0 does not switch it off.\r\n");
+    CHECK_EQ(countOf(hvr, "Problem:"), 1);
+    CHECK_HAS(hvr, "Put that right first, or use 'reset anyway'.");
+    CHECK_EQ(rig.sim.resets, 0);
   }
   {  // A pair that cannot be checked stands in the way like one that is out of order, whichever
      // of its two registers does not read.

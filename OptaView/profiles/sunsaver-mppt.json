@@ -150,7 +150,7 @@
 
     { "addr": "0xE01A", "name": "EV_tempcomp", "label": "Temperature compensation per C (0 = off)", "type": "u8", "scale": "tempco", "group": "charge", "writable": true, "min": 0, "max": 0.1, "note": "Only the low byte is used and the sign is implied negative: write a positive value. OptaView reads only the low byte, and writes 0 in the high byte." },
     { "addr": "0xE01B", "name": "EV_hvd", "label": "Battery high voltage disconnect at 25 C (0 = off)", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
-    { "addr": "0xE01C", "name": "EV_hvr", "label": "Battery high voltage reconnect", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
+    { "addr": "0xE01C", "name": "EV_hvr", "label": "Battery high voltage reconnect", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "note": "0 does not switch it off: the battery never falls to 0 V, so after a high voltage disconnect charging would not come back. 0 in EV_hvd switches the disconnect off." },
     { "addr": "0xE01D", "name": "Evb_ref_lim", "label": "Regulation ceiling, not compensated (0 = none)", "scale": "vset", "group": "charge", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
     { "addr": "0xE01E", "name": "ETb_max", "label": "Highest temperature used for compensation", "type": "i8", "units": "C", "group": "charge", "note": "Read-only in this profile: how the controller stores a negative limit is not confirmed." },
     { "addr": "0xE01F", "name": "ETb_min", "label": "Lowest temperature used for compensation", "type": "i8", "units": "C", "group": "charge", "note": "The specification's description calls this a maximum too; taken as the minimum from its name. Read-only in this profile." },
@@ -158,7 +158,7 @@
     { "addr": "0xE022", "name": "EV_lvd", "label": "Low voltage disconnect", "scale": "vset", "group": "load", "writable": true, "min": 9.0, "max": 15.0 },
     { "addr": "0xE023", "name": "EV_lvr", "label": "Low voltage reconnect", "scale": "vset", "group": "load", "writable": true, "min": 9.0, "max": 15.0 },
     { "addr": "0xE024", "name": "EV_lhvd", "label": "Load high voltage disconnect (0 = off)", "scale": "vset", "group": "load", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
-    { "addr": "0xE025", "name": "EV_lhvr", "label": "Load high voltage reconnect", "scale": "vset", "group": "load", "writable": true, "min": 10.0, "max": 18.0, "zeroOk": true },
+    { "addr": "0xE025", "name": "EV_lhvr", "label": "Load high voltage reconnect", "scale": "vset", "group": "load", "writable": true, "min": 10.0, "max": 18.0, "note": "0 does not switch it off: the battery never falls to 0 V, so after a load high voltage disconnect the load would not come back. 0 in EV_lhvd switches the disconnect off." },
     { "addr": "0xE026", "name": "ER_icomp", "label": "LVD load current compensation (0 = off)", "scale": "icomp", "group": "load", "writable": true, "min": 0, "max": 0.2, "note": "The specification's table gives ohms; its description block says V/A (the same thing)." },
     { "addr": "0xE027", "name": "Et_lvd_warn", "label": "LVD warning time", "scale": "tenths", "group": "load", "writable": true },
 

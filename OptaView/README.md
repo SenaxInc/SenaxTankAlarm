@@ -287,7 +287,10 @@ version 0.2 OptaView keeps these rules, and the host tests check each of them:
   that it does not know, and it keeps saying that a restart may be due until the register has
   been read again.
 - Pairs that must stay in order (reconnect above disconnect) are checked when you `set` one of
-  them and again before `reset`.
+  them and again before `reset`. A 0 switches a pair off only where it switches the setting
+  off, as in the high voltage disconnects. A reconnect cannot be 0: the battery never falls to
+  0 V, so the output would not come back. `set` refuses that, and a 0 that the controller
+  already holds there stands in the way of `reset`.
 - A restart counts only when it shows: after the reset command the controller misses a request
   and then answers again. One that answers every request for the profile's `resetWaitMs`
   (3 s) was not seen to restart, and OptaView keeps saying that a restart is due. A single
@@ -507,9 +510,11 @@ python3 OptaView/tools/embed_web.py     # regenerate OptaViewWebPage.h
 
 The script also works out the hashes that the page's policy names for its style sheet and its
 script, and refuses a page that needs more than that policy allows (an inline event handler, a
-style sheet brought in with `@import`, a font, any file but a `data:` image).
-`embed_web.py --selftest` shows that each of those rules refuses what it should. The host tests
-run it, and fail when the header is out of date.
+style sheet brought in with `@import` or a link, a font, a script file, any file but a `data:`
+image). It reads each tag the way a browser does, so a `>` inside a quoted value hides nothing.
+`embed_web.py --selftest` shows that each of those rules refuses what it should, and that a
+`data:` image passes wherever an image can go. The host tests run it, and fail when the header
+is out of date.
 
 ## Files
 
