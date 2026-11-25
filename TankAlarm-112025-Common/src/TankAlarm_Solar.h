@@ -422,7 +422,11 @@ public:
   // The registers of the last pass. Complete only when chargerCheckDone().
   const sunsaver::Snapshot& chargerSnapshot() const { return _chargerCheck.snapshot(); }
 
-  // True once a pass has completed since begin().
+  // True once a pass has completed since begin(): every register answered or was refused.
+  bool chargerCheckCompleted() const { return _chargerCheckCompleted; }
+
+  // True once a pass that completed since begin() read a stored setting: one completes without
+  // when the controller refuses every EEPROM register (sunsaver::anySettingRead()).
   bool chargerSettingsRead() const { return _chargerSettingsRead; }
 
   // The voltage the charger holds a full battery at, as this firmware reads the battery. The
@@ -546,6 +550,7 @@ private:
   sunsaver::SnapshotReader _chargerCheck;
   unsigned long _chargerCheckStepMillis;  // when the last step ran
   unsigned long _chargerCheckGapMs;       // the pause before the next one (0 before the first)
+  bool _chargerCheckCompleted;
   bool _chargerSettingsRead;
 
   // Charger programming

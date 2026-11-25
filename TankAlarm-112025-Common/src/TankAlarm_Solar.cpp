@@ -377,7 +377,7 @@ SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
     _floatReferenceV(0.0f), _readingFactor((float)sunsaver::readingFactor(sunsaver::SCALE_UNKNOWN, SS_VOLTAGE_SCALE_ID)),
     _packVolts(0), _packChemistry(sunsaver::CHEMISTRY_NOT_JUDGED), _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
-    _chargerSettingsRead(false), _runHook(nullptr) {
+    _chargerCheckCompleted(false), _chargerSettingsRead(false), _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
   
@@ -451,6 +451,7 @@ bool SolarManager::begin(const SolarConfig& config) {
   // A charger check that was under way belongs to the link as it was, and so does what the
   // last one found: another charger may be on the line now, or none.
   _chargerCheck.cancel();
+  _chargerCheckCompleted = false;
   _chargerSettingsRead = false;
   setFloatReference(0.0f);
 
@@ -1333,7 +1334,10 @@ bool SolarManager::serviceChargerCheck(unsigned long nowMillis) {
   _chargerCheckStepMillis = millis();
   _chargerCheckGapMs = SOLAR_CHARGER_CHECK_STEP_GAP_MS;
   if (ended && _chargerCheck.done()) {
-    _chargerSettingsRead = true;
+    _chargerCheckCompleted = true;
+    if (sunsaver::anySettingRead(_chargerCheck.snapshot())) {
+      _chargerSettingsRead = true;
+    }
   }
   return ended;
 }
@@ -1446,7 +1450,7 @@ SolarManager::SolarManager()
   : _initialized(false), _lastPollMillis(0), _noChargeConsecutivePolls(0), _cachedHoldingFC(0),
     _floatReferenceV(0.0f), _readingFactor(1.0f), _packVolts(0), _packChemistry(sunsaver::CHEMISTRY_NOT_JUDGED),
     _chargerCheckStepMillis(0), _chargerCheckGapMs(0),
-    _chargerSettingsRead(false), _runHook(nullptr) {
+    _chargerCheckCompleted(false), _chargerSettingsRead(false), _runHook(nullptr) {
   memset(&_data, 0, sizeof(SolarData));
   memset(&_config, 0, sizeof(SolarConfig));
 }

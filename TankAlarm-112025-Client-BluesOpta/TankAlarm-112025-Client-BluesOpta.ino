@@ -7030,7 +7030,7 @@ static void sendTelemetry(uint8_t idx, const char *reason, bool syncNow) {
       const SolarData &sd = gSolarManager.getData();
       doc["scOk"]     = sd.communicationOk ? 1 : 0;  // 5-poll smoothed (drives SMS escalation)
       doc["scLast"]   = sd.lastPollOk ? 1 : 0;       // R6: single-poll truth (no smoothing)
-      doc["scSpv"]    = gSolarManager.chargerSettingsRead() ? 1 : 0;  // the charger check has read the stored settings since boot
+      doc["scSpv"]    = gSolarManager.chargerSettingsRead() ? 1 : 0;  // the charger check has read a stored setting since boot
       doc["scOkEver"] = (sd.firstReadMillis > 0) ? 1 : 0;  // R2: link has succeeded since boot
       if (!sd.communicationOk) {
         // v2.0.45: when the link READS but the values are rejected by the plausibility clamp
@@ -7841,9 +7841,10 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
 
   if (!gSolarManager.chargerCheckActive()) {
     // Due once the wait is over, and, while no pass in a row has failed, when none has completed
-    // since the link was set up or a config change asked for one.
+    // since the link was set up or a config change asked for one. A pass that completed with
+    // every stored setting refused counts as completed: the next waits for its time.
     const bool due = gChargerCheckOverdue ||
-                     (gChargerCheckFailures == 0 && (gChargerCheckWanted || !gSolarManager.chargerSettingsRead()));
+                     (gChargerCheckFailures == 0 && (gChargerCheckWanted || !gSolarManager.chargerCheckCompleted()));
     if (due) {
       // False until a poll has succeeded: the check waits for a working link.
       gSolarManager.startChargerCheck();

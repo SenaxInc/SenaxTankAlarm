@@ -579,7 +579,7 @@ struct ClientMetadata {
   //   scInit    -> solarInitOk        (R3: ModbusRTUClient.begin() succeeded)
   //   scOk      -> solarCommOk        (5-poll smoothed comm health)
   //   scLast    -> solarLastPollOk    (R6: single-poll truth)
-  //   scSpv     -> solarSetpointsOk   (the charger check has read the stored settings since boot)
+  //   scSpv     -> solarSetpointsOk   (the charger check has read a stored setting since boot)
   //   scOkEver  -> solarEverOk        (R2: link has succeeded at least once since boot)
   //   scImpl    -> solarImplausible   (CRC-valid frame rejected by plausibility clamp)
   //   scErr     -> solarErrTag        (R1: "to"/"crc"/"ida"/"ifu"/"?")
@@ -1478,6 +1478,16 @@ static uint32_t gHotTierLastHash = 0;
 static inline long posix_file_size(FILE *fp) { return tankalarm_posix_file_size(fp); }
 static inline bool posix_file_exists(const char *path) { return tankalarm_posix_file_exists(path); }
 static inline void posix_log_error(const char *op, const char *path) { tankalarm_posix_log_error(op, path); }
+
+// Opens a file of this server to read. *absent tells a file that is not there (ENOENT) from one
+// that did not open for another reason (no memory, a flash error, no file handle free): that one
+// may open later, and is not an empty store.
+static FILE *openStoreToRead(const char *path, bool *absent) {
+  errno = 0;
+  FILE *fp = fopen(path, "r");
+  *absent = fp == nullptr && errno == ENOENT;
+  return fp;
+}
 
 // POSIX-compliant safe file write — delegates to atomic write-to-temp-then-rename
 // to prevent data loss on power failure during save operations. Routed through
@@ -2823,6 +2833,8 @@ static bool saveChargerReports();
 static void saveChargerReportsIfDirty(bool force);
 static void beginChargerReports();
 static void loadChargerReports();
+static void saveClientMetadataForRestore();
+static void takeUpRestoredClientMetadata();
 static void setChargerReportsAside(const char *why);
 static void handleChargerProgramResult(const char *clientUid, JsonDocument &doc);
 static bool chargerProgramAnswered(const ClientMetadata &meta);
@@ -5926,8 +5938,16 @@ static const BackupFileEntry kBackupFiles[] = {
   { "/calibration_data.txt", "calibration_data.txt", false },
   { SENSOR_REGISTRY_PATH, "sensor_registry.json", false },
   { CLIENT_METADATA_CACHE_PATH, "client_metadata.json", false },
+  // A restore of any of these three has the server read them all again
+  // (takeUpRestoredClientMetadata()).
+  { CHARGER_REPORTS_PATH, "charger_reports.json", false },
+  { CHARGER_PROGRAMS_PATH, "charger_programs.json", false },
   { "/history_settings.json", "history_settings.json", true }
 };
+
+// One file of a backup or of a restore, the largest either takes. Both run from loop(), so never
+// at once.
+static char gFtpFileBuffer[FTP_MAX_FILE_BYTES + 1];
 
 static bool prepareLocalBackupFilesForFtp(FtpResult &result) {
 #ifndef FILESYSTEM_AVAILABLE
@@ -7393,9 +7413,9 @@ static FtpResult performFtpBackupDetailed() {
     serviceTransferWatchdog();
 
     const BackupFileEntry &entry = kBackupFiles[i];
-    static char contents[FTP_MAX_FILE_BYTES + 1];
+    char *const contents = gFtpFileBuffer;
     size_t len = 0;
-    if (!readFileToBuffer(entry.localPath, contents, sizeof(contents), len)) {
+    if (!readFileToBuffer(entry.localPath, contents, sizeof(gFtpFileBuffer), len)) {
       // Log every skip so we can see why a backup produced no STORs.
       // Common causes: file absent on /fs, larger than buffer, or FS error.
       Serial.print(F("FTP backup skip (unreadable): "));
@@ -7647,18 +7667,22 @@ static FtpResult performFtpRestoreDetailed() {
     return result;
   }
 
+  saveClientMetadataForRestore();
+  bool clientMetadataRestored = false;
   for (size_t i = 0; i < sizeof(kBackupFiles) / sizeof(kBackupFiles[0]); ++i) {
     serviceTransferWatchdog();
 
     const BackupFileEntry &entry = kBackupFiles[i];
-    char contents[2048];
+    // As large as the backup takes: the client metadata cache and the charger reports and
+    // programming of a full fleet are well over 2 KB.
+    char *const contents = gFtpFileBuffer;
     size_t len = 0;
 
     char remotePath[192];
     buildRemotePath(remotePath, sizeof(remotePath), entry.remoteName);
     bool retrieved = useFtps
-                       ? ftpsRetrieveBuffer(remotePath, contents, sizeof(contents), len, err, sizeof(err))
-                       : ftpRetrieveBuffer(session, remotePath, contents, sizeof(contents), len, err, sizeof(err));
+                       ? ftpsRetrieveBuffer(remotePath, contents, sizeof(gFtpFileBuffer), len, err, sizeof(err))
+                       : ftpRetrieveBuffer(session, remotePath, contents, sizeof(gFtpFileBuffer), len, err, sizeof(err));
     if (!retrieved) {
       result.filesFailed++;
       result.addFailedFile(entry.remoteName);
@@ -7669,6 +7693,11 @@ static FtpResult performFtpRestoreDetailed() {
       result.filesProcessed++;
       Serial.print(F("FTP restore: "));
       Serial.println(entry.localPath);
+      if (strcmp(entry.localPath, CLIENT_METADATA_CACHE_PATH) == 0 ||
+          strcmp(entry.localPath, CHARGER_REPORTS_PATH) == 0 ||
+          strcmp(entry.localPath, CHARGER_PROGRAMS_PATH) == 0) {
+        clientMetadataRestored = true;
+      }
     } else {
       result.filesFailed++;
       result.addFailedFile(entry.remoteName);
@@ -7687,6 +7716,10 @@ static FtpResult performFtpRestoreDetailed() {
     ftpQuit(session);
   }
   serviceTransferWatchdog();
+
+  if (clientMetadataRestored) {
+    takeUpRestoredClientMetadata();
+  }
 
   result.success = (result.filesProcessed > 0);
   if (!result.success) {
@@ -13303,6 +13336,35 @@ static void beginChargerReports() {
   loadChargerReports();
 }
 
+// Before a restore: the client metadata, the charger reports and the charger programming this
+// server holds go to flash. A restore of any of the three files has all three read again
+// (takeUpRestoredClientMetadata()), and one it does not write is then read as the server holds it
+// now, not as at its last save.
+static void saveClientMetadataForRestore() {
+  if (gClientMetadataLoaded && gClientMetadataDirty && saveClientMetadataCache()) {
+    gClientMetadataDirty = false;
+  }
+  saveChargerReportsIfDirty(true);
+}
+
+// A restore wrote the client metadata cache, the file of charger reports or that of charger
+// programming: all three are read again, as at a start, so that the next save writes what was
+// restored, not what the server held before. The three go together: reading the cache again clears
+// what each client's metadata held of the other two, and a save would then write them without it.
+// A file that does not read now is as at a start too: the files of reports and of programming are
+// not written over until both have been read (saveChargerReportsIfDirty()).
+static void takeUpRestoredClientMetadata() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  gClientMetadataLoaded = false;
+  gChargerReportsLoaded = false;
+  gChargerProgramsLoaded = false;
+  loadClientMetadataCache();
+  beginChargerReports();
+  beginChargerPrograms();
+  recoverChargerProgramRequests();
+#endif
+}
+
 // The file has been read, or need not be: it may be written from now on.
 static void chargerReportsRead() {
   gChargerReportsLoaded = true;
@@ -13316,16 +13378,16 @@ static void chargerReportsRead() {
 // write that failed, and a restart): the file is written again without it at the next save, so
 // that it does not come back with the client should that be added again.
 //
-// A file that is there and cannot be read now (it does not open, a read fails part way, or there
-// is no memory to read or parse it) is not written over: the reports that come in meanwhile wait
-// in RAM, and saveChargerReportsIfDirty() reads the file again every CHARGER_REPORTS_RETRY_MS.
-// Such a later read takes a report only for a client the metadata held at the start
-// (chargerReportUnread), so that one removed since does not come back, also when it was added
-// again, and only when the one this server took since would not have replaced it: by the time of
-// the check, and on a tie the later to arrive (reportReplaces()). A file that can never be
-// read (empty, too large, not a list of reports) is kept as CHARGER_REPORTS_PATH ".bad", and the
-// reports start afresh. Without the metadata cache read whole the file is not read at all: no
-// report could find its client, and a write would drop them all.
+// A file that is there and cannot be read now (it does not open, but for not being there; a read
+// fails part way; there is no memory to read or parse it) is not written over: the reports that
+// come in meanwhile wait in RAM, and saveChargerReportsIfDirty() reads the file again every
+// CHARGER_REPORTS_RETRY_MS. Such a later read takes a report only for a client the metadata held
+// at the start (chargerReportUnread), so that one removed since does not come back, also when it
+// was added again, and only when the one this server took since would not have replaced it: by
+// the time of the check, and on a tie the later to arrive (reportReplaces()). A file that can
+// never be read (empty, too large, not a list of reports) is kept as CHARGER_REPORTS_PATH ".bad",
+// and the reports start afresh. Without the metadata cache read whole the file is not read at
+// all: no report could find its client, and a write would drop them all.
 static void loadChargerReports() {
 #if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
   if (!mbedFS) {
@@ -13335,12 +13397,13 @@ static void loadChargerReports() {
     Serial.println(F("Charger reports not read: the client metadata could not be read at this start"));
     return;
   }
-  if (!posix_file_exists("/fs" CHARGER_REPORTS_PATH)) {
-    chargerReportsRead();
-    return;
-  }
-  FILE *fp = fopen("/fs" CHARGER_REPORTS_PATH, "r");
+  bool absent = false;
+  FILE *fp = openStoreToRead("/fs" CHARGER_REPORTS_PATH, &absent);
   if (!fp) {
+    if (absent) {
+      chargerReportsRead();
+      return;
+    }
     posix_log_error("fopen", "/fs" CHARGER_REPORTS_PATH);
     Serial.println(F("ERROR: Charger reports file did not open, trying again in 5 minutes"));
     return;
@@ -13747,8 +13810,17 @@ static bool saveChargerPrograms() {
       Serial.println(F("ERROR: Out of memory for the charger programming file"));
       return false;
     }
-    if (arr.size() == 0 && !posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
-      return true;  // no client was ever asked: no file is needed
+    if (arr.size() == 0) {
+      // No client was ever asked: no file is needed, unless one is there, with entries to drop,
+      // or may be (it did not open for another reason than not being there).
+      bool absent = false;
+      FILE *fp = openStoreToRead("/fs" CHARGER_PROGRAMS_PATH, &absent);
+      if (fp) {
+        fclose(fp);
+      }
+      if (absent) {
+        return true;
+      }
     }
     const size_t jsonLen = measureJson(doc);
     char *buf = (char *)malloc(jsonLen + 1);
@@ -13802,12 +13874,13 @@ static void loadChargerPrograms() {
     Serial.println(F("Charger programming not read: the client metadata could not be read at this start"));
     return;
   }
-  if (!posix_file_exists("/fs" CHARGER_PROGRAMS_PATH)) {
-    chargerProgramsRead();
-    return;
-  }
-  FILE *fp = fopen("/fs" CHARGER_PROGRAMS_PATH, "r");
+  bool absent = false;
+  FILE *fp = openStoreToRead("/fs" CHARGER_PROGRAMS_PATH, &absent);
   if (!fp) {
+    if (absent) {
+      chargerProgramsRead();
+      return;
+    }
     posix_log_error("fopen", "/fs" CHARGER_PROGRAMS_PATH);
     Serial.println(F("ERROR: Charger programming file did not open, trying again in 5 minutes"));
     return;
@@ -17538,14 +17611,18 @@ static void loadClientMetadataCache() {
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) return;
     
-    if (!posix_file_exists("/fs" CLIENT_METADATA_CACHE_PATH)) {
-      Serial.println(F("No client metadata cache found - starting fresh"));
-      gClientMetadataLoaded = true;
-      return;
-    }
-    
-    FILE *fp = fopen("/fs" CLIENT_METADATA_CACHE_PATH, "r");
+    // Only a cache that is not there is a fresh start. One that does not open for another reason
+    // is not loaded: the charger reports and programming then wait (loadChargerReports(),
+    // loadChargerPrograms()), so that an entry whose client is in the cache is not dropped for
+    // want of it.
+    bool absent = false;
+    FILE *fp = openStoreToRead("/fs" CLIENT_METADATA_CACHE_PATH, &absent);
     if (!fp) {
+      if (absent) {
+        Serial.println(F("No client metadata cache found - starting fresh"));
+        gClientMetadataLoaded = true;
+        return;
+      }
       posix_log_error("fopen", "/fs" CLIENT_METADATA_CACHE_PATH);
       return;
     }

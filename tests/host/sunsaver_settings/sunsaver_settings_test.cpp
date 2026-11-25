@@ -994,6 +994,39 @@ static void testReader() {
     CHECK(reader.step(bus, 255));
     CHECK(reader.done());
     CHECK(sameSnapshot(reader.snapshot(), snapshotOf(b.sim)));
+    CHECK(ss::anySettingRead(reader.snapshot()));
+  }
+  {
+    // A controller that refuses every stored setting: the pass completes, and has read none
+    // (anySettingRead(), which the client reports to the server as scSpv).
+    Bare b;
+    for (uint8_t i = 0; i < ss::SETTING_ITEMS; ++i) {
+      b.sim.regs.erase(ss::item(i).addr);
+    }
+    BusReader bus(b.master);
+    ss::SnapshotReader reader;
+    reader.start();
+    for (int steps = 0; steps < 100 && !reader.step(bus, 4); ++steps) {
+    }
+    CHECK(reader.done());
+    CHECK(!ss::anySettingRead(reader.snapshot()));
+    CHECK(ss::have(reader.snapshot(), ss::I_ADC_VB_F));  // the live registers answered
+    // Any one stored setting that answers counts, the first and the last among them; one that
+    // gave no reply, or a live register, does not.
+    for (uint8_t index : {(uint8_t)0, (uint8_t)ss::I_EV_HVD, (uint8_t)(ss::SETTING_ITEMS - 1)}) {
+      ss::Snapshot one = reader.snapshot();
+      one.status[index] = ss::SSIO_OK;
+      CHECK_MSG(ss::anySettingRead(one), "setting %u", (unsigned)index);
+      one.status[index] = ss::SSIO_NO_REPLY;
+      CHECK_MSG(!ss::anySettingRead(one), "setting %u without a reply", (unsigned)index);
+    }
+    ss::Snapshot none;
+    ss::clearSnapshot(&none);
+    CHECK(!ss::anySettingRead(none));
+    for (uint8_t i = ss::SETTING_ITEMS; i < ss::ITEM_COUNT; ++i) {
+      none.status[i] = ss::SSIO_OK;
+    }
+    CHECK(!ss::anySettingRead(none));
   }
 }
 
@@ -1870,6 +1903,106 @@ static void testEvaluate() {
     CHECK_EQ(e.systemVolts, 0);
     CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
     CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+  }
+  {
+    // A ceiling under a range holds the battery under it in both banks whatever their voltages,
+    // so it tells also when those did not answer. The reviewer's case: a 12 V LiFePO4 system
+    // whose scale is proven, both absorption voltages refused, a ceiling of 13.50 V.
+    ss::VoltRange absorb = {0.0, 0.0};
+    ss::VoltRange floating = {0.0, 0.0};
+    CHECK(ss::chargeRanges(ss::CHEMISTRY_LIFEPO4, &absorb, &floating));
+    for (int s = 0; s < 2; ++s) {
+      const uint8_t scale = s == 0 ? ss::SCALE_100 : ss::SCALE_96667;
+      // The highest stored word under the foot of a range, beyond the tolerance of a stored
+      // voltage. The one above it is within the tolerance.
+      auto wordUnder = [scale](uint16_t word, double foot) {
+        while (ss::voltsFromRaw(word, scale) >= foot - ss::SETPOINT_TOLERANCE_VOLTS) {
+          --word;
+        }
+        return word;
+      };
+      SimSunSaver sim(100.0, s == 0 ? 100.0 : 96.667);
+      makeLiFePO4(sim);
+      sim.regs.erase(0xE000);
+      sim.regs.erase(0xE00D);
+      sim.regs[0xE01D] = sim.setVolts(13.50);
+      ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK(e.settingsScale.scale != ss::SCALE_UNKNOWN);  // the other settings prove it
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      // One bank refused is enough, and the one that answered is judged as before.
+      sim.regs[0xE000] = sim.setVolts(14.20);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE);
+      sim.regs.erase(0xE000);
+      // The foot of the range, and the tolerance of a stored voltage under it.
+      const uint16_t underAbsorb = wordUnder(sim.setVolts(absorb.low), absorb.low);
+      sim.regs[0xE01D] = sim.setVolts(absorb.low);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ);
+      sim.regs[0xE01D] = (uint16_t)(underAbsorb + 1);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ);
+      sim.regs[0xE01D] = underAbsorb;
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE);
+      // A ceiling in the range or above it, none (0), or one that did not answer leaves the
+      // judgement open.
+      for (double volts : {14.20, 14.60, 15.00}) {
+        sim.regs[0xE01D] = sim.setVolts(volts);
+        e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+        CHECK_MSG(e.findings == ss::FINDING_NOT_READ && e.verdict == ss::VERDICT_CANNOT_TELL,
+                  "ceiling %.2f V, scale %d: findings 0x%lX", volts, s, (unsigned long)e.findings);
+      }
+      sim.regs[0xE01D] = 0;
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).verdict, ss::VERDICT_CANNOT_TELL);
+      sim.regs.erase(0xE01D);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ);
+
+      // The float voltages: both refused, under a ceiling under their range (and so under the
+      // absorption range too, which holds the absorption voltages that answered).
+      SimSunSaver fl(100.0, s == 0 ? 100.0 : 96.667);
+      makeLiFePO4(fl);
+      fl.regs.erase(0xE001);
+      fl.regs.erase(0xE00E);
+      const uint16_t underFloat = wordUnder(fl.setVolts(floating.low), floating.low);
+      fl.regs[0xE01D] = underFloat;
+      e = judge(fl, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE | ss::FINDING_FLOAT_RANGE);
+      CHECK_EQ(e.verdict, ss::VERDICT_MISMATCH);
+      fl.regs[0xE01D] = (uint16_t)(underFloat + 1);
+      CHECK_EQ(judge(fl, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE);
+      // Between the feet of the two ranges only the absorption voltages are held too low.
+      fl.regs[0xE01D] = fl.setVolts(13.60);
+      CHECK_EQ(judge(fl, ss::CHEMISTRY_LIFEPO4).findings, ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE);
+    }
+    // Not where the stored voltages are not judged: an unproven scale, a battery voltage that did
+    // not answer, a battery whose voltages this check does not judge.
+    {
+      SimSunSaver sim;
+      makeLiFePO4(sim);
+      sim.regs.erase(0xE000);
+      sim.regs.erase(0xE00D);
+      sim.regs[0xE01D] = sim.setVolts(13.00);  // under both ranges
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LIFEPO4).findings,
+               ss::FINDING_NOT_READ | ss::FINDING_ABSORB_RANGE | ss::FINDING_FLOAT_RANGE);
+      CHECK_EQ(judge(sim, ss::CHEMISTRY_LEAD_SEALED).verdict, ss::VERDICT_OK);
+      for (uint8_t i = 0; i < ss::SETTING_ITEMS; ++i) {
+        const std::map<uint16_t, uint16_t>::iterator it = sim.regs.find(ss::item(i).addr);
+        if ((ss::item(i).flags & ss::ITEM_WITNESS) != 0 && it != sim.regs.end() && it->second != 0) {
+          it->second = (uint16_t)(it->second + 7);
+        }
+      }
+      ss::Evaluation e = judge(sim, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.settingsScale.scale, ss::SCALE_UNKNOWN);
+      CHECK_EQ(e.findings & (ss::FINDING_ABSORB_RANGE | ss::FINDING_FLOAT_RANGE), 0u);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+
+      SimSunSaver noBattery;
+      makeLiFePO4(noBattery);
+      noBattery.regs.erase(0xE000);
+      noBattery.regs.erase(0x0008);
+      noBattery.regs[0xE01D] = noBattery.setVolts(13.00);
+      e = judge(noBattery, ss::CHEMISTRY_LIFEPO4);
+      CHECK_EQ(e.findings, ss::FINDING_NOT_READ);
+      CHECK_EQ(e.verdict, ss::VERDICT_CANNOT_TELL);
+    }
   }
   {
     // A register the judgement needs did not answer. The ceiling too: it could be anywhere.
@@ -2786,12 +2919,73 @@ static void testReport() {
         rows += group["rows"].as<JsonArrayConst>().size();
       }
       CHECK_EQ(rows, 40);
+      // The server keeps it as it came (encodeReport()): read back after a restart, the registers
+      // that client did not ask are still not read and not shown, not refused ("no answer"). One
+      // it asked that was refused stays refused.
+      doc["nr"].to<JsonArray>().add(3);
+      CHECK(ss::decodeReport(doc.as<JsonObjectConst>(), &back, &decoded));
+      CHECK_EQ(back.status[3], ss::SSIO_REFUSED);
+      JsonDocument kept;
+      ss::encodeReport(back, decoded, kept.to<JsonObject>());
+      std::string forty = hex.substr(0, 40u * 4u);
+      forty.replace(3u * 4u, 4u, "0000");  // a register without a value is sent as 0000
+      CHECK(kept["r"].as<std::string>() == forty);
+      CHECK_EQ(kept["nr"].as<JsonArrayConst>().size(), 1);
+      CHECK_EQ(kept["nr"][0].as<int>(), 3);
+      std::string stored;
+      serializeJson(kept, stored);
+      JsonDocument reread;
+      CHECK(deserializeJson(reread, stored) == DeserializationError::Ok);
+      ss::Snapshot again;
+      ss::Evaluation againDecoded;
+      CHECK(ss::decodeReport(reread.as<JsonObjectConst>(), &again, &againDecoded));
+      CHECK(sameSnapshot(again, back));
+      CHECK_EQ(again.status[40], ss::SSIO_NOT_READ);
+      CHECK_EQ(again.status[ss::I_DIP_SWITCH], ss::SSIO_NOT_READ);
+      JsonDocument keptPage;
+      ss::describeReport(again, againDecoded, keptPage.to<JsonObject>());
+      std::string keptShown;
+      serializeJson(keptPage, keptShown);
+      rows = 0;
+      for (JsonObjectConst group : keptPage["groups"].as<JsonArrayConst>()) {
+        rows += group["rows"].as<JsonArrayConst>().size();
+      }
+      CHECK_EQ(rows, 40);
+      CHECK_EQ(countOf(keptShown, "no answer"), 1);
+      doc.remove("nr");
       doc["r"] = hex.substr(0, 4);
       CHECK(ss::decodeReport(doc.as<JsonObjectConst>(), &back, &decoded));
       CHECK(ss::have(back, 0) && !ss::have(back, 1));
       JsonDocument small;
       ss::describeReport(back, decoded, small.to<JsonObject>());
       CHECK_EQ(small["groups"].as<JsonArrayConst>().size(), 1);  // a group with no rows is left out
+      JsonDocument keptSmall;
+      ss::encodeReport(back, decoded, keptSmall.to<JsonObject>());
+      CHECK(keptSmall["r"] == hex.substr(0, 4));
+      CHECK(keptSmall["nr"].isNull());
+      // Only the registers never asked are left out: the last ones asked that were refused or
+      // did not answer are kept, and read back as refused.
+      ss::Snapshot tail = snapshot;
+      tail.status[ss::ITEM_COUNT - 1] = ss::SSIO_REFUSED;
+      tail.raw[ss::ITEM_COUNT - 1] = 0;
+      tail.status[ss::ITEM_COUNT - 2] = ss::SSIO_NO_REPLY;
+      tail.raw[ss::ITEM_COUNT - 2] = 0;
+      JsonDocument tailDoc;
+      ss::encodeReport(tail, evaluation, tailDoc.to<JsonObject>());
+      CHECK_EQ(tailDoc["r"].as<std::string>().size(), ss::REPORT_HEX_CHARS);
+      CHECK_EQ(tailDoc["nr"].as<JsonArrayConst>().size(), good["nr"].as<JsonArrayConst>().size() + 2);
+      CHECK(ss::decodeReport(tailDoc.as<JsonObjectConst>(), &back, &decoded));
+      CHECK_EQ(back.status[ss::ITEM_COUNT - 1], ss::SSIO_REFUSED);
+      CHECK_EQ(back.status[ss::ITEM_COUNT - 2], ss::SSIO_REFUSED);
+      // A snapshot with nothing asked still makes a report that reads back: one register, refused.
+      ss::Snapshot none;
+      ss::clearSnapshot(&none);
+      JsonDocument noneDoc;
+      ss::encodeReport(none, evaluation, noneDoc.to<JsonObject>());
+      CHECK(noneDoc["r"] == "0000");
+      CHECK(ss::decodeReport(noneDoc.as<JsonObjectConst>(), &back, &decoded));
+      CHECK_EQ(back.status[0], ss::SSIO_REFUSED);
+      CHECK_EQ(back.status[1], ss::SSIO_NOT_READ);
     }
     // A newer client that knows more: what this code knows is read, the rest ignored.
     {
