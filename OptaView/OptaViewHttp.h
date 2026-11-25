@@ -501,7 +501,9 @@ class OvHttpResponse : public OvOut {
   bool attached() const { return conn_ != nullptr; }
 
   // The status line and the headers. `extra` is zero or more complete header lines, each ending
-  // in CR LF. `length` is the size of the body when it is known, or -1.
+  // in CR LF. `length` is the size of the body when it is known, or -1. An answer that has no
+  // body by its status (1xx, 204) gives no length whatever `length` says: RFC 9110 (8.6) forbids
+  // a Content-Length there.
   void begin(int status, const char *contentType, const char *extra = nullptr, long length = -1) {
     begun_ = true;
     print("HTTP/1.1 ");
@@ -514,7 +516,7 @@ class OvHttpResponse : public OvOut {
       print(contentType);
       print("\r\n");
     }
-    if (length >= 0) {
+    if (length >= 0 && status != 204 && !(status >= 100 && status < 200)) {
       print("Content-Length: ");
       printU((uint32_t)length);
       print("\r\n");

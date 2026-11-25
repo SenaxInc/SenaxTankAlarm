@@ -134,9 +134,9 @@ table.settings td:nth-child(5){grid-column:2;grid-row:3;text-align:right}
 <p id="loginIntro" class="muted"></p>
 <form id="loginForm" autocomplete="off">
 <div class="field"><label for="pin">PIN</label>
-<input id="pin" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></div>
+<input id="pin" type="password" inputmode="numeric" autocomplete="off"></div>
 <div class="field hidden" id="pin2Field"><label for="pin2">The same PIN again</label>
-<input id="pin2" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></div>
+<input id="pin2" type="password" inputmode="numeric" autocomplete="off"></div>
 <p id="loginMessage" class="error-text" role="alert"></p>
 <button id="loginBtn" class="btn" type="submit">Log in</button>
 </form>
@@ -225,7 +225,7 @@ table.settings td:nth-child(5){grid-column:2;grid-row:3;text-align:right}
 <h2>Console</h2>
 <p class="muted small">The same commands as on the USB port; 'help' lists them. Everything this page sends to the controller is logged here.</p>
 <form id="consoleForm" class="row">
-<input id="consoleLine" maxlength="159" autocomplete="off" spellcheck="false" placeholder="help" aria-label="Command">
+<input id="consoleLine" autocomplete="off" spellcheck="false" placeholder="help" aria-label="Command">
 <button class="btn" type="submit">Run</button>
 </form>
 <pre id="consoleLog" class="out" aria-label="Console log"></pre>

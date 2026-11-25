@@ -32,7 +32,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,6 +54,7 @@
 #include "OptaViewText.h"
 #include "OptaViewWeb.h"
 #include "OptaViewWebPage.h"
+#include "preview_terminal.h"
 #include "sim_sunsaver.h"
 
 // A send to a browser that has gone raises SIGPIPE, which main() ignores, so the flag that keeps
@@ -269,60 +269,11 @@ class PcWebHost : public OvWebHost {
   PcConn conns_[OV_WEB_SLOTS];  // the server holds no more than this many at a time
 };
 
-// The terminal as the USB console's output and its "has a key been pressed".
+// The terminal as the USB console's output. What is typed there comes in through
+// PreviewTerminal (preview_terminal.h), which also answers "has a key been pressed".
 class TerminalOut : public OvOut {
  public:
   void write(const char *text, size_t len) override { fwrite(text, 1, len, stdout); }
-};
-
-class Terminal : public OvConsoleHost {
- public:
-  Terminal() : open_(true) {}
-
-  // A line that has been typed, without its line ending. False when there is none yet.
-  bool takeLine(std::string *line) {
-    fill();
-    const size_t end = buffer_.find('\n');
-    if (end == std::string::npos) {
-      return false;
-    }
-    *line = buffer_.substr(0, end);
-    buffer_.erase(0, end + 1);
-    if (!line->empty() && (*line)[line->size() - 1] == '\r') {
-      line->erase(line->size() - 1);
-    }
-    return true;
-  }
-
-  // On a terminal a "key press" is a line: the terminal hands over what was typed at Enter.
-  bool inputPending() override {
-    fill();
-    return !buffer_.empty();
-  }
-  void discardInput() override {
-    fill();
-    buffer_.clear();
-  }
-
- private:
-  std::string buffer_;
-  bool open_;
-
-  void fill() {
-    while (open_) {
-      struct pollfd ready = {STDIN_FILENO, POLLIN, 0};
-      if (::poll(&ready, 1, 0) <= 0) {
-        return;
-      }
-      char chunk[256];
-      const ssize_t got = ::read(STDIN_FILENO, chunk, sizeof(chunk));
-      if (got > 0) {
-        buffer_.append(chunk, (size_t)got);
-      } else if (!(got < 0 && errno == EINTR)) {
-        open_ = false;  // no terminal (any more): the page is still served
-      }
-    }
-  }
 };
 
 static bool isOnOff(const std::string &word, bool *on) {
@@ -434,7 +385,7 @@ int main(int argc, char **argv) {
   static LiveClock clock(sim);
   static PcWebHost host;
   static TerminalOut out;
-  static Terminal terminal;
+  static PreviewTerminal terminal(STDIN_FILENO);
   static OvConsole console(out, terminal, device);
   static const OvWebPage page = {OV_WEB_PAGE, OV_WEB_PAGE_LENGTH, OV_WEB_PAGE_HEADERS};
   static OvWeb web(device, host, clock, page);
@@ -463,12 +414,15 @@ int main(int argc, char **argv) {
   fflush(stdout);
 
   for (;;) {
+    // One line at most, and then the web server has its turn, as in the Opta's loop(): lines
+    // that wait (a paste) must not keep the page waiting until the last of them has run.
     std::string line;
-    while (terminal.takeLine(&line)) {
+    if (terminal.takeLine(&line)) {
       // A NUL would end the line early for everything that reads it as text ("sim delay 100",
-      // then "ms" left out), so a line that holds one goes to the console whatever it starts
-      // with: the console refuses it whole, and as the answer to a question it cancels it.
-      const bool plain = line.find('\0') == std::string::npos;
+      // then "ms" left out), and a line as long as the terminal keeps of one is longer than any
+      // command. Either goes to the console whatever it starts with: the console refuses it
+      // whole, and as the answer to a question it cancels it.
+      const bool plain = line.find('\0') == std::string::npos && line.size() < OV_LINE_MAX;
       if (plain && line.compare(0, 3, "sim") == 0 && (line.size() == 3 || line[3] == ' ' || line[3] == '\t')) {
         simCommand(sim, line);
       } else {
