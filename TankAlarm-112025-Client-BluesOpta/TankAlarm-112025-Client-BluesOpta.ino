@@ -941,6 +941,15 @@ static unsigned long gChargerReportTryMillis = 0;      // which was then
 #define CHARGER_JOURNAL_FILE "/cfg/charger_journal.json"
 #define CHARGER_JOURNAL_TMP_FILE CHARGER_JOURNAL_FILE ".tmp"  // where tankalarm_posix_write_file_atomic() writes it first
 #define CHARGER_JOURNAL_KEPT_FILE CHARGER_JOURNAL_FILE ".bad"  // one that could not be read, kept aside
+// The newest request this client had answered or taken on when it last saved its config
+// (sunsaver::Journal::answeredId), as the config file keeps it ("chargerAnswered"). Every request
+// comes with a config, which is saved after its request was answered: where flash took the
+// config but not the journal, and the result went out to the Notecard all the same (it may be
+// the refusal that says flash failed), a start would read a journal without that answer, and the
+// same request, in a config the server sent again or one left in the inbox, would be taken on
+// again although its answer had gone. A start takes this into the journal it reads
+// (beginChargerProgramming() in setup()), so that such a request is not answered twice.
+static uint32_t gChargerAnsweredKept = 0;
 #if defined(POSIX_FILE_IO_AVAILABLE)
 // loadChargerJournal() read the journal from its .tmp, which holds its only copy until
 // saveChargerJournal() renames it into place.
@@ -1087,6 +1096,9 @@ static bool gPendingConfigAckSuccess = true;
 static char gPendingConfigAckMessage[48] = "Config applied and persisted";
 static unsigned long gPendingConfigAckRetryAt = 0;
 static unsigned long gPendingConfigAckRetryDelayMs = 5000UL;
+// The acknowledgement that waits answers a config that was set aside (answerRepeatedConfig()), not
+// one that was applied: it keeps its message, and a failed save does not make it a failed one.
+static bool gPendingConfigAckRepeated = false;
 static bool gHardwareSummaryPrinted = false;
 
 // Network failure handling
@@ -1322,7 +1334,7 @@ static void enableDfuMode();
 static void pollForConfigUpdates();
 static void applyConfigUpdate(const JsonDocument &doc);
 static bool sendConfigAck(bool success, const char *message, const char *configVersion);
-static void answerRepeatedConfig(const JsonDocument &doc, uint32_t inboundTs, const char *cv);
+static void answerRepeatedConfig(const char *cv);
 static bool sendOtaReportNote(const char *st, const char *targetV, const char *reason);
 static void reportOtaOutcome();
 static void persistConfigIfDirty();
@@ -1689,7 +1701,6 @@ static void takeKeptChargerDuty();
 static void keepChargerLookAfterLostFiles();
 static void handleChargerProgramRequest(JsonObjectConst program);
 static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestId);
-static void retakeChargerProgramRequest(JsonObjectConst program);
 static void withdrawUnsuitedChargerProgram();
 static void withdrawChargerProgramForOtherCharger(uint8_t before);
 static unsigned long sampleIntervalMs();
@@ -2045,7 +2056,19 @@ void setup() {
   // Charger programming: whether a run that a restart of this client cut short left the charger
   // owed a look. A request is run only once a poll in loop() has worked. The look goes to the
   // charger that run talked to, and needs no poll when none speaks for that charger.
-  gSolarManager.beginChargerProgramming(loadChargerJournal(), saveChargerJournal);
+  // A journal that lacks requests the config file says were answered (gChargerAnsweredKept) is
+  // older than the last config this client saved: flash did not take the journal after them.
+  // They count as answered, whether or not their results reached the server.
+  sunsaver::Journal chargerJournal = loadChargerJournal();
+  if (chargerJournal.answeredId < gChargerAnsweredKept) {
+    char line[128];
+    snprintf(line, sizeof(line), "Charger programming: the journal lacks the requests answered up to %lu, which count as answered",
+             (unsigned long)gChargerAnsweredKept);
+    Serial.println(line);
+    addSerialLog(line);
+    chargerJournal.answeredId = gChargerAnsweredKept;
+  }
+  gSolarManager.beginChargerProgramming(chargerJournal, saveChargerJournal);
   // A run holds loop() for up to a minute, and a relay's time does not wait for it.
   gSolarManager.setChargerRunHook(switchOffRelaysTimeUp);
 
@@ -3908,6 +3931,8 @@ static bool loadConfigFromFlash(ClientConfig &cfg) {
 
   // Load config epoch timestamp
   cfg.configEpoch = doc["configEpoch"].is<int>() ? (uint32_t)doc["configEpoch"].as<int>() : 0;
+  // The requests answered as this config's save knew them (see gChargerAnsweredKept)
+  gChargerAnsweredKept = doc["chargerAnswered"].is<uint32_t>() ? doc["chargerAnswered"].as<uint32_t>() : 0;
 
   // Support both "sensors" (from server) and "monitors" (local config) array names
   JsonArray monitorsArray = doc["sensors"].as<JsonArray>();
@@ -4175,6 +4200,13 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
 
   // Save config epoch
   doc["configEpoch"] = cfg.configEpoch;
+  // And the newest request answered (gChargerAnsweredKept), which never goes down: a save before
+  // the journal is read at a start keeps the one the file had.
+  uint32_t answered = gSolarManager.chargerProgramming().journal().answeredId;
+  if (answered < gChargerAnsweredKept) {
+    answered = gChargerAnsweredKept;
+  }
+  doc["chargerAnswered"] = answered;
 
   // Nothing is written from a document that ran out of memory: it lacks what did not fit, and
   // the next start would take that for the config. Nor a text longer than a start loads
@@ -4220,6 +4252,9 @@ static bool saveConfigToFlash(const ClientConfig &cfg) {
     }
   }
   free(jsonBuf);
+  if (written) {
+    gChargerAnsweredKept = answered;
+  }
   return written;
 #else
   return false; // Filesystem not available
@@ -5135,7 +5170,7 @@ static void pollForConfigUpdates() {
             Serial.print(F(" Active TS: "));
             Serial.println(gConfig.configEpoch);
             // Acknowledged as taken but bypassed, to prevent overwriting (answerRepeatedConfig()).
-            answerRepeatedConfig(doc, inboundTs, cv);
+            answerRepeatedConfig(cv);
             ackSent = true;
           } else {
             if (inboundTs > 0) {
@@ -5147,6 +5182,7 @@ static void pollForConfigUpdates() {
             // will send the ACK after saveConfigToFlash() completes.
             strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
             gPendingConfigAck = true;
+            gPendingConfigAckRepeated = false;
             gPendingConfigAckSuccess = true;
             strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
             gPendingConfigAckRetryAt = 0;
@@ -5268,6 +5304,7 @@ static void resetTelemetryBaselines() {
 
 static void clearPendingConfigAckState() {
   gPendingConfigAck = false;
+  gPendingConfigAckRepeated = false;
   gPendingConfigAckVersion[0] = '\0';
   gPendingConfigAckSuccess = true;
   strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
@@ -5304,7 +5341,9 @@ static void attemptPendingConfigAckSend() {
   // the config carried: flash did not take the journal, and the Notecard does not have the result
   // yet. Until the config is acknowledged the server sends it again, a minute apart and up to five
   // times (its MAX_CONFIG_DISPATCH_RETRIES), and with it the request: a client that restarted in
-  // that time takes the request on again. The next pass looks again (retryPendingConfigAckIfDue()).
+  // that time, before flash took the config, takes the request on again. Once flash has the
+  // config, it has the request's answer too (gChargerAnsweredKept), and a restart does not take
+  // it on again. The next pass looks again (retryPendingConfigAckIfDue()).
   // A config that arrives again and is set aside is acknowledged here too (answerRepeatedConfig()).
   static bool heldForResult = false;
   if (gSolarManager.chargerProgramming().resultOnlyInRam()) {
@@ -5323,33 +5362,31 @@ static void attemptPendingConfigAckSend() {
 }
 
 // A config whose time ("_ts") is not later than that of the config this client holds, which is
-// not applied again. One with that very time is the config held, delivered once more (the server
-// gives each config it sends a later time than the one before, so its own retries are applied).
-// The charger request it carries is taken on if this client has no answer to it: a restart lost
-// the answer before flash or the Notecard had it, while the time of the config was in flash
-// already (retakeChargerProgramRequest()). It is acknowledged as an applied config is, when no
-// result of charger programming is in RAM alone (attemptPendingConfigAckSend()): that
-// acknowledgement stops the server from sending the config again, and with it the request. An
-// acknowledgement that waits already answers for this client. While the config this client holds
-// is not in flash (gConfigDirty: its save failed, and the note came again because deleting it
-// failed too), the acknowledgement waits for persistConfigIfDirty(), as for a config just
-// applied: a restart would bring the config before it back, and the server would not send this
-// one again.
-static void answerRepeatedConfig(const JsonDocument &doc, uint32_t inboundTs, const char *cv) {
-  if (inboundTs == gConfig.configEpoch) {
-    retakeChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
-  }
+// not applied again, and with it the charger request it carries. One with that very time is the
+// config held, delivered once more (the server gives each config it sends a later time than the
+// one before, so its own retries are applied): its request was answered when that config was
+// applied, and the config file says so (gChargerAnsweredKept), also to a start whose journal
+// lost the answer, which may have reached the server. It is acknowledged as an applied config
+// is, when no result of charger programming is in RAM alone (attemptPendingConfigAckSend()):
+// that acknowledgement stops the server from sending the config again, and with it the request.
+// An acknowledgement that waits already answers for this client. While the config this client
+// holds is not in flash (gConfigDirty), the acknowledgement waits for a save that succeeds
+// (persistConfigIfDirty()), as for a config just applied: a restart would bring the config
+// before it back, and the server would not send this one again. It never goes out as a failed
+// one: that would end the server's sending all the same, and says nothing of this config.
+static void answerRepeatedConfig(const char *cv) {
   if (gPendingConfigAck) {
     return;
   }
   strlcpy(gPendingConfigAckVersion, cv, sizeof(gPendingConfigAckVersion));
   gPendingConfigAck = true;
+  gPendingConfigAckRepeated = true;
   gPendingConfigAckSuccess = true;
   strlcpy(gPendingConfigAckMessage, "Config bypassed: newer version already exists", sizeof(gPendingConfigAckMessage));
   gPendingConfigAckRetryAt = 0;
   gPendingConfigAckRetryDelayMs = 5000UL;
   if (gConfigDirty) {
-    return;  // persistConfigIfDirty() sends it once flash has the config, or says that it failed
+    return;  // persistConfigIfDirty() sends it once flash has the config
   }
   attemptPendingConfigAckSend();
 }
@@ -5785,12 +5822,15 @@ static void persistConfigIfDirty() {
     // BugFix v1.6.2 (I-11): Now that config is safely on flash, send the deferred ACK.
     if (gPendingConfigAck) {
       gPendingConfigAckSuccess = true;
-      strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
+      if (!gPendingConfigAckRepeated) {  // one for a config set aside says so (answerRepeatedConfig())
+        strlcpy(gPendingConfigAckMessage, "Config applied and persisted", sizeof(gPendingConfigAckMessage));
+      }
       attemptPendingConfigAckSend();
     }
   } else {
-    // Persistence failed — notify server so it can flag the issue.
-    if (gPendingConfigAck) {
+    // Persistence failed — notify server so it can flag the issue. Not for a config set aside:
+    // its acknowledgement waits for a save that succeeds (answerRepeatedConfig()).
+    if (gPendingConfigAck && !gPendingConfigAckRepeated) {
       gPendingConfigAckSuccess = false;
       strlcpy(gPendingConfigAckMessage, "Flash persistence failed", sizeof(gPendingConfigAckMessage));
       attemptPendingConfigAckSend();
@@ -5992,7 +6032,12 @@ static bool validateSensorReading(uint8_t idx, float reading) {
   // BugFix v1.6.2 (M-12): Exempt monitors actively tracking an unload — a slowly
   // emptying tank legitimately produces near-identical readings that would
   // otherwise trip the stuck detector.
-  bool exemptFromStuck = cfg.trackUnloads && state.unloadTracking;
+  // Not a pulse monitor's reading from before a charger programming run once it no longer stands
+  // in (sampleBeforeRun, see readPulseSensor()): a count after the run timed out, and the reading
+  // is the old one again, not a level that changes slowly. Such a reading is not taken for an
+  // unload either, so an unload tracked from before the run would never end, and a sensor that
+  // gives no pulses any more would never be found stuck.
+  bool exemptFromStuck = cfg.trackUnloads && state.unloadTracking && !state.sampleBeforeRun;
   if (cfg.stuckDetectionEnabled && !exemptFromStuck && state.hasLastValidReading && fabs(reading - state.lastValidReading) < 0.05f) {
     state.stuckReadingCount++;
     if (state.stuckReadingCount >= SENSOR_STUCK_THRESHOLD) {
@@ -6593,7 +6638,8 @@ static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx) {
   // between two pulses that ends while the mark holds started after the run (the run's count was
   // started again), and from the first that saw no second pulse on, the reading is validated, as a
   // time-out's reading is without a run: a sensor that gives no pulses any more is found stuck as
-  // it would be without the run, and does not hide behind the mark for good.
+  // it would be without the run, also while an unload is tracked (validateSensorReading()), and
+  // does not hide behind the mark for good.
   if (gRpmReadingBeforeRun[idx]) {
     if (pctx.resultReady && !pctx.resultStandsIn) {
       gRpmReadingBeforeRun[idx] = false;
@@ -6684,7 +6730,8 @@ static void sampleMonitors() {
       // sensor, no failure and no recovery, and the last valid value stands. Marked reused, it
       // keeps its time and evaluateAlarms() holds its counters; the unload is not evaluated
       // (sampleBeforeRun). Once a count that started after the run has timed out, such a reading
-      // is validated below as any other, still marked reused and not taken for an unload.
+      // is validated below as any other, still marked reused and not taken for an unload, and
+      // with no exemption from the stuck check for an unload that is tracked.
       inches = gMonitorState[i].currentValue;
     } else if (!validateSensorReading(i, inches)) {
       // Keep previous valid reading if sensor failed
@@ -8565,16 +8612,6 @@ static void takeChargerProgramRequest(JsonObjectConst program, uint32_t requestI
   Serial.println(gSolarManager.chargerProgramming().requestWaiting()
                      ? F(" waits for the clock and the charger")
                      : F(" refused"));
-}
-
-// The request of a config this client holds already, which arrived again (answerRepeatedConfig()):
-// taken on when this client has no answer to it, as when it applied the config. Nothing is
-// withdrawn: the config it holds is the same.
-static void retakeChargerProgramRequest(JsonObjectConst program) {
-  const uint32_t requestId = program.isNull() ? 0 : sunsaver::readRequestId(program);
-  if (requestId != 0) {
-    takeChargerProgramRequest(program, requestId);
-  }
 }
 
 // After each config: a request that waits is withdrawn once the client could no longer take it

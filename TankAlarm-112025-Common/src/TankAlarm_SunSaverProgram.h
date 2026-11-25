@@ -2340,7 +2340,8 @@ class Supervisor {
   // A result waits to go out and is in RAM alone: flash did not take the journal that holds it,
   // and the Notecard does not have it yet. The client acknowledges no config while this holds, so
   // that the server sends it again, with the request it may carry, as long as it waits for the
-  // acknowledgement: a client that restarted in that time takes the request on again.
+  // acknowledgement: a client that restarted in that time, before flash took the config, takes
+  // the request on again (the client's config file keeps the requests answered once it is saved).
   // A look is not counted: no config brings it back, and a client that restarts before flash
   // takes it owes the controller the look again (its duty is in flash until a journal without it is).
   bool resultOnlyInRam() const { return journal_.reportDue && journalUnsaved_; }
