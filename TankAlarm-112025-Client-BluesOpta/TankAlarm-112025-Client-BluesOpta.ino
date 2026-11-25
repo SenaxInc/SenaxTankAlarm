@@ -80,6 +80,9 @@
 // Forward-declare FluidType so Arduino's auto-generated function prototypes
 // (inserted near the top of the .ino) can reference it before its definition below.
 enum FluidType : uint8_t;
+// The same for the types of this sketch that a function takes by reference: its prototype comes
+// before the type is defined (ageChargerProgramResult()).
+struct ChargerResultAge;
 
 // POSIX file I/O types (for platforms that support it)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
