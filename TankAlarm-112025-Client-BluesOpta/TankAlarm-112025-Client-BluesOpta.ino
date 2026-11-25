@@ -5477,12 +5477,15 @@ static void applyConfigUpdate(const JsonDocument &doc) {
     if (solarCfg["alertOnCommFail"].is<bool>())    gConfig.solarCharger.alertOnCommFailure = solarCfg["alertOnCommFail"].as<bool>();
     if (solarCfg["includeInDaily"].is<bool>())     gConfig.solarCharger.includeInDailyReport = solarCfg["includeInDaily"].as<bool>();
 
+    // Sanitize and clamp configuration parameters (Task 1.3)
+    sanitizeSolarConfig(gConfig.solarCharger);
+
+    // The link's settings as sanitizeSolarConfig() keeps them: it replaces a value out of range
+    // (the 200 ms timeout of older configs by 500, say), and the same config sent again would
+    // otherwise restart the link and ask for a charger check each time.
     bool transportChanged = (prevSlave != gConfig.solarCharger.modbusSlaveId) ||
                             (prevBaud  != gConfig.solarCharger.modbusBaudRate) ||
                             (prevTo    != gConfig.solarCharger.modbusTimeoutMs);
-
-    // Sanitize and clamp configuration parameters (Task 1.3)
-    sanitizeSolarConfig(gConfig.solarCharger);
 
     if (gConfig.solarCharger.enabled && (!prevEnabled || transportChanged)) {
       // (Re)initialize transport with the new config.
