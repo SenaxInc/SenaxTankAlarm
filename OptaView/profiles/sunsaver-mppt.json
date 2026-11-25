@@ -200,7 +200,11 @@
     { "below": "EV_hvr", "above": "EV_hvd", "message": "Battery high voltage reconnect (EV_hvr) must be below high voltage disconnect (EV_hvd)." },
     { "below": "EV_lhvr", "above": "EV_lhvd", "message": "Load high voltage reconnect (EV_lhvr) must be below load high voltage disconnect (EV_lhvd)." },
     { "below": "EV_reg", "above": "EV_hvd", "message": "Absorption voltage (EV_reg) must be below battery high voltage disconnect (EV_hvd)." },
-    { "below": "EV_reg2", "above": "EV_hvd", "message": "Bank 2 absorption voltage (EV_reg2) must be below battery high voltage disconnect (EV_hvd)." }
+    { "below": "EV_float", "above": "EV_hvd", "message": "Float voltage (EV_float) must be below battery high voltage disconnect (EV_hvd)." },
+    { "below": "EV_eq", "above": "EV_hvd", "message": "Equalize voltage (EV_eq) must be below battery high voltage disconnect (EV_hvd)." },
+    { "below": "EV_reg2", "above": "EV_hvd", "message": "Bank 2 absorption voltage (EV_reg2) must be below battery high voltage disconnect (EV_hvd)." },
+    { "below": "EV_float2", "above": "EV_hvd", "message": "Bank 2 float voltage (EV_float2) must be below battery high voltage disconnect (EV_hvd)." },
+    { "below": "EV_eq2", "above": "EV_hvd", "message": "Bank 2 equalize voltage (EV_eq2) must be below battery high voltage disconnect (EV_hvd)." }
   ],
   "scaleCheck": {
     "alternates": [96.667],

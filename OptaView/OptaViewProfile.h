@@ -597,6 +597,33 @@ class OvProfile {
     return true;
   }
 
+  // True when a text anywhere in `value` holds a NUL, which JSON can carry as an escape: read as
+  // C text, a name, a label or a message would end there, and a check would name another register
+  // than the one written. Member names count too. ArduinoJson's nesting limit bounds the depth.
+  static bool holdsNul(JsonVariantConst value) {
+    if (value.is<JsonObjectConst>()) {
+      for (JsonPairConst member : value.as<JsonObjectConst>()) {
+        if (strlen(member.key().c_str()) != member.key().size() || holdsNul(member.value())) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (value.is<JsonArrayConst>()) {
+      for (JsonVariantConst item : value.as<JsonArrayConst>()) {
+        if (holdsNul(item)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (!value.is<const char *>()) {
+      return false;
+    }
+    const JsonString text = value.as<JsonString>();
+    return strlen(text.c_str()) != text.size();
+  }
+
   static bool jsonU32(JsonVariantConst v, uint32_t *out) {
     if (v.is<const char *>()) {
       return ovParseU32(v.as<const char *>(), out);
@@ -715,6 +742,9 @@ class OvProfile {
     JsonObjectConst root = doc.as<JsonObjectConst>();
     if (root.isNull()) {
       return fail(error, errorCap, "the profile must be a JSON object");
+    }
+    if (holdsNul(root)) {
+      return fail(error, errorCap, "a text in the profile holds a NUL");
     }
     if ((root["schema"] | 0) != OV_PROFILE_SCHEMA) {
       return fail(error, errorCap, "unsupported profile schema (this firmware reads schema 1)");

@@ -280,8 +280,8 @@ struct SolarConfig {
 
 // Bounded retry for the VERIFIED realtime register block (0x0008..0x000C) only, for RS-485
 // noise immunity. Total Modbus attempts per poll = SOLAR_REALTIME_MAX_ATTEMPTS (1 initial +
-// retries). Worst-case added blocking on a dead bus is roughly (attempts-1) * (2 * timeout)
-// because each attempt may try both function codes; the watchdog is kicked before each attempt.
+// retries). Each attempt may try both function codes, and a poll stops at its
+// SOLAR_POLL_MAX_MISSES-th request without a reply; the watchdog is kicked before each attempt.
 // The status/fault/daily blocks are intentionally NOT retried. Note the interaction
 // with SOLAR_COMM_FAILURE_THRESHOLD: up to (attempts * threshold) low-level reads can occur
 // before a comm failure is declared, which is the intended trade for transient-noise tolerance.
@@ -290,6 +290,15 @@ struct SolarConfig {
 #endif
 #ifndef SOLAR_RETRY_DELAY_MS
 #define SOLAR_RETRY_DELAY_MS            100
+#endif
+// The requests without a usable reply (misses) one poll may have: after the last, it sends
+// nothing more. A request after a miss waits for the line rest, one Modbus timeout
+// (TankAlarm_Solar.cpp, waitForLineRest()). Without a limit, the three attempts above with both
+// function codes each would make six requests and five rests on a dead bus. With three misses, a
+// poll makes three requests at most and rests twice, where it made six requests before it waited.
+// begin() counts its startup probe and first read as one poll.
+#ifndef SOLAR_POLL_MAX_MISSES
+#define SOLAR_POLL_MAX_MISSES           3
 #endif
 
 // Charger check: how many registers one serviceChargerCheck() call reads (each is a Modbus
@@ -420,7 +429,16 @@ public:
   // no-charge alert compares the battery with it. 0 (the default) means "not known": the alert
   // then uses BATTERY_VOLTAGE_FLOAT per 12 V of pack. The client sets it from a charger check
   // that completed and clears it after one that failed, and begin() clears it.
-  void setFloatReference(float volts) { _floatReferenceV = volts; }
+  // `liveScale` is the sunsaver::ScaleId the same check found the charger's live readings in
+  // (Evaluation::liveScale), SCALE_UNKNOWN when it could not tell. BATTERY_VOLTAGE_FLOAT is a
+  // battery's voltage, and this firmware decodes the readings with SS_VOLTAGE_SCALE_ID: from a
+  // charger that reports with x100 it reads a battery 3.3 % low. The default is taken to what
+  // this firmware reads (sunsaver::readingFactor()), and while the scale is not known to the
+  // lower of the two, so that a full battery never reads below it.
+  void setFloatReference(float volts, uint8_t liveScale = sunsaver::SCALE_UNKNOWN) {
+    _floatReferenceV = volts;
+    _readingFactor = (float)sunsaver::readingFactor(liveScale, SS_VOLTAGE_SCALE_ID);
+  }
   float getFloatReference() const { return _floatReferenceV; }
 
   // The battery's nominal voltage as the config names it: 12 or 24. The no-charge alert takes
@@ -510,6 +528,7 @@ private:
   uint8_t _noChargeConsecutivePolls;
   uint8_t _cachedHoldingFC; // Caches whether FC03 (holding) or FC04 (inputs) works: 3 = holding, 4 = inputs, 0 = unknown
   float _floatReferenceV;   // See setFloatReference(). 0 = not known.
+  float _readingFactor;     // See setFloatReference(): what this firmware reads per volt of battery
   uint8_t _packVolts;       // See setPackVolts(). 0 = the config names none.
 
   // Charger check

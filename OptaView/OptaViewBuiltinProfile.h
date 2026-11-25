@@ -215,11 +215,16 @@ static const char OV_BUILTIN_PROFILE[] =
     R"OVPROFILE(sage":"Battery high voltage reconnect (EV_hvr) must be below high voltage disconnect (EV_hvd)."},{"below":"EV_)OVPROFILE"
     R"OVPROFILE(lhvr","above":"EV_lhvd","message":"Load high voltage reconnect (EV_lhvr) must be below load high voltage disco)OVPROFILE"
     R"OVPROFILE(nnect (EV_lhvd)."},{"below":"EV_reg","above":"EV_hvd","message":"Absorption voltage (EV_reg) must be below bat)OVPROFILE"
-    R"OVPROFILE(tery high voltage disconnect (EV_hvd)."},{"below":"EV_reg2","above":"EV_hvd","message":"Bank 2 absorption volt)OVPROFILE"
-    R"OVPROFILE(age (EV_reg2) must be below battery high voltage disconnect (EV_hvd)."}],"scaleCheck":{"alternates":[96.667],")OVPROFILE"
-    R"OVPROFILE(grid":0.05,"settings":{"scale":"vset","setpoints":["EV_reg","EV_float","EV_eq","EV_reg2","EV_float2","EV_eq2",)OVPROFILE"
-    R"OVPROFILE("EV_hvd","EV_hvr","EV_lvd","EV_lvr","EV_soc_y2g","EV_soc_g2y","EV_soc_y2r0","EV_soc_r2y"]},"live":{"scale":"vl)OVPROFILE"
-    R"OVPROFILE(ive","meter":"adc_vb_f","battery":"Vb_f","reference":"Vb_ref","state":"charge_state","regulating":[6,7,8]}}})OVPROFILE";
+    R"OVPROFILE(tery high voltage disconnect (EV_hvd)."},{"below":"EV_float","above":"EV_hvd","message":"Float voltage (EV_flo)OVPROFILE"
+    R"OVPROFILE(at) must be below battery high voltage disconnect (EV_hvd)."},{"below":"EV_eq","above":"EV_hvd","message":"Equ)OVPROFILE"
+    R"OVPROFILE(alize voltage (EV_eq) must be below battery high voltage disconnect (EV_hvd)."},{"below":"EV_reg2","above":"EV)OVPROFILE"
+    R"OVPROFILE(_hvd","message":"Bank 2 absorption voltage (EV_reg2) must be below battery high voltage disconnect (EV_hvd)."})OVPROFILE"
+    R"OVPROFILE(,{"below":"EV_float2","above":"EV_hvd","message":"Bank 2 float voltage (EV_float2) must be below battery high )OVPROFILE"
+    R"OVPROFILE(voltage disconnect (EV_hvd)."},{"below":"EV_eq2","above":"EV_hvd","message":"Bank 2 equalize voltage (EV_eq2) )OVPROFILE"
+    R"OVPROFILE(must be below battery high voltage disconnect (EV_hvd)."}],"scaleCheck":{"alternates":[96.667],"grid":0.05,"se)OVPROFILE"
+    R"OVPROFILE(ttings":{"scale":"vset","setpoints":["EV_reg","EV_float","EV_eq","EV_reg2","EV_float2","EV_eq2","EV_hvd","EV_h)OVPROFILE"
+    R"OVPROFILE(vr","EV_lvd","EV_lvr","EV_soc_y2g","EV_soc_g2y","EV_soc_y2r0","EV_soc_r2y"]},"live":{"scale":"vlive","meter":")OVPROFILE"
+    R"OVPROFILE(adc_vb_f","battery":"Vb_f","reference":"Vb_ref","state":"charge_state","regulating":[6,7,8]}}})OVPROFILE";
 
 }  // namespace optaview
 
