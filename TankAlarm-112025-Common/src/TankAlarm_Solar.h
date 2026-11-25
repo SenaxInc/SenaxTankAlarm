@@ -50,6 +50,15 @@
 #define SS_REG_CHARGE_CURRENT       0x000B  // adc_ic_f: filtered charge current
 #define SS_REG_LOAD_CURRENT         0x000C  // adc_il_f: filtered load current
 
+// The temperature, status and daily registers below are not where the SunSaver MPPT MODBUS
+// Specification v11 has them. There 0x001B is load_fault and 0x001C V_lvd, 0x002B and 0x002C are
+// the lowest and highest battery voltage of the day, 0x002E and 0x002F the day's load Ah and
+// array faults, 0x0034 the highest battery voltage since the last reset and 0x0038 a lighting
+// flag, and the register table ends at 0x003A, so 0x003D and 0x003E hold nothing. The poll reads
+// them only with SOLAR_ENABLE_UNVERIFIED_REGISTERS (TankAlarm_Solar.cpp). The charger check reads
+// the specification's own (charge_state 0x0011, array_fault 0x0012, load_fault 0x001B:
+// TankAlarm_SunSaverSettings.h).
+
 // Temperature
 #define SS_REG_HEATSINK_TEMP        0x001B  // Register 28: Heatsink Temperature (°C, signed)
 #define SS_REG_BATTERY_TEMP         0x001C  // Register 29: Battery Temperature (°C, signed, if RTS connected)
@@ -67,20 +76,16 @@
 #define SS_REG_WH_DAILY             0x0038  // Register 57: Watt-hours charged today (if available)
 
 // ============================================================================
-// Charge Setpoint Registers (used for chemistry verification vs. UI selection)
+// Stored charge settings
 // ============================================================================
-// SunSaver MPPT chemistry is selected via a 4-position DIP switch on the unit
-// (Sealed/Gel/Flooded/L16) and CANNOT be set over Modbus. However the active
-// setpoints derived from that DIP selection are exposed in RAM and reflect
-// whatever chemistry the controller booted with. We read them back to verify
-// the installer flipped the right switches against what was selected in the
-// web UI. Addresses per SunSaver MPPT MODBUS Specification:
-//   V_reg   = absorption / regulation voltage
-//   V_float = float voltage
-//   V_eq    = equalization voltage (zero for chemistries that don't equalize)
-#define SS_REG_V_REG                0x0033  // Regulation (absorption) setpoint
-#define SS_REG_V_FLOAT              0x0035  // Float setpoint
-#define SS_REG_V_EQ                 0x0036  // Equalization setpoint (0 = disabled)
+// What the controller has stored (its charging profile, LVD and LVR, the DIP
+// switches) is read by the charger check: TankAlarm_SunSaverSettings.h has the
+// registers and the rules, and SolarManager::startChargerCheck() below runs it.
+// The settings are in EEPROM at 0xE000 and up. Of the registers this file used
+// to read as "setpoints", 0x0033 is the controller's lowest battery voltage since
+// its counters were last reset (vb_min; the highest, vb_max, is 0x0034), and the
+// register table of the SunSaver MPPT MODBUS Specification v11 has nothing at
+// 0x0035 or 0x0036.
 
 // ============================================================================
 // Scaling Factors for 12V System
@@ -88,6 +93,9 @@
 // ============================================================================
 // Per Morningstar SunSaver MPPT PDU: V_PU (12V controller) = 96.667 V, I_PU = 79.16 A.
 #define SS_SCALE_VOLTAGE_12V        96.667f   // Voltage scaling: Raw * 96.667 / 32768
+// The same as a sunsaver::ScaleId (TankAlarm_SunSaverSettings.h), for the charger check, which
+// compares what the charger says about its own LVD with this scale. Change the two together.
+#define SS_VOLTAGE_SCALE_ID         sunsaver::SCALE_96667
 #define SS_SCALE_CURRENT_12V        79.16f    // Current scaling: Raw * 79.16  / 32768
 #define SS_SCALE_DIVISOR            32768.0f  // Common divisor
 
@@ -189,13 +197,6 @@ struct SolarData {
   bool lastPollOk;            // R6: most recent poll succeeded (NO smoothing); for realtime indicator
   uint32_t firstReadMillis;   // R2: millis() of the FIRST successful read since boot (0 = never)
 
-  // Charge setpoints read from controller (reflects DIP-switch chemistry).
-  // setpointsValid is false until we successfully read them at least once.
-  bool setpointsValid;
-  float vRegSetpoint;         // Absorption / regulation voltage (V)
-  float vFloatSetpoint;       // Float voltage (V)
-  float vEqSetpoint;          // Equalization voltage (V); 0 = disabled
-
   // v2.1.3: 12V vs 24V bank classification (LOCAL-ONLY — not transmitted; see header note
   // above the OPTA_SUPPLY_* constants). 0 = unknown (no successful poll yet), else 12 or 24.
   uint8_t systemNominalV;
@@ -231,9 +232,10 @@ enum SolarAlertType : uint8_t {
 // (`v`/`vs`, plus the solar block's `bv`), all emitted only when a voltage
 // source has data. No alert/SMS fires on this today (user decision
 // 2026-07-02), and firmware does not write charger setpoints over Modbus
-// (RAM setpoint regs are read-only copies; the EEPROM custom block is
-// unverified, wears, needs a controller reset, and temp compensation would
-// defeat a cap anyway). The constants below are retained for future logic.
+// (the EEPROM custom block is unverified on our bench, wears, needs a
+// controller reset, and temp compensation would defeat a cap anyway). The
+// charger check only reads that block. The constants below are retained for
+// future logic.
 #ifndef OPTA_SUPPLY_ABS_MAX_V
 #define OPTA_SUPPLY_ABS_MAX_V  28.8f  // Opta datasheet: 12-24 VDC +/-20%
 #endif
@@ -277,9 +279,9 @@ struct SolarConfig {
 
 // Bounded retry for the VERIFIED realtime register block (0x0008..0x000C) only, for RS-485
 // noise immunity. Total Modbus attempts per poll = SOLAR_REALTIME_MAX_ATTEMPTS (1 initial +
-// retries). Worst-case added blocking on a dead bus is roughly (attempts-1) * (2 * timeout)
-// because each attempt may try both function codes; the watchdog is kicked before each attempt.
-// The setpoint and status/fault/daily blocks are intentionally NOT retried. Note the interaction
+// retries). Each attempt may try both function codes, and a poll stops at its
+// SOLAR_POLL_MAX_MISSES-th request without a reply; the watchdog is kicked before each attempt.
+// The status/fault/daily blocks are intentionally NOT retried. Note the interaction
 // with SOLAR_COMM_FAILURE_THRESHOLD: up to (attempts * threshold) low-level reads can occur
 // before a comm failure is declared, which is the intended trade for transient-noise tolerance.
 #ifndef SOLAR_REALTIME_MAX_ATTEMPTS
@@ -288,11 +290,32 @@ struct SolarConfig {
 #ifndef SOLAR_RETRY_DELAY_MS
 #define SOLAR_RETRY_DELAY_MS            100
 #endif
+// The requests without a usable reply (misses) one poll may have: after the last, it sends
+// nothing more. A request after a miss waits for the line rest, one Modbus timeout
+// (TankAlarm_Solar.cpp, waitForLineRest()). Without a limit, the three attempts above with both
+// function codes each would make six requests and five rests on a dead bus. With three misses, a
+// poll makes three requests at most and rests twice, where it made six requests before it waited.
+// begin() counts its startup probe and first read as one poll.
+#ifndef SOLAR_POLL_MAX_MISSES
+#define SOLAR_POLL_MAX_MISSES           3
+#endif
+
+// Charger check: how many registers one serviceChargerCheck() call reads (each is a Modbus
+// request of its own), and the least time between two such calls. The check reads 49 registers,
+// so with these figures loop() is held for about as long as one poll, 13 times over a few seconds.
+#ifndef SOLAR_CHARGER_CHECK_REGISTERS_PER_STEP
+#define SOLAR_CHARGER_CHECK_REGISTERS_PER_STEP 4
+#endif
+#ifndef SOLAR_CHARGER_CHECK_STEP_GAP_MS
+#define SOLAR_CHARGER_CHECK_STEP_GAP_MS        250
+#endif
 
 // ============================================================================
 // SolarManager Class Interface
 // ============================================================================
 #ifdef __cplusplus
+
+#include "TankAlarm_SunSaverSettings.h"
 
 class SolarManager {
 public:
@@ -309,6 +332,13 @@ public:
   // Polling (call periodically from main loop)
   // Returns true when a poll attempt was performed, regardless of read success.
   bool poll(unsigned long nowMillis);
+
+  // True for one Modbus timeout after a request that got no usable reply, the timeout that
+  // request had (a config update can change it). Its reply may still be on its way, and the next
+  // request would take it for its own answer, so the poll and the charger check both keep off the
+  // line meanwhile: a poll that is due waits (poll() returns false) and so does the next step of
+  // a charger check.
+  bool lineResting() const;
   
   // Data access
   const SolarData& getData() const { return _data; }
@@ -358,31 +388,76 @@ public:
   // Force a poll execution on the next opportunity
   void forcePollSoon() { _lastPollMillis = 0; }
 
-  // Chemistry verification result vs. user-selected battery type.
-  enum ChemistryCheck : uint8_t {
-    CHEMISTRY_CHECK_OK             = 0,  // Setpoints match expected chemistry
-    CHEMISTRY_CHECK_PENDING        = 1,  // Setpoints not yet read
-    CHEMISTRY_CHECK_MISMATCH       = 2,  // Setpoints out of range for selected chemistry
-    CHEMISTRY_CHECK_VOLTAGE_MISMATCH = 3 // Setpoints suggest a different pack voltage
-  };
+  // ---------------------------------------------------------------------------------------
+  // Charger check: what the controller has stored (charging profile, LVD and LVR, DIP
+  // switches), read a few registers at a time so that loop() keeps running. It only reads.
+  // The caller judges the result with sunsaver::evaluate() (TankAlarm_SunSaverSettings.h).
+  // ---------------------------------------------------------------------------------------
 
-  /**
-   * Compare the controller's read-back setpoints against the chemistry/voltage
-   * the user selected in the web UI. Returns CHEMISTRY_CHECK_PENDING until
-   * setpointsValid is true. The check is intentionally lenient: it only flags
-   * clear mismatches (e.g. AGM selected but V_eq is non-zero, or pack voltage
-   * is half of expected).
-   *
-   * @param expectedType    Chemistry the user picked in the web UI
-   * @param nominalVoltage  Pack voltage the user picked (12 or 24)
-   * @param outDescription  Optional buffer (>= 96 chars) for human-readable explanation
-   * @param descriptionLen  Length of outDescription buffer
-   */
-  ChemistryCheck verifyChemistry(uint8_t expectedType,
-                                 uint8_t nominalVoltage,
-                                 char* outDescription = nullptr,
-                                 size_t descriptionLen = 0) const;
-  
+  // Starts a pass over the registers. What an earlier pass read is dropped. Returns false
+  // when no pass can start: the charger is not enabled, or no poll has succeeded yet (the
+  // poll finds out which Modbus function the controller answers).
+  bool startChargerCheck();
+
+  // Gives up a pass that is under way.
+  void cancelChargerCheck();
+
+  // Call from loop(). Reads the next few registers when it is time to. Returns true in the
+  // call that ends a pass; then chargerCheckDone() or chargerCheckFailed() says how.
+  bool serviceChargerCheck(unsigned long nowMillis);
+
+  bool chargerCheckActive() const { return _chargerCheck.active(); }
+  bool chargerCheckDone() const { return _chargerCheck.done(); }      // the snapshot is complete
+  bool chargerCheckFailed() const { return _chargerCheck.failed(); }  // the link was not fit for it
+
+  // The registers of the last pass. Complete only when chargerCheckDone().
+  const sunsaver::Snapshot& chargerSnapshot() const { return _chargerCheck.snapshot(); }
+
+  // True once a pass has completed since begin(): it asked every register on the list. That does
+  // not mean every one answered: a register that stayed silent through both of its requests is in
+  // the snapshot as such (SSIO_NO_REPLY). A pass completes with up to four requests unanswered,
+  // and the fifth fails it (sunsaver::SnapshotReader::MISSES_PER_PASS).
+  bool chargerCheckCompleted() const { return _chargerCheckCompleted; }
+
+  // True once a pass that completed since begin() read a stored setting: one completes without
+  // when the controller refuses every EEPROM register (sunsaver::anySettingRead()).
+  bool chargerSettingsRead() const { return _chargerSettingsRead; }
+
+  // The voltage the charger holds a full battery at, as this firmware reads the battery. The
+  // no-charge alert compares the battery with it. 0 (the default) means "not known": the alert
+  // then uses BATTERY_VOLTAGE_FLOAT per 12 V of pack. The client sets it from a charger check
+  // that completed and clears it after one that failed, and begin() clears it.
+  // `liveScale` is the sunsaver::ScaleId the same check found the charger's live readings in
+  // (Evaluation::liveScale), SCALE_UNKNOWN when it could not tell. BATTERY_VOLTAGE_FLOAT is a
+  // battery's voltage, and this firmware decodes the readings with SS_VOLTAGE_SCALE_ID: from a
+  // charger that reports with x100 it reads a battery 3.3 % low. The default is taken to what
+  // this firmware reads (sunsaver::readingFactor()), and while the scale is not known to the
+  // lower of the two, so that a full battery never reads below it.
+  void setFloatReference(float volts, uint8_t liveScale = sunsaver::SCALE_UNKNOWN) {
+    _floatReferenceV = volts;
+    _readingFactor = (float)sunsaver::readingFactor(liveScale, SS_VOLTAGE_SCALE_ID);
+  }
+  float getFloatReference() const { return _floatReferenceV; }
+
+  // The battery's nominal voltage as the config names it: 12 or 24. The no-charge alert takes
+  // the size of the pack from it when the float voltage is not known. 0 (the default, and what
+  // any other value is taken as) means the config names none: the alert then goes by the
+  // voltage it reads, and a 12 V battery that a fault has taken above SOLAR_24V_SYSTEM_MIN_V
+  // passes for a 24 V one, which hides its BATTERY_HIGH behind NO_CHARGE in daylight. Kept
+  // across begin() and end(): it is the config's, not the link's.
+  void setPackVolts(uint8_t volts) { _packVolts = (volts == 12 || volts == 24) ? volts : 0; }
+  uint8_t getPackVolts() const { return _packVolts; }
+
+  // The battery's chemistry as the config names it, a sunsaver::Chemistry: CHEMISTRY_NOT_JUDGED
+  // (the default) when it names none. While the float voltage is not known, the no-charge alert
+  // keeps its default target within 0.2 V of the lowest reading of a battery held at the lowest
+  // float voltage that the charger check accepts for that chemistry (sunsaver::chargeRanges(),
+  // with its tolerance): a battery a charger holds there is full. Lead-acid's 13.4 V had a full
+  // Li-ion battery, at 12.6 V, count as one that is not being charged. Kept across begin() and
+  // end(), like the pack.
+  void setPackChemistry(uint8_t chemistry) { _packChemistry = chemistry; }
+  uint8_t getPackChemistry() const { return _packChemistry; }
+
 private:
   SolarConfig _config;
   SolarData _data;
@@ -390,6 +465,17 @@ private:
   unsigned long _lastPollMillis;
   uint8_t _noChargeConsecutivePolls;
   uint8_t _cachedHoldingFC; // Caches whether FC03 (holding) or FC04 (inputs) works: 3 = holding, 4 = inputs, 0 = unknown
+  float _floatReferenceV;   // See setFloatReference(). 0 = not known.
+  float _readingFactor;     // See setFloatReference(): what this firmware reads per volt of battery
+  uint8_t _packVolts;       // See setPackVolts(). 0 = the config names none.
+  uint8_t _packChemistry;   // See setPackChemistry(). sunsaver::CHEMISTRY_NOT_JUDGED = none.
+
+  // Charger check
+  sunsaver::SnapshotReader _chargerCheck;
+  unsigned long _chargerCheckStepMillis;  // when the last step ran
+  unsigned long _chargerCheckGapMs;       // the pause before the next one (0 before the first)
+  bool _chargerCheckCompleted;
+  bool _chargerSettingsRead;
   
   // Modbus communication
   bool readRegisters();

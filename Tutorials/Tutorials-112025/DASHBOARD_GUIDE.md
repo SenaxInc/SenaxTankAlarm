@@ -409,6 +409,24 @@ Each client supports up to 8 tanks (A-H):
 > delivery end-to-end. While an alarm stays active, the server re-sends a reminder SMS
 > every 6 hours (configurable `smsReminderHours`, 0 disables) until the alarm clears.
 
+### Charger Check (SunSaver MPPT)
+
+A client that reads its SunSaver MPPT over RS-485 (**Voltage Monitor** set to **RS485**) also reads what the charger has stored: the charging profile of both banks, the low voltage disconnect and reconnect, and the DIP switches. It compares that with the **Battery** selected in its configuration and sends the result to the server. The client only reads; it changes nothing in the charger.
+
+**Where to find it:**
+- On a site page (`/site-config?site=...`), each client shows a badge next to its RS-485 badge: **Charger settings OK**, **Charger settings WRONG**, **Charger: cannot tell** or **Charger: not judged**. Hover over it for the time of the check, and click it for the details.
+- **Charger: check pending** means that the battery in the client's configuration has changed since its last check, so that check's verdict is not about the battery configured now. The client checks again once it runs the new configuration. The charger page says the same above the old check.
+- In the configuration console, the hardware note under **Power Configuration** links to the same page for the client you are editing.
+- The page itself is `/charger?uid=<device UID>`. It lists what was found and every register with its value.
+
+**What the verdicts mean:**
+- **Settings suit the battery**: nothing wrong was found.
+- **Settings do not suit the battery**: for example a lithium battery on a charger whose DIP switch 1 is OFF (it then charges with a built-in lead-acid profile), a stored equalize voltage, or temperature compensation switched on.
+- **Could not be judged in full**: a register did not answer, the charger's voltage encoding could not be told from its setpoints, or the stored voltages were left unjudged because this is a 24 V system or the battery voltage the charger reports does not tell whether this is a 12 V or a 24 V system. What could be checked showed nothing wrong: a setting that was read and is wrong gives **Settings do not suit the battery**, whatever else could not be read. That includes an absorption or float voltage of 0 on a 12 V system, which is wrong whatever the encoding (a float voltage of 0 is no float at all).
+- **Not judged**: there are no rules for the battery that is configured (none, custom, LiPo).
+
+The client checks after it starts, after a change to its battery or charger settings, and once a day. It sends a new report when something has changed, and once a week otherwise. A report carries the time of its check and the server keeps the newest, so a report waits for the client's clock: after a power cycle it goes out once the client has been online. It also waits while the client cannot reach its Notecard, and is tried again every 10 minutes. A page that says no check has arrived means the client has no SunSaver configured, has not reached it yet, or runs firmware from before the charger check.
+
 ### Saving Configuration
 
 **Send to Device:**
@@ -1123,6 +1141,13 @@ See [Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md) for detailed network diagn
 **`GET /api/clients`**
 - Returns list of all known clients
 - Includes last seen, firmware version, configuration summary
+
+**`GET /api/charger?client=<device UID>`**
+- Returns the client's last charger check (JSON): `c` (the device UID), `site` and `fv` (firmware version) when the server knows them, and `have` (false when no check has arrived: then nothing else follows)
+- With a check: `e` (its time in Unix seconds, 0 when not known), `vd` and `verdict` (the verdict: 0 `not judged`, 1 `ok`, 2 `mismatch`, 3 `cannot tell`), `battery` (the chemistry the settings were judged against: `LiFePO4`, `Li-ion`, `sealed lead-acid`, `flooded lead-acid` or `not judged`), `system` (12 or 24 as measured, 0 when not known), `settingsScale` and `liveScale` (one line each on how the stored voltages and the live readings are encoded), `findings` (text `t`, and `p` true when it makes the settings wrong for the battery) and `groups`: one object per group of registers, `{"title": ..., "rows": [[name, description, value, raw], ...]}`, with `value` "no answer" and `raw` empty for a register that did not answer
+- `now` is added when the battery in the config the server holds for the client is judged as another chemistry than `battery` (named the same way): the check is pending, as on the badge
+- Answers 500 when the server runs out of memory for it, so that a verdict is never shown without its findings, or as current when the config could not be read
+- Needs a session, like every `/api/` route
 
 ### POST Endpoints
 

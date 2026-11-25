@@ -8,6 +8,8 @@ Suites that need ArduinoJson receive its `src` folder as `ARDUINOJSON_DIR`. The 
 
 A suite may use another tool the Ubuntu runner provides. `email_bridge` runs the Google Apps Script email bridge from the server's `/email-setup` page under node (18 or later), with stubs for the Apps Script services; run it with `node tests/host/email_bridge/email_bridge_test.js`. `optaview` runs the OptaView headers against a simulated SunSaver MPPT in two test programs, one for the Modbus core and the console and one for the web server, and first uses python3 to lint the register profile and to check that the copies of the profile and of the web page that are embedded in the sketch are current. Its `browser-test` target drives OptaView's web page in Chromium and needs Node.js and Playwright, so it is not part of `test`: the `optaview-page` job of the same workflow runs it (see `OptaView/README.md`).
 
+`sunsaver_settings` tests the charger check that the client runs on its SunSaver MPPT: `TankAlarm_SunSaverSettings.h` (which registers it reads, how it tells the encoding of the voltages, and whether the settings suit the battery) and `TankAlarm_SunSaverReport.h` (the report the client sends and the server shows, and which of two reports the server keeps), both in `TankAlarm-112025-Common/src`. It runs them against the simulated SunSaver of the `optaview` suite, through OptaView's Modbus master. The client and OptaView do not share code, so this suite also compares the client's register table with OptaView's profile, entry by entry, and runs the two scale tests side by side on the same words.
+
 To run a suite locally (Linux, macOS or WSL, with g++ or clang++):
 
 ```bash

@@ -30,6 +30,9 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
+// The charger check that clients with a SunSaver MPPT send, as JSON (needs ArduinoJson, so
+// TankAlarm_Common.h does not include it)
+#include <TankAlarm_SunSaverReport.h>
 #include "WarmTierStore.h"  // S-D03: warm-tier daily summary storage (host-tested in tests/host/warm_store)
 #if defined(ARDUINO_OPTA) || defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4)
   #include <PortentaEthernet.h>
@@ -150,6 +153,12 @@
 
 #ifndef CLIENT_METADATA_CACHE_PATH
 #define CLIENT_METADATA_CACHE_PATH "/client_metadata.json"
+#endif
+
+// The last charger check of each client (see ClientMetadata::chargerReportValid). A file of its
+// own: with it in the metadata cache, a full fleet would come close to that cache's size limit.
+#ifndef CHARGER_REPORTS_PATH
+#define CHARGER_REPORTS_PATH "/charger_reports.json"
 #endif
 
 // Stale client alerting threshold (49 hours in seconds)
@@ -564,7 +573,7 @@ struct ClientMetadata {
   //   scInit    -> solarInitOk        (R3: ModbusRTUClient.begin() succeeded)
   //   scOk      -> solarCommOk        (5-poll smoothed comm health)
   //   scLast    -> solarLastPollOk    (R6: single-poll truth)
-  //   scSpv     -> solarSetpointsOk   (R4: chemistry setpoints ever read OK)
+  //   scSpv     -> solarSetpointsOk   (the charger check has read a stored setting since boot)
   //   scOkEver  -> solarEverOk        (R2: link has succeeded at least once since boot)
   //   scImpl    -> solarImplausible   (CRC-valid frame rejected by plausibility clamp)
   //   scErr     -> solarErrTag        (R1: "to"/"crc"/"ida"/"ifu"/"?")
@@ -586,6 +595,18 @@ struct ClientMetadata {
   uint16_t solarLastMaddr;     // scMaddr
   uint32_t solarLastOkAgoS;    // scLastOkS
   double solarTelemetryEpoch;  // When the above were last updated from telemetry
+
+  // The last charger check the client sent: what its SunSaver MPPT has stored (charging
+  // profile, LVD and LVR, DIP switches) and how that suits the configured battery. It arrives as
+  // a "chg-check" report on the config-ack notefile (handleChargerReport) and is kept in
+  // CHARGER_REPORTS_PATH, not in the metadata cache.
+  bool chargerReportValid;                 // the three fields below hold a report
+  double chargerReportEpoch;               // when the client made the check, 0 = not known
+  sunsaver::Snapshot chargerSnapshot;      // the registers
+  sunsaver::Evaluation chargerEvaluation;  // the client's judgement
+  // The client was in the metadata cache at this start, and the file of reports, which may hold
+  // one for it, has not been read yet (see loadChargerReports()).
+  bool chargerReportUnread;
 };
 
 struct SerialLogEntry {
@@ -1338,7 +1359,19 @@ static double gLastDailyEmailSentEpoch = 0.0;
 // Sensor registry & client metadata persistence state
 static bool gSensorRegistryDirty = false;         // True when sensor records need saving
 static bool gClientMetadataDirty = false;        // True when client metadata needs saving
+// The metadata cache was read whole at this start, or there was none (loadClientMetadataCache()).
+static bool gClientMetadataLoaded = false;
 static unsigned long gLastRegistrySaveMillis = 0;
+// The file of kept charger reports (CHARGER_REPORTS_PATH) holds a report that changed since its
+// last write that worked. See saveChargerReportsIfDirty().
+static bool gChargerReportsDirty = false;
+static unsigned long gChargerReportsTryMillis = 0;  // when it was last written or tried
+// The file was read whole at this start, or was not there, or was set aside as one that can never
+// be read. Until then nothing writes it: a write would replace the reports it holds with those in
+// RAM. See loadChargerReports().
+static bool gChargerReportsLoaded = false;
+static unsigned long gChargerReportsReadMillis = 0;  // when it was last read or tried
+#define CHARGER_REPORTS_RETRY_MS 300000UL           // after a write or a read that failed
 static unsigned long gLastStaleCheckMillis = 0;
 
 // ----------------------------------------------------------------------------
@@ -1405,6 +1438,16 @@ static uint32_t gHotTierLastHash = 0;
 static inline long posix_file_size(FILE *fp) { return tankalarm_posix_file_size(fp); }
 static inline bool posix_file_exists(const char *path) { return tankalarm_posix_file_exists(path); }
 static inline void posix_log_error(const char *op, const char *path) { tankalarm_posix_log_error(op, path); }
+
+// Opens a file of this server to read. *absent tells a file that is not there (ENOENT) from one
+// that did not open for another reason (no memory, a flash error, no file handle free): that one
+// may open later, and is not an empty store.
+static FILE *openStoreToRead(const char *path, bool *absent) {
+  errno = 0;
+  FILE *fp = fopen(path, "r");
+  *absent = fp == nullptr && errno == ENOENT;
+  return fp;
+}
 
 // POSIX-compliant safe file write — delegates to atomic write-to-temp-then-rename
 // to prevent data loss on power failure during save operations. Routed through
@@ -2106,6 +2149,11 @@ const pauseBtn=document.getElementById('pauseBtn');function renderPauseBtn(){if(
 async function loadPauseState(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv){state.paused=!!d.srv.ps;renderPauseBtn();}}catch(e){}}
 if(pauseBtn)pauseBtn.addEventListener('click',async()=>{try{const r=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:false})});if(r.ok){state.paused=false;renderPauseBtn();showToast('Resumed');}else throw new Error('Failed');}catch(e){showToast('Error resuming',true);}});
 await loadPauseState();
+/* A link to the charger check of the client that is being edited, or nothing without a client. */
+function chargerCheckLink(before,text,after){
+  const u=((document.getElementById('clientUid')||{}).value||'').trim();
+  return u?before+'<a href="/charger?uid='+encodeURIComponent(u)+'">'+text+'</a>'+after:'';
+}
 window.validatePowerCombination=function(){
   const ps=document.getElementById('powerSource').value||'grid';
   const bt=document.getElementById('batteryType').value||'agm';
@@ -2129,7 +2177,7 @@ window.validatePowerCombination=function(){
   }else if(ps==='grid'&&bt==='none'&&vin){
     msg='Voltage Divider on a grid-only install with no battery has nothing useful to read.';
   }else if(ps==='solar_modbus_mppt'&&(bt==='lifepo4'||bt==='li_ion')){
-    msg='SunSaver MPPT has no lithium DIP preset. You MUST load a custom lithium charge profile via Morningstar MSView (USB MeterBus adapter) before connecting the battery — DIP-only lead-acid presets will undercharge LiFePO4 and may damage Li-ion. The firmware will read the setpoints back over Modbus and warn if they still look like a lead-acid preset.';
+    msg='SunSaver MPPT has no lithium DIP preset. Before a lithium battery is connected, the charger needs a custom lithium charge profile in its memory and DIP switch 1 ON so that it uses it. Until this firmware can write that profile, load it with Morningstar MSView (USB MeterBus adapter) or OptaView. The built-in lead-acid presets adjust the voltage for temperature and can equalize, which harms a lithium battery. The client reads what the charger has stored and reports whether it suits this battery.'+chargerCheckLink(' See the ','charger check for this client','.');
   }
   if(bv===24&&vin){
     const r1=parseFloat(document.getElementById('vinR1').value)||22;
@@ -2154,7 +2202,7 @@ window.updatePowerConfigInfo=function(){
   /* Hardware-requirement banner */
   const i=document.getElementById('powerConfigInfo');
   if(i){
-    if(ps==='solar_modbus_mppt'){i.style.display='block';i.innerHTML='<strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.';}
+    if(ps==='solar_modbus_mppt'){i.style.display='block';i.innerHTML='<strong>Hardware Requirement:</strong> Modbus MPPT requires Opta WiFi (AFX00002) or Opta RS485 (AFX00001). Opta Lite (AFX00003) needs an external RS485 transceiver.'+chargerCheckLink(' The client checks what the charger has stored against the battery selected here: ','charger check','.');}
     else if(ps==='solar_mppt'){i.style.display='block';i.innerHTML='<strong>Hardware Requirement:</strong> Use this for higher-quality non-monitored solar chargers. For basic PWM chargers (for example SunKeeper-6), use Solar (Passive Charger). This mode does not require RS485 and uses battery/vin telemetry only.';}
     else{i.style.display='none';}
   }
@@ -2214,7 +2262,7 @@ window.msgAssocChanged=function(id,cb){const cid=cb.dataset.cid;const aid=curren
 window.msgChannelChanged=function(chan,cb){const cid=cb.dataset.cid;const list=chan==='sms'?dirSms:dirEmail;const i=list.indexOf(cid);if(cb.checked&&i<0)list.push(cid);if(!cb.checked&&i>=0)list.splice(i,1);saveContactsDirectory();};
 window.saveContactsDirectory=async function(){try{const r=await fetch('/api/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contacts:dirContacts,smsAlertRecipients:dirSms,emailAlertRecipients:dirEmail,dailyReportRecipients:dirDaily})});const d=await r.json();if(d&&d.success){showToast('Contact alert settings saved');}else{showToast('Failed to save contact settings',true);loadContactsDirectory();}}catch(e){showToast('Failed to save contact settings',true);loadContactsDirectory();}};
 window.autoOpenMsgSections=function(){if(!dirLoaded)return;document.querySelectorAll('.sensor-card').forEach(card=>{const id=parseInt(card.id.replace('sensor-',''));const aid=currentAlarmId(id);if(!aid)return;const msgSection=card.querySelector('.msg-section');if(!msgSection||msgSection.classList.contains('visible'))return;const alarmVisible=card.querySelector('.alarm-section').classList.contains('visible');if(!alarmVisible)return;const anyAssoc=dirContacts.some(c=>Array.isArray(c.alarmAssociations)&&c.alarmAssociations.includes(aid));if(anyAssoc)toggleMsgSection(id);});};
-document.getElementById('clientUid').addEventListener('input',()=>{document.querySelectorAll('.msg-section.visible').forEach(sec=>{const card=sec.closest('.sensor-card');if(card)renderMsgContacts(parseInt(card.id.replace('sensor-','')));});});
+document.getElementById('clientUid').addEventListener('input',()=>{document.querySelectorAll('.msg-section.visible').forEach(sec=>{const card=sec.closest('.sensor-card');if(card)renderMsgContacts(parseInt(card.id.replace('sensor-','')));});updatePowerConfigInfo();});
 loadContactsDirectory();
 window.toggleRelayDurations=function(id){const card=document.getElementById(`sensor-${id}`);const relayMode=card.querySelector('.relay-mode').value;const durationsSection=card.querySelector('.relay-durations-section');const maxOnSection=card.querySelector('.relay-max-on-section');if(relayMode==='momentary'){durationsSection.style.display='block';maxOnSection.style.display='none';}else if(relayMode==='manual_reset'){durationsSection.style.display='none';maxOnSection.style.display='flex';}else{durationsSection.style.display='none';maxOnSection.style.display='none';}};
 window.updateMonitorFields=function(id){const card=document.getElementById(`sensor-${id}`);const type=card.querySelector('.monitor-type').value;const numField=card.querySelector('.tank-num-field');const numFieldLabel=numField.querySelector('span');const nameLabel=card.querySelector('.name-label');const sensorTypeSelect=card.querySelector('.sensor-type');const pulsesPerRevField=card.querySelector('.pulses-per-rev-field');const contentsField=card.querySelector('.contents-field');const calCheckbox=card.querySelector('.calibration-enabled');if(type==='gas'){numField.style.display='flex';numFieldLabel.textContent='Display Number (optional)';nameLabel.textContent='System Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';sensorTypeSelect.value='2';calCheckbox.checked=false;updatePinOptions(id);}else if(type==='rpm'){numField.style.display='flex';numFieldLabel.textContent='Engine Number (optional)';nameLabel.textContent='Engine Name';pulsesPerRevField.style.display='flex';contentsField.style.display='none';sensorTypeSelect.value='3';calCheckbox.checked=false;updatePinOptions(id);}else{numField.style.display='flex';numFieldLabel.textContent='Tank Number (optional)';nameLabel.textContent='Name';pulsesPerRevField.style.display='none';contentsField.style.display='flex';calCheckbox.checked=true;}updateSensorTypeFields(id);};
@@ -2263,7 +2311,7 @@ if(c.vinMonitor){if(c.vinMonitor.pin!==undefined)document.getElementById('vinPin
 function closeSelectClientModal(){els.selectClientModal.classList.add('hidden');}window.closeSelectClientModal=closeSelectClientModal;
 els.clientList.addEventListener('click',e=>{const it=e.target.closest('.client-item');if(it)window.fetchClientConfig(it.dataset.uid||'');});els.loadFromCloudBtn.addEventListener('click',async()=>{els.selectClientModal.classList.remove('hidden');els.clientList.innerHTML='Loading...';try{const r=await fetch('/api/clients?summary=1');const d=await r.json();const clients=d.cs||[];els.clientList.innerHTML=clients.map(c=>{const uid=c.c||'';const label=c.n||uid;const site=c.s||'';return `<div class="client-item" data-uid="${escapeHtml(uid)}"><strong>${escapeHtml(label)}</strong> (${escapeHtml(uid)})<br>${escapeHtml(site)}</div>`;}).join('');}catch(e){els.clientList.innerHTML='Error loading clients';}});
 window.fetchClientConfig=async(uid)=>{closeSelectClientModal();try{const r=await fetch('/api/client?uid='+encodeURIComponent(uid));if(r.status===404){startCommissioning(uid);return;}if(!r.ok)throw new Error('HTTP '+r.status);const c=await r.json();if(els.clientUid)els.clientUid.value=uid;if(c&&c.config)loadConfig(c.config);else startCommissioning(uid);}catch(e){showToast('Error loading config: '+(e.message||e),true);}};
-function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;if(!document.querySelector('#sensorsContainer .sensor-card'))addSensor();showToast('No stored configuration for '+uid+' yet. Fill in this new configuration and send it to commission the client.');}
+function startCommissioning(uid){if(els.clientUid)els.clientUid.value=uid;updatePowerConfigInfo();if(!document.querySelector('#sensorsContainer .sensor-card'))addSensor();showToast('No stored configuration for '+uid+' yet. Fill in this new configuration and send it to commission the client.');}
 const importInput=document.getElementById('importFileInput');const importBtn=document.getElementById('importBtn');if(importBtn&&importInput){importBtn.addEventListener('click',()=>importInput.click());importInput.addEventListener('change',(e)=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=(evt)=>{try{loadConfig(JSON.parse(evt.target.result));}catch(err){showToast('Invalid JSON',true);}};r.readAsText(f);});}
 function getQueryParam(name){const params=new URLSearchParams(window.location.search);return params.get(name)||'';}
 async function basicInit(){try{const r=await fetch('/api/clients?summary=1');const d=await r.json();if(d&&d.srv&&d.srv.pu)els.productUid.value=d.srv.pu;if(d&&d.srv&&d.srv.cf)els.clientFleet.value=d.srv.cf;window._siteClients=d;populateRelayTargets(d);}catch(e){}const urlUid=getQueryParam('uid');if(urlUid&&els.clientUid)els.clientUid.value=urlUid;const urlSite=getQueryParam('site');if(urlSite&&els.siteName)els.siteName.value=urlSite;if(urlUid){await fetchClientConfig(urlUid);}else{addSensor();}}function populateRelayTargets(d){const dl=document.getElementById('relayTargetSuggestions');if(!dl||!d||!d.cs)return;const seen=new Set();d.cs.forEach(c=>{const uid=c.c||'';if(uid&&!seen.has(uid)){seen.add(uid);const opt=document.createElement('option');const label=c.n||c.s||'';opt.value=uid;opt.label=label?label+' ('+uid+')':uid;dl.appendChild(opt);}});}basicInit();
@@ -2341,6 +2389,32 @@ R"HTML(const toast=document.getElementById('toast');const logBody=document.getEl
 R"HTML(function typeBadge(t){const colors={sms:'#dbeafe;color:#1e40af',email:'#fce7f3;color:#9d174d',config:'#e0e7ff;color:#3730a3',relay:'#fef3c7;color:#92400e',relay_clear:'#fef3c7;color:#92400e',viewer_summary:'#d1fae5;color:#065f46',serial_request:'#f3e8ff;color:#6b21a8',location_request:'#ccfbf1;color:#0f766e'};const bg=colors[t]||'#e5e7eb;color:#374151';return `<span style="display:inline-block;padding:2px 8px;font-size:0.75rem;font-weight:600;background:${bg};border-radius:var(--radius);">${escapeHtml(t)}</span>`;}const KNOWN_TYPES=['sms','email','config','relay','relay_clear','ota','alarm','sync_request','telemetry_request','viewer_summary','viewer_contacts','archive','stale'];const KNOWN_STATUSES=['outbox','sent','failed','error','cancelled','applied','stalled','optout','optin','snooze','unsnooze','inbound','pruned','auto-removed'];const LABELS={sms:'SMS',email:'Email',ota:'OTA',optout:'Opt-out',optin:'Opt-in'};function labelFor(v){return LABELS[v]||String(v).replace(/[_-]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase());}function fillSelect(sel,known,present,allLabel){const cur=sel.value;const vals=[...new Set([...known,...present])];sel.innerHTML='<option value="all">'+allLabel+'</option>'+vals.map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(labelFor(v))}</option>`).join('');sel.value=cur;if(sel.value!==cur)sel.value='all';}function populateFilters(){fillSelect(typeFilter,KNOWN_TYPES,allEntries.map(e=>e.type).filter(Boolean),'All Types');fillSelect(statusFilter,KNOWN_STATUSES,allEntries.map(e=>e.status).filter(Boolean),'All Statuses');}function getFilteredEntries(){const tf=typeFilter.value;const sf=statusFilter.value;const search=searchInput.value.toLowerCase().trim();let filtered=allEntries;if(tf!=='all')filtered=filtered.filter(e=>e.type===tf);if(sf!=='all')filtered=filtered.filter(e=>e.status===sf);if(search)filtered=filtered.filter(e=>(e.site||'').toLowerCase().includes(search)||(e.client||'').toLowerCase().includes(search)||(e.detail||'').toLowerCase().includes(search));return filtered;}function renderTable(){const filtered=getFilteredEntries();if(filtered.length===0){logBody.innerHTML='<tr><td colspan="7" class="empty-state">No matching transmissions found.</td></tr>';return;}logBody.innerHTML=filtered.map(e=>{const cancelBtn=(e.type==='config'&&e.status==='outbox'&&e.client)?`<button class="tl-cancel" data-uid="${escapeHtml(e.client)}" style="padding:2px 8px;font-size:0.75rem;background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:var(--radius);cursor:pointer;">Cancel</button>`:'';return `<tr><td style="white-space:nowrap;">${formatEpoch(e.timestamp)}</td><td>${escapeHtml(e.site||'--')}</td><td style="font-size:0.85rem;font-family:ui-monospace,monospace;">${escapeHtml(e.client||'--')}</td><td>${typeBadge(e.type)}</td><td>${statusBadge(e.status)}</td><td style="font-size:0.85rem;">${escapeHtml(e.detail||'')}</td><td>${cancelBtn}</td></tr>`;}).join('');const cab=document.getElementById('cancelAllBtn');if(cab){const hasPending=allEntries.some(e=>e.type==='config'&&e.status==='outbox');cab.style.display=hasPending?'inline-block':'none';}}async function loadLog(){try{const res=await fetch('/api/transmission-log');if(!res.ok)throw new Error('Failed to load');const data=await res.json();allEntries=data.entries||[];populateFilters();renderTable();}catch(err){logBody.innerHTML='<tr><td colspan="7" class="empty-state">Error: '+escapeHtml(err.message)+'</td></tr>';}}logBody.addEventListener('click',e=>{const b=e.target.closest('button.tl-cancel');if(b)cancelPendingConfig(b.dataset.uid);});document.getElementById('refreshBtn').addEventListener('click',loadLog);typeFilter.addEventListener('change',renderTable);statusFilter.addEventListener('change',renderTable);searchInput.addEventListener('input',renderTable);)HTML"
 R"HTML(document.getElementById('exportBtn').addEventListener('click',()=>{let csv='Date/Time,Site,Client ID,Type,Status,Detail\n';const filtered=getFilteredEntries();filtered.forEach(e=>{const dt=e.timestamp?new Date(e.timestamp*1000).toISOString():'';csv+=`"${dt}","${e.site||''}","${e.client||''}","${e.type||''}","${e.status||''}","${(e.detail||'').replace(/"/g,'""')}"\n`;});const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='transmission_log.csv';a.click();URL.revokeObjectURL(url);showToast('CSV exported');});document.getElementById('cancelAllBtn').addEventListener('click',cancelAllPendingConfigs);)HTML"
 R"HTML(async function cancelPendingConfig(clientUid){if(!confirm('Cancel pending config dispatch for '+clientUid+'? This will stop auto-retries and purge unsent notes from the Notecard outbox.'))return;try{const res=await fetch('/api/config/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:clientUid})});const text=await res.text();if(res.ok){showToast(text||'Config dispatch cancelled');}else{showToast(text||'Cancel failed',true);}await loadLog();}catch(err){showToast('Error: '+err.message,true);}}async function cancelAllPendingConfigs(){if(!confirm('Cancel ALL pending config dispatches? This will stop all auto-retries.'))return;try{const res=await fetch('/api/config/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});const text=await res.text();if(res.ok){showToast(text||'All pending configs cancelled');}else{showToast(text||'Cancel failed',true);}await loadLog();}catch(err){showToast('Error: '+err.message,true);}}loadLog();setInterval(loadLog,15000);})();</script></body></html>)HTML";
+
+// The charger check of one client (SunSaver MPPT): /charger?uid=<client>. Reads /api/charger.
+static const char CHARGER_CHECK_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Charger Check - TankAlarm</title><link rel="stylesheet" href="/style.css"><style>.cc-verdict{display:inline-block;padding:4px 10px;margin-right:10px;font-weight:600;border:1px solid}.cc-ok{color:var(--ok);background:var(--ok-bg);border-color:var(--ok)}.cc-bad{color:var(--bad);background:var(--bad-bg);border-color:var(--bad)}.cc-warn{color:var(--warn);background:var(--warn-bg);border-color:var(--warn)}.cc-none{color:var(--muted);background:var(--chip);border-color:var(--card-border)}.cc-findings{list-style:none;padding:0;margin:16px 0}.cc-findings li{padding:8px 12px;margin-bottom:6px;border-left:4px solid var(--card-border);background:var(--chip)}.cc-findings li.p{border-left-color:var(--bad);background:var(--bad-bg);color:var(--bad)}.cc-name,.cc-raw{font-family:monospace;white-space:nowrap}.cc-raw{color:var(--muted)}.cc-note{color:var(--muted);font-size:0.9rem}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><a class="pill secondary" href="/">Dashboard</a><a class="pill secondary" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" id="logoutBtn">Logout</button></div></div></header><main><div class="card"><h2>Charger Check</h2><p id="ccWho" class="cc-note" style="margin-bottom:16px;"></p><div id="ccSummary" class="empty-state">Loading...</div><ul id="ccFindings" class="cc-findings"></ul><div id="ccScales" class="cc-note"></div><div id="ccGroups"></div><p class="cc-note" style="margin-top:24px;">The client reads these registers from its SunSaver MPPT over RS-485 and changes nothing in the charger. It reads them after it starts, after a change to its battery or charger settings, and once a day, and it sends a report when something in them has changed.</p></div></main>)HTML"
+R"HTML(<script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname+window.location.search);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);
+document.getElementById('logoutBtn').addEventListener('click',()=>{fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login';});});
+const uid=new URLSearchParams(window.location.search).get('uid')||'';
+const el=id=>document.getElementById(id);
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function when(e){if(!e)return'';const d=new Date(e*1000);if(isNaN(d.getTime()))return'';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}
+const verdicts={0:['Not judged','cc-none','The client has no rules for the battery that is configured, so it shows the settings without judging them.'],1:['Settings suit the battery','cc-ok',''],2:['Settings do not suit the battery','cc-bad',''],3:['Could not be judged in full','cc-warn','Part of the judgement could not be made. What could be checked showed nothing wrong.']};
+function render(d){
+el('ccWho').textContent=(d.site?d.site+', ':'')+'client '+uid+(d.fv?', firmware v'+d.fv:'');
+if(!d.have){el('ccSummary').className='empty-state';el('ccSummary').textContent='No charger check has arrived from this client yet. A client sends one when it has a SunSaver MPPT on RS-485 (Voltage Monitor set to RS485) and firmware that includes the charger check.';return;}
+const v=verdicts[d.vd]||verdicts[0];const t=when(d.e);
+el('ccSummary').className='';
+el('ccSummary').innerHTML='<span class="cc-verdict '+v[1]+'">'+esc(v[0])+'</span>Battery: <strong>'+esc(d.battery)+'</strong>'+(d.system?', measured as a '+esc(d.system)+' V system':'')+' <span class="cc-note">('+(t?'checked '+esc(t):'the time of this check is not known')+')</span>'+(v[2]?'<p class="cc-note" style="margin:8px 0 0;">'+esc(v[2])+'</p>':'')+(d.now?'<p id="ccStale" class="cc-verdict cc-warn" style="display:block;margin:12px 0 0;font-weight:normal;">The battery in this client\'s config is now '+esc(d.now)+'. This check was judged against '+esc(d.battery)+', so its verdict is not about the battery configured now. The client checks again once it runs that config.</p>':'');
+el('ccFindings').innerHTML=(d.findings||[]).map(f=>'<li'+(f.p?' class="p"':'')+'>'+esc(f.t)+'</li>').join('');
+el('ccScales').innerHTML='<div>How the stored voltages are encoded: '+esc(d.settingsScale)+'</div><div>How the live voltages are encoded: '+esc(d.liveScale)+'</div>';
+el('ccGroups').innerHTML=(d.groups||[]).map(g=>'<h3>'+esc(g.title)+'</h3><table><thead><tr><th>Register</th><th>What it is</th><th>Value</th><th>Raw</th></tr></thead><tbody>'+(g.rows||[]).map(r=>'<tr><td class="cc-name">'+esc(r[0])+'</td><td>'+esc(r[1])+'</td><td>'+esc(r[2])+'</td><td class="cc-raw">'+esc(r[3])+'</td></tr>').join('')+'</tbody></table>').join('');
+}
+async function load(){
+if(!uid){el('ccSummary').textContent='No client was given. Open this page from a client on its site page.';return;}
+try{const r=await fetch('/api/charger?client='+encodeURIComponent(uid));if(!r.ok)throw new Error((await r.text())||('HTTP '+r.status));render(await r.json());}
+catch(e){el('ccSummary').className='empty-state';el('ccSummary').textContent='The charger check could not be loaded: '+e.message;}
+}
+load();})();</script></body></html>)HTML";
 
 static const char LOGIN_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Login - TankAlarm</title><link rel="stylesheet" href="/style.css"></head><body data-theme="light"><div id="loading-overlay"><div class="spinner"></div></div><script>setTimeout(function(){var o=document.getElementById('loading-overlay');if(o)o.style.display='none'},5000)</script><main><h1 class="login-title"><span class="brand">TankAlarm</span> Login</h1><p>Enter your PIN to access the dashboard.</p><form id="loginForm" class="login-form"><input type="password" id="pin" class="pin-input" placeholder="Enter PIN" required autocomplete="current-password" pattern="\d{4}" title="4-digit PIN"><button type="submit" class="login-button">Login</button><div id="error" class="error">Invalid PIN</div></form></main><script>function sanitizeRedirect(value){if(!value||value.charAt(0)!=='/')return'/';if(value.startsWith('//'))return'/';if(value.toLowerCase().startsWith('/login'))return'/';return value;}window.addEventListener('load',()=>{localStorage.removeItem('tankalarm_session');const ov=document.getElementById('loading-overlay');if(ov){ov.style.display='none';ov.classList.add('hidden');}const params=new URLSearchParams(window.location.search);if(params.get('reason')==='expired'){const e=document.getElementById('error');e.textContent='Session expired \u2014 another user logged in';e.style.display='block';}});document.getElementById("loginForm").addEventListener("submit",async(e)=>{e.preventDefault();const pin=document.getElementById("pin").value;try{const res=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pin})});if(res.ok){const data=await res.json();localStorage.setItem("tankalarm_token","1");localStorage.setItem("tankalarm_session",data.session||"cookie");const params=new URLSearchParams(window.location.search);window.location.href=sanitizeRedirect(params.get("redirect"));}else{let msg="Invalid PIN";if(res.status!==401){let text="";try{text=await res.text();}catch(_){}try{const j=JSON.parse(text);text=j.message||j.error||text;}catch(_){}msg=text||("Login failed (HTTP "+res.status+")");}document.getElementById("error").textContent=msg;document.getElementById("error").style.display="block";}}catch(err){document.getElementById("error").textContent="Connection failed: "+err.message;document.getElementById("error").style.display="block";}});</script></body></html>)HTML";
 
@@ -2442,7 +2516,7 @@ const key=el.dataset.sparkKey;const readings=state.sparkData[key];if(readings&&r
 function buildSiteModel(rawClients){const sites={};rawClients.forEach(c=>{const uid=c.c||'';const site=c.s||'Unknown Site';if(!sites[site])sites[site]={name:site,clients:{}};if(!sites[site].clients[uid])sites[site].clients[uid]={uid:uid,alarm:!!c.a,lastUpdate:c.u||0,vinVoltage:c.v,vinVoltageEpoch:c.ve,otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sol:c.sol||null,updateRequestedEpoch:c.ureq||0,sensors:[]};const cl=sites[site].clients[uid];if(c.a)cl.alarm=true;if(c.u>cl.lastUpdate)cl.lastUpdate=c.u;if(c.ureq&&c.ureq>cl.updateRequestedEpoch)cl.updateRequestedEpoch=c.ureq;const sensors=Array.isArray(c.ts)?c.ts:[];if(sensors.length){sensors.forEach((t,idx)=>{cl.sensors.push({label:t.n||c.n||'Sensor',sensorIndex:t.k||'',userNumber:t.un||0,currentValue:t.l,sensorMa:t.ma,sensorType:t.st||'',objectType:t.ot||'tank',measurementUnit:t.mu||'',contents:t.ct||'',alarm:!!t.a,alarmType:t.at||'',snoozeEpoch:t.sz||0,lastUpdate:t.u||0,change24h:t.d,sensorIdx:idx,fault:t.flt||'',_clientUid:uid});});}else if(c.u){cl.sensors.push({label:c.n||'Sensor',sensorIndex:c.k||'',userNumber:c.un||0,currentValue:c.l,sensorMa:c.ma,sensorType:'',objectType:'tank',measurementUnit:'',contents:'',alarm:!!c.a,alarmType:c.at||'',snoozeEpoch:0,lastUpdate:c.u||0,change24h:undefined,sensorIdx:0,fault:c.flt||'',_clientUid:uid});}});return sites;}
 )HTML" R"HTML(
 function clientStatusColor(cl){if(cl.alarm)return'red';if(!cl.lastUpdate||isStale(cl.lastUpdate))return'yellow';return'green';}
-function solarHealthHtml(cl){if(!cl||!cl.sol)return'<span style="color:var(--muted);">--</span>';var s=cl.sol;var color,label,info='';if(!s.init){color='#dc2626';label='init FAIL';}else if(s.ok&&s.last){color='#10b981';label='OK';if(s.spv)info=' (setpoints verified)';}else if(s.ok&&!s.last){color='#f59e0b';label='last poll FAIL';if(s.err)info=' err='+s.err;}else{color='#dc2626';if(!s.ever){label='NEVER OK';}else{label='DOWN';if(s.lastOkS)label+=' '+s.lastOkS+'s';}if(s.err)info+=' err='+s.err;if(s.resMs)info+=' '+s.resMs+'ms';if(s.maddr)info+=' reg=0x'+s.maddr.toString(16);if(s.impl)info+=' [impl]';}return '<span style="color:'+color+';font-weight:500;" title="'+escapeHtml('RS-485 / SunSaver Modbus: '+label+info)+'">'+escapeHtml(label)+'</span>'+(info?'<span style="color:var(--muted);font-size:0.75rem;"> '+escapeHtml(info)+'</span>':'');}
+function solarHealthHtml(cl){if(!cl||!cl.sol)return'<span style="color:var(--muted);">--</span>';var s=cl.sol;var color,label,info='';if(!s.init){color='#dc2626';label='init FAIL';}else if(s.ok&&s.last){color='#10b981';label='OK';if(s.spv)info=' (charger settings read)';}else if(s.ok&&!s.last){color='#f59e0b';label='last poll FAIL';if(s.err)info=' err='+s.err;}else{color='#dc2626';if(!s.ever){label='NEVER OK';}else{label='DOWN';if(s.lastOkS)label+=' '+s.lastOkS+'s';}if(s.err)info+=' err='+s.err;if(s.resMs)info+=' '+s.resMs+'ms';if(s.maddr)info+=' reg=0x'+s.maddr.toString(16);if(s.impl)info+=' [impl]';}return '<span style="color:'+color+';font-weight:500;" title="'+escapeHtml('RS-485 / SunSaver Modbus: '+label+info)+'">'+escapeHtml(label)+'</span>'+(info?'<span style="color:var(--muted);font-size:0.75rem;"> '+escapeHtml(info)+'</span>':'');}
 els.siteContainer.addEventListener('click',e=>{const b=e.target.closest('.dc-update,.dc-snooze,.dc-clear,.dc-remove');if(!b||b.disabled)return;const uid=b.dataset.uid||'';if(b.classList.contains('dc-update'))requestUpdate(uid);else if(b.classList.contains('dc-snooze'))snoozeAlarm(uid,parseInt(b.dataset.idx,10)||1,b.dataset.action);else if(b.classList.contains('dc-clear'))clearRelays(uid,parseInt(b.dataset.idx,10)||0);else deleteClient(uid);});
 function renderSites(){const container=els.siteContainer;container.innerHTML='';const siteNames=Object.keys(state.sites).sort();if(!siteNames.length){container.innerHTML='<div class="no-data">No telemetry available yet.</div>';return;}
 siteNames.forEach(siteName=>{const site=state.sites[siteName];const section=document.createElement('div');section.className='site-section';const clientList=Object.values(site.clients);const hasAlarm=clientList.some(c=>c.alarm);const head=document.createElement('div');head.className='site-head';if(hasAlarm)head.style.borderLeft='4px solid var(--danger)';const left=document.createElement('div');left.innerHTML=`<div class="site-name">${escapeHtml(siteName)}</div>`;const right=document.createElement('div');right.className='site-actions';const dots=document.createElement('div');dots.className='client-dots';dots.title='Client status indicators - click to expand';clientList.forEach(cl=>{const dot=document.createElement('span');dot.className='cdot '+clientStatusColor(cl);dot.title=cl.uid;dot.dataset.uid=cl.uid;dot.dataset.site=siteName;dot.addEventListener('click',()=>toggleDotInfo(section,cl,siteName));dots.appendChild(dot);});right.appendChild(dots);const manageBtn=document.createElement('a');manageBtn.className='pill secondary';manageBtn.style.cssText='font-size:0.75rem;padding:3px 10px;';manageBtn.href='/site-config?site='+encodeURIComponent(siteName);manageBtn.textContent='Manage';right.appendChild(manageBtn);head.appendChild(left);head.appendChild(right);section.appendChild(head);const infoSlot=document.createElement('div');infoSlot.className='cdot-info-slot';section.appendChild(infoSlot);const grid=document.createElement('div');grid.className='data-grid';const allSensors=[];clientList.forEach(cl=>{cl.sensors.forEach(t=>{t._clientUid=cl.uid;t._vinVoltage=cl.vinVoltage;t._updateRequestedEpoch=cl.updateRequestedEpoch||0;t._isSolar=!!cl.sol;allSensors.push(t);});if(!cl.sensors.length){allSensors.push({label:'Configured Client',sensorIndex:'',objectType:'pending',lastUpdate:0,_clientUid:cl.uid,_vinVoltage:cl.vinVoltage,_updateRequestedEpoch:cl.updateRequestedEpoch||0,_isSolar:!!cl.sol,alarm:false});}});const grouped={};allSensors.forEach(t=>{const ot=t.objectType||'tank';if(!grouped[ot])grouped[ot]=[];grouped[ot].push(t);});const typeOrder=['tank','gas','rpm','flow','engine','pump','pending'];typeOrder.forEach(ot=>{if(!grouped[ot])return;grouped[ot].forEach(t=>{grid.appendChild(renderDataCard(t,siteName));});});Object.keys(grouped).filter(ot=>!typeOrder.includes(ot)).forEach(ot=>{grouped[ot].forEach(t=>{grid.appendChild(renderDataCard(t,siteName));});});section.appendChild(grid);container.appendChild(section);});}
@@ -2513,7 +2587,7 @@ if(els.refreshSelectedBtn)els.refreshSelectedBtn.addEventListener('click',()=>{i
 </script></body></html>)HTML";
 
 static const char SITE_CONFIG_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Site Configuration - TankAlarm</title><link rel="stylesheet" href="/style.css"><style>.site-title{font-size:1.5rem;font-weight:700;margin:0;}.site-subtitle{color:var(--muted);font-size:0.9rem;margin-top:4px;}.client-grid{display:grid;gap:16px;margin-top:16px;}.client-card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;padding:16px;}.client-card.has-alarm{border-left:4px solid var(--danger);}.client-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;}.client-name{font-weight:600;font-size:1.05rem;}.client-uid{font-family:monospace;font-size:0.8rem;color:var(--muted);margin-top:2px;}.sensor-list{display:grid;gap:8px;}.sensor-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:0.9rem;}.sensor-row.alarm{background:rgba(220,38,38,0.08);}.sensor-level{font-weight:600;font-size:1.1rem;}.sensor-status{font-size:0.85rem;}.uid-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:0.9rem;}.uid-table th,.uid-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--card-border);}.uid-table th{font-weight:600;color:var(--muted);font-size:0.8rem;text-transform:uppercase;}.uid-table td code{font-size:0.85rem;cursor:pointer;}.uid-table td code:hover{color:var(--accent);}.copy-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;padding:8px 16px;border-radius:6px;font-size:0.85rem;opacity:0;transition:opacity 0.3s;pointer-events:none;}.copy-toast.show{opacity:1;}</style></head><body data-theme="light"><header><div class="bar"><div class="brand">TankAlarm</div><div class="header-actions"><button class="pause-btn" id="pauseBtn" aria-label="Resume data flow" style="display:none">Unpause</button><a class="pill secondary" href="/">Dashboard</a><a class="pill" href="/client-console">Client Console</a><a class="pill secondary" href="/historical">History</a><a class="pill secondary" href="/contacts">Contacts</a><a class="pill secondary" href="/server-settings">Server Settings</a><button class="pill secondary" onclick="fetch('/api/logout',{method:'POST'}).finally(()=>{localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login'})">Logout</button></div></div></header><main><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;"><div><h1 class="site-title" id="siteTitle">Loading...</h1><p class="site-subtitle" id="siteSubtitle"></p></div><div style="display:flex;gap:8px;flex-wrap:wrap;"><button id="addClientBtn" class="pill">+ Add Client</button><button id="backBtn" class="pill secondary" onclick="window.location.href='/client-console'">Back to Console</button></div></div></div><div class="card"><h2 style="margin-top:0;">Client Devices</h2><div id="clientGrid" class="client-grid"><div class="empty-state">Loading site data...</div></div></div><div class="card"><h2 style="margin-top:0;">Client UID Quick Reference</h2><p style="color:var(--muted);font-size:0.9rem;margin-bottom:8px;">Click any UID to copy it. Use these UIDs for relay target configuration.</p><table class="uid-table"><thead><tr><th>Device Label</th><th>Client UID</th><th>Sensors</th><th>Firmware</th><th>Status</th></tr></thead><tbody id="uidTableBody"></tbody></table></div></main><div id="toast"></div><div class="copy-toast" id="copyToast">UID copied to clipboard</div>)HTML" R"HTML(<script>(async ()=>{const token=localStorage.getItem('tankalarm_token');const _s=localStorage.getItem('tankalarm_session');if(!token||!_s){window.location.href='/login?redirect='+encodeURIComponent(window.location.pathname);return;}const _F=window.fetch;window.fetch=function(u,o){if(!o)o={};if(!o.headers)o.headers={};if(o.headers instanceof Headers)o.headers.set('X-Session',_s);else o.headers['X-Session']=_s;return _F.call(window,u,o).then(function(r){if(r.status===401){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}return r;});};async function _ckSess(){const sid=localStorage.getItem('tankalarm_session');if(!sid){window.location.href='/login?reason=expired';return;}try{const r=await fetch('/api/session/check');const d=await r.json();if(!d.valid){localStorage.removeItem('tankalarm_token');localStorage.removeItem('tankalarm_session');window.location.href='/login?reason=expired';}}catch(e){}}document.addEventListener('visibilitychange',()=>{if(!document.hidden)_ckSess();});setInterval(_ckSess,30000);function escapeHtml(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}function otaBadge(c){if(!c||!c.otaState||c.otaState==='ok')return '';var col=c.otaState==='pending'?'#f59e0b':'#dc2626';var tgt=c.expectedFw?'&rarr;v'+escapeHtml(c.expectedFw):'';return ' <span title="'+escapeHtml(c.otaDetail||'')+'" style="background:'+col+';color:#fff;padding:1px 5px;border-radius:3px;font-size:0.7rem;white-space:nowrap;">OTA '+escapeHtml(c.otaState)+tgt+'</span>';}
-function solarBadge(c){if(!c||!c.sol)return '';var s=c.sol;var color,label,tooltip='';if(!s.init){color='var(--danger)';label='RS-485 init FAIL';tooltip='Modbus library failed to initialize at boot. Check serial log.';}else if(s.ok&&s.last){color='#10b981';label='RS-485 OK';tooltip='Comm healthy. '+(s.spv?'Setpoints verified.':'Setpoints not yet read.')+(s.ever?' Link has succeeded since boot.':'');}else if(s.ok&&!s.last){color='#f59e0b';label='RS-485 last poll FAIL';tooltip='Last single poll failed but 5-poll smoothing still up. '+(s.err?'Err='+s.err:'')+(s.resMs?' ('+s.resMs+'ms)':'');}else{color='var(--danger)';if(!s.ever){label='RS-485 NEVER OK';tooltip='No successful poll since boot. '+(s.spv?'':'Setpoints not read. ')+(s.err?'Err='+s.err:'')+(s.maddr?' reg=0x'+s.maddr.toString(16):'');}else{label='RS-485 DOWN'+(s.lastOkS?' '+s.lastOkS+'s':'');tooltip='Link down. '+(s.err?'Err='+s.err:'')+(s.resMs?' ('+s.resMs+'ms)':'')+(s.impl?' [value implausible]':'');}}return ' <span title="'+escapeHtml(tooltip)+'" style="font-size:0.7rem;color:'+color+';margin-left:8px;padding:1px 6px;border:1px solid '+color+';border-radius:3px;white-space:nowrap;">'+escapeHtml(label)+'</span>';}async function expectUpdate(uid){const v=prompt('Expected firmware version for this client (leave blank to use the server build):');if(v===null)return;try{const r=await fetch('/api/ota/expect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid,version:(v||'').trim()})});const t=await r.text();showToast(t||(r.ok?'Expectation set':'Failed'),!r.ok);if(r.ok)setTimeout(loadSiteData,500);}catch(e){showToast('Request failed',true);}}function formatNumber(v){return(typeof v==='number'&&isFinite(v))?v.toFixed(1):'--';}function formatEpoch(e){if(!e)return'--';const d=new Date(e*1000);if(isNaN(d.getTime()))return'--';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}function getQueryParam(n){return new URLSearchParams(window.location.search).get(n)||'';}const siteName=getQueryParam('site');if(!siteName){document.getElementById('siteTitle').textContent='No site specified';document.getElementById('clientGrid').innerHTML='<div class="empty-state">Use ?site=SiteName in the URL or navigate from the Client Console.</div>';return;}document.getElementById('siteTitle').textContent=siteName;document.title=siteName+' - Site Configuration';document.getElementById('addClientBtn').addEventListener('click',()=>{window.location.href='/config-generator?site='+encodeURIComponent(siteName);});function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}function copyUid(uid){navigator.clipboard.writeText(uid).then(()=>{const ct=document.getElementById('copyToast');ct.classList.add('show');setTimeout(()=>ct.classList.remove('show'),1500);}).catch(()=>{showToast('Copy failed',true);});}window.copyUid=copyUid;)HTML" R"HTML(async function loadSiteData(){try{const r=await fetch('/api/clients?summary=1');if(!r.ok)throw new Error('Failed to fetch');const raw=await r.json();const srv=raw.srv||{};const allClients=(raw.cs||[]).map(c=>({uid:c.c||'',site:c.s||'Unknown Site',label:c.n||'',sensorIndex:c.k||'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,currentValue:c.l,sensorMa:c.ma,vinVoltage:c.v,vinVoltageEpoch:c.ve,firmwareVersion:c.fv||'',otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sol:c.sol||null,sensorCount:c.tc||1,sensors:(c.ts||[]).map(t=>({label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,currentValue:t.l,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,sensorType:t.st||'',objectType:t.ot||'',measurementUnit:t.mu||'',contents:t.ct||'',change24h:t.d,fault:t.flt||'',sensorMa:t.ma}))}));const siteClients=allClients.filter(c=>c.site===siteName);const uniqueMap=new Map();siteClients.forEach(c=>{if(!uniqueMap.has(c.uid)){uniqueMap.set(c.uid,{uid:c.uid,label:c.label,alarm:false,vinVoltage:c.vinVoltage,vinVoltageEpoch:c.vinVoltageEpoch,firmwareVersion:c.firmwareVersion,otaState:c.otaState,expectedFw:c.expectedFw,otaDetail:c.otaDetail,sol:c.sol||null,sensors:[]});}const entry=uniqueMap.get(c.uid);if(c.sensors&&c.sensors.length){c.sensors.forEach(t=>entry.sensors.push(t));}else{entry.sensors.push({label:c.label||'',sensorIndex:c.sensorIndex,currentValue:c.currentValue,alarm:c.alarm,alarmType:c.alarmType,lastUpdate:c.lastUpdate,objectType:'',measurementUnit:'',contents:''});}if(c.alarm)entry.alarm=true;entry.sensors.forEach(t=>{if(t.alarm)entry.alarm=true;});});const clients=Array.from(uniqueMap.values());document.getElementById('siteSubtitle').textContent=clients.length+' client device'+(clients.length===1?'':'s')+' at this site';renderClients(clients);renderUidTable(clients);}catch(e){console.error(e);document.getElementById('clientGrid').innerHTML='<div class="empty-state">Error loading site data.</div>';}}function objectTypeLabel(ot){const map={tank:'Tank',gas:'Gas Monitor',engine:'Engine',pump:'Pump',flow:'Flow Meter'};return map[ot]||'Sensor';}function sensorDisplayName(t){const ot=t.objectType||'';const lbl=t.label||objectTypeLabel(ot);return lbl+(t.userNumber?' #'+t.userNumber:'');}function unitLabel(mu,ot){const abr={inches:'in',psi:'psi',rpm:'rpm',gpm:'gpm'};if(mu){const k=mu.toLowerCase();return abr[k]||mu;}if(ot==='gas')return'psi';if(ot==='rpm')return'rpm';if(ot==='flow')return'gpm';return'in';}function renderClients(clients){const grid=document.getElementById('clientGrid');grid.innerHTML='';if(!clients.length){grid.innerHTML='<div class="empty-state">No client devices found at this site.</div>';return;})HTML" R"HTML(clients.forEach(client=>{const card=document.createElement('div');card.className='client-card'+(client.alarm?' has-alarm':'');let tanksHtml='';client.sensors.forEach(t=>{const alarmClass=t.alarm?' alarm':'';const statusHtml=t.alarm?`<span class="sensor-status" style="color:var(--danger);font-weight:600;">ALARM: ${escapeHtml(t.alarmType)}</span>`:'<span class="sensor-status status-ok">Normal</span>';const mu=unitLabel(t.measurementUnit,t.objectType);const changeHtml=(typeof t.change24h==='number')?`<span style="font-size:0.8rem;color:var(--muted);">${t.change24h>=0?'+':''}${t.change24h.toFixed(1)} ${mu}/24h</span>`:'';const contentsHtml=t.contents?`<span style="font-size:0.8rem;color:var(--muted);margin-left:6px;">(${escapeHtml(t.contents)})</span>`:'';tanksHtml+=`<div class="sensor-row${alarmClass}"><div><strong>${escapeHtml(sensorDisplayName(t))}</strong>${contentsHtml} ${changeHtml}</div><div style="text-align:right;">${t.fault?`<span class="sensor-level" style="color:var(--danger);">FAULT</span> <small style="color:var(--danger);">${escapeHtml(t.fault)}</small>`:`<span class="sensor-level">${t.sensorType==='digital'?(t.currentValue>0.5?'ON':'OFF'):formatNumber(t.currentValue)}</span> <small style="color:var(--muted)">${t.sensorType==='digital'?'':mu}</small>${(typeof t.sensorMa==='number'&&t.sensorMa>0)?`<div style="font-size:0.75rem;color:var(--muted);">${t.sensorMa.toFixed(2)} mA</div>`:''}`}<div style="font-size:0.8rem;color:var(--muted);">${formatEpoch(t.lastUpdate)}</div></div></div>`;});const voltageHtml=(typeof client.vinVoltage==='number'&&client.vinVoltage>=6.0)?`<span style="font-size:0.85rem;color:var(--muted);">VIN: ${client.vinVoltage.toFixed(2)}V</span>`:'';const versionHtml=client.firmwareVersion?`<span style="font-size:0.75rem;color:var(--muted);margin-left:8px;background:var(--chip);padding:2px 6px;text-transform:lowercase;font-weight:600;">v${escapeHtml(client.firmwareVersion)}</span>`:'';card.innerHTML=`<div class="client-header"><div><div class="client-name" style="display:flex;align-items:center;flex-wrap:wrap;">${escapeHtml(client.label||'Client Device')}${versionHtml}${otaBadge(client)}${solarBadge(client)}</div><div class="client-uid">${escapeHtml(client.uid)}</div>${voltageHtml}</div><div style="display:flex;gap:6px;"><button class="pill secondary sc-edit" data-uid="${escapeHtml(client.uid)}" style="font-size:0.8rem;padding:4px 12px;">Edit Config</button><button class="pill secondary sc-expect" data-uid="${escapeHtml(client.uid)}" style="font-size:0.8rem;padding:4px 12px;">Expect Update</button><button class="pill secondary sc-remove" data-uid="${escapeHtml(client.uid)}" style="font-size:0.8rem;padding:4px 12px;color:var(--danger);border-color:var(--danger);">Remove Client</button></div></div><div class="sensor-list">${tanksHtml}</div>`;grid.appendChild(card);});}async function deleteClient(uid){if(!confirm('Remove client '+uid+' and all its sensor data? This action cannot be undone.'))return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid})});if(!res.ok){throw new Error(await res.text()||'Delete failed');}showToast('Client removed successfully');loadSiteData();}catch(err){showToast(err.message||'Failed to remove client',true);}}document.addEventListener('click',e=>{const el=e.target.closest('.sc-edit,.sc-expect,.sc-remove,.sc-uid');if(!el)return;const uid=el.dataset.uid||'';if(el.classList.contains('sc-edit'))window.location.href='/config-generator?uid='+encodeURIComponent(uid);else if(el.classList.contains('sc-expect'))expectUpdate(uid);else if(el.classList.contains('sc-remove'))deleteClient(uid);else copyUid(uid);});function renderUidTable(clients){const tbody=document.getElementById('uidTableBody');tbody.innerHTML='';if(!clients.length){tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);">No clients at this site.</td></tr>';return;}clients.forEach(client=>{const tr=document.createElement('tr');const hasAlarm=client.sensors.some(t=>t.alarm);const statusHtml=hasAlarm?'<span style="color:var(--danger);font-weight:600;">ALARM</span>':'<span class="status-ok">Normal</span>';tr.innerHTML=`<td>${escapeHtml(client.label||'Client Device')}</td><td><code class="sc-uid" data-uid="${escapeHtml(client.uid)}" title="Click to copy">${escapeHtml(client.uid)}</code></td><td>${client.sensors.length}</td><td>${escapeHtml(client.firmwareVersion?'v'+client.firmwareVersion:'--')}${otaBadge(client)}</td><td>${statusHtml}</td>`;tbody.appendChild(tr);});}loadSiteData();setInterval(loadSiteData,30000);})();</script></body></html>)HTML";
+function solarBadge(c){if(!c||!c.sol)return '';var s=c.sol;var color,label,tooltip='';if(!s.init){color='var(--danger)';label='RS-485 init FAIL';tooltip='Modbus library failed to initialize at boot. Check serial log.';}else if(s.ok&&s.last){color='#10b981';label='RS-485 OK';tooltip='Comm healthy. '+(s.spv?'Charger settings read.':'Charger settings not read yet.')+(s.ever?' Link has succeeded since boot.':'');}else if(s.ok&&!s.last){color='#f59e0b';label='RS-485 last poll FAIL';tooltip='Last single poll failed but 5-poll smoothing still up. '+(s.err?'Err='+s.err:'')+(s.resMs?' ('+s.resMs+'ms)':'');}else{color='var(--danger)';if(!s.ever){label='RS-485 NEVER OK';tooltip='No successful poll since boot. '+(s.spv?'':'Charger settings not read. ')+(s.err?'Err='+s.err:'')+(s.maddr?' reg=0x'+s.maddr.toString(16):'');}else{label='RS-485 DOWN'+(s.lastOkS?' '+s.lastOkS+'s':'');tooltip='Link down. '+(s.err?'Err='+s.err:'')+(s.resMs?' ('+s.resMs+'ms)':'')+(s.impl?' [value implausible]':'');}}return ' <span title="'+escapeHtml(tooltip)+'" style="font-size:0.7rem;color:'+color+';margin-left:8px;padding:1px 6px;border:1px solid '+color+';border-radius:3px;white-space:nowrap;">'+escapeHtml(label)+'</span>';}function chargerBadge(c){if(!c||!c.chg)return '';var g=c.chg;var when=g.e?' Checked '+formatEpoch(g.e)+'.':' The time of this check is not known.';var m,tip;if(g.now){m=['Charger: check pending','var(--muted)'];tip='The battery in this client\'s config has changed since this check (then '+g.was+', now '+g.now+'), so its verdict is not about the battery configured now. The client checks again once it runs that config.'+when+' Click for the details.';}else{m=[['Charger: not judged','var(--muted)'],['Charger settings OK','#10b981'],['Charger settings WRONG','var(--danger)'],['Charger: cannot tell','#f59e0b']][g.vd]||['Charger check','var(--muted)'];tip='What the SunSaver has stored, checked against the configured battery.'+when+' Click for the details.';}return ' <a href="/charger?uid='+encodeURIComponent(c.uid)+'" title="'+escapeHtml(tip)+'" style="font-size:0.7rem;color:'+m[1]+';margin-left:8px;padding:1px 6px;border:1px solid '+m[1]+';border-radius:3px;white-space:nowrap;text-decoration:none;">'+escapeHtml(m[0])+'</a>';}async function expectUpdate(uid){const v=prompt('Expected firmware version for this client (leave blank to use the server build):');if(v===null)return;try{const r=await fetch('/api/ota/expect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid,version:(v||'').trim()})});const t=await r.text();showToast(t||(r.ok?'Expectation set':'Failed'),!r.ok);if(r.ok)setTimeout(loadSiteData,500);}catch(e){showToast('Request failed',true);}}function formatNumber(v){return(typeof v==='number'&&isFinite(v))?v.toFixed(1):'--';}function formatEpoch(e){if(!e)return'--';const d=new Date(e*1000);if(isNaN(d.getTime()))return'--';return d.toLocaleString(undefined,{year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true});}function getQueryParam(n){return new URLSearchParams(window.location.search).get(n)||'';}const siteName=getQueryParam('site');if(!siteName){document.getElementById('siteTitle').textContent='No site specified';document.getElementById('clientGrid').innerHTML='<div class="empty-state">Use ?site=SiteName in the URL or navigate from the Client Console.</div>';return;}document.getElementById('siteTitle').textContent=siteName;document.title=siteName+' - Site Configuration';document.getElementById('addClientBtn').addEventListener('click',()=>{window.location.href='/config-generator?site='+encodeURIComponent(siteName);});function showToast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;t.style.background=isErr?'#dc2626':'#0284c7';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}function copyUid(uid){navigator.clipboard.writeText(uid).then(()=>{const ct=document.getElementById('copyToast');ct.classList.add('show');setTimeout(()=>ct.classList.remove('show'),1500);}).catch(()=>{showToast('Copy failed',true);});}window.copyUid=copyUid;)HTML" R"HTML(async function loadSiteData(){try{const r=await fetch('/api/clients?summary=1');if(!r.ok)throw new Error('Failed to fetch');const raw=await r.json();const srv=raw.srv||{};const allClients=(raw.cs||[]).map(c=>({uid:c.c||'',site:c.s||'Unknown Site',label:c.n||'',sensorIndex:c.k||'',alarm:!!c.a,alarmType:c.at||'',lastUpdate:c.u||0,currentValue:c.l,sensorMa:c.ma,vinVoltage:c.v,vinVoltageEpoch:c.ve,firmwareVersion:c.fv||'',otaState:c.os||'',expectedFw:c.efv||'',otaDetail:c.od||'',sol:c.sol||null,chg:c.chg||null,sensorCount:c.tc||1,sensors:(c.ts||[]).map(t=>({label:t.n||'',sensorIndex:t.k||'',userNumber:t.un||0,currentValue:t.l,alarm:!!t.a,alarmType:t.at||'',lastUpdate:t.u||0,sensorType:t.st||'',objectType:t.ot||'',measurementUnit:t.mu||'',contents:t.ct||'',change24h:t.d,fault:t.flt||'',sensorMa:t.ma}))}));const siteClients=allClients.filter(c=>c.site===siteName);const uniqueMap=new Map();siteClients.forEach(c=>{if(!uniqueMap.has(c.uid)){uniqueMap.set(c.uid,{uid:c.uid,label:c.label,alarm:false,vinVoltage:c.vinVoltage,vinVoltageEpoch:c.vinVoltageEpoch,firmwareVersion:c.firmwareVersion,otaState:c.otaState,expectedFw:c.expectedFw,otaDetail:c.otaDetail,sol:c.sol||null,chg:c.chg||null,sensors:[]});}const entry=uniqueMap.get(c.uid);if(c.sensors&&c.sensors.length){c.sensors.forEach(t=>entry.sensors.push(t));}else{entry.sensors.push({label:c.label||'',sensorIndex:c.sensorIndex,currentValue:c.currentValue,alarm:c.alarm,alarmType:c.alarmType,lastUpdate:c.lastUpdate,objectType:'',measurementUnit:'',contents:''});}if(c.alarm)entry.alarm=true;entry.sensors.forEach(t=>{if(t.alarm)entry.alarm=true;});});const clients=Array.from(uniqueMap.values());document.getElementById('siteSubtitle').textContent=clients.length+' client device'+(clients.length===1?'':'s')+' at this site';renderClients(clients);renderUidTable(clients);}catch(e){console.error(e);document.getElementById('clientGrid').innerHTML='<div class="empty-state">Error loading site data.</div>';}}function objectTypeLabel(ot){const map={tank:'Tank',gas:'Gas Monitor',engine:'Engine',pump:'Pump',flow:'Flow Meter'};return map[ot]||'Sensor';}function sensorDisplayName(t){const ot=t.objectType||'';const lbl=t.label||objectTypeLabel(ot);return lbl+(t.userNumber?' #'+t.userNumber:'');}function unitLabel(mu,ot){const abr={inches:'in',psi:'psi',rpm:'rpm',gpm:'gpm'};if(mu){const k=mu.toLowerCase();return abr[k]||mu;}if(ot==='gas')return'psi';if(ot==='rpm')return'rpm';if(ot==='flow')return'gpm';return'in';}function renderClients(clients){const grid=document.getElementById('clientGrid');grid.innerHTML='';if(!clients.length){grid.innerHTML='<div class="empty-state">No client devices found at this site.</div>';return;})HTML" R"HTML(clients.forEach(client=>{const card=document.createElement('div');card.className='client-card'+(client.alarm?' has-alarm':'');let tanksHtml='';client.sensors.forEach(t=>{const alarmClass=t.alarm?' alarm':'';const statusHtml=t.alarm?`<span class="sensor-status" style="color:var(--danger);font-weight:600;">ALARM: ${escapeHtml(t.alarmType)}</span>`:'<span class="sensor-status status-ok">Normal</span>';const mu=unitLabel(t.measurementUnit,t.objectType);const changeHtml=(typeof t.change24h==='number')?`<span style="font-size:0.8rem;color:var(--muted);">${t.change24h>=0?'+':''}${t.change24h.toFixed(1)} ${mu}/24h</span>`:'';const contentsHtml=t.contents?`<span style="font-size:0.8rem;color:var(--muted);margin-left:6px;">(${escapeHtml(t.contents)})</span>`:'';tanksHtml+=`<div class="sensor-row${alarmClass}"><div><strong>${escapeHtml(sensorDisplayName(t))}</strong>${contentsHtml} ${changeHtml}</div><div style="text-align:right;">${t.fault?`<span class="sensor-level" style="color:var(--danger);">FAULT</span> <small style="color:var(--danger);">${escapeHtml(t.fault)}</small>`:`<span class="sensor-level">${t.sensorType==='digital'?(t.currentValue>0.5?'ON':'OFF'):formatNumber(t.currentValue)}</span> <small style="color:var(--muted)">${t.sensorType==='digital'?'':mu}</small>${(typeof t.sensorMa==='number'&&t.sensorMa>0)?`<div style="font-size:0.75rem;color:var(--muted);">${t.sensorMa.toFixed(2)} mA</div>`:''}`}<div style="font-size:0.8rem;color:var(--muted);">${formatEpoch(t.lastUpdate)}</div></div></div>`;});const voltageHtml=(typeof client.vinVoltage==='number'&&client.vinVoltage>=6.0)?`<span style="font-size:0.85rem;color:var(--muted);">VIN: ${client.vinVoltage.toFixed(2)}V</span>`:'';const versionHtml=client.firmwareVersion?`<span style="font-size:0.75rem;color:var(--muted);margin-left:8px;background:var(--chip);padding:2px 6px;text-transform:lowercase;font-weight:600;">v${escapeHtml(client.firmwareVersion)}</span>`:'';card.innerHTML=`<div class="client-header"><div><div class="client-name" style="display:flex;align-items:center;flex-wrap:wrap;">${escapeHtml(client.label||'Client Device')}${versionHtml}${otaBadge(client)}${solarBadge(client)}${chargerBadge(client)}</div><div class="client-uid">${escapeHtml(client.uid)}</div>${voltageHtml}</div><div style="display:flex;gap:6px;"><button class="pill secondary sc-edit" data-uid="${escapeHtml(client.uid)}" style="font-size:0.8rem;padding:4px 12px;">Edit Config</button><button class="pill secondary sc-expect" data-uid="${escapeHtml(client.uid)}" style="font-size:0.8rem;padding:4px 12px;">Expect Update</button><button class="pill secondary sc-remove" data-uid="${escapeHtml(client.uid)}" style="font-size:0.8rem;padding:4px 12px;color:var(--danger);border-color:var(--danger);">Remove Client</button></div></div><div class="sensor-list">${tanksHtml}</div>`;grid.appendChild(card);});}async function deleteClient(uid){if(!confirm('Remove client '+uid+' and all its sensor data? This action cannot be undone.'))return;try{const res=await fetch('/api/client',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:uid})});if(!res.ok){throw new Error(await res.text()||'Delete failed');}showToast('Client removed successfully');loadSiteData();}catch(err){showToast(err.message||'Failed to remove client',true);}}document.addEventListener('click',e=>{const el=e.target.closest('.sc-edit,.sc-expect,.sc-remove,.sc-uid');if(!el)return;const uid=el.dataset.uid||'';if(el.classList.contains('sc-edit'))window.location.href='/config-generator?uid='+encodeURIComponent(uid);else if(el.classList.contains('sc-expect'))expectUpdate(uid);else if(el.classList.contains('sc-remove'))deleteClient(uid);else copyUid(uid);});function renderUidTable(clients){const tbody=document.getElementById('uidTableBody');tbody.innerHTML='';if(!clients.length){tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);">No clients at this site.</td></tr>';return;}clients.forEach(client=>{const tr=document.createElement('tr');const hasAlarm=client.sensors.some(t=>t.alarm);const statusHtml=hasAlarm?'<span style="color:var(--danger);font-weight:600;">ALARM</span>':'<span class="status-ok">Normal</span>';tr.innerHTML=`<td>${escapeHtml(client.label||'Client Device')}</td><td><code class="sc-uid" data-uid="${escapeHtml(client.uid)}" title="Click to copy">${escapeHtml(client.uid)}</code></td><td>${client.sensors.length}</td><td>${escapeHtml(client.firmwareVersion?'v'+client.firmwareVersion:'--')}${otaBadge(client)}</td><td>${statusHtml}</td>`;tbody.appendChild(tr);});}loadSiteData();setInterval(loadSiteData,30000);})();</script></body></html>)HTML";
 
 static void initializeStorage();
 static void ensureConfigLoaded();
@@ -2649,6 +2723,23 @@ static void reconcileClientOta(ClientMetadata *meta, double now);
 static void noteClientFirmwareAndReconcile(const char *clientUid, const char *fwVer, double epoch);
 static void setClientOtaExpectation(ClientMetadata *meta, const char *ver, double now);
 static void handleOtaResult(const char *clientUid, const char *status, JsonDocument &doc, double now);
+static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc);
+static void handleChargerGet(EthernetClient &client, const String &query);
+// What configuredChargerChemistry() could tell.
+enum ConfigChemistry : uint8_t {
+  CONFIG_CHEMISTRY_NONE = 0,  // no config, or one that names no battery type and leaves monitoring on
+  CONFIG_CHEMISTRY_KNOWN,     // the chemistry is set
+  CONFIG_CHEMISTRY_NO_MEMORY  // the config could not be read for lack of memory
+};
+static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *config, uint8_t *chemistry);
+static bool addChargerSummary(JsonObject clientObj, const ClientMetadata *meta, const ClientConfigSnapshot *config);
+static bool saveChargerReports();
+static void saveChargerReportsIfDirty(bool force);
+static void beginChargerReports();
+static void loadChargerReports();
+static void saveClientMetadataForRestore();
+static void takeUpRestoredClientMetadata();
+static void setChargerReportsAside(const char *why);
 static void handleConfigCancelPost(EthernetClient &client, const String &body);
 static void handleSyncRequestPost(EthernetClient &client, const String &body);
 static void handleTelemetryRequestPost(EthernetClient &client, const String &body);
@@ -2683,7 +2774,7 @@ static void saveSensorRegistry();
 static void loadSensorRegistry();
 static uint8_t deduplicateSensorRecordsLinear();
 static void handleDebugSensors(EthernetClient &client, const String &method, const String &body, const String &queryString);
-static void saveClientMetadataCache();
+static bool saveClientMetadataCache();
 static void loadClientMetadataCache();
 // Stale client alerting
 static void checkStaleClients();
@@ -4537,6 +4628,7 @@ void setup() {
 #endif
   loadHotTierSnapshot();  // Restore hot tier ring buffer from LittleFS (survive reboot)
   loadClientMetadataCache();  // Restore client metadata from LittleFS
+  beginChargerReports();      // and each client's last charger check
   printHardwareRequirements();
 
   Wire.begin();
@@ -4964,6 +5056,9 @@ void loop() {
     saveClientMetadataCache();
     gClientMetadataDirty = false;
   }
+
+  // The charger reports, when their last write failed
+  saveChargerReportsIfDirty(false);
   
   // Periodic stale client check (every hour)
   if (now - gLastStaleCheckMillis > STALE_CHECK_INTERVAL_MS) {
@@ -5036,6 +5131,7 @@ static void recoverOrphanedTmpFiles() {
     "/fs/contacts_config.json",
     "/fs/sensor_registry.json",
     "/fs/client_metadata.json",
+    "/fs" CHARGER_REPORTS_PATH,
     "/fs/client_config_cache.txt",
     "/fs/calibration_data.txt",
     "/fs/email_format.json",
@@ -5734,8 +5830,14 @@ static const BackupFileEntry kBackupFiles[] = {
   { "/calibration_data.txt", "calibration_data.txt", false },
   { SENSOR_REGISTRY_PATH, "sensor_registry.json", false },
   { CLIENT_METADATA_CACHE_PATH, "client_metadata.json", false },
+  // A restore of either has the server read both again (takeUpRestoredClientMetadata()).
+  { CHARGER_REPORTS_PATH, "charger_reports.json", false },
   { "/history_settings.json", "history_settings.json", true }
 };
+
+// One file of a backup or of a restore, the largest either takes. Both run from loop(), so never
+// at once.
+static char gFtpFileBuffer[FTP_MAX_FILE_BYTES + 1];
 
 static bool prepareLocalBackupFilesForFtp(FtpResult &result) {
 #ifndef FILESYSTEM_AVAILABLE
@@ -7201,9 +7303,9 @@ static FtpResult performFtpBackupDetailed() {
     serviceTransferWatchdog();
 
     const BackupFileEntry &entry = kBackupFiles[i];
-    static char contents[FTP_MAX_FILE_BYTES + 1];
+    char *const contents = gFtpFileBuffer;
     size_t len = 0;
-    if (!readFileToBuffer(entry.localPath, contents, sizeof(contents), len)) {
+    if (!readFileToBuffer(entry.localPath, contents, sizeof(gFtpFileBuffer), len)) {
       // Log every skip so we can see why a backup produced no STORs.
       // Common causes: file absent on /fs, larger than buffer, or FS error.
       Serial.print(F("FTP backup skip (unreadable): "));
@@ -7455,18 +7557,22 @@ static FtpResult performFtpRestoreDetailed() {
     return result;
   }
 
+  saveClientMetadataForRestore();
+  bool clientMetadataRestored = false;
   for (size_t i = 0; i < sizeof(kBackupFiles) / sizeof(kBackupFiles[0]); ++i) {
     serviceTransferWatchdog();
 
     const BackupFileEntry &entry = kBackupFiles[i];
-    char contents[2048];
+    // As large as the backup takes: the client metadata cache and the charger reports of a full
+    // fleet are well over 2 KB.
+    char *const contents = gFtpFileBuffer;
     size_t len = 0;
 
     char remotePath[192];
     buildRemotePath(remotePath, sizeof(remotePath), entry.remoteName);
     bool retrieved = useFtps
-                       ? ftpsRetrieveBuffer(remotePath, contents, sizeof(contents), len, err, sizeof(err))
-                       : ftpRetrieveBuffer(session, remotePath, contents, sizeof(contents), len, err, sizeof(err));
+                       ? ftpsRetrieveBuffer(remotePath, contents, sizeof(gFtpFileBuffer), len, err, sizeof(err))
+                       : ftpRetrieveBuffer(session, remotePath, contents, sizeof(gFtpFileBuffer), len, err, sizeof(err));
     if (!retrieved) {
       result.filesFailed++;
       result.addFailedFile(entry.remoteName);
@@ -7477,6 +7583,10 @@ static FtpResult performFtpRestoreDetailed() {
       result.filesProcessed++;
       Serial.print(F("FTP restore: "));
       Serial.println(entry.localPath);
+      if (strcmp(entry.localPath, CLIENT_METADATA_CACHE_PATH) == 0 ||
+          strcmp(entry.localPath, CHARGER_REPORTS_PATH) == 0) {
+        clientMetadataRestored = true;
+      }
     } else {
       result.filesFailed++;
       result.addFailedFile(entry.remoteName);
@@ -7495,6 +7605,10 @@ static FtpResult performFtpRestoreDetailed() {
     ftpQuit(session);
   }
   serviceTransferWatchdog();
+
+  if (clientMetadataRestored) {
+    takeUpRestoredClientMetadata();
+  }
 
   result.success = (result.filesProcessed > 0);
   if (!result.success) {
@@ -9168,6 +9282,7 @@ static void enableDfuMode() {
     saveClientMetadataCache();
     gClientMetadataDirty = false;
   }
+  saveChargerReportsIfDirty(true);
   saveHotTierSnapshot();
   saveClientConfigSnapshots();
   saveHistorySettings();
@@ -9631,6 +9746,8 @@ static void handleWebRequests() {
     serveFile(client, HISTORICAL_DATA_HTML);
   } else if (method == "GET" && path == "/transmission-log") {
     serveFile(client, TRANSMISSION_LOG_HTML);
+  } else if (method == "GET" && (path == "/charger" || path.startsWith("/charger?"))) {
+    serveFile(client, CHARGER_CHECK_HTML);
   } else if (method == "POST" && path == "/api/login") {
     handleLoginPost(client, body);
   } else if (method == "POST" && path == "/api/logout") {
@@ -9683,6 +9800,9 @@ static void handleWebRequests() {
       queryString = path.substring(queryStart + 1);
     }
     handleClientConfigGet(client, queryString);
+  } else if (method == "GET" && (path == "/api/charger" || path.startsWith("/api/charger?"))) {
+    const int chargerQs = path.indexOf('?');
+    handleChargerGet(client, chargerQs >= 0 ? path.substring(chargerQs + 1) : String());
   } else if (method == "GET" && path == "/api/calibration") {
     handleCalibrationGet(client);
   } else if (method == "GET" && path == "/api/contacts") {
@@ -10606,6 +10726,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
 
   // Build client list from sensor records (needed for both summary and full responses)
   JsonArray clientsArr = doc["cs"].to<JsonArray>();
+  bool chargerConfigUnread = false;  // a charger badge could not tell whether its verdict is current
   for (uint8_t i = 0; i < gSensorRecordCount; ++i) {
     const SensorRecord &rec = gSensorRecords[i];
 
@@ -10694,6 +10815,9 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
         if (meta->solarLastMaddr > 0)       solObj["maddr"]   = meta->solarLastMaddr;
         if (meta->solarLastOkAgoS > 0)      solObj["lastOkS"] = meta->solarLastOkAgoS;
         solObj["epoch"]   = meta->solarTelemetryEpoch;
+      }
+      if (!addChargerSummary(clientObj, meta, cfgSnap)) {
+        chargerConfigUnread = true;
       }
     }
 
@@ -10841,12 +10965,16 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
       clientObj["a"] = false;
       clientObj["u"] = 0.0;
       clientObj["tc"] = 0;
+      // A charger report can come before the first telemetry.
+      if (!addChargerSummary(clientObj, findClientMetadata(snap.uid), &snap)) {
+        chargerConfigUnread = true;
+      }
     }
   }
 
   // In summary mode, return server metadata + client list but skip config payloads
   if (summaryOnly) {
-    if (doc.overflowed()) {
+    if (doc.overflowed() || chargerConfigUnread) {
       Serial.println(F("[ERROR] Client summary JSON overflowed"));
       respondStatus(client, 500, F("Client data too large"));
       return;
@@ -10885,7 +11013,7 @@ static void sendClientDataJson(EthernetClient &client, const String &query) {
   }
 
   // Detect if we ran out of memory while building the document
-  if (doc.overflowed()) {
+  if (doc.overflowed() || chargerConfigUnread) {
     Serial.println(F("[ERROR] Client data JSON document overflowed"));
     respondStatus(client, 500, F("Client data too large"));
     return;
@@ -12704,6 +12832,444 @@ static void handleOtaResult(const char *clientUid, const char *status, JsonDocum
   sendServerSmsAlert(sms);
 }
 
+// ============================================================================
+// Charger check (SunSaver MPPT)
+// ============================================================================
+// A client with a SunSaver MPPT on RS-485 reads what the controller has stored (its charging
+// profile, LVD and LVR, the DIP switches), judges that against the configured battery and sends
+// the registers with its judgement: a "chg-check" report on the config-ack notefile. The server
+// keeps the last report of each client and shows it at /charger. The report's layout and the
+// rules are in TankAlarm_SunSaverReport.h and TankAlarm_SunSaverSettings.h (Common library),
+// shared with the client and tested in tests/host/sunsaver_settings.
+
+static void handleChargerReport(const char *clientUid, const char *status, JsonDocument &doc) {
+  if (strcmp(status, "chg-check") != 0) {
+    return;  // a report of a newer client, which this server has no use for
+  }
+  sunsaver::Snapshot snapshot;
+  sunsaver::Evaluation evaluation;
+  if (!sunsaver::decodeReport(doc.as<JsonObjectConst>(), &snapshot, &evaluation)) {
+    Serial.print(F("Charger check from "));
+    Serial.print(clientUid);
+    Serial.println(F(" is not in a layout this server reads"));
+    return;
+  }
+  ClientMetadata *meta = findOrCreateClientMetadata(clientUid);
+  if (!meta) {
+    return;
+  }
+  // The client's own time of the check orders the reports: one can arrive late (the client
+  // keeps it while it cannot reach its Notecard, and the Notecard until it syncs), and then an
+  // older one must not replace a newer one. A report without a time, or with one that is plainly
+  // wrong, keeps 0 for "not known" and replaces only another such report (see reportCheckTime()).
+  // A client of this firmware sends no report without a time: it waits for its clock.
+  //
+  // Both are judged by this server's clock, not by the time the note carries: that is the
+  // clock of the Notecard that sent it, and a report whose time is days ahead with it would
+  // pass and rank above every report after it. The time of the report held is judged again:
+  // one that came while the clock was not set can be more than a day ahead of it.
+  const double serverNow = currentEpoch();
+  const double checkedAt = sunsaver::reportCheckTime(doc["epoch"] | 0.0, serverNow);
+  const double heldAt = sunsaver::reportCheckTime(meta->chargerReportEpoch, serverNow);
+  if (!sunsaver::reportReplaces(meta->chargerReportValid, heldAt, checkedAt)) {
+    Serial.print(F("Charger check from "));
+    Serial.print(clientUid);
+    Serial.println(checkedAt > 0.0 ? F(" is older than the one this server holds: not kept")
+                                   : F(" carries no time and this server holds one that does: not kept"));
+    return;
+  }
+  const bool verdictChanged = !meta->chargerReportValid || meta->chargerEvaluation.verdict != evaluation.verdict ||
+                              meta->chargerEvaluation.findings != evaluation.findings ||
+                              meta->chargerEvaluation.chemistry != evaluation.chemistry;
+  meta->chargerReportValid = true;
+  meta->chargerReportEpoch = checkedAt;
+  meta->chargerSnapshot = snapshot;
+  meta->chargerEvaluation = evaluation;
+  // Written at once, with the metadata cache that a client new here has to be in for its report
+  // to be kept at a start (see saveChargerReportsIfDirty()): the client does not send an
+  // unchanged report again for a week.
+  gChargerReportsDirty = true;
+  saveChargerReportsIfDirty(true);
+
+  char line[160];
+  snprintf(line, sizeof(line), "Charger check from %s: %s (battery %s)", clientUid,
+           sunsaver::verdictName(evaluation.verdict), sunsaver::chemistryName(evaluation.chemistry));
+  Serial.println(line);
+  if (verdictChanged) {
+    addServerSerialLog(line, evaluation.verdict == sunsaver::VERDICT_MISMATCH ? "warn" : "info", "charger");
+  }
+}
+
+// GET /api/charger?client=<uid>: the client's last charger check, readable. "have" is false
+// when none has arrived. See sunsaver::describeReport() for the members. "now" is added when the
+// config this server holds names a battery that is judged as another chemistry than the one the
+// check was judged against (its sunsaver::chemistryName()): the client has not checked since
+// that config. See configuredChargerChemistry().
+static void handleChargerGet(EthernetClient &client, const String &query) {
+  const String uid = getQueryParam(query, "client");
+  if (uid.length() == 0) {
+    respondStatus(client, 400, F("Missing client parameter"));
+    return;
+  }
+  JsonDocument doc;
+  JsonObject out = doc.to<JsonObject>();
+  out["c"] = uid;
+  const ClientConfigSnapshot *config = findClientConfigSnapshot(uid.c_str());
+  if (config && config->site[0] != '\0') {
+    out["site"] = config->site;
+  }
+  const ClientMetadata *meta = findClientMetadata(uid.c_str());
+  if (meta && meta->firmwareVersion[0] != '\0') {
+    out["fv"] = meta->firmwareVersion;
+  }
+  bool configUnread = false;  // without the config the page could show an old verdict as current
+  if (!meta || !meta->chargerReportValid) {
+    out["have"] = false;
+  } else {
+    out["have"] = true;
+    out["e"] = (uint32_t)meta->chargerReportEpoch;
+    sunsaver::describeReport(meta->chargerSnapshot, meta->chargerEvaluation, out);
+    uint8_t configured = 0;
+    const ConfigChemistry known = configuredChargerChemistry(config, &configured);
+    if (known == CONFIG_CHEMISTRY_NO_MEMORY) {
+      configUnread = true;
+    } else if (known == CONFIG_CHEMISTRY_KNOWN && configured != meta->chargerEvaluation.chemistry) {
+      out["now"] = sunsaver::chemistryName(configured);
+    }
+  }
+  if (doc.overflowed() || configUnread) {
+    // The page would show what fitted as if it were all: a verdict without the findings, for one.
+    Serial.println(F("[ERROR] Charger JSON document overflowed"));
+    respondStatus(client, 500, F("Charger data too large for available memory"));
+    return;
+  }
+  respondJson(client, doc);
+}
+
+// The chemistry that the battery type in the config this server holds for a client is judged as,
+// as the client judges it (sunsaver::chemistryForBatteryType()). A config that waits to be sent,
+// or that the client turned down, counts as well: it is the one the config page shows. One that
+// switches battery monitoring off ("enabled": false) is judged as no battery, whatever its type
+// says, as the client judges it. NONE when there is no config, or it names no battery type and
+// does not switch the monitoring off: the client then keeps the battery it had, which is not
+// known here. NO_MEMORY when the config could not be read: a caller that shows a verdict answers
+// with an error then, as it does when its own document runs out.
+static ConfigChemistry configuredChargerChemistry(const ClientConfigSnapshot *config, uint8_t *chemistry) {
+  if (!config || config->payload[0] == '\0') {
+    return CONFIG_CHEMISTRY_NONE;
+  }
+  JsonDocument filter;
+  filter["batteryConfig"]["batteryType"] = true;
+  filter["batteryConfig"]["enabled"] = true;
+  if (filter.overflowed()) {
+    return CONFIG_CHEMISTRY_NO_MEMORY;  // a filter cut short would keep nothing
+  }
+  JsonDocument cfg;
+  const DeserializationError error = deserializeJson(cfg, config->payload, DeserializationOption::Filter(filter));
+  if (error == DeserializationError::NoMemory) {
+    return CONFIG_CHEMISTRY_NO_MEMORY;
+  }
+  if (error != DeserializationError::Ok) {
+    return CONFIG_CHEMISTRY_NONE;
+  }
+  // The client reads the flag as true unless it is the boolean false.
+  JsonVariantConst enabled = cfg["batteryConfig"]["enabled"];
+  if (enabled.is<bool>() && !enabled.as<bool>()) {
+    *chemistry = sunsaver::CHEMISTRY_NOT_JUDGED;
+    return CONFIG_CHEMISTRY_KNOWN;
+  }
+  JsonVariantConst type = cfg["batteryConfig"]["batteryType"];
+  if (!type.is<int>()) {
+    return CONFIG_CHEMISTRY_NONE;
+  }
+  *chemistry = sunsaver::chemistryForBatteryType(type.as<int>());
+  return CONFIG_CHEMISTRY_KNOWN;
+}
+
+// The verdict of the client's last charger check, for the badge on the site page: "vd" the
+// verdict and "e" the time of the check, 0 when not known. "was" and "now" are added when the
+// config this server holds names a battery that is judged as another chemistry than the one the
+// check was judged against (sunsaver::chemistryName() of each): the verdict is about a battery
+// the client no longer has, or will not have once it runs that config, and the badge shows the
+// check as pending. /api/charger has the rest. False when the config could not be read for lack
+// of memory: the caller answers with an error, since the badge could show an old verdict as
+// current.
+static bool addChargerSummary(JsonObject clientObj, const ClientMetadata *meta, const ClientConfigSnapshot *config) {
+  if (!meta || !meta->chargerReportValid) {
+    return true;
+  }
+  JsonObject chg = clientObj["chg"].to<JsonObject>();
+  chg["vd"] = meta->chargerEvaluation.verdict;
+  chg["e"] = (uint32_t)meta->chargerReportEpoch;
+  uint8_t configured = 0;
+  const ConfigChemistry known = configuredChargerChemistry(config, &configured);
+  if (known == CONFIG_CHEMISTRY_KNOWN && configured != meta->chargerEvaluation.chemistry) {
+    chg["was"] = sunsaver::chemistryName(meta->chargerEvaluation.chemistry);
+    chg["now"] = sunsaver::chemistryName(configured);
+  }
+  return known != CONFIG_CHEMISTRY_NO_MEMORY;
+}
+
+// One compact report for each client that has sent one. Members "c" (client) and "e" (when the
+// check was made) are added to sunsaver::encodeReport()'s. True once the file holds them.
+static bool saveChargerReports() {
+#ifdef FILESYSTEM_AVAILABLE
+  #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
+    if (!mbedFS) {
+      return false;
+    }
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+      const ClientMetadata &meta = gClientMetadata[i];
+      if (meta.clientUid[0] == '\0' || !meta.chargerReportValid) {
+        continue;
+      }
+      JsonObject obj = arr.add<JsonObject>();
+      obj["c"] = meta.clientUid;
+      obj["e"] = (uint32_t)meta.chargerReportEpoch;
+      sunsaver::encodeReport(meta.chargerSnapshot, meta.chargerEvaluation, obj);
+    }
+    if (doc.overflowed()) {
+      // What fitted would replace the whole file, and the reports that did not fit would be lost
+      // at the next start: the file stays as it is, and the save is tried again.
+      Serial.println(F("ERROR: Out of memory for the charger report file"));
+      return false;
+    }
+    const size_t jsonLen = measureJson(doc);
+    char *buf = (char *)malloc(jsonLen + 1);
+    if (!buf) {
+      Serial.println(F("ERROR: Cannot allocate charger report save buffer"));
+      return false;
+    }
+    serializeJson(doc, buf, jsonLen + 1);
+    const bool written = posix_write_file("/fs" CHARGER_REPORTS_PATH, buf, jsonLen);
+    free(buf);
+    return written;
+  #endif
+#endif
+  return true;  // no file system in this build: nothing to keep a report in
+}
+
+// Writes the file of kept reports when a report was taken or dropped since its last write that
+// worked: at once when `force` is set, and otherwise (from loop()) every CHARGER_REPORTS_RETRY_MS
+// after a write that failed. The note a report came in is deleted once it has been handled, so
+// until a write works the report is in RAM only and would be lost at a restart.
+//
+// At a start a report is kept only for a client that the metadata cache holds (see
+// loadChargerReports()), and a client that is new here is in that cache only once it has been
+// written. So the cache is written first, every time, and the reports count as kept only when
+// both writes worked. gClientMetadataDirty cannot tell: other savers clear it after a write
+// that failed.
+//
+// Until the file has been read at this start (gChargerReportsLoaded), neither is written from
+// here: the file is read again instead, every CHARGER_REPORTS_RETRY_MS, and once that works what
+// came in meanwhile is written at once.
+static void saveChargerReportsIfDirty(bool force) {
+  const unsigned long nowMs = millis();
+  if (!gChargerReportsLoaded) {
+    if (!gClientMetadataLoaded || (nowMs - gChargerReportsReadMillis) < CHARGER_REPORTS_RETRY_MS) {
+      return;
+    }
+    gChargerReportsReadMillis = nowMs;
+    loadChargerReports();
+    if (!gChargerReportsLoaded) {
+      return;
+    }
+    force = true;
+  }
+  if (!gChargerReportsDirty) {
+    return;
+  }
+  if (!force && (nowMs - gChargerReportsTryMillis) < CHARGER_REPORTS_RETRY_MS) {
+    return;
+  }
+  gChargerReportsTryMillis = nowMs;
+  const bool ownersSaved = saveClientMetadataCache();
+  if (ownersSaved) {
+    gClientMetadataDirty = false;
+  }
+  // The reports are written even when the cache was not: those of clients it already held on
+  // flash are then kept.
+  const bool reportsSaved = saveChargerReports();
+  if (ownersSaved && reportsSaved) {
+    gChargerReportsDirty = false;
+  } else {
+    Serial.println(ownersSaved ? F("ERROR: Charger reports not saved, trying again in 5 minutes")
+                               : F("ERROR: Client metadata not saved with the charger reports, trying again in 5 minutes"));
+  }
+}
+
+// At a start, after loadClientMetadataCache(): every client the metadata cache holds may have a
+// report in the file.
+static void beginChargerReports() {
+  for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+    gClientMetadata[i].chargerReportUnread = true;
+  }
+  gChargerReportsReadMillis = millis();
+  loadChargerReports();
+}
+
+// Before a restore: the client metadata and the charger reports this server holds go to flash. A
+// restore of either file has both read again (takeUpRestoredClientMetadata()), and the one it
+// does not write is then read as the server holds it now, not as at its last save.
+static void saveClientMetadataForRestore() {
+  if (gClientMetadataLoaded && gClientMetadataDirty && saveClientMetadataCache()) {
+    gClientMetadataDirty = false;
+  }
+  saveChargerReportsIfDirty(true);
+}
+
+// A restore wrote the client metadata cache or the file of charger reports: both are read again,
+// as at a start, so that the next save writes what was restored, not what the server held
+// before. A file that does not read now is as at a start too: the file of reports is not written
+// over until it has been read (loadChargerReports()).
+static void takeUpRestoredClientMetadata() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  gClientMetadataLoaded = false;
+  gChargerReportsLoaded = false;
+  loadClientMetadataCache();
+  beginChargerReports();
+#endif
+}
+
+// The file has been read, or need not be: it may be written from now on.
+static void chargerReportsRead() {
+  gChargerReportsLoaded = true;
+  for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
+    gClientMetadata[i].chargerReportUnread = false;
+  }
+}
+
+// A report is kept only for a client that has metadata, so one that was removed does not come
+// back. Such a report is still in the file when it was not written since the client went (a
+// write that failed, and a restart): the file is written again without it at the next save, so
+// that it does not come back with the client should that be added again.
+//
+// A file that is there and cannot be read now (it does not open, but for not being there; a read
+// fails part way; there is no memory to read or parse it) is not written over: the reports that
+// come in meanwhile wait in RAM, and saveChargerReportsIfDirty() reads the file again every
+// CHARGER_REPORTS_RETRY_MS. Such a later read takes a report only for a client the metadata held
+// at the start (chargerReportUnread), so that one removed since does not come back, also when it
+// was added again, and only when the one this server took since would not have replaced it: by
+// the time of the check, and on a tie the later to arrive (reportReplaces()). A file that can
+// never be read (empty, too large, not a list of reports) is kept as CHARGER_REPORTS_PATH ".bad",
+// and the reports start afresh. Without the metadata cache read whole the file is not read at
+// all: no report could find its client, and a write would drop them all.
+static void loadChargerReports() {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  if (!mbedFS) {
+    return;  // nothing is written either
+  }
+  if (!gClientMetadataLoaded) {
+    Serial.println(F("Charger reports not read: the client metadata could not be read at this start"));
+    return;
+  }
+  bool absent = false;
+  FILE *fp = openStoreToRead("/fs" CHARGER_REPORTS_PATH, &absent);
+  if (!fp) {
+    if (absent) {
+      chargerReportsRead();
+      return;
+    }
+    posix_log_error("fopen", "/fs" CHARGER_REPORTS_PATH);
+    Serial.println(F("ERROR: Charger reports file did not open, trying again in 5 minutes"));
+    return;
+  }
+  // A report is under 600 bytes of JSON with every register refused and the longest client id.
+  const long fileSize = posix_file_size(fp);
+  if (fileSize < 0) {
+    fclose(fp);
+    Serial.println(F("ERROR: Charger reports file size not read, trying again in 5 minutes"));
+    return;
+  }
+  if (fileSize == 0 || fileSize > (long)MAX_CLIENT_METADATA * 640L + 64L) {
+    fclose(fp);
+    setChargerReportsAside("its size");
+    return;
+  }
+  fseek(fp, 0, SEEK_SET);
+  char *buf = (char *)malloc((size_t)fileSize + 1);
+  if (!buf) {
+    fclose(fp);
+    Serial.println(F("ERROR: Cannot allocate charger report load buffer, trying again in 5 minutes"));
+    return;
+  }
+  const size_t bytesRead = fread(buf, 1, (size_t)fileSize, fp);
+  fclose(fp);
+  if (bytesRead != (size_t)fileSize) {
+    free(buf);
+    Serial.println(F("ERROR: Charger reports file read failed, trying again in 5 minutes"));
+    return;
+  }
+  buf[bytesRead] = '\0';
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, buf);
+  free(buf);
+  if (err == DeserializationError::NoMemory) {
+    Serial.println(F("ERROR: Out of memory for the charger report file, trying again in 5 minutes"));
+    return;
+  }
+  if (err) {
+    setChargerReportsAside(err.c_str());
+    return;
+  }
+  if (!doc.is<JsonArrayConst>()) {
+    setChargerReportsAside("not a list");
+    return;
+  }
+  uint8_t loaded = 0;
+  const double now = currentEpoch();
+  for (JsonObjectConst obj : doc.as<JsonArrayConst>()) {
+    ClientMetadata *meta = findClientMetadata(obj["c"] | "");
+    if (!meta || !meta->chargerReportUnread) {
+      gChargerReportsDirty = true;  // its client is gone, or came (back) since: the next save leaves it out
+      continue;
+    }
+    sunsaver::Snapshot snapshot;
+    sunsaver::Evaluation evaluation;
+    if (!sunsaver::decodeReport(obj, &snapshot, &evaluation)) {
+      continue;
+    }
+    // Judged as at its arrival, and so is the one that came in since (see handleChargerReport()):
+    // the file can hold any time, written by an older firmware or by hand.
+    const double checkedAt = sunsaver::reportCheckTime(obj["e"] | 0.0, now);
+    if (meta->chargerReportValid &&
+        sunsaver::reportReplaces(true, checkedAt, sunsaver::reportCheckTime(meta->chargerReportEpoch, now))) {
+      continue;  // the one that came in since would have replaced it, and is due to be written
+    }
+    meta->chargerReportValid = true;
+    meta->chargerReportEpoch = checkedAt;
+    meta->chargerSnapshot = snapshot;
+    meta->chargerEvaluation = evaluation;
+    ++loaded;
+  }
+  chargerReportsRead();
+  Serial.print(F("Charger reports loaded: "));
+  Serial.println(loaded);
+#else
+  chargerReportsRead();  // no file of reports in this build
+#endif
+}
+
+// A file of reports that can never be read. Kept for a look, out of the way, and the reports
+// start afresh with those in RAM. A rename that fails is tried again with the next read.
+static void setChargerReportsAside(const char *why) {
+#if defined(FILESYSTEM_AVAILABLE) && (defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED))
+  Serial.print(F("ERROR: Charger reports file cannot be read ("));
+  Serial.print(why);
+  if (rename("/fs" CHARGER_REPORTS_PATH, "/fs" CHARGER_REPORTS_PATH ".bad") != 0) {
+    Serial.println(F("), and could not be set aside: trying again in 5 minutes"));
+    return;
+  }
+  Serial.println(F("): kept as " CHARGER_REPORTS_PATH ".bad"));
+  chargerReportsRead();
+#else
+  (void)why;
+#endif
+}
+
 // POST /api/ota/expect  { pin, client?, version?, all? }
 // Records the firmware version the operator expects a client (or all clients) to run so the
 // server can flag stalled/failed OTA updates. version defaults to the server's own build.
@@ -12750,8 +13316,10 @@ static void handleOtaExpectPost(EthernetClient &client, const String &body) {
     count = 1;
   }
 
-  gClientMetadataDirty = true;
-  saveClientMetadataCache();
+  if (count > 0) {  // nothing changed otherwise, and an empty table is written as one
+    gClientMetadataDirty = true;
+    saveClientMetadataCache();
+  }
   char msg[80];
   snprintf(msg, sizeof(msg), "Expecting v%s on %u client(s)", ver, count);
   Serial.println(msg);
@@ -13376,10 +13944,17 @@ static ClientMetadata *findOrCreateClientMetadata(const char *clientUid) {
   
   // Reuse evicted slot
   ClientMetadata *meta = &gClientMetadata[evictIdx];
+  const bool hadChargerReport = meta->chargerReportValid;
   memset(meta, 0, sizeof(ClientMetadata));
   strlcpy(meta->clientUid, clientUid, sizeof(meta->clientUid));
   meta->cachedTemperatureF = TEMPERATURE_UNAVAILABLE;
   gClientMetadataDirty = true;
+  if (hadChargerReport) {
+    // The evicted client's charger check goes from flash too: left in the file, it would come
+    // back with that client, should it be added again before a restart (loadChargerReports()).
+    gChargerReportsDirty = true;
+    saveChargerReportsIfDirty(true);
+  }
   return meta;
 }
 
@@ -16186,13 +16761,18 @@ static void loadSensorRegistry() {
 // Client Metadata Persistence (LittleFS JSON)
 // ============================================================================
 
-static void saveClientMetadataCache() {
+// True once the file holds every entry. Only saveChargerReportsIfDirty() looks at the result.
+// With no entry left (the last client was removed) the file is written as an empty list: a file
+// left as it was would bring the removed client back at the next start, and with it a charger
+// report that was deleted. Every caller saves after a change only, so an empty table that was
+// never loaded does not overwrite the file.
+static bool saveClientMetadataCache() {
 #ifdef FILESYSTEM_AVAILABLE
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
-    if (!mbedFS || gClientMetadataCount == 0) {
-      return;
+    if (!mbedFS) {
+      return false;
     }
-    
+
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
     for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
@@ -16243,23 +16823,33 @@ static void saveClientMetadataCache() {
       }
       // Note: cachedTemperatureF and staleAlertSent are runtime-only, not persisted
     }
-    
+    if (doc.overflowed()) {
+      // What fitted would replace the whole file: the clients that did not fit would be gone at
+      // the next start, and their charger reports with them (loadChargerReports() keeps a report
+      // only for a client this file holds). The file stays as it is, and the save fails.
+      Serial.println(F("ERROR: Out of memory for the client metadata file"));
+      return false;
+    }
+
     size_t jsonLen = measureJson(doc);
     char *buf = (char *)malloc(jsonLen + 1);
     if (!buf) {
       Serial.println(F("ERROR: Cannot allocate metadata save buffer"));
-      return;
+      return false;
     }
     serializeJson(doc, buf, jsonLen + 1);
     
-    if (posix_write_file("/fs" CLIENT_METADATA_CACHE_PATH, buf, jsonLen)) {
+    const bool written = posix_write_file("/fs" CLIENT_METADATA_CACHE_PATH, buf, jsonLen);
+    if (written) {
       Serial.print(F("Client metadata saved: "));
       Serial.print(gClientMetadataCount);
       Serial.println(F(" entries"));
     }
     free(buf);
+    return written;
   #endif
 #endif
+  return true;  // no file system in this build
 }
 
 static void loadClientMetadataCache() {
@@ -16267,13 +16857,17 @@ static void loadClientMetadataCache() {
   #if defined(ARDUINO_OPTA) || defined(ARDUINO_ARCH_MBED)
     if (!mbedFS) return;
     
-    if (!posix_file_exists("/fs" CLIENT_METADATA_CACHE_PATH)) {
-      Serial.println(F("No client metadata cache found - starting fresh"));
-      return;
-    }
-    
-    FILE *fp = fopen("/fs" CLIENT_METADATA_CACHE_PATH, "r");
+    // Only a cache that is not there is a fresh start. One that does not open for another reason
+    // is not loaded: the charger reports then wait (loadChargerReports()), so that a report
+    // whose client is in the cache is not dropped for want of it.
+    bool absent = false;
+    FILE *fp = openStoreToRead("/fs" CLIENT_METADATA_CACHE_PATH, &absent);
     if (!fp) {
+      if (absent) {
+        Serial.println(F("No client metadata cache found - starting fresh"));
+        gClientMetadataLoaded = true;
+        return;
+      }
       posix_log_error("fopen", "/fs" CLIENT_METADATA_CACHE_PATH);
       return;
     }
@@ -16340,6 +16934,7 @@ static void loadClientMetadataCache() {
       meta.staleAlertSent = false;
       meta.staleDeletionPending = obj["sdp"] | false;
     }
+    gClientMetadataLoaded = true;
     
     Serial.print(F("Client metadata loaded: "));
     Serial.print(gClientMetadataCount);
@@ -16644,6 +17239,11 @@ static void handleConfigAck(JsonDocument &doc, double epoch) {
   // client->server) using an "ota-" status namespace, so no new Notehub route is required.
   if (strncmp(status, "ota-", 4) == 0) {
     handleOtaResult(clientUid, status, doc, (epoch > 0.0) ? epoch : currentEpoch());
+    return;
+  }
+  // So do the reports about the client's SunSaver MPPT, under "chg-".
+  if (strncmp(status, "chg-", 4) == 0) {
+    handleChargerReport(clientUid, status, doc);  // judged by this server's clock
     return;
   }
 
@@ -17016,12 +17616,17 @@ static bool removeClientData(const char *clientUid) {
   // Remove client metadata
   for (uint8_t i = 0; i < gClientMetadataCount; ++i) {
     if (strcmp(gClientMetadata[i].clientUid, clientUid) == 0) {
+      const bool hadChargerReport = gClientMetadata[i].chargerReportValid;
       for (uint8_t j = i; j < gClientMetadataCount - 1; ++j) {
         memcpy(&gClientMetadata[j], &gClientMetadata[j + 1], sizeof(ClientMetadata));
       }
       gClientMetadataCount--;
       gClientMetadataDirty = true;
       removedAny = true;
+      if (hadChargerReport) {
+        gChargerReportsDirty = true;  // its charger check goes with it
+        saveChargerReportsIfDirty(true);
+      }
       break;
     }
   }

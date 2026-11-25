@@ -1,4 +1,5 @@
-// A simulated SunSaver MPPT behind an MRC-1, for the OptaView host tests.
+// A simulated SunSaver MPPT behind an MRC-1, for the OptaView host tests and for the tests of
+// the TankAlarm client's charger check (../sunsaver_settings).
 //
 // It is the serial link (optaview::MbTransport) and the controller in one object: frames the
 // master sends are answered the way the Morningstar specification describes, byte by byte and
