@@ -962,10 +962,10 @@ static bool gChargerReportUnsure = false;              // a try has failed since
 // again although its answer had gone. A start takes this into the journal it reads
 // (beginChargerProgramming() in setup()), so that such a request is not answered twice.
 static uint32_t gChargerAnsweredKept = 0;
-// A config named another charger while the journal owed a look to none that it names, and the
-// look was bound to the charger named before (bindChargerDutyBeforeOtherCharger()), but flash
-// has not taken the journal that says so yet. Until it has, no config is saved
-// (persistConfigIfDirty()).
+// A config named another charger, or turned the charger off, while the journal owed a look to
+// none that it names, and the look was bound to the charger named before
+// (bindChargerDutyBeforeOtherCharger()), but flash has not taken the journal that says so yet.
+// Until it has, no config is saved (persistConfigIfDirty()).
 static bool gChargerDutyBindingUnsaved = false;
 #if defined(POSIX_FILE_IO_AVAILABLE)
 // loadChargerJournal() read the journal from its .tmp, which holds its only copy until
@@ -1262,6 +1262,11 @@ static bool gRpmTimedOutAfterRun[MAX_MONITORS] = {false};
 // (resetPulseMonitor()). Until one has, the reading is a placeholder, not a measurement
 // (readPulseSensor()).
 static bool gPulseCountEnded[MAX_MONITORS] = {false};
+// A reading of the monitor that is a measurement has been taken since boot, or since a config
+// started its count again (resetPulseMonitor()). Until one has, what telemetry sent of it, if
+// anything, was a placeholder that measured nothing, and the first measurement goes out whatever
+// its change (sampleMonitors()).
+static bool gPulseMeasured[MAX_MONITORS] = {false};
 
 // Atomic access helpers for volatile pulse counter (protects against future interrupt use)
 // On 32-bit ARM (Cortex-M7 in STM32H747XI), 32-bit aligned reads/writes are atomic,
@@ -1643,13 +1648,17 @@ static float readPulseSensorResult(uint8_t idx) {
 
 // A monitor's pulse count as at boot: no count under way, no last reading, no accumulated pulses,
 // no mark of a charger programming run, and no count ended, so that its readings are
-// placeholders until one has (readPulseSensor()). For a slot that a config empties, fills, or
-// gives another sensor or other pulse settings (applyConfigUpdate(), pulseMonitorChanged()): what
-// the slot keeps is the old monitor's. A count under way would go on with the old pin and
-// settings, a count of the time between two pulses that sees no second one gives the last reading
-// again, and the mark of a run that cut into the old monitor's count would keep every reading of
-// the new one marked reused until a count of it measures something. A sensor that gives no pulses
-// would never get there: with stuck detection off, its alarms would never be judged.
+// placeholders until one has (readPulseSensor()), and none measured, so that the first
+// measurement goes out (sampleMonitors()). The slot's value and its time go too, as at boot: a
+// placeholder is sent with them (sampleMonitors() keeps the value of a reading that stands in),
+// and the new monitor has measured neither. For a slot that a config empties, fills, or gives
+// another sensor or other pulse settings (applyConfigUpdate(), pulseMonitorChanged()): what the
+// slot keeps is the old monitor's. A count under way would go on with the old pin and settings,
+// a count of the time between two pulses that sees no second one gives the last reading again,
+// the mark of a run that cut into the old monitor's count would keep every reading of the new
+// one marked reused until a count of it measures something, and the placeholders would send the
+// old monitor's value and time under the new one's number. A sensor that gives no pulses would
+// never get there: with stuck detection off, its alarms would never be judged.
 static void resetPulseMonitor(uint8_t idx) {
   if (idx >= MAX_MONITORS) {
     return;
@@ -1663,6 +1672,9 @@ static void resetPulseMonitor(uint8_t idx) {
   gRpmReadingBeforeRun[idx] = false;
   gRpmTimedOutAfterRun[idx] = false;
   gPulseCountEnded[idx] = false;
+  gPulseMeasured[idx] = false;
+  gMonitorState[idx].currentValue = 0.0f;
+  gMonitorState[idx].lastReadingEpoch = 0.0;
 }
 
 // Whether the monitor a config puts in a slot is another sensor than the one it held (another
@@ -1685,6 +1697,8 @@ static void retryPendingAlarm(uint8_t idx, uint8_t pendingAtEntry, bool highInAl
 static uint8_t alarmPendingCodeFor(const char *alarmType);
 static const char *alarmPendingName(uint8_t code);
 static bool digitalAlarmCondition(const MonitorConfig &cfg, float value, bool &triggerOnActivated);
+static bool alarmTriggersRelay(const MonitorConfig &cfg, const char *alarmType);
+static void queueLatchedAlarmReassertion(uint8_t idx, float reading);
 static bool checkAlarmRateLimit(uint8_t idx, const char *alarmType);
 static void sendDailyReport();
 static bool publishNote(const char *fileName, JsonDocument &doc, bool syncNow);
@@ -5283,6 +5297,60 @@ static void pollForConfigUpdates() {
   notecard.deleteResponse(rsp);
 }
 
+// A pulse monitor that reads as before a charger programming run (gRpmReadingBeforeRun, see
+// readPulseSensor()): a config keeps its latches, which there is no reading to judge by
+// (reinitializeHardware()), and moves the relays of its alarm with it (moveHeldAlarmRelays()).
+static bool alarmsHeldAcrossConfig(uint8_t idx) {
+  return idx < gConfig.monitorCount && gConfig.monitors[idx].sensorInterface == SENSOR_PULSE &&
+         gRpmReadingBeforeRun[idx];
+}
+
+// Whether an alarm of `alarmType` ("high", "low", ...) switches the monitor's relays on, by its
+// relay trigger (sendAlarm()).
+static bool alarmTriggersRelay(const MonitorConfig &cfg, const char *alarmType) {
+  return cfg.relayTrigger == RELAY_TRIGGER_ANY ||
+         (cfg.relayTrigger == RELAY_TRIGGER_HIGH && strcmp(alarmType, "high") == 0) ||
+         (cfg.relayTrigger == RELAY_TRIGGER_LOW && strcmp(alarmType, "low") == 0);
+}
+
+// Whether an alarm of the monitor has relays on (gRelayRuntime, RELAY_SRC_ALARM), and since when
+// (`onAt`): an alarm switches its relays on together.
+static bool alarmRelaysOnSince(uint8_t idx, unsigned long &onAt) {
+  for (uint8_t r = 0; r < MAX_RELAYS; r++) {
+    if (gRelayRuntime[r].active && gRelayRuntime[r].ownerMonitor == idx && gRelayRuntime[r].source == RELAY_SRC_ALARM) {
+      onAt = gRelayRuntime[r].activatedAt;
+      return true;
+    }
+  }
+  return false;
+}
+
+// A config gave the monitor another relay target or mask while an alarm of it had relays on
+// (since `onAt`), and has switched those off (applyConfigUpdate()). A monitor whose latches the
+// config keeps (alarmsHeldAcrossConfig()) makes no new edge for its alarm, which would switch on
+// the relays the config names now, and waits for a measurement that may not come for as long as
+// its sensor gives no pulses: its alarm switches them on here, as its edge would have (its relay
+// trigger), from the time it switched the old ones on, so that a momentary relay's time and the
+// safety limit of one that stays on until it is reset run on from then. Any other monitor's
+// latches go with the config (reinitializeHardware()), and its next edge switches its relays.
+static void moveHeldAlarmRelays(uint8_t idx, unsigned long onAt) {
+  if (!alarmsHeldAcrossConfig(idx)) {
+    return;
+  }
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  const MonitorRuntime &state = gMonitorState[idx];
+  const char *latched = state.highAlarmLatched ? "high" : (state.lowAlarmLatched ? "low" : nullptr);
+  if (latched == nullptr || cfg.relayTargetClient[0] == '\0' || cfg.relayMask == 0 || !alarmTriggersRelay(cfg, latched)) {
+    return;
+  }
+  triggerRemoteRelays(cfg.relayTargetClient, cfg.relayMask, true);
+  activateRelayForMonitor(idx, cfg.relayMask, RELAY_SRC_ALARM, onAt);
+  Serial.print(F("Relay moved with the config for the held "));
+  Serial.print(latched);
+  Serial.print(F(" alarm of monitor "));
+  Serial.println(idx);
+}
+
 static void reinitializeHardware() {
   // Reinitialize I2C bus in case of configuration changes or bus issues
   Wire.end();
@@ -5329,8 +5397,15 @@ static void reinitializeHardware() {
     // every monitor's. The config started the count again of a monitor it changed
     // (resetPulseMonitor(), which takes the mark away), so such a monitor is cleared and judged
     // anew, and the alarms of a monitor whose alarms it switched off are cleared already
-    // (applyConfigUpdate()).
-    const bool alarmsHeld = cfg.sensorInterface == SENSOR_PULSE && gRpmReadingBeforeRun[i];
+    // (applyConfigUpdate(), which also moves the relays of a held alarm to those it names).
+    const bool alarmsHeld = alarmsHeldAcrossConfig(i);
+    // The sensor-recovered note above, of a monitor that had failed, is a clear to the server: a
+    // monitor whose latches are held re-asserts its latched edge (NEW-B, see
+    // validateSensorReading()), which goes out with the first measurement in alarm. Any other
+    // monitor's latches go below, and a clear goes out for them.
+    if (alarmsHeld && gMonitorState[i].sensorFailed) {
+      queueLatchedAlarmReassertion(i, gMonitorState[i].currentValue);
+    }
 
     // If alarm was latched, send clear to server before resetting
     if (!alarmsHeld && (gMonitorState[i].highAlarmLatched || gMonitorState[i].lowAlarmLatched)) {
@@ -5635,7 +5710,8 @@ static void applyConfigUpdate(const JsonDocument &doc) {
   // the charger block above have been applied, and the link restarted if the transport changed,
   // so the client's own refusals go by the new config. A config that names another charger
   // withdraws it first, also when it carries the request again, and a look owed to no charger
-  // the journal names stays with the one the config named before.
+  // the journal names stays with the one the config named before, also when it turns the
+  // charger off.
   bindChargerDutyBeforeOtherCharger(chargerBefore, chargerWasOn);
   withdrawChargerProgramForOtherCharger(chargerBefore);
   handleChargerProgramRequest(doc["solarCharger"]["program"].as<JsonObjectConst>());
@@ -5781,7 +5857,11 @@ static void applyConfigUpdate(const JsonDocument &doc) {
       JsonObjectConst t = sensors[i];
       parseMonitorFromJson(gConfig.monitors[i], t, i);
       // A monitor in a slot that held none, or another sensor than before, or one counted another
-      // way: its pulse count starts as at boot (resetPulseMonitor()).
+      // way: its pulse count starts as at boot (resetPulseMonitor()). One the config leaves as it
+      // was keeps its count, also when the config gives its accumulated mode again, unchanged:
+      // started again there, an accumulated count would end with the sample under way, whose
+      // time ran from before the config (pollPulseSampler()), and a count of a few seconds would
+      // be taken as a measurement, one that may read 0.
       if (i >= oldCount || pulseMonitorChanged(was, gConfig.monitors[i])) {
         resetPulseMonitor(i);
       }
@@ -5820,8 +5900,12 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           recovDoc["rd"] = 0;
           recovDoc["t"] = noteEpochMinute(currentEpoch());
           publishNote(ALARM_FILE, recovDoc, true);
-          // C-T01: no NEW-B re-assertion here; reinitializeHardware() below clears the latch
-          // and sends a clear (see validateSensorReading())
+          // C-T01 (NEW-B): the server takes it as a clear, so the latched edge is re-asserted
+          // (see validateSensorReading()). reinitializeHardware() below drops it with the latch
+          // of a monitor whose alarms it clears, and sends a clear; a monitor whose alarms it
+          // holds (a pulse monitor that reads as before a charger programming run) keeps both,
+          // and the edge goes out with the first measurement in alarm.
+          queueLatchedAlarmReassertion(i, gMonitorState[i].currentValue);
         }
         gMonitorState[i].sensorFailed = false;
         gMonitorState[i].stuckReadingCount = 0;
@@ -5841,6 +5925,8 @@ static void applyConfigUpdate(const JsonDocument &doc) {
                                   (strcmp(wasRelayTarget, gConfig.monitors[i].relayTargetClient) != 0);
         bool relayMaskChanged = (wasRelayMask != 0) && (wasRelayMask != gConfig.monitors[i].relayMask);
         if (relayRemoved || relayTargetChanged || relayMaskChanged) {
+          unsigned long alarmRelaysOnAt = 0;  // see moveHeldAlarmRelays()
+          const bool alarmRelaysOn = alarmRelaysOnSince(i, alarmRelaysOnAt);
           // Deactivate relays using the OLD config (where the target/mask was)
           if (wasRelayTarget[0] != '\0' && wasRelayMask != 0) {
             triggerRemoteRelays(wasRelayTarget, wasRelayMask, false);
@@ -5849,16 +5935,12 @@ static void applyConfigUpdate(const JsonDocument &doc) {
           deactivateRelayForMonitor(i, activeMask);
           Serial.print(F("Relay deactivated: config removed/changed for monitor "));
           Serial.println(i);
+          if (alarmRelaysOn && !relayRemoved) {
+            moveHeldAlarmRelays(i, alarmRelaysOnAt);
+          }
         }
       }
 
-      // Side effect: reset accumulated state when pulse mode config changes
-      if (!t["pulseAccumulatedMode"].isNull() || !t["rpmAccumulatedMode"].isNull()) {
-        atomicResetPulses(i);
-        gRpmAccumulatedStartMillis[i] = millis();
-        gRpmAccumulatedInitialized[i] = false;
-        gRpmAccumulatedCutByRun[i] = false;  // the count starts again, without the run's time
-      }
       // BugFix 04022026: Reset unload tracking unconditionally when the field
       // is present, not only when enabled. Previously, disabling trackUnloads
       // left stale peak/epoch state that could cause false unload events if
@@ -5894,8 +5976,9 @@ static void persistConfigIfDirty() {
     return;
   }
   // A look owed to no charger the journal named was bound to the one the config named before it
-  // named another (bindChargerDutyBeforeOtherCharger()): the config waits until flash has the
-  // journal that says so, which Supervisor::maintain() writes again until it does.
+  // named another, or turned the charger off (bindChargerDutyBeforeOtherCharger()): the config
+  // waits until flash has the journal that says so, which Supervisor::maintain() writes again
+  // until it does.
   if (gChargerDutyBindingUnsaved) {
     if (gSolarManager.chargerProgramming().journalUnsaved()) {
       return;
@@ -6189,35 +6272,52 @@ static bool validateSensorReading(uint8_t idx, float reading) {
       // only while the sample is in alarm: a reading in the latch's release zone (level moved
       // during the outage, or a stuck float recovered by changing state) holds it, so no
       // false alarm, and the normal debounce's clear then supersedes it; if the level returns
-      // to alarm before the latch clears, it is sent then. Two other recoveries are not
-      // hooked. A config update that turns stuck detection off publishes sensor-recovered,
-      // but reinitializeHardware() then clears every latch, this pending edge with it, and
-      // sends a clear (NEW-A), so client and server agree and the level re-latches from fresh
-      // samples; C-A02 must re-assert there if it keeps latches across a config save. The I2C
-      // sensor-only recovery in loop() clears sensorFailed silently; the server's
-      // fresh-telemetry sensor-fault self-clear still drops the level alarm on that path (C-A04).
-      if (cfg.alarmsEnabled && state.pendingAlarm == ALARM_PENDING_NONE) {
-        if (cfg.sensorInterface == SENSOR_DIGITAL) {
-          if (state.highAlarmLatched) {
-            bool triggerOnActivated = true;
-            (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);  // resolves the type only
-            state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
-          }
-        } else if (state.highAlarmLatched) {
-          state.pendingAlarm = ALARM_PENDING_HIGH;
-        } else if (state.lowAlarmLatched) {
-          state.pendingAlarm = ALARM_PENDING_LOW;
-        }
-        if (state.pendingAlarm != ALARM_PENDING_NONE) {
-          Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
-          Serial.println(cfg.name);
-        }
-      }
+      // to alarm before the latch clears, it is sent then. A config publishes sensor-recovered
+      // too: one that turns stuck detection off (applyConfigUpdate()), and reinitializeHardware()
+      // for a monitor that had failed. reinitializeHardware() then clears the latches of most
+      // monitors, a pending edge with them, and sends a clear (NEW-A), so client and server
+      // agree and the level re-latches from fresh samples. A pulse monitor that reads as before
+      // a charger programming run keeps its latches (C-A02: there is no reading to judge them
+      // by), and there the edge is re-asserted as here. The I2C sensor-only recovery in loop()
+      // clears sensorFailed silently; the server's fresh-telemetry sensor-fault self-clear still
+      // drops the level alarm on that path (C-A04).
+      queueLatchedAlarmReassertion(idx, reading);
     }
   }
   state.lastValidReading = reading;
   state.hasLastValidReading = true;
   return true;
+}
+
+// C-T01 (NEW-B): a sensor-recovered note went out, which the server takes as a clear, while the
+// monitor keeps its latch: the latched edge is queued as the pending one, a publish-only
+// re-assertion that evaluateAlarms() sends from a later sample in alarm (retryPendingAlarm()).
+// Nothing when the monitor's alarms are off, an edge is pending already, or no latch is set.
+// `reading` resolves the alarm type of a digital monitor, and only that.
+static void queueLatchedAlarmReassertion(uint8_t idx, float reading) {
+  if (idx >= gConfig.monitorCount) {
+    return;
+  }
+  const MonitorConfig &cfg = gConfig.monitors[idx];
+  MonitorRuntime &state = gMonitorState[idx];
+  if (!cfg.alarmsEnabled || state.pendingAlarm != ALARM_PENDING_NONE) {
+    return;
+  }
+  if (cfg.sensorInterface == SENSOR_DIGITAL) {
+    if (state.highAlarmLatched) {
+      bool triggerOnActivated = true;
+      (void)digitalAlarmCondition(cfg, reading, triggerOnActivated);  // resolves the type only
+      state.pendingAlarm = triggerOnActivated ? ALARM_PENDING_TRIGGERED : ALARM_PENDING_NOT_TRIGGERED;
+    }
+  } else if (state.highAlarmLatched) {
+    state.pendingAlarm = ALARM_PENDING_HIGH;
+  } else if (state.lowAlarmLatched) {
+    state.pendingAlarm = ALARM_PENDING_LOW;
+  }
+  if (state.pendingAlarm != ALARM_PENDING_NONE) {
+    Serial.print(F("Re-asserting latched alarm after sensor recovery: "));
+    Serial.println(cfg.name);
+  }
 }
 
 // ============================================================================
@@ -6758,9 +6858,11 @@ static float readPulseSensor(const MonitorConfig &cfg, uint8_t idx) {
   // from before a run is: marked reused, so evaluateAlarms() neither latches nor clears an alarm
   // with it, nor restores a relay after boot on it; not taken for an unload (sampleBeforeRun); and
   // standing in, so sampleMonitors() does not validate it: it counts towards no stuck sensor, the
-  // last valid value stands, and it gets no time. A count ends with its result, a measurement or
-  // that of a count of the time between two pulses that saw no second one in its time (the last
-  // reading, the placeholder at first), which is a reading from then on, as before.
+  // last valid value stands (0 as at boot, also after a config: resetPulseMonitor()), and it gets
+  // no time. A count ends with its result, a measurement or that of a count of the time between
+  // two pulses that saw no second one in its time (the last reading, the placeholder at first),
+  // which is a reading from then on, as before. The first reading that is a measurement goes out
+  // whatever its change (gPulseMeasured, sampleMonitors()).
   if (pctx.resultReady) {
     gPulseCountEnded[idx] = true;
   } else if (!gPulseCountEnded[idx]) {
@@ -6857,6 +6959,16 @@ static void sampleMonitors() {
       gMonitorState[i].currentValue = inches;
       if (!gMonitorState[i].sampleReused) {
         gMonitorState[i].lastReadingEpoch = sampleEpoch;
+        // A pulse monitor's first measurement since boot, or since a config started its count
+        // again (resetPulseMonitor()). What telemetry sent of it until now, if anything, was a
+        // placeholder (readPulseSensor()), marked reused and with no time, which the server keeps
+        // out of its history. That placeholder may be the value a change is measured from (a
+        // sample's baseline, or an on-demand request's), and a first measurement at 0 like it, or
+        // within the threshold of it, would not go out: so it goes out whatever its change.
+        if (gConfig.monitors[i].sensorInterface == SENSOR_PULSE && !gPulseMeasured[i]) {
+          gPulseMeasured[i] = true;
+          gMonitorState[i].lastReportedValue = -9999.0f;
+        }
       }
     }
 
@@ -7460,13 +7572,7 @@ static void sendAlarm(uint8_t idx, const char *alarmType, float inches) {
     // Check if this alarm type matches the relay trigger condition
     // relay_timeout is excluded — it is a notification, not an alarm trigger
     if (isAlarm) {
-      if (cfg.relayTrigger == RELAY_TRIGGER_ANY) {
-        shouldActivateRelay = true;
-      } else if (cfg.relayTrigger == RELAY_TRIGGER_HIGH && strcmp(alarmType, "high") == 0) {
-        shouldActivateRelay = true;
-      } else if (cfg.relayTrigger == RELAY_TRIGGER_LOW && strcmp(alarmType, "low") == 0) {
-        shouldActivateRelay = true;
-      }
+      shouldActivateRelay = alarmTriggersRelay(cfg, alarmType);
     } else if (!isRelayTimeout) {
       // BugFix 04022026 (CRITICAL-3): UNTIL_CLEAR relay clearing was broken.
       // When alarmType is "clear", comparing it against "high"/"low" always fails.
@@ -8856,24 +8962,33 @@ static void withdrawChargerProgramForOtherCharger(uint8_t before) {
 }
 
 // A config that names another charger (another Modbus id) than `before`, the one the config named
-// until now, with the charger on (`wasOn`). A look that the journal owes to no charger it names
-// (sunsaver::cautiousJournal(): a start could not tell what its journal held) goes to the one the
-// config names at each try, and stands for a run that talked to the one the config named then: a
-// look at the new one would settle it without asking the charger that may wait for its restart.
-// So it stays with `before` (sunsaver::Supervisor::bindDuty()). With the charger off, the config
-// may be the default one (a start without flash, or with flash that lost its files), whose
-// Modbus id names no charger in particular: the look then goes to the one the config names, as
-// before. The new config waits for the journal that binds the look: persistConfigIfDirty() saves
-// no config until flash has taken it, so that a restart never finds the new config beside a
-// journal that names no charger, which would send the look to the new one.
+// until now with the charger on (`wasOn`), or that turns the charger off. A look that the journal
+// owes to no charger it names (sunsaver::cautiousJournal(): a start could not tell what its
+// journal held) goes to the one the config names at each try, and stands for a run that talked to
+// the one the config named then: a look at another one would settle it without asking the
+// charger that may wait for its restart. So it stays with `before` (sunsaver::Supervisor::
+// bindDuty()). With the charger off, the config may be the default one (a start without flash,
+// or with flash that lost its files), whose Modbus id names no charger in particular: the look
+// then goes to the one the config names, as before. That is why the look is bound as the charger
+// goes off, too, whatever Modbus id the config gives: a later config would name the next charger
+// with the charger off, and the look would go to that one. The new config waits for the journal
+// that binds the look: persistConfigIfDirty() saves no config until flash has taken it, so that a
+// restart never finds the new config beside a journal that names no charger, which would send the
+// look to the one the new config names.
 static void bindChargerDutyBeforeOtherCharger(uint8_t before, bool wasOn) {
-  if (!wasOn || gConfig.solarCharger.modbusSlaveId == before || !gSolarManager.bindChargerDuty(before)) {
+  const bool sameCharger = gConfig.solarCharger.enabled && gConfig.solarCharger.modbusSlaveId == before;
+  if (!wasOn || sameCharger || !gSolarManager.bindChargerDuty(before)) {
     return;
   }
   gChargerDutyBindingUnsaved = gSolarManager.chargerProgramming().journalUnsaved();
   char line[128];
-  snprintf(line, sizeof(line), "Charger programming: the look owed stays with charger %u, which the config named before charger %u",
-           (unsigned)before, (unsigned)gConfig.solarCharger.modbusSlaveId);
+  if (gConfig.solarCharger.enabled) {
+    snprintf(line, sizeof(line), "Charger programming: the look owed stays with charger %u, which the config named before charger %u",
+             (unsigned)before, (unsigned)gConfig.solarCharger.modbusSlaveId);
+  } else {
+    snprintf(line, sizeof(line), "Charger programming: the look owed stays with charger %u, which the config named before it turned the charger off",
+             (unsigned)before);
+  }
   Serial.println(line);
   addSerialLog(line);
 }
