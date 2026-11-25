@@ -677,7 +677,7 @@ enum Finding : uint32_t {
   FINDING_RESET_PENDING = 1ul << 8,     // settings were written, the controller has not restarted
   FINDING_CHARGER_FAULT = 1ul << 9,     // the controller reports another fault
   FINDING_PACK_VOLTAGE = 1ul << 10,     // the battery is not the 12 V or 24 V pack that was configured
-  FINDING_PRESET_LVD = 1ul << 11,       // SW2 OFF: the load disconnects at the built-in 11.50 V
+  FINDING_PRESET_LVD = 1ul << 11,       // SW2 OFF: the load disconnects at the built-in 11.50 V (23.00 V at 24 V)
   FINDING_LIVE_SCALE = 1ul << 12,       // the charger's own LVD reads wrong with this firmware's scale
   FINDING_SYSTEM_24V = 1ul << 13,       // a 24 V system: the stored voltages were not judged
   FINDING_SYSTEM_UNKNOWN = 1ul << 14    // the battery voltage tells no system: not judged either
@@ -713,7 +713,8 @@ inline const char *findingText(uint32_t finding) {
     case FINDING_PACK_VOLTAGE:
       return "The battery voltage does not match the pack voltage that was configured.";
     case FINDING_PRESET_LVD:
-      return "DIP switch 2 is OFF: the load is disconnected at the built-in 11.50 V, not at the stored LVD.";
+      return "DIP switch 2 is OFF: the load is disconnected at the built-in 11.50 V (23.00 V on a 24 V "
+             "system), not at the stored LVD.";
     case FINDING_LIVE_SCALE:
       return "The charger's own LVD reads wrong with the scale this firmware uses for voltages, so the "
              "battery voltage it reports is off by 3.3 %.";
@@ -1279,14 +1280,23 @@ inline void describeSettingsScale(const ScaleVerdict &verdict, Text *out) {
   out->add(scaleName(candidateScale(other))).add(")");
 }
 
-inline void describeLiveScale(uint8_t scale, uint8_t source, Text *out) {
+// systemVolts is Evaluation::systemVolts: the built-in LVD is 11.50 V on a 12 V system and twice
+// that on a 24 V one.
+inline void describeLiveScale(uint8_t scale, uint8_t source, uint8_t systemVolts, Text *out) {
   if (scale == SCALE_UNKNOWN) {
     out->add("not proven");
     return;
   }
   out->add(scaleName(scale));
-  out->add(source == LIVE_SOURCE_PRESET_LVD ? " (the built-in 11.50 V LVD reads right with it)"
-                                             : " (the stored LVD reads right with it)");
+  if (source != LIVE_SOURCE_PRESET_LVD) {
+    out->add(" (the stored LVD reads right with it)");
+  } else if (systemVolts == 24) {
+    out->add(" (the built-in 23.00 V LVD reads right with it)");
+  } else if (systemVolts == 12) {
+    out->add(" (the built-in 11.50 V LVD reads right with it)");
+  } else {
+    out->add(" (the built-in LVD, 11.50 V or 23.00 V on a 24 V system, reads right with it)");
+  }
 }
 
 }  // namespace sunsaver

@@ -895,6 +895,7 @@ static bool gSolarPolledLastPass = false;         // the last pass of loop() pol
 static bool gChargerReportSent = false;           // a report has gone out since boot
 static uint32_t gChargerReportFingerprint = 0;    // sunsaver::settingsFingerprint() of that report
 static unsigned long gChargerReportMillis = 0;    // when it went out
+static bool gChargerReportStale = false;          // and it is a week old or more: see serviceChargerCheck()
 // The report that still has to go out, kept apart from the pass that made it so that it can
 // wait: for the clock (the server keeps the newest report by the time of the check), or for a
 // Notecard that would not take it. See sendDueChargerReport().
@@ -7425,6 +7426,11 @@ static bool chargerCheckHeldBack() {
 // it. `lineFree` is false in a pass in which a poll talked to the charger: then nothing is read,
 // and a report that waits is still sent.
 static void serviceChargerCheck(unsigned long now, bool lineFree) {
+  // Noted in every pass, held back or not: once millis() has come round, a report that went out
+  // more than 49.7 days ago would look new again, and an unchanged one would wait another week.
+  if (gChargerReportSent && (now - gChargerReportMillis) >= CHARGER_REPORT_REFRESH_MS) {
+    gChargerReportStale = true;
+  }
   if (chargerCheckHeldBack()) {
     gSolarManager.cancelChargerCheck();
     return;
@@ -7463,18 +7469,24 @@ static void serviceChargerCheck(unsigned long now, bool lineFree) {
     finishChargerCheck(millis());
     sendDueChargerReport(now);
   } else {
-    if (gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES) {
-      gChargerCheckFailures = 0;  // the daily try after a run of failures
+    // From the third pass in a row that the link did not carry, one try a day, until a pass
+    // completes or a config change asks for one (requestChargerCheck()).
+    const bool again = gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES;
+    if (!again) {
+      ++gChargerCheckFailures;
     }
-    ++gChargerCheckFailures;
     // The charger's settings may have changed since the last pass that completed, and the polls
     // may go on working while its settings cannot be read: the no-charge alert goes back to its
     // default until a pass completes again.
     gSolarManager.setFloatReference(0.0f);
     Serial.print(F("Charger check: the charger stopped answering part way ("));
-    Serial.print(gChargerCheckFailures);
-    Serial.print(F(" of "));
-    Serial.print(CHARGER_CHECK_MAX_FAILURES);
+    if (again) {
+      Serial.print(F("again"));
+    } else {
+      Serial.print(gChargerCheckFailures);
+      Serial.print(F(" of "));
+      Serial.print(CHARGER_CHECK_MAX_FAILURES);
+    }
     Serial.println(gChargerCheckFailures >= CHARGER_CHECK_MAX_FAILURES ? F("), next try in a day")
                                                                       : F("), next try in 10 minutes"));
   }
@@ -7524,13 +7536,14 @@ static void finishChargerCheck(unsigned long endedAt) {
     Serial.println(line);
     {
       sunsaver::Text text(line, sizeof(line));
-      sunsaver::describeLiveScale(evaluation.liveScale, evaluation.liveSource, &text);
+      sunsaver::describeLiveScale(evaluation.liveScale, evaluation.liveSource, evaluation.systemVolts, &text);
     }
     Serial.print(F("  Live readings: "));
     Serial.println(line);
   }
 
-  if (!changed && !gChargerReportSyncNow && (endedAt - gChargerReportMillis) < CHARGER_REPORT_REFRESH_MS) {
+  const bool stale = gChargerReportStale || (endedAt - gChargerReportMillis) >= CHARGER_REPORT_REFRESH_MS;
+  if (!changed && !gChargerReportSyncNow && !stale) {
     gChargerReportDue = false;  // the server has this report
     return;
   }
@@ -7614,6 +7627,7 @@ static void sendDueChargerReport(unsigned long now) {
   gChargerReportSent = true;
   gChargerReportFingerprint = gChargerReportDueFingerprint;
   gChargerReportMillis = now;
+  gChargerReportStale = false;
   gChargerReportSyncNow = false;
 }
 

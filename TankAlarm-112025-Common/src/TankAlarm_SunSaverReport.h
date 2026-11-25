@@ -229,7 +229,7 @@ inline void describeReport(const Snapshot &snapshot, const Evaluation &evaluatio
   }
   {
     Text text(line, sizeof(line));
-    describeLiveScale(evaluation.liveScale, evaluation.liveSource, &text);
+    describeLiveScale(evaluation.liveScale, evaluation.liveSource, evaluation.systemVolts, &text);
     out["liveScale"] = line;
   }
 
