@@ -2474,7 +2474,7 @@ static void testReport() {
     CHECK_EQ(rows, ss::ITEM_COUNT);
     CHECK_HAS(shown, "[\"EV_reg\",\"Absorption voltage at 25 C\",\"14.00 V\",\"0x11EC\"]");
     CHECK_HAS(shown, "[\"EV_eq\",\"Equalize voltage at 25 C\",\"0 (off)\",\"0x0000\"]");
-    CHECK_HAS(shown, "[\"ER_icomp\",\"LVD load current compensation\",\"0 (off)\",\"0x0000\"]");
+    CHECK_HAS(shown, "[\"ER_icomp\",\"Load current compensation\",\"0 (off)\",\"0x0000\"]");
     CHECK_HAS(shown, "[\"Et_lvd_warn\",\"LVD warning time\",\"no answer\",\"\"]");
     CHECK_HAS(shown, "[\"dip_switch\",\"DIP switches\",\"SW1 OFF, SW2 ON, SW3 OFF, SW4 ON\",\"0x000A\"]");
     CHECK_HAS(shown, "\"13.68 V\"");  // the live voltages use the scale the LVD proved
